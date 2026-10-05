@@ -930,6 +930,88 @@ fn covers_near(s: SectionPos, near: (i64, i64, i64, i64), across: Option<&super:
     x0 < near.1 && x1 > near.0 && z0 < near.3 && z1 > near.2
 }
 
+/// Farthest and nearest distance from `(eu, ev)` to the closed span square of `s`.
+/// The farthest corner is what [`World::full_res_covers`](super::World::full_res_covers) tests.
+pub(in crate::world) fn span_reach(s: SectionPos, eu: i32, ev: i32) -> (f32, f32) {
+    let span = s.span();
+    let (x0, z0) = (s.min_x(), s.min_z());
+    let (x1, z1) = (x0 + span, z0 + span);
+    let fx = (x0 - eu).abs().max((x1 - eu).abs()) as f32;
+    let fz = (z0 - ev).abs().max((z1 - ev).abs()) as f32;
+    let dx = if eu < x0 { x0 - eu } else if eu > x1 { eu - x1 } else { 0 };
+    let dz = if ev < z0 { z0 - ev } else if ev > z1 { ev - z1 } else { 0 };
+    ((fx * fx + fz * fz).sqrt(), ((dx * dx + dz * dz) as f32).sqrt())
+}
+
+/// Pieces of a cube-face section against the full-view skip disk. A tile that crosses the disk, or
+/// sits wholly inside it while its relief leaves the near window, is replaced by the largest
+/// descendants that do not, down to detail 0 (span 32). A piece wholly inside whose relief fits
+/// stays, so the chunks can take it over once they are final. A tile still crossing at detail 0
+/// stays: dropping it would hole the sliver outside the disk.
+fn push_split(
+    s: SectionPos,
+    eu: i32,
+    ev: i32,
+    h_lim: f32,
+    margin: f32,
+    out: &mut Vec<SectionPos>,
+    sticks: &impl Fn(SectionPos) -> bool,
+) {
+    let (far, near) = span_reach(s, eu, ev);
+    let inside = far + margin <= h_lim;
+    let crosses = near < h_lim - margin && !inside;
+    if s.detail.0 == 0 || !(crosses || (inside && sticks(s))) {
+        out.push(s);
+        return;
+    }
+    for q in super::section::Quadrant::ALL {
+        push_split(s.child(q), eu, ev, h_lim, margin, out, sticks);
+    }
+}
+
+/// Merge tiles that miss the skip disk until `set` fits `budget`. A parent that meets the disk
+/// is left split: merging it would put a coarse tile back over the player.
+fn coarsen_off_disk(set: &mut FastSet<SectionPos>, budget: usize, eu: i32, ev: i32, limit: f32) {
+    let cap = crate::render_config::LOD_COARSEST_DETAIL as i8;
+    while set.len() > budget {
+        let mut merged = false;
+        for child_d in (0..cap).rev() {
+            if set.len() <= budget {
+                break;
+            }
+            let mut kids: FastMap<SectionPos, u8> = FastMap::default();
+            for &c in set.iter() {
+                if c.detail.0 == child_d {
+                    *kids.entry(c.parent()).or_insert(0) += 1;
+                }
+            }
+            let mut parents: Vec<_> = kids.into_iter().filter(|&(_, n)| n >= 2).collect();
+            parents.sort_unstable_by_key(|(p, n)| (std::cmp::Reverse(*n), p.body, p.face as u8, p.x, p.z));
+            for (p, _) in parents {
+                if set.len() <= budget {
+                    break;
+                }
+                if span_reach(p, eu, ev).1 < limit {
+                    continue;
+                }
+                let mut removed = 0u8;
+                for q in super::section::Quadrant::ALL {
+                    if set.remove(&p.child(q)) {
+                        removed += 1;
+                    }
+                }
+                if removed > 0 {
+                    set.insert(p);
+                    merged = true;
+                }
+            }
+        }
+        if !merged {
+            break;
+        }
+    }
+}
+
 /// Whether `s` lies wholly inside the full-res chunk box.
 fn inside_near(s: SectionPos, near: (i64, i64, i64, i64), across: Option<&super::seam::SeamAcross>) -> bool {
     let (x0, z0, x1, z1) = home_rect(s, across);
@@ -3754,7 +3836,7 @@ impl World {
     /// Streaming centre in a warped-cube box, mapped back to the reference cube. Outside every
     /// cube box this is the centre unchanged, so an identity fold stays bit-identical. A reference
     /// centre is not inside a box, so a second call does not translate again.
-    fn lod_place(&self, center: Coord) -> (Coord, f64, bool) {
+    pub(in crate::world) fn lod_place(&self, center: Coord) -> (Coord, f64, bool) {
         let cs = CHUNK_SIZE as i64;
         let cell = [center.x as i64 * cs, center.y as i64 * cs, center.z as i64 * cs];
         for atlas in self.generator.atlases() {
@@ -3777,6 +3859,14 @@ impl World {
             return (reference, eye_y, true);
         }
         (center, self.section_eye_y, false)
+    }
+
+    /// Cells added to a storage-frame altitude on `face` to reach the reference cube.
+    /// Zero when `reference` is `storage` (anything outside a cube box).
+    pub(in crate::world) fn face_alt_shift(storage: Coord, reference: Coord, face: Face) -> i64 {
+        let (_, sa) = ColumnKey::of(face, storage);
+        let (_, ra) = ColumnKey::of(face, reference);
+        (i64::from(ra) - i64::from(sa)) * i64::from(CHUNK_SIZE as i32)
     }
 
     fn section_metric_on(&self, center: Coord, delta: DVec3, face: Face, datum: i32) -> EyeMetric {
@@ -4205,7 +4295,7 @@ impl World {
     /// static frontier bit-for-bit. Open space and a round body seen from past the far reach
     /// select nothing; a far-field centre on a chart (in or above its box) selects that chart's
     /// sections, reading chart surfaces through `memo`; the sections its near window holds go to
-    /// `held`.
+    /// `held`. On a warped cube, up-face tiles that cross the near disk are split to detail 0.
     fn desired_sections_with(
         &self,
         center: Coord,
@@ -4221,7 +4311,51 @@ impl World {
         for nface in self.edge_faces(center, body, face) {
             out = quadtree::union_frontiers(out, self.frontier_union(center, body, nface));
         }
+        // The disk is the full view, not the reduced loading window: the frontier key has no
+        // load radius, and a fast flight must not bake the small disk in.
+        if self.lod_place(center).2 {
+            out = self.split_near_cube(center, out);
+        }
         out
+    }
+
+    /// [`desired_sections_with`](Self::desired_sections_with) on a warped cube: sections of the up
+    /// face that cross the skip disk are split down to detail 0, then tiles clear of the disk are
+    /// merged back until the frontier fits the section budget.
+    fn split_near_cube(&self, center: Coord, sections: Vec<SectionPos>) -> Vec<SectionPos> {
+        let Some(face) = self.live_up() else {
+            return sections;
+        };
+        let (reference, _, _) = self.lod_place(center);
+        let cs = CHUNK_SIZE as i32;
+        let h_lim = 0.75 * self.view.coverage().half.x;
+        let margin = cs as f32 * 0.5 * std::f32::consts::SQRT_2;
+        let frame = FaceFrame::new(face);
+        let mid = |c: i32| (i64::from(c) * i64::from(cs) + i64::from(cs / 2)) as i32;
+        let (eu, _, ev) = frame.cell_to_local((mid(reference.x), mid(reference.y), mid(reference.z)));
+        let shift = Self::face_alt_shift(center, reference, face);
+        let band = self.window_alts().map(|[a0, a1]| (a0 + shift, a1 + shift));
+        let sticks = |s: SectionPos| {
+            let Some((a0, a1)) = band else { return false };
+            let Some((lo, hi)) = self.cover_band(s, true) else { return false };
+            lo < self.baked_height(s, a0) || hi > self.baked_height(s, a1)
+        };
+        let mut split = Vec::with_capacity(sections.len());
+        for s in sections {
+            if s.face == face {
+                push_split(s, eu, ev, h_lim, margin, &mut split, &sticks);
+            } else {
+                split.push(s);
+            }
+        }
+        let budget = self.sections_allowed();
+        if split.len() > budget {
+            let mut set: FastSet<SectionPos> = split.into_iter().collect();
+            coarsen_off_disk(&mut set, budget, eu, ev, h_lim - margin);
+            split = set.into_iter().collect();
+        }
+        split.sort_unstable_by_key(section_key);
+        split
     }
 
     fn frontier_union(&self, center: Coord, body: u16, face: Face) -> Vec<SectionPos> {
@@ -4974,7 +5108,8 @@ impl World {
             }
         }
         // LOD2 far field: all desired cells covered and no uploads pending. Skipped
-        // when disabled (no far field in near-only mode).
+        // when disabled (no far field in near-only mode). A cell the settled chunks
+        // already draw is not admitted, so it counts as done without a section mesh.
         if self.desired_unrefined().is_some() {
             if !self.section_upload_queue.is_empty() {
                 return false;
@@ -4982,7 +5117,7 @@ impl World {
             if self
                 .section_desired
                 .iter()
-                .any(|&c| !self.section_covered(c))
+                .any(|&c| !self.section_covered(c) && !self.full_res_covers(center, c))
             {
                 return false;
             }
@@ -5231,7 +5366,7 @@ impl World {
             let uncovered = self
                 .section_desired
                 .iter()
-                .filter(|&&c| !self.section_covered(c))
+                .filter(|&&c| !self.section_covered(c) && !self.full_res_covers(center, c))
                 .count();
             if uncovered != 0 {
                 return format!(

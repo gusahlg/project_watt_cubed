@@ -2012,6 +2012,30 @@ impl World {
             .or_else(|| self.section_mip.as_ref()?.relief_band(key))
     }
 
+    /// [`section_relief_band`](Self::section_relief_band), or the baked ancestor's envelope when
+    /// `in_cube` and `key` is finer than the bake. The ancestor covers this tile, so a band that
+    /// fits the window proves the tile does too. Off a cube the bake's own cell is the only proof,
+    /// which keeps charts and flat worlds on the bands they had.
+    pub(in crate::world) fn cover_band(&self, key: SectionPos, in_cube: bool) -> Option<(f32, f32)> {
+        if let Some(band) = self.section_relief_band(key) {
+            return Some(band);
+        }
+        if !in_cube {
+            return None;
+        }
+        let mut p = key;
+        for _ in 0..8 {
+            if p.detail.0 >= crate::render_config::LOD_COARSEST_DETAIL as i8 {
+                return None;
+            }
+            p = p.parent();
+            if let Some(band) = self.section_relief_band(p) {
+                return Some(band);
+            }
+        }
+        None
+    }
+
     /// Eye altitude in the bake's height space. A zero datum on +Y stores world Y;
     /// every other bake stores height above the face datum.
     fn baked_eye(&self, key: SectionPos) -> f32 {
@@ -2029,16 +2053,12 @@ impl World {
         if key.face == Face::PosY && datum == 0 { a as f32 } else { (a - i64::from(datum)) as f32 }
     }
 
-    /// World Y of one baked height, then the chunk rows a band occupies.
+    /// Geometric altitude of one baked height. +Y with a zero datum stores world Y;
+    /// every other bake stores height above the face datum.
     fn baked_world_y(&self, key: SectionPos, h: f32) -> i32 {
         let datum = self.generator.face_datum(key.body, key.face);
         let rel = h.floor() as i32;
         if key.face == Face::PosY && datum == 0 { rel } else { datum.saturating_add(rel) }
-    }
-
-    fn baked_chunk_ys(&self, key: SectionPos, lo: f32, hi: f32) -> (i32, i32) {
-        let cs = CHUNK_SIZE as i32;
-        (self.baked_world_y(key, lo).div_euclid(cs), self.baked_world_y(key, hi).div_euclid(cs))
     }
 
     /// Skip near-field LOD load if the section's footprint is provably inside the
@@ -2055,13 +2075,10 @@ impl World {
 
     /// The full-res chunks draw everything `key` would: its footprint lies well inside the near
     /// square, its relief inside the near window, and every chunk under it has settled. Such a
-    /// section is neither loaded nor drawn.
+    /// section is neither loaded nor drawn. The footprint is face-local on every cube face; off a
+    /// cube the reference frame is the streaming centre, so a flat world and a chart stay as they
+    /// were.
     fn full_res_covers(&self, center: Coord, key: SectionPos) -> bool {
-        // Off the camera's +Y face the world-XZ proof does not apply. Keeping the
-        // section loaded is the safe side (the clip still discards it once settled).
-        if key.face != Face::PosY {
-            return false;
-        }
         let cov = self.view.coverage();
         let cs = CHUNK_SIZE as i32;
         let (mut h_lim, mut v_lim) = (0.75 * cov.half.x, 0.75 * cov.half.y);
@@ -2074,26 +2091,39 @@ impl World {
         if self.load_v >= 0 && self.load_v < self.view.vertical {
             v_lim = 0.75 * (self.load_v.max(0) * cs) as f32;
         }
-        // The f64 eye XZ was floored to `center` before this lane; inflate the reach
+        // The f64 eye tangents were floored to the centre chunk; inflate the reach
         // by one chunk half-diagonal so the true eye can't sit outside our bound.
         let margin = cs as f32 * 0.5 * std::f32::consts::SQRT_2;
-        let (ex, ez) = (center.x * cs + cs / 2, center.z * cs + cs / 2);
-        let span = key.span();
-        let (x0, z0) = (key.min_x(), key.min_z());
-        let fx = (x0 - ex).abs().max((x0 + span - ex).abs()) as f32;
-        let fz = (z0 - ez).abs().max((z0 + span - ez).abs()) as f32;
-        if (fx * fx + fz * fz).sqrt() + margin > h_lim {
+        let (reference, eye_y, in_cube) = self.lod_place(center);
+        let frame = FaceFrame::new(key.face);
+        let mid = |c: i32| (i64::from(c) * i64::from(cs) + i64::from(cs / 2)) as i32;
+        let (eu, _, ev) = frame.cell_to_local((mid(reference.x), mid(reference.y), mid(reference.z)));
+        if streaming::span_reach(key, eu, ev).0 + margin > h_lim {
             return false;
         }
         // Vertical: the section's terrain must sit inside the near window (the eye's
-        // slab without one), else clip draws the part that pokes out. If unbaked, can't
-        // prove, so don't skip. An edited footprint prefers the fresh overlay over the
-        // (possibly stale) bake.
-        let Some((lo, hi)) = self.section_relief_band(key) else {
+        // slab without one). If unbaked, can't prove, so don't skip. An edited footprint
+        // prefers the fresh overlay over the (possibly stale) bake. Window altitudes are
+        // storage-frame; the bake is reference-frame.
+        let Some((lo, hi)) = self.cover_band(key, in_cube) else {
             return false;
         };
         let (floor, ceil) = match self.window_alts() {
-            Some([a0, a1]) if self.live_up() == Some(key.face) => (self.baked_height(key, a0), self.baked_height(key, a1)),
+            Some([a0, a1]) if self.live_up() == Some(key.face) => {
+                let shift = if in_cube { Self::face_alt_shift(center, reference, key.face) } else { 0 };
+                (self.baked_height(key, a0 + shift), self.baked_height(key, a1 + shift))
+            }
+            _ if in_cube => {
+                let eye = DVec3::new(f64::from(mid(reference.x)), eye_y, f64::from(mid(reference.z)));
+                let altitude = frame.point_to_local(eye).y;
+                let datum = self.generator.face_datum(key.body, key.face);
+                let ey = if key.face == Face::PosY && datum == 0 {
+                    altitude as f32
+                } else {
+                    (altitude - f64::from(datum)) as f32
+                };
+                (ey - v_lim, ey + v_lim)
+            }
             _ => {
                 let ey = self.baked_eye(key);
                 (ey - v_lim, ey + v_lim)
@@ -2104,7 +2134,7 @@ impl World {
         }
         // Every chunk backing the footprint is settled, so the near area is
         // actually covered now, not just in-range.
-        self.backing_chunks_ready(key)
+        self.backing_chunks_ready(center, reference, in_cube, key)
     }
 
     /// Whether every full-res chunk backing `key`'s footprint is settled
@@ -2112,20 +2142,45 @@ impl World {
     /// to skip the near-LOD load only where full-res provably covers. A footprint
     /// whose vertical band can't be proven (no overlay, no baked mip) reads as
     /// NOT ready — fail toward keeping the section loaded, never toward a hole.
-    fn backing_chunks_ready(&self, key: SectionPos) -> bool {
-        let cs = CHUNK_SIZE as i32;
-        let span = key.span();
-        let (x0, z0) = (key.min_x(), key.min_z());
-        let Some((lo, hi)) = self.section_relief_band(key) else {
+    /// Chunks of a warped cube are loaded in its storage box; `key` is reference-frame.
+    fn backing_chunks_ready(&self, storage: Coord, reference: Coord, in_cube: bool, key: SectionPos) -> bool {
+        let Some((lo, hi)) = self.cover_band(key, in_cube) else {
             return false;
         };
-        let (cx_lo, cx_hi) = (x0.div_euclid(cs), (x0 + span - 1).div_euclid(cs));
-        let (cz_lo, cz_hi) = (z0.div_euclid(cs), (z0 + span - 1).div_euclid(cs));
-        let (cy_lo, cy_hi) = self.baked_chunk_ys(key, lo, hi);
-        for cy in cy_lo..=cy_hi {
-            for cz in cz_lo..=cz_hi {
-                for cx in cx_lo..=cx_hi {
-                    if !self.chunk_final(Coord::new(cx, cy, cz)) {
+        let frame = FaceFrame::new(key.face);
+        let span = key.span();
+        let (u0, v0) = (key.min_x(), key.min_z());
+        let (u1, v1) = (u0 + span - 1, v0 + span - 1);
+        let (a_lo, a_hi) = (self.baked_world_y(key, lo), self.baked_world_y(key, hi));
+        let mut lo_c = [i32::MAX; 3];
+        let mut hi_c = [i32::MIN; 3];
+        for a in [a_lo, a_hi] {
+            for u in [u0, u1] {
+                for v in [v0, v1] {
+                    let (x, y, z) = frame.cell_to_world((u, a, v));
+                    let c = Self::chunk_of(x, y, z);
+                    let p = [c.x, c.y, c.z];
+                    for i in 0..3 {
+                        lo_c[i] = lo_c[i].min(p[i]);
+                        hi_c[i] = hi_c[i].max(p[i]);
+                    }
+                }
+            }
+        }
+        let (dx, dy, dz) = if in_cube {
+            (
+                i64::from(reference.x) - i64::from(storage.x),
+                i64::from(reference.y) - i64::from(storage.y),
+                i64::from(reference.z) - i64::from(storage.z),
+            )
+        } else {
+            (0, 0, 0)
+        };
+        for y in lo_c[1]..=hi_c[1] {
+            for z in lo_c[2]..=hi_c[2] {
+                for x in lo_c[0]..=hi_c[0] {
+                    let c = Coord::new((i64::from(x) - dx) as i32, (i64::from(y) - dy) as i32, (i64::from(z) - dz) as i32);
+                    if !self.chunk_final(c) {
                         return false;
                     }
                 }

@@ -475,7 +475,7 @@ fn coverage_skip_is_sound_and_backed() {
     let cs = CHUNK_SIZE as i32;
     let nchunks = cell.span() / cs;
     let (cx0, cz0) = (cell.min_x().div_euclid(cs), cell.min_z().div_euclid(cs));
-    let (cy_lo, cy_hi) = world.baked_chunk_ys(cell, lo, hi);
+    let (cy_lo, cy_hi) = (world.baked_world_y(cell, lo).div_euclid(cs), world.baked_world_y(cell, hi).div_euclid(cs));
     for cy in cy_lo..=cy_hi {
         for dz in 0..nchunks {
             for dx in 0..nchunks {

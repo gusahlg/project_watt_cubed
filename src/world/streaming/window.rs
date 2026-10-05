@@ -2,9 +2,10 @@
 //! the player stands on or builds beside unloads, and it grows over the terrain of the near square:
 //! down to one chunk under its lowest ground and up to one chunk over its highest, within a cap
 //! that keeps the data box inside [`CHUNK_BUDGET`]. Far sections the window holds give way only
-//! once the chunks under them have settled (on a chart the punch waits per section; elsewhere the
-//! engine's clip box keeps to the span its settled rings prove), and a shrink that gives up ground
-//! waits for the far field.
+//! once the chunks under them have settled (on a chart the punch waits per section; on a warped
+//! cube the section is skipped once those chunks are final; in physical space the engine's clip
+//! box keeps to the span its settled rings prove), and a shrink that gives up ground waits for the
+//! far field.
 
 use super::*;
 use super::super::section::{CHART_BODY_BASE, FINEST_DETAIL, section_span};
@@ -106,15 +107,23 @@ fn meets(a: [i32; 2], b: [i32; 2]) -> bool {
 
 impl World {
     /// The near window grows past the eye band wherever the far field gives way to it: on a round
-    /// world's chart, punched by key, and in physical space, where the engine's clip box follows
-    /// it ([`lod_clip_box`](Self::lod_clip_box)). A warped cube's storage clips nothing, and open
-    /// space has no up axis.
+    /// world's chart, punched by key, on a warped cube's storage when the centre's own sky is that
+    /// cube face (the section is skipped once its chunks are final; the clip stays off), and in
+    /// physical space, where the engine's clip box follows it
+    /// ([`lod_clip_box`](Self::lod_clip_box)). Open space has no up axis.
     fn window_grows(&self, center: Coord) -> bool {
         match self.live_up() {
             Some(_) if self.fold.is_identity() => true,
-            Some(Face::PosY) => self.section_on_chart(center),
+            Some(Face::PosY) if self.section_on_chart(center) => true,
+            Some(face) if self.on_cube_face(center, face) => true,
             _ => false,
         }
+    }
+
+    /// `center` is inside a warped cube's storage and its sky is `face` (not an open edge kept
+    /// only by the up-face hysteresis).
+    fn on_cube_face(&self, center: Coord, face: Face) -> bool {
+        self.lod_place(center).2 && self.generator.sky(center) == Sky::Axis(face)
     }
 
     /// The frame the window's altitudes are measured in: the up face, and a chart's atlas.
@@ -271,7 +280,68 @@ impl World {
     /// Chunk layers of the near square's terrain: one under the layer of its lowest solid top to
     /// one over the layer of its highest, edits included.
     fn ground_span(&mut self, center: Coord) -> Option<[i32; 2]> {
-        if self.fold.is_identity() { self.relief_span(center) } else { self.chart_span(center) }
+        if self.live_up().is_some_and(|face| self.on_cube_face(center, face)) {
+            self.cube_span(center)
+        } else if self.fold.is_identity() {
+            self.relief_span(center)
+        } else {
+            self.chart_span(center)
+        }
+    }
+
+    /// [`ground_span`](Self::ground_span) on a warped cube. The relief is read in the reference
+    /// face frame (where the bake lives) and returned as storage up-local chunk altitudes, the
+    /// frame [`window_raw`](Self::window_raw) already uses. `None` until the bake has landed.
+    fn cube_span(&self, center: Coord) -> Option<[i32; 2]> {
+        let (reference, _, in_cube) = self.lod_place(center);
+        if !in_cube {
+            return None;
+        }
+        let face = self.live_up()?;
+        let (body, _) = self.section_lod_face.filter(|&(_, f)| f == face)?;
+        let frame = FaceFrame::new(face);
+        let (cu, _, cv) = frame.chunk_to_local(reference);
+        let h = self.view.horizontal;
+        let span = section_span(FINEST_DETAIL);
+        // Face-local chunk `c` does not cover cells `[c·16, c·16+16)` on a flipped tangent.
+        let cells = |c0: i32, c1: i32, along_u: bool| -> (i32, i32) {
+            let mut lo = i32::MAX;
+            let mut hi = i32::MIN;
+            let cs = CHUNK_SIZE as i32;
+            for c in [c0, c1] {
+                let w = if along_u { frame.chunk_to_world((c, 0, 0)) } else { frame.chunk_to_world((0, 0, c)) };
+                for o in [0, cs - 1] {
+                    let wx = (i64::from(w.x) * i64::from(cs) + i64::from(o)) as i32;
+                    let wy = (i64::from(w.y) * i64::from(cs) + i64::from(o)) as i32;
+                    let wz = (i64::from(w.z) * i64::from(cs) + i64::from(o)) as i32;
+                    let (u, _, v) = frame.cell_to_local((wx, wy, wz));
+                    let t = if along_u { u } else { v };
+                    lo = lo.min(t);
+                    hi = hi.max(t);
+                }
+            }
+            (lo, hi)
+        };
+        let (u0, u1) = cells(cu - h, cu + h, true);
+        let (v0, v1) = cells(cv - h, cv + h, false);
+        let tiles = |a: i32, b: i32| a.div_euclid(span)..=b.div_euclid(span);
+        let at = |x: i32, z: i32| SectionPos { detail: FINEST_DETAIL, body, face, x, z };
+        let mut band: Option<(f32, f32)> = None;
+        for z in tiles(v0, v1) {
+            for x in tiles(u0, u1) {
+                let (lo, hi) = self.section_relief_band(at(x, z))?;
+                band = Some(band.map_or((lo, hi), |(a, b)| (a.min(lo), b.max(hi))));
+            }
+        }
+        let (lo, hi) = band?;
+        let probe = at(0, 0);
+        let layer = |h: f32| -> i64 {
+            let (x, y, z) = frame.cell_to_world((0, self.baked_world_y(probe, h), 0));
+            i64::from(ColumnKey::of(face, World::chunk_of(x, y, z)).1)
+        };
+        let shift = Self::face_alt_shift(center, reference, face) / i64::from(CHUNK_SIZE as i32);
+        let (a, b) = (layer(lo) - 1 - shift, layer(hi) + 1 - shift);
+        Some([i32::try_from(a).ok()?, i32::try_from(b).ok()?])
     }
 
     /// [`ground_span`](Self::ground_span) off a chart, from the far field's baked relief over the
@@ -366,7 +436,12 @@ impl World {
         if !self.lod2 {
             return true;
         }
-        if !self.fold.is_identity() && self.section_frontier_key.is_none_or(|k| k.window != self.window.punch) {
+        // The frontier key records the punch only on a chart, where selection reads it. A cube
+        // face does not, so a shrink waits on coverage instead of a key that stays `None`.
+        if !self.fold.is_identity()
+            && self.section_on_chart(center)
+            && self.section_frontier_key.is_none_or(|k| k.window != self.window.punch)
+        {
             return false;
         }
         self.section_desired
@@ -388,6 +463,21 @@ impl World {
             }
             let (cu, _, cv) = FaceFrame::new(face).chunk_to_local(center);
             (c0, c1, (cu, cv))
+        } else if self.lod_place(center).2 {
+            let Some(face) = self.live_up() else { return true };
+            if s.face != face || self.section_lod_face != Some((s.body, face)) {
+                return true;
+            }
+            let (reference, _, _) = self.lod_place(center);
+            let frame = FaceFrame::new(face);
+            let (cu, _, cv) = frame.chunk_to_local(reference);
+            let chunk_uv = |u: i32, v: i32| {
+                let (x, y, z) = frame.cell_to_world((u, 0, v));
+                let (tu, _, tv) = frame.chunk_to_local(World::chunk_of(x, y, z));
+                (tu, tv)
+            };
+            let (a, b) = (chunk_uv(s.min_x(), s.min_z()), chunk_uv(s.min_x() + s.span() - 1, s.min_z() + s.span() - 1));
+            ((a.0.min(b.0), a.1.min(b.1)), (a.0.max(b.0), a.1.max(b.1)), (cu, cv))
         } else {
             let Some(seat) = self.seams.chart_seat(center) else { return true };
             let floor = seat.lo[1].div_euclid(CHUNK_SIZE as i64) as i32;
@@ -415,7 +505,9 @@ impl World {
     pub(in crate::world) fn note_settled(&mut self) {
         self.lod_clip_grow.set();
         self.held_recheck.set();
-        if self.fold.is_identity() {
+        // Charts punch by key. A cube has no clip, so a settled chunk has to drop the section
+        // the same pass, which the visible rebuild does only when this flag is set.
+        if self.fold.is_identity() || self.center.is_some_and(|c| self.lod_place(c).2) {
             self.section_cover_dirty.set();
         }
     }
@@ -1231,5 +1323,473 @@ mod tests {
         assert!(world.lod_clip_next.is_none_or(|(_, r)| r == 0), "the pending span kept its rings");
         assert_eq!(clip_bare(&world, eye, &cols), 0, "bare right after the teardown");
         settle(&mut world, eye, &|w| clip_bare(w, eye, &cols), "remesh");
+    }
+
+    fn gentle_world() -> World {
+        let gentle = crate::world::terrain::TerrainCfg { relief: 25, ..Default::default() };
+        World::with_kind_cfg(
+            crate::world::DEFAULT_SEED,
+            RenderConfig::default(),
+            WorldgenKind::Diffusion,
+            gentle,
+            true,
+        )
+    }
+
+    fn air(cx: i32, cy: i32, cz: i32) -> Loaded {
+        Loaded {
+            chunk: std::sync::Arc::new(Chunk::from_uniform(cx, cy, cz, AIR)),
+            state: MeshState::Air,
+            rev: 0,
+            connectivity: None,
+            visible: true,
+            light: None,
+            has_blocklight: false,
+            light_reseed: false,
+            light_gen: 0,
+            mesh_hash: None,
+        }
+    }
+
+    /// Reference-frame chunks under `key`, or the storage chunks that hold them when `storage` is set.
+    fn footprint_chunks(world: &World, key: SectionPos, storage: Option<Coord>) -> Vec<Coord> {
+        let frame = FaceFrame::new(key.face);
+        let (lo, hi) = world.section_relief_band(key).expect("baked");
+        let (a0, a1) = (world.baked_world_y(key, lo), world.baked_world_y(key, hi));
+        let span = key.span();
+        let (u0, v0) = (key.min_x(), key.min_z());
+        let (u1, v1) = (u0 + span - 1, v0 + span - 1);
+        let mut lo_c = [i32::MAX; 3];
+        let mut hi_c = [i32::MIN; 3];
+        for a in [a0, a1] {
+            for u in [u0, u1] {
+                for v in [v0, v1] {
+                    let (x, y, z) = frame.cell_to_world((u, a, v));
+                    let c = World::chunk_of(x, y, z);
+                    let p = [c.x, c.y, c.z];
+                    for i in 0..3 {
+                        lo_c[i] = lo_c[i].min(p[i]);
+                        hi_c[i] = hi_c[i].max(p[i]);
+                    }
+                }
+            }
+        }
+        let d = storage
+            .map(|s| {
+                let (reference, _, _) = world.lod_place(s);
+                [
+                    i64::from(reference.x) - i64::from(s.x),
+                    i64::from(reference.y) - i64::from(s.y),
+                    i64::from(reference.z) - i64::from(s.z),
+                ]
+            })
+            .unwrap_or([0; 3]);
+        let mut out = Vec::new();
+        for y in lo_c[1]..=hi_c[1] {
+            for z in lo_c[2]..=hi_c[2] {
+                for x in lo_c[0]..=hi_c[0] {
+                    out.push(Coord::new(
+                        (i64::from(x) - d[0]) as i32,
+                        (i64::from(y) - d[1]) as i32,
+                        (i64::from(z) - d[2]) as i32,
+                    ));
+                }
+            }
+        }
+        out
+    }
+
+    /// A warped cube's near section is proved in the reference face frame and backed by storage
+    /// chunks. Reference-frame coords, which the old proof looked up, do not cover it.
+    #[test]
+    fn cube_coverage_reads_storage_chunks() {
+        use crate::ident::Detail;
+        use crate::world::heightmip::BakeExtent;
+        use crate::world::terrain::cosmos::{Kind, Shape};
+
+        for face in [Face::PosY, Face::PosX] {
+            let mut world = gentle_world();
+            // A finest section is 128 blocks wide. The proof wants its farthest corner inside
+            // 0.75 of the near radius, which a view of 8 (96 blocks) can never show. 18 reaches
+            // 216. The bake's finest radius is half_m >> 3, so 4096 covers the near square.
+            world.set_view_distances(18, 5);
+            let twin = world
+                .generator
+                .cosmos()
+                .expect("cosmos")
+                .bodies()
+                .iter()
+                .copied()
+                .filter(|b| b.kind == Kind::Twin)
+                .nth(1)
+                .expect("twin 2");
+            let Shape::Cube { .. } = twin.shape else { panic!("twin is a cube") };
+            let centre = (
+                i32::try_from(twin.centre[0]).unwrap(),
+                i32::try_from(twin.centre[1]).unwrap(),
+                i32::try_from(twin.centre[2]).unwrap(),
+            );
+            let (cu, _, cv) = FaceFrame::new(face).cell_to_local(centre);
+            let open = world.generator.surface(face, cu, cv);
+            assert_ne!(open, i32::MIN, "{face:?} has no surface");
+            let grid = world
+                .generator
+                .atlases()
+                .iter()
+                .find_map(|a| a.grid.filter(|g| g.body == twin.id))
+                .expect("cube box");
+            let (rx, ry, rz) = FaceFrame::new(face).cell_to_world((cu, open, cv));
+            let cs = CHUNK_SIZE as i64;
+            let d = [
+                (grid.ref_min[0] - grid.origin[0]) / cs,
+                (grid.ref_min[1] - grid.origin[1]) / cs,
+                (grid.ref_min[2] - grid.origin[2]) / cs,
+            ];
+            let reference = World::chunk_of(rx, ry, rz);
+            let storage = Coord::new(
+                (i64::from(reference.x) - d[0]) as i32,
+                (i64::from(reference.y) - d[1]) as i32,
+                (i64::from(reference.z) - d[2]) as i32,
+            );
+            world.section_eye_y = (i64::from(ry) - (grid.ref_min[1] - grid.origin[1])) as f64 + 1.62;
+            world.adopt_fold(storage);
+            world.stream_up = world.resolve_stream_up(storage);
+            world.stream_up_set = true;
+            world.center = Some(storage);
+            assert!(!world.fold.is_identity(), "{face:?} box is physical space");
+            assert_eq!(world.live_up(), Some(face), "{face:?} centre sky");
+            let (placed, _, in_cube) = world.lod_place(storage);
+            assert!(in_cube && placed == reference, "{face:?} lod_place {placed:?} != {reference:?}");
+            assert_ne!(World::face_alt_shift(storage, placed, face), 0, "{face:?} box did not translate");
+            world.section_lod_face = world.dominant_lod_face(storage);
+            world.section_face_set = true;
+            assert_eq!(world.section_lod_face, Some((twin.id, face)), "{face:?} dominant face");
+            let (au, av) = world.face_tangent_centre(storage, face);
+            world.section_mip = Some(HeightMip::bake_at(
+                &*world.generator,
+                &world.registry.color_snapshot(),
+                BakeExtent::new(4096, Detail(FINEST_DETAIL.0 + 3)),
+                au,
+                av,
+                face,
+                twin.id,
+            ));
+            assert!(world.place_window(storage, true));
+            assert!(world.window.ground.is_some() && world.window.grounded, "{face:?} window did not read the face");
+            let punch = world.window.punch.expect("punch");
+            let (_, eye) = ColumnKey::of(face, storage);
+            assert!(punch[0] <= eye - 4 && punch[1] >= eye + 4, "{face:?} punch {punch:?} dropped the eye");
+            assert_eq!(world.lod_clip().half.x, 0.0, "{face:?} clip came on");
+            // A coarse tile must not cross the skip disk: the part over the player is a wholly
+            // inside piece (the chunks draw it) and the part outside stops at detail 0.
+            let h_lim = 0.75 * world.view.coverage().half.x;
+            let margin = (CHUNK_SIZE as f32) * 0.5 * std::f32::consts::SQRT_2;
+            let n = CHUNK_SIZE as i32;
+            let mid = |c: i32| (i64::from(c) * i64::from(n) + i64::from(n / 2)) as i32;
+            let (eu, _, ev) = FaceFrame::new(face).cell_to_local((mid(placed.x), mid(placed.y), mid(placed.z)));
+            world.gpu_live_slots = 6000;
+            let desired = world.desired_sections(storage);
+            assert!(
+                desired.len() <= crate::world::SECTION_SLOT_FLOOR,
+                "{face:?} frontier {} exceeds the section floor",
+                desired.len()
+            );
+            let shift = World::face_alt_shift(storage, placed, face);
+            let [a0, a1] = world.window_alts().expect("window");
+            for s in desired.iter().copied().filter(|s| s.face == face && s.detail.0 > 0) {
+                let (far, near) = super::super::span_reach(s, eu, ev);
+                assert!(
+                    !(near < h_lim - margin && far + margin > h_lim),
+                    "{face:?} coarse tile {s:?} still crosses the near disk"
+                );
+                if far + margin <= h_lim
+                    && let Some((lo, hi)) = world.cover_band(s, true)
+                {
+                    let (floor, ceil) = (world.baked_height(s, a0 + shift), world.baked_height(s, a1 + shift));
+                    assert!(
+                        lo >= floor && hi <= ceil,
+                        "{face:?} {s:?} is inside the disk with relief outside the window"
+                    );
+                }
+            }
+            let span = section_span(FINEST_DETAIL);
+            let cell = SectionPos {
+                body: twin.id,
+                face,
+                detail: FINEST_DETAIL,
+                x: cu.div_euclid(span),
+                z: cv.div_euclid(span),
+            };
+            assert!(world.section_relief_band(cell).is_some(), "{face:?} stand section is not baked");
+            assert!(!world.full_res_covers(storage, cell), "{face:?} unbacked section was skipped");
+            for c in footprint_chunks(&world, cell, None) {
+                world.chunks.insert(c, air(c.x, c.y, c.z));
+            }
+            assert!(!world.full_res_covers(storage, cell), "{face:?} reference chunks covered a storage section");
+            world.chunks.clear();
+            let stored = footprint_chunks(&world, cell, Some(storage));
+            assert!(!stored.is_empty());
+            let stand = {
+                let rc = World::chunk_of(rx, ry, rz);
+                Coord::new((i64::from(rc.x) - d[0]) as i32, (i64::from(rc.y) - d[1]) as i32, (i64::from(rc.z) - d[2]) as i32)
+            };
+            assert!(stored.contains(&stand), "{face:?} stand chunk {stand:?} is outside the footprint");
+            for c in &stored {
+                world.chunks.insert(*c, air(c.x, c.y, c.z));
+            }
+            assert!(world.full_res_covers(storage, cell), "{face:?} storage-backed section was kept");
+            world.chunks.insert(stand, Loaded {
+                state: MeshState::NeedsMesh { building: true, prev: None },
+                ..air(stand.x, stand.y, stand.z)
+            });
+            assert!(!world.full_res_covers(storage, cell), "{face:?} an in-flight chunk still skipped");
+        }
+    }
+
+    /// Columns of the near square in the streaming centre's face frame: face-local `(u, v)` and the
+    /// storage chunk holding the solid top.
+    fn cube_columns(world: &World) -> Vec<(i32, i32, Coord)> {
+        let Some(center) = world.center else { return Vec::new() };
+        let Some(face) = world.live_up() else { return Vec::new() };
+        let (reference, _, in_cube) = world.lod_place(center);
+        if !in_cube {
+            return Vec::new();
+        }
+        let frame = FaceFrame::new(face);
+        let (cu, _, cv) = frame.chunk_to_local(reference);
+        let h = world.view.horizontal;
+        let cs = CHUNK_SIZE as i32;
+        let (dx, dy, dz) = (
+            i64::from(reference.x) - i64::from(center.x),
+            i64::from(reference.y) - i64::from(center.y),
+            i64::from(reference.z) - i64::from(center.z),
+        );
+        let mut out = Vec::new();
+        for dv in -h..=h {
+            for du in -h..=h {
+                let w = frame.chunk_to_world((cu + du, 0, cv + dv));
+                let p = (
+                    (i64::from(w.x) * i64::from(cs) + i64::from(cs / 2)) as i32,
+                    (i64::from(w.y) * i64::from(cs) + i64::from(cs / 2)) as i32,
+                    (i64::from(w.z) * i64::from(cs) + i64::from(cs / 2)) as i32,
+                );
+                let (u, _, v) = frame.cell_to_local(p);
+                let open = world.generator.surface(face, u, v);
+                if open == i32::MIN {
+                    continue;
+                }
+                let (x, y, z) = frame.cell_to_world((u, open - 1, v));
+                let rc = World::chunk_of(x, y, z);
+                out.push((
+                    u,
+                    v,
+                    Coord::new((i64::from(rc.x) - dx) as i32, (i64::from(rc.y) - dy) as i32, (i64::from(rc.z) - dz) as i32),
+                ));
+            }
+        }
+        out
+    }
+
+    fn cube_far(world: &World, face: Face, body: u16, u: i32, v: i32) -> bool {
+        world.section_visible.iter().any(|&(s, mask)| {
+            if s.face != face || s.body != body {
+                return false;
+            }
+            let half = s.span() / 2;
+            in_rect(s, u, v) && mask.iter().any(|q| (u - s.min_x()) / half == q.dx() && (v - s.min_z()) / half == q.dz())
+        })
+    }
+
+    fn cube_bare(world: &World) -> usize {
+        let Some((body, face)) = world.section_lod_face else { return 0 };
+        if world.live_up() != Some(face) {
+            return 0;
+        }
+        cube_columns(world)
+            .into_iter()
+            .filter(|&(u, v, c)| !world.chunks.get(&c).is_some_and(|l| l.state.settled()) && !cube_far(world, face, body, u, v))
+            .count()
+    }
+
+    /// Visible sections on `face` whose footprint lies inside the proof (farthest corner within
+    /// 0.75 of the near radius, relief inside the window). Also prints how many remain inside the
+    /// full near radius, and why the proof does not cover them.
+    fn proof_hits(world: &World, face: Face) -> (usize, usize) {
+        let center = world.center.expect("a centre");
+        let (reference, _, _) = world.lod_place(center);
+        let frame = FaceFrame::new(face);
+        let cs = CHUNK_SIZE as i32;
+        let mid = |c: i32| (i64::from(c) * i64::from(cs) + i64::from(cs / 2)) as i32;
+        let (eu, _, ev) = frame.cell_to_local((mid(reference.x), mid(reference.y), mid(reference.z)));
+        let radius = world.view.horizontal * cs;
+        let h_lim = 0.75 * radius as f32;
+        let margin = cs as f32 * 0.5 * std::f32::consts::SQRT_2;
+        let shift = World::face_alt_shift(center, reference, face);
+        let window = world.window_alts().map(|[a0, a1]| (a0 + shift, a1 + shift));
+        let (mut within, mut proof, mut straddling, mut relief_out, mut other_face) = (0, 0, 0, 0, 0);
+        let mut by_detail = [0usize; 10];
+        let mut nearest = i32::MAX;
+        let mut nearest_coarse = i32::MAX;
+        for &(s, _) in &world.section_visible {
+            if s.face != face {
+                other_face += 1;
+                continue;
+            }
+            let span = s.span();
+            let (x0, z0) = (s.min_x(), s.min_z());
+            let dx = if eu < x0 { x0 - eu } else if eu > x0 + span - 1 { eu - (x0 + span - 1) } else { 0 };
+            let dz = if ev < z0 { z0 - ev } else if ev > z0 + span - 1 { ev - (z0 + span - 1) } else { 0 };
+            let gap = dx.max(dz);
+            if gap >= radius {
+                continue;
+            }
+            within += 1;
+            nearest = nearest.min(gap);
+            if s.detail.0 >= 2 {
+                nearest_coarse = nearest_coarse.min(gap);
+            }
+            if (s.detail.0 as usize) < by_detail.len() {
+                by_detail[s.detail.0 as usize] += 1;
+            }
+            let fx = (x0 - eu).abs().max((x0 + span - eu).abs()) as f32;
+            let fz = (z0 - ev).abs().max((z0 + span - ev).abs()) as f32;
+            let inside = (fx * fx + fz * fz).sqrt() + margin <= h_lim;
+            let relief_in = match (window, world.cover_band(s, true)) {
+                (Some((a0, a1)), Some((lo, hi))) => {
+                    lo >= world.baked_height(s, a0) && hi <= world.baked_height(s, a1)
+                }
+                _ => false,
+            };
+            if inside && relief_in {
+                proof += 1;
+                println!("  proof hit {s:?} span {span} gap {gap}");
+            } else if !inside && gap * 4 < radius * 3 {
+                straddling += 1;
+            } else if inside {
+                relief_out += 1;
+            }
+        }
+        println!(
+            "{face:?}: {within} visible within {radius} blocks ({proof} inside the proof, {straddling} reaching the 0.75 core but not wholly inside, {relief_out} wholly inside with relief outside the window); nearest {nearest} nearest detail>=2 {nearest_coarse} by detail {by_detail:?}; {other_face} visible on another face; window {:?} grounded {}",
+            world.window.punch, world.window.grounded
+        );
+        (within, proof)
+    }
+
+    fn twin_under(world: &World, p: DVec3) -> crate::world::terrain::cosmos::Body {
+        use crate::world::terrain::cosmos::Kind;
+        let cosmos = world.generator.cosmos().expect("cosmos");
+        cosmos
+            .bodies()
+            .iter()
+            .copied()
+            .filter(|b| b.kind == Kind::Twin)
+            .min_by(|a, b| cosmos.altitude(a, p).abs().total_cmp(&cosmos.altitude(b, p).abs()))
+            .expect("a twin")
+    }
+
+    /// Physical point on `dir` from `body`'s centre at the same altitude above the cube datum as
+    /// the +Y face-centre eye (`surface + 2`).
+    fn physical_on(world: &World, body: &crate::world::terrain::cosmos::Body, dir: DVec3) -> DVec3 {
+        use crate::world::terrain::cosmos::Shape;
+        let cosmos = world.generator.cosmos().expect("cosmos");
+        let Shape::Cube { half } = body.shape else { panic!("cube") };
+        let centre = (
+            i32::try_from(body.centre[0]).unwrap(),
+            i32::try_from(body.centre[1]).unwrap(),
+            i32::try_from(body.centre[2]).unwrap(),
+        );
+        let (cu, _, cv) = FaceFrame::new(Face::PosY).cell_to_local(centre);
+        let open = world.generator.surface(Face::PosY, cu, cv);
+        let above = f64::from(open + 2) - (body.centre[1] as f64 + half as f64);
+        let (mut lo, mut hi) = (0.0, 2.0 * half as f64);
+        let c = body.centre_f();
+        for _ in 0..80 {
+            let mid = 0.5 * (lo + hi);
+            if cosmos.altitude(body, c + dir * mid) < above { lo = mid } else { hi = mid }
+        }
+        c + dir * lo
+    }
+
+    fn settle_twin(world: &mut World, eye: DVec3, face: Face) {
+        world.prepare_around(eye);
+        world.drive_spawn_ready();
+        let passes = settle(world, eye, NONE, "stand");
+        for _ in 0..8 {
+            if world.window.grounded && !world.window.stale {
+                break;
+            }
+            step(world, eye);
+        }
+        let center = world.center.expect("a centre");
+        println!(
+            "settled in {passes} at {eye:?}: centre {center:?} up {:?} face {:?} window {:?} grounded {} bare {}",
+            world.live_up(),
+            world.section_lod_face,
+            world.window.punch,
+            world.window.grounded,
+            cube_bare(world)
+        );
+        assert_eq!(world.live_up(), Some(face), "stood on {face:?}");
+        assert!(world.window.grounded, "{face:?} window never reached the face");
+        assert_eq!(world.lod_clip().half, voxel_engine::Vec3::ZERO, "{face:?} clip came on");
+        assert_eq!(cube_bare(world), 0, "{face:?} bare ground after settling");
+        let (within, proof) = proof_hits(world, face);
+        assert_eq!(proof, 0, "{face:?}: {within} sections within the near radius, {proof} inside the proof");
+        let covered = world.section_visible.iter().filter(|&&(s, _)| world.full_res_covers(center, s)).count();
+        assert_eq!(covered, 0, "{face:?}: a section the chunks draw is still drawn");
+    }
+
+    /// Seed 42, RD16/V5, twin 2. Before the frame fix, nine detail-2 sections stayed visible 0–120
+    /// blocks from the +Y eye. After settling, none that the proof covers (footprint wholly inside
+    /// 0.75 of the near radius, relief inside the window) is still drawn.
+    /// `cargo test --release --lib twin_cube_lod -- --ignored --nocapture --test-threads=1`
+    #[test]
+    #[ignore]
+    fn twin_cube_lod_stays_off_the_player() {
+        let y_eye = DVec3::new(296_989_696.0, -308_421_885.0, -370_431_824.0);
+        let mut world = seeded(42, 16, 5);
+        let twin = twin_under(&world, y_eye);
+        let y_bisect = physical_on(&world, &twin, DVec3::Y);
+        let dy = (y_eye - y_bisect).length();
+        println!(
+            "+Y given {y_eye:?} bisect {y_bisect:?} altitude {} delta {dy} body {} centre {:?}",
+            world.generator.cosmos().unwrap().altitude(&twin, y_eye),
+            twin.id,
+            twin.centre
+        );
+        // Same column as the face-centre ray. The published eye sits a few blocks above
+        // `surface + 2` once the cube's warp is inverted; both are the +Y stand.
+        assert!(y_bisect.x == y_eye.x && y_bisect.z == y_eye.z && dy < 8.0, "+Y stand drifted from the bisection by {dy}");
+        settle_twin(&mut world, y_eye, Face::PosY);
+
+        let x_eye = physical_on(&world, &twin, DVec3::X);
+        println!("+X stand {x_eye:?} altitude {}", world.generator.cosmos().unwrap().altitude(&twin, x_eye));
+        let mut world = seeded(42, 16, 5);
+        settle_twin(&mut world, x_eye, Face::PosX);
+    }
+
+    /// From 600 above twin 2's +Y stand, eight blocks a pass: every near column is drawn by a
+    /// settled chunk or a far section. Same bare rule as the chart descent, in the cube's frames.
+    #[test]
+    #[ignore]
+    fn twin_cube_descent_never_bares_the_near_columns() {
+        let stand = DVec3::new(296_989_696.0, -308_421_885.0, -370_431_824.0);
+        let mut world = seeded(42, 16, 5);
+        let high = stand + DVec3::new(0.0, 600.0, 0.0);
+        world.prepare_around(high);
+        world.drive_spawn_ready();
+        settle(&mut world, high, NONE, "high");
+        assert_eq!(world.live_up(), Some(Face::PosY), "the descent is not on +Y");
+        assert_eq!(world.section_lod_face.map(|(_, f)| f), Some(Face::PosY), "the hover has no face");
+        assert_eq!(cube_bare(&world), 0, "bare at 600 above");
+        for k in 1..=75 {
+            let eye = stand + DVec3::new(0.0, 600.0 - 8.0 * f64::from(k), 0.0);
+            step(&mut world, eye);
+            assert_eq!(cube_bare(&world), 0, "descent pass {k}: bare ground");
+        }
+        let passes = settle(&mut world, stand, &|w| cube_bare(w), "land");
+        println!("descent settled in {passes}, window {:?} bare {}", world.window.punch, cube_bare(&world));
+        assert_eq!(cube_bare(&world), 0, "bare on the stand");
     }
 }
