@@ -1119,14 +1119,23 @@ impl World {
             || (self.load_h >= self.view.horizontal && self.load_v >= self.view.vertical)
     }
 
-    /// Chunks new mesh admission will spend workers on.
+    /// Chunks new mesh admission will spend workers on: the mesh box, grown window included, while
+    /// the whole view loads; a reduced window keeps to the eye's band.
     fn load_mesh_box(&self, center: Coord) -> ChunkBox {
-        self.load_volume().mesh(center, self.live_up())
+        if self.loading_full() {
+            self.mesh_box(center)
+        } else {
+            self.load_volume().mesh(center, self.live_up())
+        }
     }
 
     /// Voxel data the loading window generates and lights: the load mesh box plus one data shell.
     fn load_data_box(&self, center: Coord) -> ChunkBox {
-        self.load_volume().data(center, self.live_up())
+        if self.loading_full() {
+            self.data_box(center)
+        } else {
+            self.load_volume().data(center, self.live_up())
+        }
     }
 
     /// Publish the speed-reduced radii and the travel heading. A change is a
