@@ -226,12 +226,63 @@ const CELL_INNER: f64 = 1.29 * 1.29;
 pub fn cellular3(seed: u32, p: [f64; 3]) -> (f32, f32, u32, u32) {
     let (ix, iy, iz) = (floor_i(p[0]), floor_i(p[1]), floor_i(p[2]));
     let (mut best, mut second) = (Cand::NONE, Cand::NONE);
-    // `-1` skips nothing: the centre cell is a candidate.
-    search(seed, p, ix, iy, iz, 1, -1, &mut best, &mut second);
-    if second.d2 > CELL_INNER {
-        search(seed, p, ix, iy, iz, 2, 1, &mut best, &mut second);
-    }
+    NEAR.with_borrow_mut(|slots| {
+        let key = (seed, ix, iy, iz);
+        let slot = &mut slots[(hash3(seed, ix, iy, iz) & (NEAR_SLOTS as u32 - 1)) as usize];
+        if slot.as_ref().is_none_or(|n| n.key != key) {
+            *slot = Some(Neighbourhood::new(key));
+        }
+        let Some(near) = slot.as_mut() else { return };
+        scan(&near.inner, p, &mut best, &mut second);
+        if second.d2 > CELL_INNER {
+            let ring = near.ring.get_or_insert_with(|| {
+                let mut ring = Box::new([Feat::NONE; RING]);
+                cells(seed, ix, iy, iz, 2, 1, &mut ring[..]);
+                ring
+            });
+            scan(&ring[..], p, &mut best, &mut second);
+        }
+    });
     (best.d2.sqrt() as f32, second.d2.sqrt() as f32, best.id, second.id)
+}
+
+/// Cells around the query cell: the 3×3×3, and the ring out to 5×5×5.
+const INNER: usize = 27;
+const RING: usize = 125 - INNER;
+
+/// Cached neighbourhoods per thread, direct-mapped. Province and region lookups alternate.
+const NEAR_SLOTS: usize = 4;
+
+/// One lattice cell's id and feature point.
+#[derive(Clone, Copy)]
+struct Feat {
+    id: u32,
+    at: [f64; 3],
+}
+
+impl Feat {
+    const NONE: Self = Self { id: 0, at: [0.0; 3] };
+}
+
+/// The cells around one lattice cell in search order: the 3×3×3, then the ring once a query needs
+/// it. A chunk's or a section's columns share their lattice cell, so its hashes are paid once.
+struct Neighbourhood {
+    key: (u32, i32, i32, i32),
+    inner: [Feat; INNER],
+    ring: Option<Box<[Feat; RING]>>,
+}
+
+impl Neighbourhood {
+    fn new((seed, ix, iy, iz): (u32, i32, i32, i32)) -> Self {
+        let mut inner = [Feat::NONE; INNER];
+        // `-1` skips nothing: the centre cell is a candidate.
+        cells(seed, ix, iy, iz, 1, -1, &mut inner);
+        Self { key: (seed, ix, iy, iz), inner, ring: None }
+    }
+}
+
+thread_local! {
+    static NEAR: std::cell::RefCell<[Option<Neighbourhood>; NEAR_SLOTS]> = const { std::cell::RefCell::new([const { None }; NEAR_SLOTS]) };
 }
 
 #[derive(Clone, Copy)]
@@ -251,7 +302,9 @@ fn floor_i(p: f64) -> i32 {
     p.floor() as i64 as i32
 }
 
-fn search(seed: u32, p: [f64; 3], ix: i32, iy: i32, iz: i32, reach: i32, inner: i32, best: &mut Cand, second: &mut Cand) {
+/// The cells within `reach` of the query cell and outside `inner` of it, in a fixed order.
+fn cells(seed: u32, ix: i32, iy: i32, iz: i32, reach: i32, inner: i32, out: &mut [Feat]) {
+    let mut n = 0;
     for dz in -reach..=reach {
         for dy in -reach..=reach {
             for dx in -reach..=reach {
@@ -259,17 +312,24 @@ fn search(seed: u32, p: [f64; 3], ix: i32, iy: i32, iz: i32, reach: i32, inner: 
                     continue;
                 }
                 let (x, y, z) = (ix.wrapping_add(dx), iy.wrapping_add(dy), iz.wrapping_add(dz));
-                let id = hash3(seed ^ 0xCE11_1D00, x, y, z);
-                let feat = feature(seed, x, y, z);
-                let (ax, ay, az) = (feat[0] - p[0], feat[1] - p[1], feat[2] - p[2]);
-                let d2 = ax * ax + ay * ay + az * az;
-                if best.nearer(d2, id) {
-                    *second = *best;
-                    *best = Cand { d2, id };
-                } else if id != best.id && second.nearer(d2, id) {
-                    *second = Cand { d2, id };
-                }
+                out[n] = Feat { id: hash3(seed ^ 0xCE11_1D00, x, y, z), at: feature(seed, x, y, z) };
+                n += 1;
             }
+        }
+    }
+    debug_assert_eq!(n, out.len());
+}
+
+/// Fold `cells` into the nearest and second-nearest candidates, in order.
+fn scan(cells: &[Feat], p: [f64; 3], best: &mut Cand, second: &mut Cand) {
+    for c in cells {
+        let (ax, ay, az) = (c.at[0] - p[0], c.at[1] - p[1], c.at[2] - p[2]);
+        let d2 = ax * ax + ay * ay + az * az;
+        if best.nearer(d2, c.id) {
+            *second = *best;
+            *best = Cand { d2, id: c.id };
+        } else if c.id != best.id && second.nearer(d2, c.id) {
+            *second = Cand { d2, id: c.id };
         }
     }
 }
@@ -285,6 +345,62 @@ fn feature(seed: u32, x: i32, y: i32, z: i32) -> [f64; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pre-cache search, verbatim: every cell hashed per query.
+    #[allow(clippy::too_many_arguments)]
+    fn search(seed: u32, p: [f64; 3], ix: i32, iy: i32, iz: i32, reach: i32, inner: i32, best: &mut Cand, second: &mut Cand) {
+        for dz in -reach..=reach {
+            for dy in -reach..=reach {
+                for dx in -reach..=reach {
+                    if dx.abs() <= inner && dy.abs() <= inner && dz.abs() <= inner {
+                        continue;
+                    }
+                    let (x, y, z) = (ix.wrapping_add(dx), iy.wrapping_add(dy), iz.wrapping_add(dz));
+                    let id = hash3(seed ^ 0xCE11_1D00, x, y, z);
+                    let feat = feature(seed, x, y, z);
+                    let (ax, ay, az) = (feat[0] - p[0], feat[1] - p[1], feat[2] - p[2]);
+                    let d2 = ax * ax + ay * ay + az * az;
+                    if best.nearer(d2, id) {
+                        *second = *best;
+                        *best = Cand { d2, id };
+                    } else if id != best.id && second.nearer(d2, id) {
+                        *second = Cand { d2, id };
+                    }
+                }
+            }
+        }
+    }
+
+    fn cellular3_reference(seed: u32, p: [f64; 3]) -> (f32, f32, u32, u32) {
+        let (ix, iy, iz) = (floor_i(p[0]), floor_i(p[1]), floor_i(p[2]));
+        let (mut best, mut second) = (Cand::NONE, Cand::NONE);
+        search(seed, p, ix, iy, iz, 1, -1, &mut best, &mut second);
+        if second.d2 > CELL_INNER {
+            search(seed, p, ix, iy, iz, 2, 1, &mut best, &mut second);
+        }
+        (best.d2.sqrt() as f32, second.d2.sqrt() as f32, best.id, second.id)
+    }
+
+    /// The cache returns bit for bit what hashing every cell returns, across interleaved seeds,
+    /// neighbouring and distant cells, and points near ±10⁹.
+    #[test]
+    fn cached_cellular_matches_the_reference() {
+        for i in 0..200_000u32 {
+            let seed = [7, 0x51E0_0003, 0xDEAD_BEEF][(i % 3) as usize];
+            let t = f64::from(i);
+            let p = match i % 4 {
+                0 => [t * 0.0137, -t * 0.0071, t * 0.0029],
+                1 => [1e9 + t * 0.37, -1e9 + t * 0.11, 5e8 - t * 0.23],
+                2 => [(t * 0.61).sin() * 40.0, t * 1e-3, -(t * 0.17).cos() * 40.0],
+                _ => [t * 3.1, t * -2.7, t * 1.3],
+            };
+            let (a, b) = (cellular3(seed, p), cellular3_reference(seed, p));
+            assert!(
+                a.0.to_bits() == b.0.to_bits() && a.1.to_bits() == b.1.to_bits() && a.2 == b.2 && a.3 == b.3,
+                "{seed:#x} {p:?}: {a:?} vs {b:?}"
+            );
+        }
+    }
 
     #[test]
     fn noise_is_bounded_continuous_and_deterministic() {
