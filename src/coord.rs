@@ -375,6 +375,14 @@ impl ChunkBox {
         }
     }
 
+    /// Inclusive corners.
+    #[inline]
+    fn bounds(self) -> ([i32; 3], [i32; 3]) {
+        let r = self.radii();
+        let c = [self.center.x, self.center.y, self.center.z];
+        (std::array::from_fn(|a| c[a] - r[a]), std::array::from_fn(|a| c[a] + r[a]))
+    }
+
     #[inline]
     pub fn contains(self, c: ChunkCoord) -> bool {
         let r = self.radii();
@@ -384,8 +392,8 @@ impl ChunkBox {
 
     #[inline]
     pub fn min(self) -> ChunkCoord {
-        let r = self.radii();
-        ChunkCoord::new(self.center.x - r[0], self.center.y - r[1], self.center.z - r[2])
+        let (lo, _) = self.bounds();
+        ChunkCoord::new(lo[0], lo[1], lo[2])
     }
 
     /// Inclusive axis lengths: `(x, y, z)`.
@@ -406,17 +414,7 @@ impl ChunkBox {
     ///
     /// Sign does not change the order: both faces of an axis share its box.
     pub fn coords(self) -> ChunkBoxIter {
-        let r = self.radii();
-        let start = [
-            self.center.x - r[0],
-            self.center.y - r[1],
-            self.center.z - r[2],
-        ];
-        let end = [
-            self.center.x + r[0],
-            self.center.y + r[1],
-            self.center.z + r[2],
-        ];
+        let (start, end) = self.bounds();
         let done = start[0] > end[0] || start[1] > end[1] || start[2] > end[2];
         ChunkBoxIter {
             cur: start,
@@ -425,6 +423,32 @@ impl ChunkBox {
             order: axis_order(self.up),
             done,
         }
+    }
+
+    /// The chunks of [`coords`](Self::coords), in the same order, that `other` does not hold.
+    /// A row through `other` skips its span instead of testing each chunk, so a moved box costs
+    /// its rows plus the shell, not its volume.
+    pub fn coords_outside(self, other: ChunkBox) -> impl Iterator<Item = ChunkCoord> {
+        let (lo, hi) = self.bounds();
+        let (olo, ohi) = other.bounds();
+        let [outer, mid, inner] = axis_order(self.up);
+        let place = move |a: i32, b: i32, c: i32| {
+            let mut v = [0; 3];
+            v[outer] = a;
+            v[mid] = b;
+            v[inner] = c;
+            ChunkCoord::new(v[0], v[1], v[2])
+        };
+        (lo[outer]..=hi[outer]).flat_map(move |a| {
+            (lo[mid]..=hi[mid]).flat_map(move |b| {
+                let through = (olo[outer]..=ohi[outer]).contains(&a) && (olo[mid]..=ohi[mid]).contains(&b);
+                let (cut_lo, cut_hi) =
+                    if through { (olo[inner], ohi[inner]) } else { (hi[inner] + 1, hi[inner]) };
+                let below = lo[inner]..=hi[inner].min(cut_lo - 1);
+                let above = lo[inner].max(cut_hi + 1)..=hi[inner];
+                below.chain(above).map(move |c| place(a, b, c))
+            })
+        })
     }
 }
 
@@ -608,6 +632,28 @@ mod tests {
                     }
                 }
                 assert_eq!(got, want, "box coords differ at rh={rh} rv={rv} center={center:?}");
+            }
+        }
+    }
+
+    /// The shell of a moved, resized or re-faced box is exactly the filtered volume, in order.
+    #[test]
+    fn coords_outside_is_the_filtered_volume() {
+        let ups = [Some(Face::PosY), Some(Face::NegX), Some(Face::PosZ), None];
+        let moves = [(0, 0, 0), (1, 0, 0), (0, -1, 0), (2, 1, -3), (9, 0, 0), (-1, 1, 1)];
+        for &up in &ups {
+            for &other_up in &ups {
+                for &(dx, dy, dz) in &moves {
+                    for &(rh, rv, orh, orv) in &[(3, 2, 3, 2), (2, 1, 4, 3), (0, 0, 1, 0), (5, 2, 2, 5)] {
+                        let a = ChunkBox::with_up(ChunkCoord::new(4, -2, 7), rh, rv, up);
+                        let moved = ChunkCoord::new(4 + dx, -2 + dy, 7 + dz);
+                        let b = ChunkBox::with_up(moved, orh, orv, other_up);
+                        let got: Vec<ChunkCoord> = a.coords_outside(b).collect();
+                        let want: Vec<ChunkCoord> = a.coords().filter(|&c| !b.contains(c)).collect();
+                        let radii = (rh, rv, orh, orv);
+                        assert_eq!(got, want, "{up:?} vs {other_up:?} at {moved:?}, radii {radii:?}");
+                    }
+                }
             }
         }
     }

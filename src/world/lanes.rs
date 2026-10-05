@@ -132,7 +132,7 @@ stream_lanes! {
             let Some(eng) = ctx.eng.as_deref_mut() else {
                 return Progress::Idle;
             };
-            ctx.world.rebuild_occlusion(eng, b)
+            ctx.world.rebuild_occlusion(Some(eng), b)
         },
     /// Synchronous remesh of edited (`Dirty`) chunks (`World::remesh_dirty`).
     /// Uploads through the engine, so it needs `ctx.eng`.

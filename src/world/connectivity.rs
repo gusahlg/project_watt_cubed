@@ -19,7 +19,7 @@
 //! weakens the cull. So this implementation is deliberately permissive: it reaches
 //! at least every visible chunk. Tighter optimizations are deferred.
 use super::brick::ChunkPayload;
-use super::chunk::{CHUNK_VOLUME, Chunk};
+use super::chunk::Chunk;
 use crate::block::registry::BlockId;
 use crate::coord::{ChunkBox, ChunkCoord, Face};
 
@@ -74,59 +74,100 @@ impl Connectivity {
     /// module knowing which. Keys on *opacity*, not solidity: water/glass are solid
     /// but see-through, so a sightline passes through them.
     pub fn compute(chunk: &Chunk, blocks_sight: impl Fn(BlockId) -> bool) -> Connectivity {
+        let mut rows = [0u16; ROWS];
         match &chunk.data().payload {
             // Uniform chunks need no scan: opaque seals everything, see-through opens it.
             ChunkPayload::Uniform(v) => {
-                if blocks_sight(v.id) { Self::SEALED } else { Self::OPEN }
+                return if blocks_sight(v.id) { Self::SEALED } else { Self::OPEN };
             }
-            // One classify per palette entry up front; the fill then reads a
-            // bool per cell instead of re-classifying ids.
+            // One classify per palette entry up front; the cell pass then reads a
+            // bit per cell instead of re-classifying ids.
             ChunkPayload::Paletted { palette, cells } => {
-                let sight: Vec<bool> = palette.iter().map(|s| blocks_sight(s.id)).collect();
-                Self::flood(|i| !sight[cells[i] as usize])
-            }
-            ChunkPayload::Dense(cells) => Self::flood(|i| !blocks_sight(cells[i].id)),
-        }
-    }
-
-    /// The pocket flood fill over an abstract passability predicate — shared by
-    /// every dense representation.
-    fn flood(passable: impl Fn(usize) -> bool) -> Connectivity {
-        let mut visited = [false; CHUNK_VOLUME];
-        let mut conn = Connectivity::SEALED;
-        let mut stack: Vec<usize> = Vec::new();
-        for start in 0..CHUNK_VOLUME {
-            if visited[start] || !passable(start) {
-                continue;
-            }
-            visited[start] = true;
-            stack.push(start);
-            let mut faces: u8 = 0;
-            while let Some(i) = stack.pop() {
-                let (x, y, z) = Chunk::local_of(i);
-                faces |= boundary_faces(x, y, z);
-                for (nx, ny, nz) in orthogonal_neighbours(x, y, z) {
-                    let j = Chunk::index(nx, ny, nz);
-                    if !visited[j] && passable(j) {
-                        visited[j] = true;
-                        stack.push(j);
-                    }
+                let mut open = [0u16; super::brick::PALETTE_MAX];
+                for (o, p) in open.iter_mut().zip(palette.iter()) {
+                    *o = u16::from(!blocks_sight(p.id));
+                }
+                for (i, &c) in cells.iter().enumerate() {
+                    rows[i >> 4] |= open[c as usize] << (i & 15);
                 }
             }
-            conn.add_pocket(faces);
+            ChunkPayload::Dense(cells) => {
+                for (i, c) in cells.iter().enumerate() {
+                    rows[i >> 4] |= u16::from(!blocks_sight(c.id)) << (i & 15);
+                }
+            }
+        }
+        Self::flood(rows)
+    }
+
+    /// The pocket flood over passable rows (`rows[z + 16y]`, bit x). A pocket takes whole x runs
+    /// and steps to the rows beside each new run, so every run is visited once.
+    fn flood(mut left: [u16; ROWS]) -> Connectivity {
+        let mut conn = Connectivity::SEALED;
+        // A push takes at least one run out of `left`, and a row holds at most eight.
+        let mut stack = [(0u8, 0u16); ROWS * 8];
+        for start in 0..ROWS {
+            while left[start] != 0 {
+                let run = x_runs(left[start], left[start] & left[start].wrapping_neg());
+                left[start] &= !run;
+                stack[0] = (start as u8, run);
+                let mut len = 1;
+                let mut faces = 0u8;
+                while len > 0 {
+                    len -= 1;
+                    let (r, bits) = stack[len];
+                    let r = usize::from(r);
+                    faces |= row_faces(r, bits);
+                    let (z, y) = (r & 15, r >> 4);
+                    let beside = [
+                        (r.wrapping_sub(1), z > 0),
+                        (r + 1, z < 15),
+                        (r.wrapping_sub(16), y > 0),
+                        (r + 16, y < 15),
+                    ];
+                    for (n, inside) in beside {
+                        if !inside {
+                            continue;
+                        }
+                        let touch = bits & left[n];
+                        if touch != 0 {
+                            let run = x_runs(left[n], touch);
+                            left[n] &= !run;
+                            stack[len] = (n as u8, run);
+                            len += 1;
+                        }
+                    }
+                }
+                conn.add_pocket(faces);
+            }
         }
         conn
     }
 }
 
-/// Bitmask of chunk faces that a cell touches (0 for interior cells).
-fn boundary_faces(x: usize, y: usize, z: usize) -> u8 {
+/// One passable mask per (y, z) row of a chunk.
+const ROWS: usize = super::chunk::CHUNK_SIZE * super::chunk::CHUNK_SIZE;
+
+/// The runs of set bits in `row` that hold a bit of `seed` (`seed ⊆ row`). A carry sweeps up each
+/// run from its lowest seed, the bit-reversed row sweeps down from its highest, and seeds between
+/// them are the seed bits themselves.
+fn x_runs(row: u16, seed: u16) -> u16 {
+    let up = |r: u16, s: u16| {
+        let r = u32::from(r);
+        (((r + u32::from(s)) ^ r) & r) as u16
+    };
+    up(row, seed) | up(row.reverse_bits(), seed.reverse_bits()).reverse_bits() | seed
+}
+
+/// Chunk faces a non-empty run of row `r` touches.
+fn row_faces(r: usize, bits: u16) -> u8 {
     const EDGE: usize = super::chunk::CHUNK_SIZE - 1;
+    let (z, y) = (r & EDGE, r >> 4);
     let mut m = 0u8;
-    if x == 0 {
+    if bits & 1 != 0 {
         m |= 1 << Face::NegX as usize;
     }
-    if x == EDGE {
+    if bits >> EDGE != 0 {
         m |= 1 << Face::PosX as usize;
     }
     if y == 0 {
@@ -144,40 +185,17 @@ fn boundary_faces(x: usize, y: usize, z: usize) -> u8 {
     m
 }
 
-/// The in-bounds orthogonal neighbours of a chunk-local cell (2–6 of them).
-fn orthogonal_neighbours(x: usize, y: usize, z: usize) -> impl Iterator<Item = (usize, usize, usize)> {
-    const EDGE: usize = super::chunk::CHUNK_SIZE - 1;
-    let mut out = [(0usize, 0usize, 0usize); 6];
-    let mut n = 0;
-    let mut push = |c: (usize, usize, usize)| {
-        out[n] = c;
-        n += 1;
-    };
-    if x > 0 {
-        push((x - 1, y, z));
-    }
-    if x < EDGE {
-        push((x + 1, y, z));
-    }
-    if y > 0 {
-        push((x, y - 1, z));
-    }
-    if y < EDGE {
-        push((x, y + 1, z));
-    }
-    if z > 0 {
-        push((x, y, z - 1));
-    }
-    if z < EDGE {
-        push((x, y, z + 1));
-    }
-    out.into_iter().take(n)
-}
-
 /// Dense occupancy for the occlusion BFS: bit 6 is visible, bits 0–5 are the
-/// entry faces already expanded. A loaded chunk outside the current unload box
-/// reports visible so it is never culled.
+/// entry faces already queued (expansion is tracked in [`Occlusion::exits`]).
+/// A loaded chunk outside the current unload box reports visible so it is
+/// never culled.
 const VISIBLE_BIT: u8 = 1 << 6;
+
+/// Marks a loaded cell in [`Occlusion::conn`]; the low 15 bits are its [`Connectivity`].
+const LOADED_BIT: u16 = 1 << 15;
+
+/// Every face in [`Occlusion::exits`].
+const ALL_EXITS: u8 = (1 << 6) - 1;
 
 /// The occlusion pass: determines which chunks are visible from the camera.
 /// Rebuilt into a dense byte grid covering the unload box — one array lookup
@@ -188,8 +206,13 @@ pub struct Occlusion {
     ny: i32,
     nz: i32,
     cells: Vec<u8>,
-    /// Frontier of (chunk, entry-face); the root carries no entry face.
-    queue: Vec<(ChunkCoord, Option<Face>)>,
+    /// Loaded chunks' connectivity over the same grid, filled once per rebuild so the BFS
+    /// never hashes.
+    conn: Vec<u16>,
+    /// Exit faces each cell has already pushed: a second entry face re-opens the same exits.
+    exits: Vec<u8>,
+    /// Frontier of (chunk, entry face), each pair queued once.
+    queue: Vec<(ChunkCoord, Face)>,
 }
 
 impl Default for Occlusion {
@@ -200,6 +223,8 @@ impl Default for Occlusion {
             ny: 0,
             nz: 0,
             cells: Vec::new(),
+            conn: Vec::new(),
+            exits: Vec::new(),
             queue: Vec::new(),
         }
     }
@@ -236,61 +261,77 @@ impl Occlusion {
     /// Recompute the visible set using BFS from the camera's chunk. Each chunk
     /// is entered through a face and may exit through connected faces. The camera's
     /// chunk can see out of every face; other chunks are reached progressively.
+    /// `loaded` lists every loaded chunk with its connectivity; those outside `volume`
+    /// are ignored.
     pub fn rebuild(
         &mut self,
         volume: ChunkBox,
         origin: ChunkCoord,
-        conn_of: impl Fn(ChunkCoord) -> Option<Connectivity>,
+        loaded: impl IntoIterator<Item = (ChunkCoord, Connectivity)>,
     ) {
         let (nx, ny, nz) = volume.size();
         let n = (nx * ny * nz) as usize;
-        if self.nx != nx || self.ny != ny || self.nz != nz || self.cells.len() != n {
-            self.cells.resize(n, 0);
-            self.nx = nx;
-            self.ny = ny;
-            self.nz = nz;
-        } else {
-            self.cells.fill(0);
-        }
+        self.nx = nx;
+        self.ny = ny;
+        self.nz = nz;
         self.origin = volume.min();
+        self.cells.clear();
+        self.cells.resize(n, 0);
+        self.conn.clear();
+        self.conn.resize(n, 0);
+        self.exits.clear();
+        self.exits.resize(n, 0);
+        for (coord, conn) in loaded {
+            if let Some(idx) = self.index(coord) {
+                self.conn[idx] = LOADED_BIT | conn.0;
+            }
+        }
         self.queue.clear();
-        self.queue.push((origin, None));
-
+        let Some(root) = self.index(origin) else {
+            return;
+        };
+        // The camera's own chunk is the root: always expanded, and seen out of every face (it is
+        // generated synchronously, so it is loaded in practice).
+        self.cells[root] |= VISIBLE_BIT;
+        self.exits[root] = ALL_EXITS;
+        for exit in Face::ALL {
+            self.enter(origin.step(exit), exit.opposite());
+        }
         while let Some((coord, entry)) = self.queue.pop() {
-            let Some(idx) = self.index(coord) else {
+            let idx = self.index(coord).expect("queued cells are in the box");
+            let pushed = self.exits[idx];
+            if pushed == ALL_EXITS {
                 continue;
-            };
-            let conn = match entry {
-                // The camera's own chunk is the root: always expanded (and it is
-                // generated synchronously, so it is loaded in practice).
-                None => conn_of(coord).unwrap_or(Connectivity::OPEN),
-                // A reached chunk that isn't loaded is the frontier: it is not
-                // drawn and must NOT be propagated through, or the BFS would
-                // flood outward across infinite empty space and never terminate.
-                Some(face) => {
-                    let Some(conn) = conn_of(coord) else { continue };
-                    let seen = self.cells[idx];
-                    if seen & (1 << face as usize) != 0 {
-                        continue; // this entry face already expanded
-                    }
-                    self.cells[idx] = seen | (1 << face as usize);
-                    conn
-                }
-            };
-            self.cells[idx] |= VISIBLE_BIT;
+            }
+            let conn = Connectivity(self.conn[idx] & !LOADED_BIT);
             for exit in Face::ALL {
-                let open = match entry {
-                    None => true, // camera chunk sees out of every face
-                    Some(entry) => conn.connects(entry, exit),
-                };
-                if open {
-                    // NOTE: per-chunk connectivity is conservative—we don't check if
-                    // the shared boundary is actually open, which can over-report
-                    // visibility. This never culls a visible chunk.
-                    self.queue.push((coord.step(exit), Some(exit.opposite())));
+                let bit = 1u8 << exit as usize;
+                // NOTE: per-chunk connectivity is conservative—we don't check if
+                // the shared boundary is actually open, which can over-report
+                // visibility. This never culls a visible chunk.
+                if pushed & bit == 0 && conn.connects(entry, exit) {
+                    self.exits[idx] |= bit;
+                    self.enter(coord.step(exit), exit.opposite());
                 }
             }
         }
+    }
+
+    /// Queue `coord` entered through `face` once. A chunk that isn't loaded is the frontier: it
+    /// is not drawn and must NOT be propagated through, or the BFS would flood outward across
+    /// infinite empty space and never terminate.
+    #[inline]
+    fn enter(&mut self, coord: ChunkCoord, face: Face) {
+        let Some(idx) = self.index(coord) else {
+            return;
+        };
+        let bit = 1u8 << face as usize;
+        let cell = self.cells[idx];
+        if cell & bit != 0 || self.conn[idx] & LOADED_BIT == 0 {
+            return;
+        }
+        self.cells[idx] = cell | bit | VISIBLE_BIT;
+        self.queue.push((coord, face));
     }
 }
 
@@ -298,6 +339,7 @@ impl Occlusion {
 mod tests {
     use super::*;
     use crate::block::registry::AIR;
+    use crate::world::chunk::CHUNK_VOLUME;
 
     const STONE: BlockId = BlockId(1);
     /// Only `STONE` is solid.
@@ -316,6 +358,114 @@ mod tests {
             }
         }
         Chunk::from_cells(0, 0, 0, cells)
+    }
+
+    /// The cell-by-cell pocket fill the row flood replaced: the reference it must match.
+    fn cell_flood(passable: impl Fn(usize) -> bool) -> Connectivity {
+        let mut visited = vec![false; CHUNK_VOLUME];
+        let mut conn = Connectivity::SEALED;
+        for start in 0..CHUNK_VOLUME {
+            if visited[start] || !passable(start) {
+                continue;
+            }
+            visited[start] = true;
+            let mut stack = vec![start];
+            let mut faces = 0u8;
+            while let Some(i) = stack.pop() {
+                let (x, y, z) = Chunk::local_of(i);
+                for (axis, v) in [(0, x), (1, y), (2, z)] {
+                    if v == 0 {
+                        faces |= 1 << [Face::NegX, Face::NegY, Face::NegZ][axis] as usize;
+                    }
+                    if v == 15 {
+                        faces |= 1 << [Face::PosX, Face::PosY, Face::PosZ][axis] as usize;
+                    }
+                }
+                let steps = [(-1, 0, 0), (1, 0, 0), (0, -1, 0), (0, 1, 0), (0, 0, -1), (0, 0, 1)];
+                for (dx, dy, dz) in steps {
+                    let (nx, ny, nz) = (x as i32 + dx, y as i32 + dy, z as i32 + dz);
+                    if !(0..16).contains(&nx) || !(0..16).contains(&ny) || !(0..16).contains(&nz) {
+                        continue;
+                    }
+                    let j = Chunk::index(nx as usize, ny as usize, nz as usize);
+                    if !visited[j] && passable(j) {
+                        visited[j] = true;
+                        stack.push(j);
+                    }
+                }
+            }
+            conn.add_pocket(faces);
+        }
+        conn
+    }
+
+    /// Random chunks of every density, a few structured ones, and the paletted and dense
+    /// payloads: the row flood finds the same face pairs as the cell flood.
+    #[test]
+    fn row_flood_matches_the_cell_flood() {
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let opaque = |id: BlockId| id.0 % 2 == 1;
+        for round in 0..300u64 {
+            let density = round % 10;
+            let ids = if round % 7 == 0 { 400 } else { 4 };
+            let structured = round % 5;
+            let chunk = dense(|x, y, z| {
+                let r = next();
+                let solid = match structured {
+                    0 => (x + y + z) % 2 == 0,
+                    1 => x == 8 || (y == 3 && z != 5),
+                    _ => r % 10 < density,
+                };
+                let base = (r >> 16) % ids * 2;
+                BlockId((base + u64::from(solid)) as u16)
+            });
+            let data = chunk.data();
+            let get = |i: usize| match &data.payload {
+                ChunkPayload::Uniform(v) => v.id,
+                ChunkPayload::Paletted { palette, cells } => palette[cells[i] as usize].id,
+                ChunkPayload::Dense(cells) => cells[i].id,
+            };
+            assert_eq!(
+                Connectivity::compute(&chunk, opaque),
+                cell_flood(|i| !opaque(get(i))),
+                "round {round}"
+            );
+        }
+    }
+
+    /// The carry sweep keeps exactly the runs a seed touches.
+    #[test]
+    fn x_runs_are_the_runs_a_seed_touches() {
+        let smear = |row: u16, seed: u16| {
+            let mut r = seed;
+            loop {
+                let n = (r | r << 1 | r >> 1) & row;
+                if n == r {
+                    return r;
+                }
+                r = n;
+            }
+        };
+        let mut seed = 0x9E37_79B9u64;
+        for row in 0..=u16::MAX {
+            for _ in 0..4 {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let s = row & seed as u16;
+                assert_eq!(x_runs(row, s), smear(row, s), "row {row:#06x} seed {s:#06x}");
+            }
+            if row != 0 {
+                let low = row & row.wrapping_neg();
+                assert_eq!(x_runs(row, low), smear(row, low));
+            }
+        }
     }
 
     #[test]
@@ -382,9 +532,7 @@ mod tests {
             .collect();
         let origin = ChunkCoord::new(0, 0, 0);
         let mut occ = Occlusion::default();
-        occ.rebuild(ChunkBox::new(origin, 2, 2), origin, |c| {
-            loaded.contains(&c).then_some(Connectivity::OPEN)
-        });
+        occ.rebuild(ChunkBox::new(origin, 2, 2), origin, loaded.iter().map(|&c| (c, Connectivity::OPEN)));
         assert_eq!(occ.visible_count(), loaded.len());
         assert!(loaded.iter().all(|&c| occ.is_visible(c)));
     }
@@ -395,9 +543,7 @@ mod tests {
         // unloaded neighbour instead of flooding outward forever.
         let origin = ChunkCoord::new(5, -3, 2);
         let mut occ = Occlusion::default();
-        occ.rebuild(ChunkBox::new(origin, 1, 1), origin, |c| {
-            (c == origin).then_some(Connectivity::OPEN)
-        });
+        occ.rebuild(ChunkBox::new(origin, 1, 1), origin, [(origin, Connectivity::OPEN)]);
         assert_eq!(occ.visible_count(), 1);
         assert!(occ.is_visible(origin));
     }
@@ -409,17 +555,11 @@ mod tests {
         let b = ChunkCoord::new(1, 0, 0); // sealed wall
         let beyond = ChunkCoord::new(2, 0, 0);
         let mut occ = Occlusion::default();
-        occ.rebuild(ChunkBox::new(a, 3, 3), a, |c| {
-            if c == a {
-                Some(Connectivity::OPEN)
-            } else if c == b {
-                Some(Connectivity::SEALED)
-            } else if c == beyond {
-                Some(Connectivity::OPEN)
-            } else {
-                None
-            }
-        });
+        occ.rebuild(
+            ChunkBox::new(a, 3, 3),
+            a,
+            [(a, Connectivity::OPEN), (b, Connectivity::SEALED), (beyond, Connectivity::OPEN)],
+        );
         assert!(occ.is_visible(a) && occ.is_visible(b), "the wall chunk itself is still drawn");
         assert!(!occ.is_visible(beyond), "sightline can't pass through the sealed wall");
     }
@@ -428,9 +568,68 @@ mod tests {
     fn outside_the_box_reports_visible() {
         let origin = ChunkCoord::new(0, 0, 0);
         let mut occ = Occlusion::default();
-        occ.rebuild(ChunkBox::new(origin, 1, 1), origin, |c| {
-            (c.ring(origin) <= 1 && c.updown(origin) <= 1).then_some(Connectivity::OPEN)
-        });
+        let near = ChunkBox::with_up(origin, 1, 1, None).coords();
+        occ.rebuild(ChunkBox::new(origin, 1, 1), origin, near.map(|c| (c, Connectivity::OPEN)));
         assert!(occ.is_visible(ChunkCoord::new(8, 0, 0)));
+    }
+
+    /// The grid BFS reaches exactly what a hash-set BFS over the same rules reaches. Loaded
+    /// chunks outside the box are ignored, and an unloaded root still sees out of every face.
+    #[test]
+    fn grid_bfs_matches_a_set_bfs() {
+        use std::collections::{HashMap, HashSet};
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for round in 0..40 {
+            let origin = ChunkCoord::new(3, -2, 7);
+            let volume = ChunkBox::new(origin, 4, 2);
+            let mut loaded: HashMap<ChunkCoord, Connectivity> = HashMap::new();
+            for x in -6..=6 {
+                for y in -4..=4 {
+                    for z in -6..=6 {
+                        let c = ChunkCoord::new(origin.x + x, origin.y + y, origin.z + z);
+                        let r = next();
+                        if r % 5 == 0 || (round % 4 == 0 && c == origin) {
+                            continue;
+                        }
+                        let conn = match r % 3 {
+                            0 => Connectivity::OPEN,
+                            1 => Connectivity::SEALED,
+                            _ => Connectivity((r >> 8) as u16 & 0x7FFF),
+                        };
+                        loaded.insert(c, conn);
+                    }
+                }
+            }
+            let mut occ = Occlusion::default();
+            occ.rebuild(volume, origin, loaded.iter().map(|(&c, &k)| (c, k)));
+            let mut seen: HashSet<(ChunkCoord, Option<Face>)> = HashSet::new();
+            let mut visible: HashSet<ChunkCoord> = HashSet::new();
+            let mut stack = vec![(origin, None)];
+            while let Some((c, entry)) = stack.pop() {
+                if !volume.contains(c) || !seen.insert((c, entry)) {
+                    continue;
+                }
+                let conn = match (entry, loaded.get(&c)) {
+                    (None, k) => k.copied().unwrap_or(Connectivity::OPEN),
+                    (Some(_), Some(&k)) => k,
+                    (Some(_), None) => continue,
+                };
+                visible.insert(c);
+                for exit in Face::ALL {
+                    if entry.is_none_or(|e| conn.connects(e, exit)) {
+                        stack.push((c.step(exit), Some(exit.opposite())));
+                    }
+                }
+            }
+            for c in volume.coords() {
+                assert_eq!(occ.is_visible(c), visible.contains(&c), "round {round} at {c:?}");
+            }
+        }
     }
 }

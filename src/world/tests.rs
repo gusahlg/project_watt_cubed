@@ -3068,6 +3068,55 @@ fn a_round_world_streams_its_chart_net_around_the_eye() {
     assert!(world.spawn_ready(), "the slab is loaded, glued chunks included");
 }
 
+/// The shell walks skip the other box by net cell, so near a chart seam every real chunk of a box
+/// must fold back to the cell it unfolded from. With the centre moved toward, away from and along
+/// the seam, the shells equal the filtered volume walks they replaced.
+#[test]
+fn chart_net_shells_match_the_filtered_walks() {
+    let (mut world, c) = storage_ball_world(-3);
+    world.set_view_distances(3, 2);
+    // Two chunks in from the +X seam: every box reaches across it.
+    let home = c.step(Face::NegX).step(Face::NegX);
+    assert!(world.adopt_fold(home));
+    world.center = Some(home);
+    assert!(world.spawn_slab.is_none(), "no slab is kept back");
+    let fold = world.fold;
+    let up = world.live_up();
+    let prev = world.unload_box(home);
+    let loads: Vec<Coord> = world.view_coords(prev).collect();
+    for k in loads {
+        world.ensure_data(k);
+    }
+    let moves = [(1, 0, 0), (2, 0, 0), (-1, 0, 0), (-2, 0, 0), (0, 0, 1), (0, 0, -2), (1, 0, -1), (-2, 1, 1)];
+    let (mut crossed, mut left_across) = (false, false);
+    for (dx, dy, dz) in moves {
+        let next = Coord::new(home.x + dx, home.y + dy, home.z + dz);
+        assert_eq!(world.seams.unfold_at(next), fold, "{next:?} streams in the same net");
+        let new = world.unload_box(next);
+        for (b, o) in [(prev, new), (new, prev), (world.view.mesh(next, up), world.view.mesh(home, up))] {
+            for v in b.coords() {
+                if let Some(k) = fold.unfold(v) {
+                    assert_eq!(fold.fold(k), v, "net cell {v:?} unfolds to {k:?}");
+                }
+            }
+            let shell: Vec<Coord> = world.view_shell(b, o).collect();
+            let walk: Vec<Coord> = world.view_coords(b).filter(|&k| !world.view_contains(o, k)).collect();
+            assert_eq!(shell, walk, "shell of {b:?} past {o:?}");
+            crossed |= shell.iter().any(|&k| fold.fold(k) != k);
+        }
+        world.prev_unload_box = Some(prev);
+        let leaving: FastSet<Coord> = world.unload_leaving(new).into_iter().collect();
+        let walk: FastSet<Coord> = world
+            .view_coords(prev)
+            .filter(|&k| !world.view_contains(new, k) && world.chunks.contains_key(&k))
+            .collect();
+        assert_eq!(leaving, walk, "unloading toward {next:?}");
+        left_across |= leaving.iter().any(|&k| fold.fold(k) != k);
+    }
+    assert!(crossed, "the shells reach across the seam");
+    assert!(left_across, "chunks across the seam unload");
+}
+
 fn chunk_holding(x: i32, y: i32, z: i32) -> Coord {
     let cs = CHUNK_SIZE as i32;
     Coord::new(x.div_euclid(cs), y.div_euclid(cs), z.div_euclid(cs))

@@ -1363,6 +1363,8 @@ pub struct World {
     /// from. While they are unchanged the frontier is retained across streaming
     /// passes — a still camera repeats no grid walk or relief coarsening.
     section_frontier_key: Option<SectionFrontierKey>,
+    /// Surface bounds the near-window punch read, kept across frontier recomputes.
+    near_bounds: streaming::NearBounds,
     /// Far-lane configuration epoch: bumped by every live ladder change so an
     /// in-flight worker result from a retired configuration can never land.
     section_epoch: u32,
@@ -1386,10 +1388,16 @@ pub struct World {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct SectionFrontierKey {
     center_xz: [i32; 2],
+    center_y: i32,
     body: u16,
     face: u8,
+    /// The altitude the selection reads: the exact eye on a cube face, the block on a chart.
     eye_y: u64,
+    /// The prediction the selection reads (see `World::refresh_frontier`).
     velocity: [u64; 3],
+    /// The full-res window's height and up face; a chart punches sections the window holds.
+    vertical: i32,
+    up: Option<Face>,
     unit: u32,
     finest: i8,
     levels: u8,
@@ -1572,6 +1580,7 @@ impl World {
             section_visible: Vec::new(),
             section_fade: coverage::Coverage::default(),
             section_frontier_key: None,
+            near_bounds: streaming::NearBounds::default(),
             lod_clip_rings: 0,
             lod_clip_grow: Sticky::default(),
             lod_clip_shrunk: Sticky::raised(),
@@ -1991,9 +2000,10 @@ impl World {
     /// a load flood spends the lane budget classifying chunks and rebuilds once
     /// the queue drains (or immediately on a root move / edit). Unclassified
     /// chunks stay OPEN in the BFS — over-draw, never a hole.
+    /// `eng` is `None` only in headless tests: the masks then touch no GPU.
     pub(in crate::world) fn rebuild_occlusion(
         &mut self,
-        eng: &mut Engine,
+        mut eng: Option<&mut Engine>,
         budget: Budget,
     ) -> Progress {
         let on = self.occlusion_enabled();
@@ -2001,7 +2011,7 @@ impl World {
         self.occlusion_active = on;
         if !on {
             if was_active {
-                self.reveal_all(eng);
+                self.reveal_all(eng.as_deref_mut());
             }
             return Progress::Idle;
         }
@@ -2072,12 +2082,12 @@ impl World {
             return Progress::Idle;
         };
         let volume = self.unload_box(origin);
-        self.occlusion.rebuild(volume, origin, |c| {
-            self.chunks
-                .get(&c)
-                .map(|l| l.connectivity.unwrap_or(Connectivity::OPEN))
-        });
-        self.apply_occlusion_masks(eng);
+        let loaded = self
+            .chunks
+            .iter()
+            .map(|(&c, l)| (c, l.connectivity.unwrap_or(Connectivity::OPEN)));
+        self.occlusion.rebuild(volume, origin, loaded);
+        self.apply_occlusion_masks(eng.as_deref_mut());
         if fill_remaining {
             Progress::Partial {
                 remaining: self.conn_fill_queue.len() as u32,
@@ -2088,14 +2098,14 @@ impl World {
     }
 
     /// Patch drawable meshes whose occlusion bit changed since the last push.
-    fn apply_occlusion_masks(&mut self, eng: &mut Engine) {
+    fn apply_occlusion_masks(&mut self, mut eng: Option<&mut Engine>) {
         for (&coord, loaded) in self.chunks.iter_mut() {
             let vis = self.occlusion.is_visible(coord);
             if vis == loaded.visible {
                 continue;
             }
             loaded.visible = vis;
-            if let Some(meshes) = loaded.state.live_meshes() {
+            if let (Some(eng), Some(meshes)) = (eng.as_deref_mut(), loaded.state.live_meshes()) {
                 meshes.set_visible(eng, vis);
             }
         }
@@ -2104,13 +2114,13 @@ impl World {
     /// Reveal every drawable chunk (set its mask visible) — the one-shot restore
     /// when the occlusion gate turns off, since only occlusion ever hides a
     /// resident chunk mesh.
-    fn reveal_all(&mut self, eng: &mut Engine) {
+    fn reveal_all(&mut self, mut eng: Option<&mut Engine>) {
         for loaded in self.chunks.values_mut() {
             if loaded.visible {
                 continue;
             }
             loaded.visible = true;
-            if let Some(meshes) = loaded.state.live_meshes() {
+            if let (Some(eng), Some(meshes)) = (eng.as_deref_mut(), loaded.state.live_meshes()) {
                 meshes.set_visible(eng, true);
             }
         }
