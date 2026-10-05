@@ -349,6 +349,7 @@ impl Game {
             if matches!(self.debug_view, DebugView::Normal) {
                 let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::ListSky);
                 let view_blocks = crate::sky::chunk_view_blocks(self.world.view_radius());
+                self.sky.drive_planet(|| self.world.terrain_arc(), self.world.registry());
                 self.sky.draw(
                     &mut f3,
                     scene.sky_frame,

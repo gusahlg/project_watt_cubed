@@ -204,6 +204,13 @@ impl Shape {
         self.describe(x, z, height, slope4, &f)
     }
 
+    /// Surface block, tree cover and species, without the four slope samples.
+    pub(super) fn far(&self, x: i32, z: i32) -> (BlockId, f32, Species) {
+        let f = self.field(x, z);
+        let col = self.describe(x, z, lifted(f.h), 0, &f);
+        (col.surface, col.trees, col.species)
+    }
+
     /// One chunk of columns. Edge heights are sampled so slopes match [`column`](Self::column).
     pub(super) fn columns_16(&self, u0: i32, v0: i32) -> Vec<Column> {
         const N: usize = 18;

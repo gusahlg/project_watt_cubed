@@ -22,12 +22,28 @@ const EMBER_CAP: f64 = 2.0;
 /// The inner wall's glow on the Ember's own surface, relative to the Ember's light on the wall.
 const WALL_GLOW: f64 = 0.35;
 
+/// Rebased home datum and the unit direction of each sample. Built once.
+#[derive(Debug)]
+struct HomeMap {
+    res: u32,
+    datum: Vec<f32>,
+    dir: Vec<DVec3>,
+    radius: f64,
+    centre: DVec3,
+}
+
 /// Reused far-body list. Capacity stays at [`MAX_FAR_BODIES`] after the first frame.
 #[derive(Debug)]
 pub struct FarBodies {
     list: Vec<FarBody>,
     /// Core light while the eye is in a Hollow's cavity. `None` outside it.
     sun: Option<SunOverride>,
+    /// Looked up once. `None` when the generator has no relaxed home datum.
+    map: Option<HomeMap>,
+    looked: bool,
+    /// Eye the cached horizon was computed for.
+    horizon_eye: Option<DVec3>,
+    horizon: f32,
 }
 
 impl Default for FarBodies {
@@ -35,6 +51,10 @@ impl Default for FarBodies {
         Self {
             list: Vec::with_capacity(MAX_FAR_BODIES),
             sun: None,
+            map: None,
+            looked: false,
+            horizon_eye: None,
+            horizon: 1.0,
         }
     }
 }
@@ -45,10 +65,23 @@ impl FarBodies {
         self.sun
     }
 
+    /// Sine of the highest datum elevation seen from the last eye. 1 until an eye is known.
+    pub(crate) fn horizon(&self) -> f32 {
+        self.horizon
+    }
+
+    /// Rebased datum the mapped impostor will upload: resolution, offsets, reference radius.
+    pub(crate) fn map_parts(&self) -> Option<(u32, &[f32], f64)> {
+        let map = self.map.as_ref()?;
+        Some((map.res, map.datum.as_slice(), map.radius))
+    }
+
     /// Bodies to draw this frame, relative to `eye`. Empty when the generator has no cosmos.
     pub fn update(&mut self, generator: &dyn TerrainGenerator, eye: DVec3) -> &[FarBody] {
         self.list.clear();
         self.sun = None;
+        self.prepare_map(generator);
+        self.refresh_horizon(eye);
         let Some(cosmos) = generator.cosmos() else {
             return &self.list;
         };
@@ -73,6 +106,49 @@ impl FarBodies {
             }
         }
         &self.list
+    }
+
+    /// One allocation of the rebased datum and its sample directions. Later frames do nothing.
+    fn prepare_map(&mut self, generator: &dyn TerrainGenerator) {
+        if self.map.is_some() || self.looked {
+            return;
+        }
+        self.looked = true;
+        let Some(cosmos) = generator.cosmos() else { return };
+        let body = cosmos.home();
+        if body.kind != Kind::Home {
+            return;
+        }
+        let centre = body.centre_f();
+        let Some(field) = generator.atlases().iter().find_map(|a| {
+            let same = (a.centre - centre).length_squared() < 1.0;
+            a.datum.as_ref().filter(|_| same).map(|d| d.as_ref())
+        }) else {
+            return;
+        };
+        let Some((res, datum)) = super::planet_map::impostor_datum(cosmos, body, field) else { return };
+        let g = field.g;
+        let mut dir = Vec::with_capacity(datum.len());
+        for f in 0..6 {
+            for j in 0..g {
+                for i in 0..g {
+                    dir.push(crate::space::datum::DatumField::direction(f, g, i, j));
+                }
+            }
+        }
+        let radius = home_impostor(cosmos, body).1;
+        self.map = Some(HomeMap { res, datum, dir, radius, centre });
+    }
+
+    /// Recompute only after the eye moves more than a kilometre. The sample list is already owned.
+    fn refresh_horizon(&mut self, eye: DVec3) {
+        let Some(map) = self.map.as_ref() else { return };
+        if self.horizon_eye.is_some_and(|prev| (eye - prev).length_squared() <= super::planet_map::HORIZON_STEP_SQ) {
+            return;
+        }
+        let horizon = super::planet_map::horizon_sin(map.centre, map.radius, &map.dir, &map.datum, eye);
+        self.horizon = horizon;
+        self.horizon_eye = Some(eye);
     }
 
     /// The shell's far wall and the Ember. Nothing outside the shell is visible.
@@ -309,7 +385,7 @@ fn streams(cosmos: &Cosmos, body: &Body, eye: DVec3, dist: f64) -> bool {
 /// whose solid holds the eye, and the sky would show below the horizon). A superellipsoid fitted to
 /// the face centre and the corner rose above the datum on almost every other direction: the corner
 /// highlands are narrow, not shoulders.
-fn home_impostor(cosmos: &Cosmos, body: &Body) -> (FarShape, f64) {
+pub(crate) fn home_impostor(cosmos: &Cosmos, body: &Body) -> (FarShape, f64) {
     let r = radius_of(body);
     let lo = cosmos.relief_range(body).0.min(cosmos.face_offset(body));
     (FarShape::Sphere, r + lo - sink(body).unwrap_or(0.0))
