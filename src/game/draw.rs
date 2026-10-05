@@ -112,7 +112,15 @@ impl Game {
     pub fn draw(&mut self, eng: &mut Engine, mods: &mut Mods, fov: f32, shake: f32) {
         // The home map is installed on the engine, so it has to land before the frame opens.
         if matches!(self.debug_view, DebugView::Normal) {
-            self.sky.drive_planet(|| self.world.terrain_arc(), self.world.registry());
+            // Benchmarks and the scripted harness stay on the sphere unless a bench opts in.
+            if crate::sky::planet_map::bake_wanted(self.scripted) {
+                self.sky.drive_planet(
+                    || self.world.terrain_arc(),
+                    self.world.registry(),
+                    self.world.worldgen(),
+                    self.world.terrain_cfg(),
+                );
+            }
             self.sky.sync_far_map(eng, self.world.terrain());
         }
         let mut scene = self.compose_phase(eng, fov, shake);

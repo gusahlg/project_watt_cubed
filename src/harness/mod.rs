@@ -1666,6 +1666,13 @@ mod tests {
     // a real windowed `Engine` and are exercised by `cargo run --bin golden`.
 
     #[test]
+    fn a_scripted_game_never_starts_the_planet_bake() {
+        // `Game::scripted` is what every golden stage draws. The opt-in does not override it.
+        assert!(!crate::sky::planet_map::bake_enabled(true, false, false));
+        assert!(!crate::sky::planet_map::bake_enabled(true, true, true));
+    }
+
+    #[test]
     fn scripted_default_day_matches_clock() {
         // The pre-existing shots pin `day` to SCRIPTED_DEFAULT_DAY so `set_day`
         // is a no-op for them; that only holds while it equals the scripted

@@ -98,24 +98,18 @@ impl Sky {
         }
     }
 
-    /// Start the home albedo bake once. The closure runs only on that first call,
-    /// and test builds never start the thread.
+    /// Start the home albedo bake once. The closure runs only on that first call.
     pub(crate) fn drive_planet(
         &mut self,
         generator: impl FnOnce() -> crate::world::terrain::Generator,
         registry: &crate::block::registry::BlockRegistry,
+        kind: crate::world::generation::WorldgenKind,
+        cfg: crate::world::terrain::TerrainCfg,
     ) {
         if self.maps.started() {
             return;
         }
-        #[cfg(not(test))]
-        {
-            self.maps.ensure(generator(), registry);
-        }
-        #[cfg(test)]
-        {
-            let _ = (generator, registry);
-        }
+        self.maps.ensure(generator(), registry, kind, cfg);
     }
 
     /// Datum, horizon and any faces baked so far.
@@ -155,35 +149,28 @@ impl Sky {
 
     /// Install the home datum once, then each baked face as it arrives. Call before the frame
     /// opens: the map lives on the engine, not on the draw list. A quiet frame only reads flags.
+    /// Home stays a sphere until every face of the installed cube has been sent.
     pub(crate) fn sync_far_map(
         &mut self,
         sink: &mut impl planet_map::FarSink,
         generator: &dyn TerrainGenerator,
     ) {
+        let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::ListSky);
         let Sky { far, maps, feed, .. } = self;
         maps.poll();
         far.prepare_map(generator);
-        let installed = if let Some((datum_res, datum, radius)) = far.map_parts() {
-            let handle = planet_map::PlanetHandle {
-                datum_res,
-                datum,
-                radius,
-                horizon: far.horizon(),
-                preview: maps.faces(false),
-                full: maps.faces(true),
-            };
+        let horizon_ok = far.horizon().is_finite();
+        let live = if let Some((datum_res, datum, radius)) = far.map_parts() {
             // The engine drops a body whose horizon or radius is not finite. Stay a sphere then.
-            if !handle.radius.is_finite() || !handle.horizon.is_finite() {
-                false
+            if radius.is_finite() && horizon_ok {
+                feed.flush(datum_res, datum, maps, sink)
             } else {
-                feed.flush(handle.datum_res, handle.datum, &handle.preview, &handle.full, sink)
+                false
             }
         } else {
             false
         };
-        if installed {
-            far.set_live(true);
-        }
+        far.set_live(live);
     }
 
     /// Drop the home map. The next sync installs it again, and home draws a sphere until then.
