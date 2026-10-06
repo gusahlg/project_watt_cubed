@@ -839,7 +839,7 @@ fn save_world(state: &Mutex<State>, ctx: &Ctx, gate: &Mutex<()>) {
         let edits = state
             .edits
             .iter()
-            .map(|(&(x, y, z), cell)| (x, y, z, cell.spec.to_string()))
+            .map(|(&(x, y, z), cell)| (x, y, z, Arc::clone(&cell.spec)))
             .collect();
         persist::Snapshot {
             seed: ctx.seed,
@@ -904,19 +904,24 @@ fn push_unique(into: &mut Vec<String>, extra: Vec<String>) {
 /// The dedicated server binary's entry point. SIGINT and SIGTERM save and close.
 pub fn run(port: u16, config: Config) -> io::Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    // Listen before the server exists, so a signal during startup is not the default kill.
+    #[cfg(unix)]
     let (mut sigint, mut sigterm) = rt.block_on(async {
-        let sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
-        let sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-        io::Result::Ok((sigint, sigterm))
+        use tokio::signal::unix::{SignalKind, signal};
+        io::Result::Ok((signal(SignalKind::interrupt())?, signal(SignalKind::terminate())?))
     })?;
     let handle = spawn(port, config)?;
     println!("watt-cubed server listening on {}", handle.addr());
+    #[cfg(unix)]
     rt.block_on(async {
         tokio::select! {
             _ = sigint.recv() => {}
             _ = sigterm.recv() => {}
         }
     });
+    // Elsewhere Ctrl-C (and Ctrl-Break / console close on Windows) is the stop request.
+    #[cfg(not(unix))]
+    rt.block_on(tokio::signal::ctrl_c())?;
     handle.stop();
     Ok(())
 }
@@ -4198,6 +4203,8 @@ mod tests {
         rebound.expect("the port accepts a new server").stop();
     }
 
+    /// Sends SIGTERM to this test process: tokio's handler, installed by `run`, takes it.
+    #[cfg(unix)]
     #[test]
     fn sigterm_saves_the_world() {
         use crate::net::client::Connection;

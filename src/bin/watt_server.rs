@@ -16,8 +16,8 @@
 //! few minutes and on shutdown (SIGINT, SIGTERM). Next to that file, `ops.txt`
 //! (one name a line) and `mods.toml` are read and united with the flags:
 //! ```toml
-//! allow = ["pwc.hotbar"]
 //! deny = ["pwc.dev-toolkit"]
+//! # allow = [...] would admit only the listed packages: name every package players need.
 //! ```
 //! With no `--seed`, a fresh time-based seed is chosen and printed so it can be
 //! reused. With no `--password`, the server is open to anyone who can reach the port.

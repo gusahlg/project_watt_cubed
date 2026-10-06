@@ -58,8 +58,12 @@ cargo run --release --bin watt_server -- --world world.save --port 5555 --passwo
 on disk wins over `--seed` and `--worldgen`. `--teleport` is `off`, `ops` (the
 default), or `all`. `--max-speed` is metres per second. `--mods-allow` and
 `--mods-deny` name package ids, and `mods.toml` beside the world does the same
-(`allow = ["pwc.hotbar"]`, `deny = ["pwc.dev-toolkit"]`). That list is what the
-client reports. With no `--seed` a fresh one is chosen and printed; with no
+(`deny = ["pwc.dev-toolkit"]` keeps the developer tools off). An allow list admits
+only the packages it names, so it must name every package players need (the
+Essentials packages: `pwc.menus`, `pwc.start-screen`, `pwc.hotbar`, ...). A refused
+package is turned off on the player's side while they are connected. That list is
+what the client reports; teleport, time, the speed cap, reach and movement are
+enforced by the server whatever a client claims. With no `--seed` a fresh one is chosen and printed; with no
 `--password` the server is open to anyone who can reach the port. `--data-dir`
 sets the data/config root (same as `WATT_DATA_DIR`).
 

@@ -10,10 +10,11 @@
 //! or a world from before this universe is an error — the server must not replace
 //! it with a fresh world. When a file loads, its seed and generator win.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::save::format::{self, Decoded, Edit, PlayerState, SaveDoc, WorldgenStamp};
 use crate::save::slot::SaveMeta;
@@ -51,13 +52,14 @@ pub(crate) struct Store {
     doc: Mutex<SaveDoc>,
 }
 
-/// Live ledger captured for one save.
+/// Live ledger captured for one save. Specs are the server's shared `Arc`s, so capturing under the
+/// state lock copies no strings.
 pub(crate) struct Snapshot {
     pub seed: i64,
     pub worldgen: WorldgenKind,
     pub terrain: TerrainCfg,
     pub day: f32,
-    pub edits: Vec<(i32, i32, i32, String)>,
+    pub edits: Vec<(i32, i32, i32, Arc<str>)>,
 }
 
 /// Operators and mod policy that live beside a world file.
@@ -208,20 +210,22 @@ fn blank_doc(flags: &Flags) -> SaveDoc {
 }
 
 fn encode_snapshot(doc: &mut SaveDoc, snap: &Snapshot) -> Result<Vec<u8>, String> {
-    let mut edits: Vec<&(i32, i32, i32, String)> = snap.edits.iter().collect();
-    edits.sort_by_key(|e| (e.0, e.1, e.2));
+    let mut edits: Vec<&(i32, i32, i32, Arc<str>)> = snap.edits.iter().collect();
+    edits.sort_unstable_by_key(|e| (e.0, e.1, e.2));
     let mut specs: Vec<String> = Vec::new();
+    let mut index_of: HashMap<&str, u16> = HashMap::new();
     let mut records = Vec::with_capacity(edits.len());
     for (x, y, z, spec) in edits {
-        let index = match specs.iter().position(|s| s == spec) {
-            Some(i) => i,
+        let spec_index = match index_of.get(spec.as_ref()) {
+            Some(&i) => i,
             None => {
-                specs.push(spec.clone());
-                specs.len() - 1
+                let Ok(i) = u16::try_from(specs.len()) else {
+                    return Err("too many distinct block specs to save".into());
+                };
+                specs.push(spec.to_string());
+                index_of.insert(spec.as_ref(), i);
+                i
             }
-        };
-        let Ok(spec_index) = u16::try_from(index) else {
-            return Err("too many distinct block specs to save".into());
         };
         records.push(Edit { x: *x, y: *y, z: *z, spec: spec_index });
     }
