@@ -46,7 +46,7 @@ use tokio::sync::Notify;
 use glam::DQuat;
 use voxel_engine::{DVec3, Vec3};
 
-use crate::coord::Face;
+use crate::coord::{BlockCoord, Face};
 use crate::gravity::Field;
 use crate::math::block_coord;
 use crate::player::{self, standing_pose};
@@ -59,6 +59,7 @@ use crate::net::persist::{self, Store};
 use crate::net::protocol::{self, ClientMessage, ModOffer, ServerMessage};
 use crate::net::{MAX_CHAT, MAX_FRAME, MAX_NAME, MAX_SPEC, PROTOCOL_VERSION, chat, quic};
 use crate::presence::Stance;
+use crate::world::seam::Seams;
 use crate::world::terrain::TerrainCfg;
 use crate::world::generation::{TerrainGenerator, WorldgenKind};
 
@@ -330,6 +331,8 @@ struct Ctx {
     worldgen: WorldgenKind,
     terrain: TerrainCfg,
     generator: crate::world::terrain::Generator,
+    /// The client's seam reads: a storage cell just past a chart's box is the neighbour chart's cell.
+    seams: Seams,
     /// `None` when [`Config::hooks`] is empty so the default server never
     /// touches a second lock. When `Some`, hook calls happen *outside* the
     /// [`State`] lock: collect facts under it, drop it, then run the table.
@@ -892,6 +895,7 @@ pub(crate) fn spawn(port: u16, config: Config) -> io::Result<ServerHandle> {
         noclip: config.noclip,
         worldgen: loaded.worldgen,
         terrain: loaded.terrain,
+        seams: Seams::new(generator.atlases().to_vec()),
         generator,
         hooks,
         ops: canonical_ops(&config.ops),
@@ -1688,7 +1692,7 @@ fn on_move(
             (free, too_far, occupied, occupied_n)
         };
         let blocked =
-            !free && !too_far && body_blocked(&state, &ctx.generator, pos, stance, up, &occupied[..occupied_n]);
+            !free && !too_far && body_blocked(&state, &ctx.generator, &ctx.seams, pos, stance, up, &occupied[..occupied_n]);
         if too_far || blocked {
             let Some(h) = state.players.get(&id) else { return };
             h.correct_position(id, &mut sends);
@@ -1751,10 +1755,13 @@ fn remember_occupied(h: &mut PlayerHandle, pos: DVec3, stance: Stance, up: Face)
 }
 
 /// True when a newly entered body cell is solid in the edit overlay or the generator.
-/// Cells already in `occupied` are not queried again.
+/// Cells already in `occupied` are not queried again. Cells are read the way the client's
+/// collision reads them: in storage, with a cell just past a chart's box glued to the
+/// neighbour chart's cell.
 fn body_blocked(
     state: &State,
     generator: &crate::world::terrain::Generator,
+    seams: &Seams,
     pos: DVec3,
     stance: Stance,
     up: Face,
@@ -1764,30 +1771,16 @@ fn body_blocked(
     let Some(n) = fill_body_cells(pos, stance, up, &mut cells) else {
         return true;
     };
-    let atlases = generator.atlases();
-    for &cell in &cells[..n] {
-        if occupied.contains(&cell) {
+    for &(x, y, z) in &cells[..n] {
+        if occupied.contains(&(x, y, z)) {
             continue;
         }
-        let query = storage_cell(atlases, cell).unwrap_or(cell);
+        let query = seams.glue_cell(BlockCoord::new(x, y, z)).map_or((x, y, z), |g| (g.x, g.y, g.z));
         if state.registry.is_solid(server_block(state, generator, query)) {
             return true;
         }
     }
     false
-}
-
-/// Storage cell of a physical body cell, when a round-body atlas maps its centre.
-fn storage_cell(atlases: &[Arc<crate::space::atlas::Atlas>], cell: (i32, i32, i32)) -> Option<(i32, i32, i32)> {
-    let centre = DVec3::new(cell.0 as f64 + 0.5, cell.1 as f64 + 0.5, cell.2 as f64 + 0.5);
-    for atlas in atlases {
-        let Some(stored) = atlas.storage_of(centre) else { continue };
-        let x = i32::try_from(stored[0]).ok()?;
-        let y = i32::try_from(stored[1]).ok()?;
-        let z = i32::try_from(stored[2]).ok()?;
-        return Some((x, y, z));
-    }
-    None
 }
 
 /// Snap to the last accepted pose without applying the request. Used when a
@@ -2793,6 +2786,7 @@ mod tests {
             noclip: NoclipPolicy::All,
             worldgen: WorldgenKind::Diffusion,
             terrain: TerrainCfg::default(),
+            seams: Seams::new(test_generator().atlases().to_vec()),
             generator: test_generator(),
             hooks: None,
             ops: Vec::new(),
@@ -5046,6 +5040,7 @@ mod tests {
             noclip,
             worldgen: WorldgenKind::Flat,
             terrain: TerrainCfg::default(),
+            seams: Seams::new(generator.atlases().to_vec()),
             generator,
             hooks: None,
             ops: ops.iter().map(|name| (*name).to_ascii_lowercase()).collect(),
@@ -5128,10 +5123,70 @@ mod tests {
         assert_eq!(shared.lock_recover().players[&1].pos, start, "a solid edit the body newly enters snaps back");
     }
 
+    /// A body standing on the start world across a chart's edge reads the cells past the edge
+    /// through the seam, as the client's collision does: standing on the surface there is clear,
+    /// and the same body sunk into the ground is blocked.
+    #[test]
+    fn noclip_reads_a_chart_edge_like_the_client() {
+        use crate::space::atlas::Patch;
+        let mut registry = BlockRegistry::with_builtins();
+        let generator = crate::world::terrain::generator(&mut registry, 4242, TerrainCfg::default());
+        let seams = Seams::new(generator.atlases().to_vec());
+        let state = State {
+            edits: HashMap::new(),
+            spec_pool: HashMap::new(),
+            registry,
+            players: HashMap::new(),
+            grid: HashMap::new(),
+            next_id: 2,
+            day: 0.3,
+            day_set: Instant::now(),
+            reactions: ReactionScheduler::new(),
+            max_speed: crate::player::MAX_SPEED,
+            panic_tick: false,
+        };
+        let home = generator.cosmos().expect("cosmos").home();
+        let atlas = generator
+            .atlases()
+            .iter()
+            .find(|a| (a.centre - home.centre_f()).length() < 1.0)
+            .expect("the start world is charted");
+        let patch = Patch::Shell { band: 0, face: Face::PosY };
+        let (o, size) = atlas.storage_box(patch);
+        let edge = (o[0] + size[0] - 1) as i32;
+        let top = |x: i32, z: i32| {
+            let g = seams.glue_cell(BlockCoord::new(x, 0, z)).map_or((x, z), |g| (g.x, g.z));
+            generator.height(g.0, g.1)
+        };
+        let eye = crate::player::Stance::Standing.eye_offset();
+        let mut checked = 0;
+        for k in 0..64 {
+            let z = (o[2] + size[2] / 2) as i32 + k * 7;
+            let (inside, outside) = (generator.height(edge, z), top(edge + 1, z));
+            if inside == i32::MIN || outside == i32::MIN || outside > inside {
+                continue;
+            }
+            // Feet on the inside column's top, the body reaching past the box edge.
+            let pos = DVec3::new(f64::from(edge) + 0.9, f64::from(inside) + eye, f64::from(z) + 0.5);
+            assert!(
+                !body_blocked(&state, &generator, &seams, pos, Stance::Standing, Face::PosY, &[]),
+                "standing across the edge at z {z} (inside top {inside}, glued top {outside}) was blocked"
+            );
+            let sunk = pos - DVec3::Y * 1.5;
+            assert!(
+                body_blocked(&state, &generator, &seams, sunk, Stance::Standing, Face::PosY, &[]),
+                "a body sunk into the edge at z {z} was clear"
+            );
+            checked += 1;
+        }
+        assert!(checked >= 8, "only {checked} edge columns were level enough to stand across");
+    }
+
     #[test]
     fn noclip_check_stays_cheap() {
         let mut registry = BlockRegistry::with_builtins();
         let generator = crate::world::terrain::generator(&mut registry, 1, TerrainCfg::default());
+        let seams = Seams::new(generator.atlases().to_vec());
         let state = State {
             edits: HashMap::new(),
             spec_pool: HashMap::new(),
@@ -5147,7 +5202,7 @@ mod tests {
         };
         let mut pos = DVec3::new(8.5, 80.0, 8.5);
         for _ in 0..40 {
-            if !body_blocked(&state, &generator, pos, Stance::Standing, Face::PosY, &[]) {
+            if !body_blocked(&state, &generator, &seams, pos, Stance::Standing, Face::PosY, &[]) {
                 break;
             }
             pos.y += 16.0;
@@ -5158,7 +5213,7 @@ mod tests {
         occupied.extend_from_slice(&cells[..n]);
         for _ in 0..8 {
             pos.x += 0.5;
-            let _ = body_blocked(&state, &generator, pos, Stance::Standing, Face::PosY, &occupied);
+            let _ = body_blocked(&state, &generator, &seams, pos, Stance::Standing, Face::PosY, &occupied);
             let n = fill_body_cells(pos, Stance::Standing, Face::PosY, &mut cells).expect("body fits");
             occupied.clear();
             occupied.extend_from_slice(&cells[..n]);
@@ -5170,6 +5225,7 @@ mod tests {
             let blocked = std::hint::black_box(body_blocked(
                 &state,
                 &generator,
+                &seams,
                 next,
                 Stance::Standing,
                 Face::PosY,
@@ -5189,6 +5245,7 @@ mod tests {
             let blocked = std::hint::black_box(body_blocked(
                 &state,
                 &generator,
+                &seams,
                 pos,
                 Stance::Standing,
                 Face::PosY,
