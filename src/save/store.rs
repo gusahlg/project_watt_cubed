@@ -24,6 +24,11 @@ fn live_path(id: &SlotId) -> PathBuf {
     saves_dir().join(format!("{id}.save"))
 }
 
+/// Path of a slot's live save file. Does not create it.
+pub fn file_path(id: &SlotId) -> PathBuf {
+    live_path(id)
+}
+
 fn bak_path(id: &SlotId) -> PathBuf {
     saves_dir().join(format!("{id}.save.bak"))
 }

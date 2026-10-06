@@ -236,6 +236,81 @@ impl TryFrom<Vec<u8>> for ModBytes {
     }
 }
 
+/// One enabled mod an honest client reports at join: the build's package id
+/// and version. A modified client can put anything here. The server still
+/// enforces teleport, the speed cap, time permission, edit reach, and the
+/// movement envelope; this list is not a security boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModOffer {
+    pub id: Arc<str>,
+    pub version: Arc<str>,
+}
+
+/// How many mod ids one Hello or ModsDenied may carry.
+const MAX_MOD_OFFERS: usize = 128;
+/// Longest accepted mod id or version, in bytes.
+const MAX_MOD_ID: usize = 64;
+
+impl Wire for ModOffer {
+    fn put(&self, w: &mut codec::Writer) {
+        w.str16(&self.id);
+        w.str16(&self.version);
+    }
+    fn get(r: &mut codec::Reader) -> Option<Self> {
+        let id = bounded_mod_str(r)?;
+        let version = bounded_mod_str(r)?;
+        Some(Self { id, version })
+    }
+}
+
+fn bounded_mod_str(r: &mut codec::Reader) -> Option<Arc<str>> {
+    let s = r.str16_lossy().ok()?;
+    if s.is_empty() || s.len() > MAX_MOD_ID {
+        return None;
+    }
+    Some(Arc::from(s))
+}
+
+impl Wire for Vec<ModOffer> {
+    fn put(&self, w: &mut codec::Writer) {
+        w.u16(self.len() as u16);
+        for offer in self {
+            offer.put(w);
+        }
+    }
+    fn get(r: &mut codec::Reader) -> Option<Self> {
+        let count = r.u16().ok()? as usize;
+        if count > MAX_MOD_OFFERS {
+            return None;
+        }
+        let mut offers = Vec::with_capacity(count);
+        for _ in 0..count {
+            offers.push(ModOffer::get(r)?);
+        }
+        Some(offers)
+    }
+}
+
+impl Wire for Vec<Arc<str>> {
+    fn put(&self, w: &mut codec::Writer) {
+        w.u16(self.len() as u16);
+        for s in self {
+            w.str16(s);
+        }
+    }
+    fn get(r: &mut codec::Reader) -> Option<Self> {
+        let count = r.u16().ok()? as usize;
+        if count > MAX_MOD_OFFERS {
+            return None;
+        }
+        let mut ids = Vec::with_capacity(count);
+        for _ in 0..count {
+            ids.push(bounded_mod_str(r)?);
+        }
+        Some(ids)
+    }
+}
+
 /// u16 length prefix, then the bytes. Decode rejects a length prefix past the
 /// cap before the bytes are trusted.
 impl Wire for ModBytes {
@@ -359,6 +434,7 @@ mod tag {
     pub const PEER_EXITED: u8 = 13;
     pub const PEER_MOD_DATA: u8 = 14;
     pub const TOOL_RESULT: u8 = 15;
+    pub const MODS_DENIED: u8 = 16;
 }
 
 messages! {
@@ -367,7 +443,8 @@ messages! {
         /// Content parts only: generator version, gravity, material law, palette.
         /// Worldgen kind and terrain knobs arrive in [`ServerMessage::Welcome`].
         /// `protocol` stays the first field so a peer can be told "server vX, client vY"
-        /// before the rest of the payload is decoded.
+        /// before the rest of the payload is decoded. `mods` follows the password:
+        /// enabled package ids and versions. That list is the client's own report.
         Hello = tag::HELLO {
             protocol: u32,
             worldgen: u32,
@@ -376,6 +453,7 @@ messages! {
             palette: u64,
             name: Arc<str>,
             password: Arc<str>,
+            mods: Vec<ModOffer>,
         },
         /// Declare cruise. `speed` 0 ends it; otherwise the movement envelope may
         /// follow up to `min(speed, CRUISE_MAX)`. Sent when the cruise state changes.
@@ -459,6 +537,9 @@ messages! {
         /// anything, the cell's committed revision, and both configurations afterwards (unchanged
         /// specs when nothing reacted or the request was refused).
         ToolResult = tag::TOOL_RESULT { req: u32, reacted: bool, rev: u32, cell_spec: Arc<str>, tool_spec: Arc<str> },
+        /// The stream closes after this. `ids` are the enabled mods this server
+        /// refuses. An honest client disables them for the session and joins once more.
+        ModsDenied = tag::MODS_DENIED { ids: Vec<Arc<str>> },
     }
 }
 
@@ -552,6 +633,7 @@ mod tests {
                 palette: 0x2222,
                 name: "player".into(),
                 password: "hunter2".into(),
+                mods: vec![ModOffer { id: "pwc.hotbar".into(), version: "0.1.0".into() }],
             },
             ClientMessage::Cruise { speed: 1.5e8 },
             ClientMessage::Cruise { speed: 0.0 },
@@ -665,6 +747,7 @@ mod tests {
                 cell_spec: "air".into(),
                 tool_spec: "c:0201020304aabbccdd".into(),
             },
+            ServerMessage::ModsDenied { ids: vec!["pwc.dev-toolkit".into()] },
         ]
     }
 
@@ -1159,6 +1242,7 @@ mod tests {
             palette: 0,
             name: cap_name.clone(),
             password: "".into(),
+            mods: vec![],
         };
         assert_eq!(ClientMessage::decode(&hello.encode()), Some(hello));
 
@@ -1171,6 +1255,7 @@ mod tests {
             palette: 0,
             name: over,
             password: "p".repeat(super::super::MAX_NAME + 1).into(),
+            mods: vec![],
         };
         decode_must_not_panic(&hello_over.encode());
 

@@ -38,8 +38,9 @@ headless (no window, no GPU), which is what lets it scale and run on a plain box
 ### Host from the game
 
 Pick **Host Server** on the start menu, choose a port, an optional password, and your
-name, then press Enter. This starts an integrated server and drops you straight into
-its world. Friends join with your machine's IP and that port.
+name, then press Enter. This hosts the most recent save (a new world when there is
+none) and drops you straight into it. Friends join with your machine's IP and that port.
+The host is an operator; everyone may teleport.
 
 ### Join a server
 
@@ -50,10 +51,19 @@ Pick **Join Server**, enter the address, port, password, and your name, then Ent
 For a server that runs on its own (e.g. a VPS), use the `watt_server` binary:
 
 ```sh
-cargo run --release --bin watt_server -- --port 5555 --password hunter2 --seed 42
+cargo run --release --bin watt_server -- --world world.save --port 5555 --password hunter2 --ops ada
 ```
 
-All flags are optional: with no `--seed` a fresh one is chosen and printed; with no
+`--world` loads and saves the seed, generator, edits, and clock. A file already
+on disk wins over `--seed` and `--worldgen`. `--teleport` is `off`, `ops` (the
+default), or `all`. `--max-speed` is metres per second. `--mods-allow` and
+`--mods-deny` name package ids, and `mods.toml` beside the world does the same
+(`deny = ["pwc.dev-toolkit"]` keeps the developer tools off). An allow list admits
+only the packages it names, so it must name every package players need (the
+Essentials packages: `pwc.menus`, `pwc.start-screen`, `pwc.hotbar`, ...). A refused
+package is turned off on the player's side while they are connected. That list is
+what the client reports; teleport, time, the speed cap, reach and movement are
+enforced by the server whatever a client claims. With no `--seed` a fresh one is chosen and printed; with no
 `--password` the server is open to anyone who can reach the port. `--data-dir`
 sets the data/config root (same as `WATT_DATA_DIR`).
 
@@ -71,7 +81,7 @@ worldgen would produce a different world from the shared seed is refused at
 join). Every wire frame is length-capped, each client is rate-limited, and
 pre-auth connections are bounded. Movement is plausibility-checked server-side
 (implausible jumps are snapped back; `/tp` is an explicit request the server
-may refuse via `--no-teleport`), and every edit is validated against reach,
+may refuse via `--teleport`), and every edit is validated against reach,
 spec well-formedness, and the cell's current revision — racing edits resolve
 to exactly one winner and the loser's client rolls its prediction back.
 Traffic uses QUIC encrypted with TLS 1.3. The server currently generates a

@@ -214,6 +214,8 @@ pub struct ModRow {
     pub worldgen: bool,
     /// The mod's group (`None` if ungrouped or its group was never declared).
     pub group: Option<crate::modding::Group>,
+    /// The connected server forced this mod's package off for the session.
+    pub server_off: bool,
 }
 
 impl ModRow {
@@ -231,6 +233,7 @@ impl ModRow {
                 visual_group: mods.visual_group(i),
                 worldgen: mods.is_worldgen(i),
                 group: mods.group_of(i),
+                server_off: mods.server_off(i),
             })
             .collect()
     }

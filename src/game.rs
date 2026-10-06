@@ -768,8 +768,15 @@ impl Game {
             let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::NetEvents);
             self.apply_net_events(mods, events)
         };
-        if net_disconnected {
-            self.console.print("* disconnected from server".to_string());
+        if let Some(reason) = net_disconnected {
+            let line = if reason.to_ascii_lowercase().contains("shutting down") {
+                "* server shutting down".to_string()
+            } else if reason.is_empty() {
+                "* disconnected from server".to_string()
+            } else {
+                format!("* disconnected: {reason}")
+            };
+            self.console.print(line);
             return Some(Signal::ExitToMenu);
         }
         if let Some(net) = &mut self.net {
@@ -1419,13 +1426,13 @@ impl Game {
 
     /// Drain queued server messages: apply world edits, resolve our own edit
     /// verdicts (rolling back rejected predictions), surface chat, and report
-    /// a lost connection. Returns `true` if the server dropped us.
-    fn apply_net_events(&mut self, mods: &mut Mods, events: &mut Vec<GameEvent>) -> bool {
+    /// a lost connection. `Some(reason)` if the server dropped us.
+    fn apply_net_events(&mut self, mods: &mut Mods, events: &mut Vec<GameEvent>) -> Option<String> {
         let incoming = match &mut self.net {
             Some(net) => net.poll(),
-            None => return false,
+            None => return None,
         };
-        let mut disconnected = false;
+        let mut disconnected = None;
         for event in incoming {
             match event {
                 Incoming::Edit { x, y, z, spec } => {
@@ -1517,7 +1524,7 @@ impl Game {
                     self.sky.clock.set_day(day as f64);
                     self.sky.day_length = crate::sky::DayLength::clamped(day_secs as f64);
                 }
-                Incoming::Disconnected => disconnected = true,
+                Incoming::Disconnected { reason } => disconnected = Some(reason),
                 Incoming::ToolResult { req, reacted, cell, cell_spec, tool_spec } => {
                     let Some(tool) = self.pending_tools.remove(&req) else { continue };
                     if !reacted {

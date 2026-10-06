@@ -6,7 +6,7 @@
 //! The window itself belongs to the engine: [`App::run`] hands a per-frame
 //! closure to [`voxel_engine::run`], which is the moral equivalent of the old
 //! raylib `while !window_should_close()` loop.
-use std::thread;
+use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use voxel_engine::{Color, DVec3, Engine};
@@ -19,9 +19,9 @@ use crate::menu::menus::{ModsMenu, SettingsHub};
 use crate::menu::start::{StartFacts, StartRoot, VERSION};
 use crate::menu::theme::{DefaultTheme, MenuTheme};
 use crate::menu::{AppEffect, Ctx, Framed, HostInfo, JoinInfo, MenuStack, ModRow};
-use crate::modding::{ActionSet, ChoicesFlush, GameBuild, Mods};
-use crate::net::client::Connection;
-use crate::net::server::{self, Config, ServerHandle};
+use crate::modding::{ActionSet, ChoicesFlush, GameBuild, ModDescriptor, Mods};
+use crate::net::client::{ConnectError, Connection};
+use crate::net::server::{self, Config, ServerHandle, TeleportPolicy};
 use crate::player::Player;
 use crate::save::{self, Autosaver, SaveMeta, Slot, SlotId, Tick};
 use crate::session::Session;
@@ -66,6 +66,8 @@ pub struct App {
     router: Router,
     /// Installed mods and their on/off state; shared with the game while playing.
     mods: Mods,
+    /// Packages compiled into this executable. `Hello` reports the enabled ones.
+    packages: Vec<ModDescriptor>,
     screen: Screen,
     /// The integrated server when hosting, kept alive for the session so friends can
     /// stay connected; stopping it frees the port for a later host.
@@ -141,6 +143,7 @@ impl App {
         }
         // While the menu is up, so the first world's frame does not pay for it.
         crate::world::terrain::prewarm();
+        let packages = build.packages().to_vec();
         let mut mods = Mods::from_build(build);
         mods.load_choices();
         let pins = Benchmark::mod_pins_from_env();
@@ -181,6 +184,7 @@ impl App {
             active: None,
             router: Router::new(),
             mods,
+            packages,
             screen,
             host: None,
             settings,
@@ -613,8 +617,9 @@ impl App {
                 }
             }
             AppEffect::ToggleMod(index) => {
-                self.mods.toggle(index);
-                self.choices_flush.mark(self.now_ms());
+                if self.mods.toggle(index) {
+                    self.choices_flush.mark(self.now_ms());
+                }
             }
             AppEffect::StepModKnob {
                 mod_index,
@@ -625,8 +630,9 @@ impl App {
                 self.choices_flush.mark(self.now_ms());
             }
             AppEffect::SetGroup { id, on } => {
-                self.mods.set_group_enabled(id, on);
-                self.choices_flush.mark(self.now_ms());
+                if self.mods.set_group_enabled(id, on) {
+                    self.choices_flush.mark(self.now_ms());
+                }
             }
             AppEffect::Quit => {
                 self.flush_mod_choices_if_dirty();
@@ -708,6 +714,9 @@ impl App {
 
     /// Return to the start menu with an optional notice (e.g. a failed connect).
     fn return_to_menu(&mut self, notice: Option<String>) {
+        // Mods a server turned off for the session come back on leave.
+        // The hold was never written to mods.cfg.
+        self.mods.release_server();
         self.fan_world_edge(GameEvent::LeaveWorld);
         self.sound.leave_world();
         self.audio.enter_world();
@@ -722,27 +731,35 @@ impl App {
         ));
     }
 
-    /// Spin up a fresh integrated server and join it on loopback. Any previous host
-    /// is stopped first so its port is free to reuse.
+    /// The most recent readable save, or a new slot file when the list is empty.
+    fn host_world_path(&self) -> PathBuf {
+        host_save_path(&self.saves)
+    }
+
+    /// Spin up the integrated server on the most recent save and join it on loopback.
+    /// Any previous host is stopped first so its port is free. The host is an
+    /// operator and teleport stays open. A stored seed and generator win.
     fn start_host(&mut self, eng: &mut Engine, info: HostInfo) {
         if let Some(previous) = self.host.take() {
             previous.stop();
-            thread::sleep(Duration::from_millis(150));
         }
-        let seed = fresh_seed();
         let config = Config {
             password: info.password.clone(),
-            seed,
+            seed: fresh_seed(),
             worldgen: self.mods.worldgen_kind(),
             terrain: terrain_cfg_from_mods(&self.mods),
+            teleport: TeleportPolicy::All,
+            world: Some(self.host_world_path()),
+            ops: vec![info.name.clone()],
+            warn_world_overrides: false,
             ..Config::default()
         };
         match server::spawn(info.port, config) {
             Ok(handle) => {
                 let port = handle.addr().port();
                 self.host = Some(handle);
-                match join_server("127.0.0.1", port, &info.name, &info.password) {
-                    Ok(conn) => self.enter_net_game(eng, conn),
+                match connect_session(&mut self.mods, &self.packages, "127.0.0.1", port, &info.name, &info.password) {
+                    Ok((conn, notice)) => self.enter_net_game(eng, conn, notice),
                     Err(e) => self.fail_to_menu(format!("hosted, but could not connect: {e}")),
                 }
             }
@@ -752,14 +769,14 @@ impl App {
 
     /// Connect to a remote server and enter its world.
     fn start_join(&mut self, eng: &mut Engine, info: JoinInfo) {
-        match join_server(&info.host, info.port, &info.name, &info.password) {
-            Ok(conn) => self.enter_net_game(eng, conn),
+        match connect_session(&mut self.mods, &self.packages, &info.host, info.port, &info.name, &info.password) {
+            Ok((conn, notice)) => self.enter_net_game(eng, conn, notice),
             Err(e) => self.fail_to_menu(format!("could not join: {e}")),
         }
     }
 
     /// Join a remote world via an existing connection.
-    fn enter_net_game(&mut self, eng: &mut Engine, conn: Connection) {
+    fn enter_net_game(&mut self, eng: &mut Engine, conn: Connection, notice: Option<String>) {
         // Lazy construction: the collision-safe spawn slab is prepared in
         // `enter_game`; streaming fills the remainder asynchronously.
         let world = World::with_kind_cfg(
@@ -775,7 +792,10 @@ impl App {
         // starts clean, but the player's enable/disable choices persist.
         self.active = None;
         self.mods.reset_state();
-        let game = Game::new(world, player, "multiplayer".to_string()).with_net(conn);
+        let mut game = Game::new(world, player, "multiplayer".to_string()).with_net(conn);
+        if let Some(notice) = notice {
+            game.notify(notice);
+        }
         self.enter_game(eng, game);
     }
 
@@ -988,10 +1008,67 @@ impl App {
 }
 
 
-/// Join `host:port`. The fingerprint is code and content only; the server's
-/// worldgen kind and terrain arrive on the connection after Welcome.
-pub(crate) fn join_server(host: &str, port: u16, name: &str, password: &str) -> Result<Connection, String> {
+/// Join `host:port` reporting no mods. Test clients use this. The game's own
+/// join goes through [`connect_session`].
+#[cfg(test)]
+pub(crate) fn join_server(host: &str, port: u16, name: &str, password: &str) -> Result<Connection, ConnectError> {
     Connection::connect(host, port, name, password)
+}
+
+/// The most recent readable slot, else a fresh id. `saves` is already ordered
+/// most-recently played first.
+fn host_save_path(saves: &[crate::save::Slot]) -> PathBuf {
+    if let Some(slot) = saves.iter().find(|s| s.meta.is_ok()) {
+        return save::file_path(&slot.id);
+    }
+    save::file_path(&save::fresh_id())
+}
+
+/// Join, reporting the packages this client has enabled. The mod list is what
+/// an honest client says; a modified client can lie. One refusal turns those
+/// packages off for this session and retries once. A second failure restores
+/// them and returns the error. Nothing here writes `mods.cfg`.
+fn connect_session(
+    mods: &mut Mods,
+    packages: &[ModDescriptor],
+    host: &str,
+    port: u16,
+    name: &str,
+    password: &str,
+) -> Result<(Connection, Option<String>), ConnectError> {
+    let reports = mods.enabled_package_reports(packages);
+    match Connection::connect_with(host, port, name, password, &reports) {
+        Ok(conn) => Ok((conn, None)),
+        Err(err) if err.mods_denied.is_empty() => Err(err),
+        Err(err) => {
+            let notice = mod_hold_notice(packages, &err.mods_denied);
+            mods.hold_packages(&err.mods_denied);
+            let reports = mods.enabled_package_reports(packages);
+            match Connection::connect_with(host, port, name, password, &reports) {
+                Ok(conn) => Ok((conn, Some(notice))),
+                Err(again) => {
+                    mods.release_server();
+                    Err(again)
+                }
+            }
+        }
+    }
+}
+
+/// "This server does not allow: Developer Toolkit; it is off while you are connected".
+/// Several names use "they are". Display names come from the build; an unknown
+/// id is shown as itself.
+fn mod_hold_notice(packages: &[ModDescriptor], ids: &[String]) -> String {
+    let names: Vec<&str> = ids
+        .iter()
+        .map(|id| packages.iter().find(|pkg| pkg.id == id).map(|pkg| pkg.name).unwrap_or(id.as_str()))
+        .collect();
+    let list = names.join("; ");
+    if names.len() == 1 {
+        format!("This server does not allow: {list}; it is off while you are connected")
+    } else {
+        format!("This server does not allow: {list}; they are off while you are connected")
+    }
 }
 
 /// Parse the winning worldgen payload as generator knobs.
@@ -1074,6 +1151,123 @@ mod tests {
         assert_eq!(conn.worldgen(), WorldgenKind::Diffusion);
         assert_eq!(conn.terrain(), terrain);
         assert_eq!(conn.seed(), 99);
+        handle.stop();
+    }
+
+    struct Named(&'static str, &'static str);
+
+    impl crate::modding::Mod for Named {
+        fn id(&self) -> &'static str {
+            self.0
+        }
+        fn name(&self) -> &str {
+            self.1
+        }
+    }
+
+    fn register_toolkit(reg: &mut crate::modding::ModRegistrar) {
+        reg.add(Named("dev-toolkit", "Developer Toolkit"));
+    }
+
+    fn register_hotbar(reg: &mut crate::modding::ModRegistrar) {
+        reg.add(Named("hotbar", "Hotbar"));
+    }
+
+    fn sample_packages() -> [ModDescriptor; 2] {
+        [
+            ModDescriptor {
+                id: "pwc.dev-toolkit",
+                name: "Developer Toolkit",
+                version: "1.0.0",
+                register: register_toolkit,
+            },
+            ModDescriptor {
+                id: "pwc.hotbar",
+                name: "Hotbar",
+                version: "0.1.0",
+                register: register_hotbar,
+            },
+        ]
+    }
+
+    #[test]
+    fn mod_hold_notice_names_one_and_several() {
+        let packages = sample_packages();
+        assert_eq!(
+            mod_hold_notice(&packages, &["pwc.dev-toolkit".into()]),
+            "This server does not allow: Developer Toolkit; it is off while you are connected"
+        );
+        assert_eq!(
+            mod_hold_notice(&packages, &["pwc.dev-toolkit".into(), "pwc.hotbar".into()]),
+            "This server does not allow: Developer Toolkit; Hotbar; they are off while you are connected"
+        );
+    }
+
+    #[test]
+    fn host_save_path_is_the_newest_readable_slot() {
+        let slots = vec![Slot::for_test("newer", 3, 1), Slot::for_test("older", 1, 0)];
+        assert_eq!(host_save_path(&slots), save::file_path(&slots[0].id));
+        assert_eq!(
+            host_save_path(&[]).extension().and_then(|ext| ext.to_str()),
+            Some("save")
+        );
+    }
+
+    /// The server refuses the toolkit, the client turns it off and joins once,
+    /// and the Mods menu will not turn it back on while that hold lasts.
+    #[test]
+    fn denied_mod_is_disabled_for_the_session_and_the_menu_cannot_reenable_it() {
+        use crate::menu::menus::ModsMenu;
+        use crate::menu::{Command, Menu, Msg, ValueView};
+        let packages = sample_packages();
+        let mut mods = GameBuild::new().with_mod(packages[0]).with_mod(packages[1]).mods();
+        let handle = server::spawn(
+            0,
+            Config {
+                seed: 1,
+                worldgen: WorldgenKind::Flat,
+                mods_deny: vec!["pwc.dev-toolkit".into()],
+                ..Config::default()
+            },
+        )
+        .unwrap();
+        let (conn, notice) = connect_session(&mut mods, &packages, "127.0.0.1", handle.addr().port(), "ada", "")
+            .expect("retry joins");
+        assert!(conn.is_alive());
+        assert_eq!(
+            notice.as_deref(),
+            Some("This server does not allow: Developer Toolkit; it is off while you are connected")
+        );
+        let index = (0..mods.len()).find(|&i| mods.id(i) == "dev-toolkit").expect("toolkit");
+        assert!(!mods.is_enabled(index));
+        assert!(mods.server_off(index));
+        assert!(!mods.toggle(index), "the menu's toggle is refused while connected");
+        let hotbar = (0..mods.len()).find(|&i| mods.id(i) == "hotbar").expect("hotbar");
+        assert!(mods.is_enabled(hotbar));
+        let snap = ModRow::snapshot(&mods);
+        let mut settings = Settings::default();
+        let session = Session::default();
+        let mut ctx = crate::menu::Ctx {
+            settings: &mut settings,
+            saves: &[],
+            mods: &snap,
+            session: &session,
+            mods_save_error: None,
+        };
+        let view = ModsMenu.view(&ctx);
+        let row = view.rows.iter().find(|row| row.label.contains("Developer Toolkit")).expect("row");
+        match &row.kind {
+            crate::menu::RowKind::Value(ValueView::Choice(value)) => assert_eq!(value, "off (server)"),
+            _ => panic!("expected off (server)"),
+        }
+        assert!(matches!(
+            ModsMenu.update(Msg::Pick(crate::menu::menus::ModsAction::ServerOff), &mut ctx),
+            Command::Stay
+        ));
+        drop(conn);
+        mods.release_server();
+        assert!(mods.is_enabled(index));
+        assert!(!mods.server_off(index));
         handle.stop();
     }
 
