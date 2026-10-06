@@ -137,14 +137,18 @@ fn main() {
         },
         config.max_speed / PER_METER
     );
-    if config.mods_allow.is_empty() && config.mods_deny.is_empty() {
-        println!("mods: unrestricted");
-    } else {
-        println!(
-            "mods allow: {} deny: {}",
+    match (config.mods_allow.is_empty(), config.mods_deny.is_empty()) {
+        (true, true) => println!("mods: unrestricted"),
+        (true, false) => println!("mods: deny {}", config.mods_deny.join(",")),
+        (false, true) => println!("mods: allow only {}", config.mods_allow.join(",")),
+        (false, false) => println!(
+            "mods: allow only {}; deny {}",
             config.mods_allow.join(","),
             config.mods_deny.join(",")
-        );
+        ),
+    }
+    if !config.ops.is_empty() {
+        println!("operators: {}", config.ops.join(", "));
     }
     if config.password.is_empty() {
         println!("warning: no password set — anyone who can reach the port can join");
