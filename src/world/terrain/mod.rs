@@ -63,6 +63,11 @@ pub const MAX_GROUND: i32 = 470;
 /// Ground never sinks below this (the far-LOD floor is 0).
 pub const MIN_GROUND: i32 = 6;
 
+/// Dig depth, plant reach, and the coarsest cell that still draws them.
+/// Morph bands and the column sampler share these.
+pub(in crate::world) use marks::DIG;
+pub(in crate::world) use round::{LOD_DRESS_CELL, PLANT_REACH};
+
 /// Atlas index of a chart body id, if `body` is one.
 fn chart_body(body: u16) -> Option<usize> {
     let base = super::section::CHART_BODY_BASE;

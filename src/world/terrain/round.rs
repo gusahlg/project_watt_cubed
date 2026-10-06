@@ -60,9 +60,9 @@ const SHORE: f32 = 72.0;
 /// How far above a column's first open cell a plant or landmark can reach.
 /// Colossal trees and lava fountains top out at [`marks::TALL`]; the extra cells keep a crown
 /// that stands on a slightly higher neighbour inside the far-field window.
-pub(super) const PLANT_REACH: i64 = marks::TALL + 8;
+pub(in crate::world) const PLANT_REACH: i64 = marks::TALL + 8;
 /// Coarsest far-field cell that still carries plants and landmarks.
-const LOD_DRESS_CELL: i64 = 8;
+pub(in crate::world) const LOD_DRESS_CELL: i64 = 8;
 /// Landmark site spacing. Bigger than [`SITE`] so a grove, an arch or a cone has room to be read.
 /// Anchors sit on this grid; each shape then stays inside the chart by its own reach, at most
 /// [`marks::REACH`] (wider than [`SITE_MARGIN`], because a grove or a trench outgrows a tree).

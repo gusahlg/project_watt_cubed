@@ -12,7 +12,7 @@ pub(super) const REACH: i64 = 48;
 /// Tallest cell a mark paints above its anchor, exclusive. The far field keeps a little more.
 pub(super) const TALL: i64 = 120;
 /// Cave band starts at depth 5, so a dig stops here.
-pub(super) const DIG: i64 = 4;
+pub(in crate::world) const DIG: i64 = 4;
 
 pub(super) const V_GROVE: u8 = 0;
 pub(super) const V_ARCH: u8 = 1;

@@ -126,6 +126,11 @@ impl EyeMetric {
         raw.min(self.cap)
     }
 
+    /// `(ex, ey, ez)` in the frame this metric was built in.
+    pub(in crate::world) fn pos(self) -> (f64, f64, f64) {
+        (self.ex, self.ey, self.ez)
+    }
+
     /// Integer grid cell containing the eye's XZ position.
     pub fn anchor(&self) -> (i32, i32) {
         (self.ex.floor() as i32, self.ez.floor() as i32)
