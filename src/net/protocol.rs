@@ -435,6 +435,7 @@ mod tag {
     pub const PEER_MOD_DATA: u8 = 14;
     pub const TOOL_RESULT: u8 = 15;
     pub const MODS_DENIED: u8 = 16;
+    pub const SNAPSHOT_END: u8 = 17;
 }
 
 messages! {
@@ -502,6 +503,9 @@ messages! {
         /// Sent once right after [`Welcome`](Self::Welcome). Each cell carries its
         /// authoritative revision so the joiner's future edit expectations line up.
         Snapshot = tag::SNAPSHOT { edits: Vec<(i32, i32, i32, u32, Arc<str>)> },
+        /// The join overlay is complete. Later [`Snapshot`](Self::Snapshot) frames are
+        /// reaction batches and do not reopen the loading screen.
+        SnapshotEnd = tag::SNAPSHOT_END,
         /// Roster only — a peer's pose arrives via [`PeerMove`](Self::PeerMove) once
         /// they are inside interest range.
         PeerJoined = tag::PEER_JOINED { id: u32, name: Arc<str> },
@@ -551,6 +555,21 @@ pub(crate) enum HelloPeek {
     Truncated,
     /// Little-endian protocol number sitting immediately after the tag.
     Protocol(u32),
+}
+
+/// Subject id of a [`ServerMessage::PeerMove`] payload, if this frame is one.
+pub(crate) fn peer_move_id(frame: &[u8]) -> Option<u32> {
+    if frame.first().copied() != Some(tag::PEER_MOVE) || frame.len() < 5 {
+        return None;
+    }
+    let mut bytes = [0u8; 4];
+    bytes.copy_from_slice(&frame[1..5]);
+    Some(u32::from_le_bytes(bytes))
+}
+
+/// A [`ServerMessage::PeerSwing`] payload. Cosmetic: a joining backlog may drop it.
+pub(crate) fn is_peer_swing(frame: &[u8]) -> bool {
+    frame.first().copied() == Some(tag::PEER_SWING)
 }
 
 /// Tag, then the protocol number. A v12 `Hello` laid the same two fields first,
@@ -748,6 +767,7 @@ mod tests {
                 tool_spec: "c:0201020304aabbccdd".into(),
             },
             ServerMessage::ModsDenied { ids: vec!["pwc.dev-toolkit".into()] },
+            ServerMessage::SnapshotEnd,
         ]
     }
 

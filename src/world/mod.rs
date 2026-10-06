@@ -51,7 +51,7 @@ pub(crate) mod lanes;
 mod metric;
 mod quadtree;
 mod query;
-mod seam;
+pub(crate) mod seam;
 mod streaming;
 mod summary;
 mod worklist;

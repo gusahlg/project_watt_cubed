@@ -20,8 +20,11 @@ use crate::menu::start::{StartFacts, StartRoot, VERSION};
 use crate::menu::theme::{DefaultTheme, MenuTheme};
 use crate::menu::{AppEffect, Ctx, Framed, HostInfo, JoinInfo, MenuStack, ModRow};
 use crate::modding::{ActionSet, ChoicesFlush, GameBuild, ModDescriptor, Mods};
-use crate::net::client::{ConnectError, Connection};
-use crate::net::server::{self, Config, ServerHandle, TeleportPolicy};
+#[cfg(test)]
+use crate::net::client::ConnectError;
+use crate::net::client::{Connection, PendingConnect};
+use crate::net::server::{self, Config, NoclipPolicy, ServerHandle, TeleportPolicy};
+use crate::ui::{self, Anchor};
 use crate::player::Player;
 use crate::save::{self, Autosaver, SaveMeta, Slot, SlotId, Tick};
 use crate::session::Session;
@@ -51,7 +54,22 @@ fn pacing(in_world: bool, bench: bool, settings: &Settings) -> (bool, u32) {
 
 enum Screen {
     Menus(MenuStack),
+    /// DNS, handshake, and Welcome, off the render thread.
+    Connecting(ConnectJob),
     Playing(Box<Game>),
+}
+
+/// One join attempt. A mod refusal starts a second attempt and keeps `retried`.
+struct ConnectJob {
+    pending: PendingConnect,
+    hosted: bool,
+    retried: bool,
+    host: String,
+    port: u16,
+    name: String,
+    password: String,
+    /// Shown once the retry joins.
+    notice: Option<String>,
 }
 
 /// The whole program: the installed mods (persist across worlds), the graphics
@@ -278,6 +296,10 @@ impl App {
         let t_update = watch.then(Instant::now);
         let quit = match self.screen {
             Screen::Menus(_) => self.update_menus(eng),
+            Screen::Connecting(_) => {
+                self.update_connecting(eng);
+                false
+            }
             Screen::Playing(_) => {
                 self.update_playing(eng);
                 false
@@ -345,6 +367,12 @@ impl App {
             Screen::Menus(_) => {
                 eprintln!(
                     "frame stall {}ms update={update_ms:.1}ms draw={draw_ms:.1}ms (menus)",
+                    dt.as_millis()
+                );
+            }
+            Screen::Connecting(_) => {
+                eprintln!(
+                    "frame stall {}ms update={update_ms:.1}ms draw={draw_ms:.1}ms (connecting)",
                     dt.as_millis()
                 );
             }
@@ -739,7 +767,7 @@ impl App {
     /// Spin up the integrated server on the most recent save and join it on loopback.
     /// Any previous host is stopped first so its port is free. The host is an
     /// operator and teleport stays open. A stored seed and generator win.
-    fn start_host(&mut self, eng: &mut Engine, info: HostInfo) {
+    fn start_host(&mut self, _eng: &mut Engine, info: HostInfo) {
         if let Some(previous) = self.host.take() {
             previous.stop();
         }
@@ -749,6 +777,7 @@ impl App {
             worldgen: self.mods.worldgen_kind(),
             terrain: terrain_cfg_from_mods(&self.mods),
             teleport: TeleportPolicy::All,
+            noclip: NoclipPolicy::All,
             world: Some(self.host_world_path()),
             ops: vec![info.name.clone()],
             warn_world_overrides: false,
@@ -758,21 +787,103 @@ impl App {
             Ok(handle) => {
                 let port = handle.addr().port();
                 self.host = Some(handle);
-                match connect_session(&mut self.mods, &self.packages, "127.0.0.1", port, &info.name, &info.password) {
-                    Ok((conn, notice)) => self.enter_net_game(eng, conn, notice),
-                    Err(e) => self.fail_to_menu(format!("hosted, but could not connect: {e}")),
-                }
+                self.open_connect("127.0.0.1", port, &info.name, &info.password, true);
             }
             Err(e) => self.fail_to_menu(format!("could not host on port {}: {e}", info.port)),
         }
     }
 
-    /// Connect to a remote server and enter its world.
-    fn start_join(&mut self, eng: &mut Engine, info: JoinInfo) {
-        match connect_session(&mut self.mods, &self.packages, &info.host, info.port, &info.name, &info.password) {
-            Ok((conn, notice)) => self.enter_net_game(eng, conn, notice),
-            Err(e) => self.fail_to_menu(format!("could not join: {e}")),
+    /// Connect to a remote server. The attempt runs behind the connecting screen.
+    fn start_join(&mut self, _eng: &mut Engine, info: JoinInfo) {
+        self.open_connect(&info.host, info.port, &info.name, &info.password, false);
+    }
+
+    /// Start one attempt. The render thread polls it; Cancel calls [`PendingConnect::cancel`].
+    fn open_connect(&mut self, host: &str, port: u16, name: &str, password: &str, hosted: bool) {
+        let reports = self.mods.enabled_package_reports(&self.packages);
+        let pending = Connection::begin_connect(host, port, name, password, &reports);
+        self.screen = Screen::Connecting(ConnectJob {
+            pending,
+            hosted,
+            retried: false,
+            host: host.to_string(),
+            port,
+            name: name.to_string(),
+            password: password.to_string(),
+            notice: None,
+        });
+    }
+
+    /// Poll the attempt. Cancel returns to the menu and stops a host we started.
+    /// A mod refusal retries once; any other failure leaves a spawned host running.
+    fn update_connecting(&mut self, eng: &mut Engine) {
+        let dt = eng.frame_time();
+        self.router.set_context(Context::Menu);
+        let cancel = match self.router.frame(eng, dt).view() {
+            View::Menu(menu) => crate::menu::gather(&menu).iter().any(|intent| matches!(intent, crate::menu::Intent::Cancel)),
+            _ => false,
+        };
+        if cancel {
+            self.cancel_connect();
+            return;
         }
+        let outcome = match &mut self.screen {
+            Screen::Connecting(job) => job.pending.poll(),
+            _ => return,
+        };
+        let Some(result) = outcome else { return };
+        let standby = self.standby_menu();
+        let Screen::Connecting(job) = std::mem::replace(&mut self.screen, Screen::Menus(standby)) else {
+            return;
+        };
+        match result {
+            Ok(conn) => self.enter_net_game(eng, conn, job.notice),
+            Err(err) if !err.mods_denied.is_empty() && !job.retried => {
+                let notice = mod_hold_notice(&self.packages, &err.mods_denied);
+                self.mods.hold_packages(&err.mods_denied);
+                let reports = self.mods.enabled_package_reports(&self.packages);
+                let pending = Connection::begin_connect(&job.host, job.port, &job.name, &job.password, &reports);
+                self.screen = Screen::Connecting(ConnectJob {
+                    pending,
+                    hosted: job.hosted,
+                    retried: true,
+                    host: job.host,
+                    port: job.port,
+                    name: job.name,
+                    password: job.password,
+                    notice: Some(notice),
+                });
+            }
+            Err(err) => {
+                if job.retried {
+                    self.mods.release_server();
+                }
+                let text = if job.hosted {
+                    format!("hosted, but could not connect: {err}")
+                } else {
+                    format!("could not join: {err}")
+                };
+                self.fail_to_menu(text);
+            }
+        }
+    }
+
+    fn cancel_connect(&mut self) {
+        let hosted = match &self.screen {
+            Screen::Connecting(job) => {
+                job.pending.cancel();
+                job.hosted
+            }
+            _ => false,
+        };
+        if hosted && let Some(host) = self.host.take() {
+            host.stop();
+        }
+        self.return_to_menu(None);
+    }
+
+    fn standby_menu(&self) -> MenuStack {
+        Self::start_stack(&self.mods, &self.saves, &self.session, None, self.host.is_some())
     }
 
     /// Join a remote world via an existing connection.
@@ -908,12 +1019,16 @@ impl App {
         );
         if let Signal::ExitToMenu = signal {
             self.flush_save();
-            if let Screen::Playing(game) = &mut self.screen {
+            let notice = if let Screen::Playing(game) = &mut self.screen {
+                let notice = game.take_leave_notice();
                 // Return the world's GPU meshes to the engine before dropping it.
                 game.free_gpu(eng);
-            }
+                notice
+            } else {
+                None
+            };
             eng.enable_cursor();
-            self.return_to_menu(None); // drops the Box<Game>
+            self.return_to_menu(notice); // drops the Box<Game>
             return;
         }
         // Periodic autosave on edits; bench/multiplayer never save.
@@ -989,6 +1104,32 @@ impl App {
             game.draw(eng, &mut self.mods, fov, shake);
             return;
         }
+        if let Screen::Connecting(_) = &self.screen {
+            let mut f = eng.begin_frame(MENU_CLEAR.to_linear());
+            let theme = ui::Theme::new();
+            let screen = (w as i32, h as i32);
+            ui::label(
+                &mut f,
+                &theme,
+                screen,
+                Anchor::Center,
+                (0, -16),
+                28,
+                ui::Role::Primary.color(),
+                "Connecting…",
+            );
+            ui::label(
+                &mut f,
+                &theme,
+                screen,
+                Anchor::Center,
+                (0, 24),
+                20,
+                ui::Role::Muted.color(),
+                "Cancel",
+            );
+            return;
+        }
         // Mods snapshot avoids borrow conflict between theme and view.
         let mods = ModRow::snapshot(&self.mods);
         let fallback = DefaultTheme;
@@ -1009,7 +1150,7 @@ impl App {
 
 
 /// Join `host:port` reporting no mods. Test clients use this. The game's own
-/// join goes through [`connect_session`].
+/// join is [`Connection::begin_connect`], off the render thread.
 #[cfg(test)]
 pub(crate) fn join_server(host: &str, port: u16, name: &str, password: &str) -> Result<Connection, ConnectError> {
     Connection::connect(host, port, name, password)
@@ -1027,7 +1168,9 @@ fn host_save_path(saves: &[crate::save::Slot]) -> PathBuf {
 /// Join, reporting the packages this client has enabled. The mod list is what
 /// an honest client says; a modified client can lie. One refusal turns those
 /// packages off for this session and retries once. A second failure restores
-/// them and returns the error. Nothing here writes `mods.cfg`.
+/// them and returns the error. Nothing here writes `mods.cfg`. The menu uses
+/// [`App::update_connecting`]; this stays for the session-hold test.
+#[cfg(test)]
 fn connect_session(
     mods: &mut Mods,
     packages: &[ModDescriptor],
@@ -1037,14 +1180,14 @@ fn connect_session(
     password: &str,
 ) -> Result<(Connection, Option<String>), ConnectError> {
     let reports = mods.enabled_package_reports(packages);
-    match Connection::connect_with(host, port, name, password, &reports) {
+    match Connection::begin_connect(host, port, name, password, &reports).wait() {
         Ok(conn) => Ok((conn, None)),
         Err(err) if err.mods_denied.is_empty() => Err(err),
         Err(err) => {
             let notice = mod_hold_notice(packages, &err.mods_denied);
             mods.hold_packages(&err.mods_denied);
             let reports = mods.enabled_package_reports(packages);
-            match Connection::connect_with(host, port, name, password, &reports) {
+            match Connection::begin_connect(host, port, name, password, &reports).wait() {
                 Ok(conn) => Ok((conn, Some(notice))),
                 Err(again) => {
                     mods.release_server();

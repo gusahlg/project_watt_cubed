@@ -6,7 +6,7 @@
 //! ```text
 //! watt_server [--port <n>] [--password <pw>] [--seed <n>] [--day-secs <n>]
 //!             [--world <path>] [--ops <name,name>] [--teleport off|ops|all]
-//!             [--max-speed <m/s>] [--mods-allow <id,id>] [--mods-deny <id,id>]
+//!             [--noclip off|ops|all] [--max-speed <m/s>] [--mods-allow <id,id>] [--mods-deny <id,id>]
 //!             [--worldgen <flat|diffusion>] [--relief <n>] [--caves <n>] [--mines <n>]
 //!             [--space <n>] [--variety <n>] [--features <n>] [--structures <n>] [--deep <n>]
 //!             [--data-dir <dir>]
@@ -24,7 +24,9 @@
 //! `--worldgen` selects the generator (default diffusion) for a new world. The
 //! eight knobs are percents of the designed terrain and are snapped onto the
 //! game's stepper. `--day-secs` sets the shared day/night cycle length.
-//! `--teleport` defaults to `ops` (only operators). `--max-speed` is metres per
+//! `--teleport` defaults to `ops` (only operators). `--noclip` defaults to `ops`:
+//! a move whose body overlaps solid ground snaps back unless that player may pass.
+//! `--max-speed` is metres per
 //! second; omitted, it is the game's own cap, which leaves cruise alone.
 //! `--mods-allow` and `--mods-deny` name package ids. With no allow list every
 //! reported mod is admitted. The list is the client's own word.
@@ -35,13 +37,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use project_watt_cubed::math::PER_METER;
 use project_watt_cubed::net::DEFAULT_PORT;
-use project_watt_cubed::net::server::{self, Config, TeleportPolicy};
+use project_watt_cubed::net::server::{self, Config, NoclipPolicy, TeleportPolicy};
 use project_watt_cubed::paths::Paths;
 use project_watt_cubed::world::generation::WorldgenKind;
 
 const USAGE: &str = "\
 usage: watt_server [--port <n>] [--password <pw>] [--seed <n>] [--day-secs <n>] \
-[--world <path>] [--ops <name,name>] [--teleport off|ops|all] [--max-speed <m/s>] \
+[--world <path>] [--ops <name,name>] [--teleport off|ops|all] [--noclip off|ops|all] \
+[--max-speed <m/s>] \
 [--mods-allow <id,id>] [--mods-deny <id,id>] \
 [--worldgen <flat|diffusion>] [--relief <n>] [--caves <n>] [--mines <n>] [--space <n>] \
 [--variety <n>] [--features <n>] [--structures <n>] [--deep <n>] [--data-dir <dir>]";
@@ -51,6 +54,7 @@ fn main() {
     let mut config = Config {
         seed: fresh_seed(),
         teleport: TeleportPolicy::Ops,
+        noclip: NoclipPolicy::Ops,
         warn_world_overrides: true,
         ..Config::default()
     };
@@ -98,6 +102,14 @@ fn main() {
                     _ => die("teleport must be off, ops, or all"),
                 };
             }
+            "--noclip" => {
+                config.noclip = match take(&args, &mut i, "--noclip").as_str() {
+                    "off" => NoclipPolicy::Off,
+                    "ops" => NoclipPolicy::Ops,
+                    "all" => NoclipPolicy::All,
+                    _ => die("noclip must be off, ops, or all"),
+                };
+            }
             "--max-speed" => {
                 let mps: f64 = take(&args, &mut i, "--max-speed")
                     .parse()
@@ -129,11 +141,16 @@ fn main() {
         config.worldgen.id()
     );
     println!(
-        "teleport {}, max speed {:.0} m/s",
+        "teleport {}, noclip {}, max speed {:.0} m/s",
         match config.teleport {
             TeleportPolicy::Off => "off",
             TeleportPolicy::Ops => "ops",
             TeleportPolicy::All => "all",
+        },
+        match config.noclip {
+            NoclipPolicy::Off => "off",
+            NoclipPolicy::Ops => "ops",
+            NoclipPolicy::All => "all",
         },
         config.max_speed / PER_METER
     );

@@ -44,10 +44,11 @@ pub(crate) mod quic {
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
     use rustls::{DigitallySignedStruct, SignatureScheme};
 
-    /// Idle connections are reaped after this long (mirrors the server's
-    /// `IDLE_TIMEOUT`); a keep-alive well under it holds a quiet-but-live link open.
-    const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-    const KEEP_ALIVE: Duration = Duration::from_secs(10);
+    /// Idle connections are reaped after this long. A keep-alive well under it
+    /// holds a quiet-but-live link open. The client's own silence watch gives up
+    /// on the same interval.
+    const IDLE_TIMEOUT: Duration = Duration::from_secs(12);
+    const KEEP_ALIVE: Duration = Duration::from_secs(3);
 
     /// rustls 0.23 requires a provider installed before any TLS config is built;
     /// both endpoints call this, so `Once` makes concurrent callers safe.
@@ -61,7 +62,7 @@ pub(crate) mod quic {
     /// Caps concurrent bidi streams at 1: all app traffic multiplexes onto one stream.
     fn transport() -> Arc<TransportConfig> {
         let mut t = TransportConfig::default();
-        t.max_idle_timeout(Some(IDLE_TIMEOUT.try_into().expect("30s fits a QUIC VarInt")));
+        t.max_idle_timeout(Some(IDLE_TIMEOUT.try_into().expect("12s fits a QUIC VarInt")));
         t.keep_alive_interval(Some(KEEP_ALIVE));
         t.max_concurrent_bidi_streams(VarInt::from_u32(1));
         Arc::new(t)
@@ -155,7 +156,7 @@ pub(crate) mod quic {
 
 /// Wire revision. Client and server must match exactly at join. Bump on any
 /// incompatible frame change; history is `documentation/notes/protocol-history.md`.
-pub(crate) const PROTOCOL_VERSION: u32 = 15;
+pub(crate) const PROTOCOL_VERSION: u32 = 16;
 
 pub const DEFAULT_PORT: u16 = 5555;
 

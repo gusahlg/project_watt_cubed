@@ -328,6 +328,8 @@ pub struct Game {
     /// Last frame's named-phase durations, for the stall detector.
     phases: FramePhases,
     hud_scratch: Vec<HudElement>,
+    /// Menu notice taken when a network session leaves. The console goes with the game.
+    leave_notice: Option<String>,
 }
 
 /// Durations of `Game::update` phases, sampled every frame for stall logs.
@@ -413,6 +415,7 @@ impl Game {
             peer_up_scratch: Vec::new(),
             phases: FramePhases::default(),
             hud_scratch: Vec::new(),
+            leave_notice: None,
         }
     }
 
@@ -588,6 +591,11 @@ impl Game {
     /// local save, so the app does not autosave it).
     pub fn is_multiplayer(&self) -> bool {
         self.net.is_some()
+    }
+
+    /// Why a network session left, for the menu. Cleared by the take.
+    pub fn take_leave_notice(&mut self) -> Option<String> {
+        self.leave_notice.take()
     }
     pub fn world(&self) -> &World {
         &self.world
@@ -769,14 +777,18 @@ impl Game {
             self.apply_net_events(mods, events)
         };
         if let Some(reason) = net_disconnected {
-            let line = if reason.to_ascii_lowercase().contains("shutting down") {
+            let interrupted = reason == crate::net::client::INTERRUPTED;
+            let line = if interrupted {
+                crate::net::client::INTERRUPTED.to_string()
+            } else if reason.to_ascii_lowercase().contains("shutting down") {
                 "* server shutting down".to_string()
             } else if reason.is_empty() {
                 "* disconnected from server".to_string()
             } else {
                 format!("* disconnected: {reason}")
             };
-            self.console.print(line);
+            self.console.print(line.clone());
+            self.leave_notice = Some(line);
             return Some(Signal::ExitToMenu);
         }
         if let Some(net) = &mut self.net {
@@ -1525,6 +1537,10 @@ impl Game {
                     self.sky.day_length = crate::sky::DayLength::clamped(day_secs as f64);
                 }
                 Incoming::Disconnected { reason } => disconnected = Some(reason),
+                Incoming::Interrupted => {
+                    self.console
+                        .push(ui::Line::of(ui::Role::Warning, crate::net::client::INTERRUPTED));
+                }
                 Incoming::ToolResult { req, reacted, cell, cell_spec, tool_spec } => {
                     let Some(tool) = self.pending_tools.remove(&req) else { continue };
                     if !reacted {

@@ -2,23 +2,22 @@
 //!
 //! The bytes are a [`save::format`](crate::save::format) document. Edits use the
 //! spec palette. The clock is the mod record `pwc.clock` (eight hex digits of
-//! `f32::to_bits`); singleplayer ignores that name. Pending reactions are written
-//! empty: the server has no way to export a live scheduler, and replaying a stale
-//! list would apply those contacts twice.
+//! `f32::to_bits`); singleplayer ignores that name. Pending reactions are the live
+//! scheduler's contacts, so a reload continues work in progress. A spec this build
+//! cannot parse stays in the file until a later edit replaces that cell.
 //!
 //! A missing file starts from the caller's flags. A corrupt file, a law mismatch,
 //! or a world from before this universe is an error — the server must not replace
 //! it with a fresh world. When a file loads, its seed and generator win.
 
-use std::collections::HashMap;
 use std::fs;
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use crate::save::format::{self, Decoded, Edit, PlayerState, SaveDoc, WorldgenStamp};
+use crate::save::format::{self, Decoded, Edit, PendingContact, PlayerState, SaveDoc, WorldgenStamp};
 use crate::save::slot::SaveMeta;
-use crate::save::{self, write_atomic_file};
+use crate::save;
 use crate::world::generation::WorldgenKind;
 use crate::world::terrain::{TerrainCfg, WORLDGEN_VERSION};
 
@@ -43,6 +42,8 @@ pub(crate) struct Loaded {
     pub terrain: TerrainCfg,
     pub day: f32,
     pub edits: Vec<(i32, i32, i32, String)>,
+    /// Contacts the file still had waiting. Restored into the scheduler before the first tick.
+    pub pending: Vec<PendingContact>,
     pub store: Option<Store>,
 }
 
@@ -50,6 +51,9 @@ pub(crate) struct Loaded {
 pub(crate) struct Store {
     path: PathBuf,
     doc: Mutex<SaveDoc>,
+    /// Cells whose spec this build could not parse. Re-emitted on the next save
+    /// unless the live ledger has since written that cell.
+    kept: Mutex<Vec<(i32, i32, i32, String)>>,
 }
 
 /// Live ledger captured for one save. Specs are the server's shared `Arc`s, so capturing under the
@@ -60,6 +64,8 @@ pub(crate) struct Snapshot {
     pub terrain: TerrainCfg,
     pub day: f32,
     pub edits: Vec<(i32, i32, i32, Arc<str>)>,
+    /// Active reaction contacts, in processing order.
+    pub pending: Vec<PendingContact>,
 }
 
 /// Operators and mod policy that live beside a world file.
@@ -74,13 +80,63 @@ impl Store {
         &self.path
     }
 
-    /// Replace the ledger, clock, and generator stamp. Player, other mod
-    /// records, name, created time, and playtime stay.
+    /// Cells skipped at load because their spec does not parse. Set before the
+    /// server threads start.
+    pub fn set_kept(&self, cells: Vec<(i32, i32, i32, String)>) {
+        *self.kept.lock().unwrap_or_else(|p| p.into_inner()) = cells;
+    }
+
+    /// Replace the ledger, clock, generator stamp, and pending reactions.
+    /// Player, other mod records, name, created time, and playtime stay.
+    /// The previous file is rotated to `.bak` the way a singleplayer slot is.
     pub fn write(&self, snap: &Snapshot) -> io::Result<()> {
         let mut doc = self.doc.lock().unwrap_or_else(|p| p.into_inner());
-        let bytes = encode_snapshot(&mut doc, snap).map_err(|e| io::Error::other(e))?;
-        write_atomic_file(&self.path, &bytes)
+        let mut kept = self.kept.lock().unwrap_or_else(|p| p.into_inner());
+        let bytes = encode_snapshot(&mut doc, snap, &mut kept).map_err(|e| io::Error::other(e))?;
+        write_rotating(&self.path, &bytes)
     }
+}
+
+/// `{path}.bak` / `{path}.tmp`, matching [`save::store`]'s slot names (`id.save.bak`).
+fn suffixed(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(suffix);
+    path.with_file_name(name)
+}
+
+/// Write `bytes` via a sibling `.tmp`, then rename the live file to `.bak` and
+/// the temp file into place. A failed second rename puts the backup back.
+fn write_rotating(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    if let Some(dir) = path.parent() {
+        if !dir.as_os_str().is_empty() {
+            fs::create_dir_all(dir)?;
+        }
+    }
+    let tmp = suffixed(path, ".tmp");
+    let bak = suffixed(path, ".bak");
+    let wrote = (|| {
+        let mut file = fs::File::create(&tmp)?;
+        std::io::Write::write_all(&mut file, bytes)?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    if let Err(err) = wrote {
+        let _ = fs::remove_file(&tmp);
+        return Err(err);
+    }
+    let had_live = path.exists();
+    if had_live && let Err(err) = fs::rename(path, &bak) {
+        let _ = fs::remove_file(&tmp);
+        return Err(err);
+    }
+    if let Err(err) = fs::rename(&tmp, path) {
+        if had_live {
+            let _ = fs::rename(&bak, path);
+        }
+        let _ = fs::remove_file(&tmp);
+        return Err(err);
+    }
+    Ok(())
 }
 
 /// No file: the flags are the world, and nothing is saved.
@@ -91,6 +147,7 @@ pub(crate) fn fresh(flags: &Flags) -> Loaded {
         terrain: flags.terrain,
         day: DEFAULT_DAY,
         edits: Vec::new(),
+        pending: Vec::new(),
         store: None,
     }
 }
@@ -106,9 +163,11 @@ pub(crate) fn load(path: &Path, flags: &Flags) -> Result<Loaded, String> {
                 terrain: flags.terrain,
                 day: DEFAULT_DAY,
                 edits: Vec::new(),
+                pending: Vec::new(),
                 store: Some(Store {
                     path: path.to_path_buf(),
                     doc: Mutex::new(blank_doc(flags)),
+                    kept: Mutex::new(Vec::new()),
                 }),
             });
         }
@@ -153,7 +212,7 @@ pub(crate) fn load(path: &Path, flags: &Flags) -> Result<Loaded, String> {
     let day = clock_of(&doc.mods);
     let spec_table = std::mem::take(&mut doc.specs);
     let stored = std::mem::take(&mut doc.edits);
-    doc.pending.clear();
+    let pending = std::mem::take(&mut doc.pending);
     let mut edits = Vec::with_capacity(stored.len());
     for edit in stored {
         let Some(spec) = spec_table.get(usize::from(edit.spec)) else { continue };
@@ -165,7 +224,12 @@ pub(crate) fn load(path: &Path, flags: &Flags) -> Result<Loaded, String> {
         terrain,
         day,
         edits,
-        store: Some(Store { path: path.to_path_buf(), doc: Mutex::new(doc) }),
+        pending,
+        store: Some(Store {
+            path: path.to_path_buf(),
+            doc: Mutex::new(doc),
+            kept: Mutex::new(Vec::new()),
+        }),
     })
 }
 
@@ -209,25 +273,28 @@ fn blank_doc(flags: &Flags) -> SaveDoc {
     }
 }
 
-fn encode_snapshot(doc: &mut SaveDoc, snap: &Snapshot) -> Result<Vec<u8>, String> {
-    let mut edits: Vec<&(i32, i32, i32, Arc<str>)> = snap.edits.iter().collect();
-    edits.sort_unstable_by_key(|e| (e.0, e.1, e.2));
+fn spec_index(specs: &mut Vec<String>, spec: &str) -> Result<u16, String> {
+    if let Some(index) = specs.iter().position(|have| have == spec) {
+        return u16::try_from(index).map_err(|_| "too many distinct block specs to save".to_string());
+    }
+    let index = u16::try_from(specs.len()).map_err(|_| "too many distinct block specs to save".to_string())?;
+    specs.push(spec.to_string());
+    Ok(index)
+}
+
+fn encode_snapshot(doc: &mut SaveDoc, snap: &Snapshot, kept: &mut Vec<(i32, i32, i32, String)>) -> Result<Vec<u8>, String> {
+    let mut cells: Vec<(i32, i32, i32, &str)> = snap.edits.iter().map(|(x, y, z, spec)| (*x, *y, *z, spec.as_ref())).collect();
+    // A live edit replaces an unparsed one at the same cell. The unparsed text stays only while
+    // this build still has no opinion about that cell.
+    kept.retain(|(x, y, z, _)| !snap.edits.iter().any(|edit| edit.0 == *x && edit.1 == *y && edit.2 == *z));
+    for (x, y, z, spec) in kept.iter() {
+        cells.push((*x, *y, *z, spec.as_str()));
+    }
+    cells.sort_unstable_by_key(|cell| (cell.0, cell.1, cell.2));
     let mut specs: Vec<String> = Vec::new();
-    let mut index_of: HashMap<&str, u16> = HashMap::new();
-    let mut records = Vec::with_capacity(edits.len());
-    for (x, y, z, spec) in edits {
-        let spec_index = match index_of.get(spec.as_ref()) {
-            Some(&i) => i,
-            None => {
-                let Ok(i) = u16::try_from(specs.len()) else {
-                    return Err("too many distinct block specs to save".into());
-                };
-                specs.push(spec.to_string());
-                index_of.insert(spec.as_ref(), i);
-                i
-            }
-        };
-        records.push(Edit { x: *x, y: *y, z: *z, spec: spec_index });
+    let mut records = Vec::with_capacity(cells.len());
+    for (x, y, z, spec) in cells {
+        records.push(Edit { x, y, z, spec: spec_index(&mut specs, spec)? });
     }
     doc.meta.seed = snap.seed;
     doc.meta.last_played = save::unix_now();
@@ -236,7 +303,7 @@ fn encode_snapshot(doc: &mut SaveDoc, snap: &Snapshot) -> Result<Vec<u8>, String
     doc.law_stamp = material::Law::current().stamp();
     doc.specs = specs;
     doc.edits = records;
-    doc.pending.clear();
+    doc.pending = snap.pending.clone();
     doc.mods.retain(|(name, _)| name != CLOCK_MOD);
     let day = if snap.day.is_finite() { snap.day.rem_euclid(1.0) } else { DEFAULT_DAY };
     doc.mods.push((CLOCK_MOD.to_string(), format!("{:08x}", day.to_bits())));
@@ -329,6 +396,7 @@ fn mod_ids(table: &toml::map::Map<String, toml::Value>, key: &str) -> Result<Vec
 mod tests {
     use super::*;
     use crate::save::format::{Edit, PendingContact, SaveDoc};
+    use crate::save::write_atomic_file;
 
     fn flags(seed: i64) -> Flags {
         Flags {
@@ -372,6 +440,8 @@ mod tests {
             vec![(3, 1, 2, "air".into()), (1, 2, 3, "natural:Stone".into())]
         );
         let store = loaded.store.unwrap();
+        let pending = loaded.pending.clone();
+        assert_eq!(pending, vec![PendingContact { x: 1, y: 2, z: 3, axis: 0, age: 4 }]);
         store
             .write(&Snapshot {
                 seed: 42,
@@ -379,19 +449,22 @@ mod tests {
                 terrain: TerrainCfg::default(),
                 day,
                 edits: vec![(1, 2, 3, "natural:Stone".into()), (3, 1, 2, "air".into())],
+                pending: pending.clone(),
             })
             .unwrap();
         let again = load(&path, &flags(99)).unwrap();
         assert_eq!(again.seed, 42);
         assert_eq!(again.day.to_bits(), day.to_bits());
         assert_eq!(again.edits, vec![(1, 2, 3, "natural:Stone".into()), (3, 1, 2, "air".into())]);
+        assert_eq!(again.pending, pending, "a server save keeps the scheduler's contacts");
         let saved = match format::decode(&fs::read(&path).unwrap()).unwrap() {
             Decoded::Intact(doc) => doc,
             Decoded::Salvaged { .. } => panic!("resave must be intact"),
         };
-        assert!(saved.pending.is_empty(), "a server save does not keep stale reactions");
+        assert_eq!(saved.pending, pending);
         assert!(saved.mods.iter().any(|(n, d)| n == "inventory" && d == "Stone"));
         let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(suffixed(&path, ".bak"));
     }
 
     #[test]
@@ -438,6 +511,103 @@ mod tests {
         assert_eq!(side.allow, vec!["pwc.hotbar".to_string()]);
         assert_eq!(side.deny, vec!["pwc.dev-toolkit".to_string()]);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn host_save_rotates_a_slot_backup() {
+        let id = crate::save::SlotId::new("__pwc_g25_rotate__").unwrap();
+        let path = crate::save::store::file_path(&id);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(suffixed(&path, ".bak"));
+        let loaded = load(&path, &flags(1)).unwrap();
+        let store = loaded.store.unwrap();
+        let pending = vec![PendingContact { x: 4, y: 5, z: 6, axis: 1, age: 2 }];
+        store
+            .write(&Snapshot {
+                seed: 1,
+                worldgen: WorldgenKind::Flat,
+                terrain: TerrainCfg::default(),
+                day: 0.25,
+                edits: vec![(1, 2, 3, "air".into())],
+                pending: pending.clone(),
+            })
+            .unwrap();
+        store
+            .write(&Snapshot {
+                seed: 2,
+                worldgen: WorldgenKind::Flat,
+                terrain: TerrainCfg::default(),
+                day: 0.5,
+                edits: vec![(9, 9, 9, "air".into())],
+                pending: Vec::new(),
+            })
+            .unwrap();
+        fs::write(&path, b"not a save").unwrap();
+        let (decoded, source) = crate::save::store::read(&id).unwrap();
+        assert_eq!(source, crate::save::store::Source::Backup);
+        let doc = match decoded {
+            Decoded::Intact(doc) => doc,
+            Decoded::Salvaged { .. } => panic!("the backup must be intact"),
+        };
+        assert_eq!(doc.meta.seed, 1);
+        assert_eq!(doc.pending, pending);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(suffixed(&path, ".bak"));
+    }
+
+    #[test]
+    fn unparsed_specs_survive_the_next_save() {
+        let path = crate::save::store::test_temp_path("kept");
+        let doc = doc_with(
+            3,
+            0.3f32.to_bits(),
+            vec![Edit { x: 1, y: 2, z: 3, spec: 0 }, Edit { x: 4, y: 5, z: 6, spec: 1 }],
+            vec!["natural:Stone".into(), "air".into()],
+        );
+        write_atomic_file(&path, &format::encode(&doc).unwrap()).unwrap();
+        let loaded = load(&path, &flags(1)).unwrap();
+        let mut registry = crate::block::BlockRegistry::with_builtins();
+        let mut kept = Vec::new();
+        let mut parsed = Vec::new();
+        for (x, y, z, spec) in &loaded.edits {
+            if registry.parse_spec(spec).is_none() {
+                kept.push((*x, *y, *z, spec.clone()));
+            } else {
+                parsed.push((*x, *y, *z, Arc::from(spec.clone())));
+            }
+        }
+        assert_eq!(kept, vec![(1, 2, 3, "natural:Stone".to_string())]);
+        let store = loaded.store.unwrap();
+        store.set_kept(kept);
+        store
+            .write(&Snapshot {
+                seed: 3,
+                worldgen: WorldgenKind::Flat,
+                terrain: TerrainCfg::default(),
+                day: 0.3,
+                edits: parsed,
+                pending: Vec::new(),
+            })
+            .unwrap();
+        let again = load(&path, &flags(1)).unwrap();
+        assert!(again.edits.iter().any(|edit| edit.3 == "natural:Stone"));
+        assert!(again.edits.iter().any(|edit| edit.3 == "air"));
+        let store = again.store.unwrap();
+        store.set_kept(vec![(1, 2, 3, "natural:Stone".into())]);
+        store
+            .write(&Snapshot {
+                seed: 3,
+                worldgen: WorldgenKind::Flat,
+                terrain: TerrainCfg::default(),
+                day: 0.3,
+                edits: vec![(1, 2, 3, "air".into()), (4, 5, 6, "air".into())],
+                pending: Vec::new(),
+            })
+            .unwrap();
+        let replaced = load(&path, &flags(1)).unwrap();
+        assert!(replaced.edits.iter().all(|edit| edit.3 == "air"));
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(suffixed(&path, ".bak"));
     }
 
     /// A minimal v9 flat file: four knobs, the old 33-byte player, one `air` edit.
