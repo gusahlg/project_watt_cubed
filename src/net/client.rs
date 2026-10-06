@@ -1,18 +1,20 @@
 //! The client side of multiplayer: a [`Connection`] the [`Game`](crate::game)
 //! owns while playing on a server, hiding the socket behind a small poll-based
 //! API. A background thread does the blocking reads and feeds a channel, so
-//! the render loop never stalls on the network. Sends happen inline from the
-//! game thread (tiny and infrequent). Position sends are throttled and
-//! heartbeat so a standing-still player still proves they are alive.
+//! the render loop never stalls on the network. Sends go through a bounded
+//! writer thread. Position sends are throttled and heartbeat so a
+//! standing-still player still proves they are alive. The join itself
+//! ([`Connection::begin_connect`]) runs off the render thread and can be cancelled.
 //! Teleport echo (`Position` after `Teleport`) is part of protocol v9.
 use std::collections::{HashMap, VecDeque};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use quinn::{Endpoint, SendStream};
+use quinn::Endpoint;
 use tokio::runtime::Runtime;
 use glam::DQuat;
 use voxel_engine::{DVec3, Vec3};
@@ -24,6 +26,15 @@ use crate::presence::{self, Eye, Stance, WireAction};
 use crate::sched::RateGate;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Outbound frames waiting on the writer thread. A full queue drops the new
+/// frame and leaves the link up; the edit stays pending and expires on its own.
+const OUT_QUEUE: usize = 64;
+/// No `Pong` for this long: tell the player the link has gone quiet.
+const SILENCE_WARN: Duration = Duration::from_secs(5);
+/// No `Pong` for this long: give up. Matches the QUIC idle timeout.
+const SILENCE_GIVE_UP: Duration = Duration::from_secs(12);
+/// HUD, console, and the disconnect reason share this phrase.
+pub const INTERRUPTED: &str = "connection interrupted";
 const MOVE_INTERVAL: Duration = Duration::from_millis(33);
 /// So the server's idle timeout never reaps an active-but-idle player.
 const HEARTBEAT: Duration = Duration::from_secs(1);
@@ -198,6 +209,8 @@ pub enum Incoming {
     /// `reason` is the server's close phrase when it sent one (empty if the
     /// peer just vanished). "server shutting down" means the process is exiting.
     Disconnected { reason: String },
+    /// No `Pong` for [`SILENCE_WARN`]. Cleared by the next `Pong`.
+    Interrupted,
 }
 
 /// Why [`Connection::connect`] failed. `mods_denied` is empty unless the server
@@ -247,12 +260,14 @@ struct PendingReq {
 /// signals the server that this player left.
 pub struct Connection {
     conn: quinn::Connection,
-    send: SendStream,
     /// Not needed to keep the connection alive (quinn's driver self-sustains
     /// while a connection is open), but required at [`Drop`] to `wait_idle` —
     /// flushing the close frame before the runtime is torn down.
     endpoint: Endpoint,
     rt: Arc<Runtime>,
+    /// Bounded handoff to the writer thread. `None` after [`Drop`] takes it.
+    writer_tx: Option<SyncSender<Arc<[u8]>>>,
+    writer: Option<JoinHandle<()>>,
     inbox: Receiver<ServerMessage>,
     /// Kept OUT of `inbox`. Each channel has its own drop-oldest ring, so one
     /// channel cannot flush another. `HashMap::new` allocates nothing until the
@@ -288,6 +303,12 @@ pub struct Connection {
     disconnect_emitted: bool,
     /// Filled by the reader when the stream ends, before the inbox disconnects.
     close_reason: Arc<Mutex<String>>,
+    /// Last evidence the server answered. Set at connect and on every `Pong`.
+    last_pong: Instant,
+    /// [`Incoming::Interrupted`] already surfaced for the current gap.
+    warned: bool,
+    /// The join overlay has arrived ([`ServerMessage::SnapshotEnd`]). Stays set.
+    snapshot_ready: bool,
 }
 
 impl Connection {
@@ -299,7 +320,8 @@ impl Connection {
 
     /// As [`connect`](Self::connect), reporting `mods` as the enabled packages.
     /// That list is the client's own word; the server does not trust it for
-    /// anything except the whitelist.
+    /// anything except the whitelist. Blocks until the attempt finishes;
+    /// [`begin_connect`](Self::begin_connect) is the same work off this thread.
     pub fn connect_with(
         host: &str,
         port: u16,
@@ -307,24 +329,139 @@ impl Connection {
         password: &str,
         mods: &[(String, String)],
     ) -> Result<Self, ConnectError> {
-        let addrs: Vec<SocketAddr> = (host, port)
-            .to_socket_addrs()
-            .map_err(|e| ConnectError::plain(format!("bad address: {e}")))?
-            .collect();
-        if addrs.is_empty() {
-            return Err(ConnectError::plain("address resolved to nothing"));
-        }
-        let rt = Arc::new(Runtime::new().map_err(|e| ConnectError::plain(format!("runtime: {e}")))?);
-        quic::install_crypto();
-        let mut last = ConnectError::plain("could not connect");
-        for addr in addrs {
-            match connect_one(&rt, addr, name, password, mods) {
-                Ok(conn) => return Ok(conn),
-                Err(e) => last = e,
-            }
-        }
-        Err(last)
+        Self::begin_connect(host, port, name, password, mods).wait()
     }
+
+    /// DNS, the QUIC handshake, and `Welcome`, on a worker thread.
+    /// [`PendingConnect::poll`] is the render thread's view of it.
+    pub fn begin_connect(
+        host: &str,
+        port: u16,
+        name: &str,
+        password: &str,
+        mods: &[(String, String)],
+    ) -> PendingConnect {
+        let flag = Arc::new(AtomicBool::new(false));
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let (tx, done) = mpsc::channel();
+        let host = host.to_string();
+        let name = name.to_string();
+        let password = password.to_string();
+        let mods = mods.to_vec();
+        let flag_worker = Arc::clone(&flag);
+        let notify_worker = Arc::clone(&notify);
+        thread::spawn(move || {
+            let stop = Stop { flag: flag_worker, notify: notify_worker };
+            let result = connect_cancellable(&host, port, &name, &password, &mods, &stop);
+            let _ = tx.send(result);
+        });
+        PendingConnect { done, flag, notify }
+    }
+}
+
+/// One connect attempt the render thread can poll or cancel.
+pub struct PendingConnect {
+    done: Receiver<Result<Connection, ConnectError>>,
+    flag: Arc<AtomicBool>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl PendingConnect {
+    /// `None` while the attempt is still running.
+    pub fn poll(&mut self) -> Option<Result<Connection, ConnectError>> {
+        match self.done.try_recv() {
+            Ok(result) => Some(result),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => Some(Err(ConnectError::plain("connect ended"))),
+        }
+    }
+
+    /// Ask the worker to stop. A cancel that lands before the worker waits is
+    /// kept: [`Notify::notify_one`](tokio::sync::Notify::notify_one) stores a permit.
+    pub fn cancel(&self) {
+        self.flag.store(true, Ordering::Relaxed);
+        self.notify.notify_one();
+    }
+
+    /// Block until the attempt finishes. [`Connection::connect`] is this.
+    pub fn wait(self) -> Result<Connection, ConnectError> {
+        self.done.recv().unwrap_or_else(|_| Err(ConnectError::plain("connect ended")))
+    }
+}
+
+/// Shared cancel flag. The worker owns this view; [`PendingConnect`] holds the same arcs.
+struct Stop {
+    flag: Arc<AtomicBool>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl Stop {
+    fn check(&self) -> Result<(), ConnectError> {
+        if self.flag.load(Ordering::Relaxed) {
+            Err(ConnectError::plain("cancelled"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+async fn until_stopped(stop: &Stop) {
+    loop {
+        if stop.flag.load(Ordering::Relaxed) {
+            return;
+        }
+        stop.notify.notified().await;
+    }
+}
+
+fn with_stop<T>(
+    rt: &Runtime,
+    stop: &Stop,
+    timeout_msg: &'static str,
+    fut: impl std::future::Future<Output = Result<T, ConnectError>>,
+) -> Result<T, ConnectError> {
+    stop.check()?;
+    rt.block_on(async {
+        tokio::select! {
+            biased;
+            _ = until_stopped(stop) => Err(ConnectError::plain("cancelled")),
+            result = tokio::time::timeout(CONNECT_TIMEOUT, fut) => match result {
+                Ok(value) => value,
+                Err(_) => Err(ConnectError::plain(timeout_msg)),
+            },
+        }
+    })
+}
+
+fn connect_cancellable(
+    host: &str,
+    port: u16,
+    name: &str,
+    password: &str,
+    mods: &[(String, String)],
+    stop: &Stop,
+) -> Result<Connection, ConnectError> {
+    stop.check()?;
+    let addrs: Vec<SocketAddr> = (host, port)
+        .to_socket_addrs()
+        .map_err(|e| ConnectError::plain(format!("bad address: {e}")))?
+        .collect();
+    stop.check()?;
+    if addrs.is_empty() {
+        return Err(ConnectError::plain("address resolved to nothing"));
+    }
+    let rt = Arc::new(Runtime::new().map_err(|e| ConnectError::plain(format!("runtime: {e}")))?);
+    quic::install_crypto();
+    let mut last = ConnectError::plain("could not connect");
+    for addr in addrs {
+        stop.check()?;
+        match connect_one(&rt, addr, name, password, mods, stop) {
+            Ok(conn) => return Ok(conn),
+            Err(e) if e.message == "cancelled" => return Err(e),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
 }
 
 fn connect_one(
@@ -333,6 +470,7 @@ fn connect_one(
     name: &str,
     password: &str,
     mods: &[(String, String)],
+    stop: &Stop,
 ) -> Result<Connection, ConnectError> {
     let bind = if addr.is_ipv4() {
         SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
@@ -346,41 +484,42 @@ fn connect_one(
     };
     endpoint.set_default_client_config(quic::client_config());
 
-    let conn = rt.block_on(async {
+    let conn = with_stop(rt, stop, "connect timed out", async {
         let connecting = endpoint.connect(addr, "watt").map_err(|e| ConnectError::plain(e.to_string()))?;
-        tokio::time::timeout(CONNECT_TIMEOUT, connecting)
-            .await
-            .map_err(|_| ConnectError::plain("connect timed out"))?
-            .map_err(|e| ConnectError::plain(format!("could not reach {addr}: {e}")))
+        connecting.await.map_err(|e| ConnectError::plain(format!("could not reach {addr}: {e}")))
     })?;
-        let (mut send, mut recv) =
-            rt.block_on(conn.open_bi()).map_err(|e| ConnectError::plain(format!("stream: {e}")))?;
+    let (mut send, mut recv) = with_stop(rt, stop, "connect timed out", async {
+        conn.open_bi().await.map_err(|e| ConnectError::plain(format!("stream: {e}")))
+    })?;
 
-        let id = crate::net::content_id(&crate::block::BlockRegistry::with_builtins());
-        let hello = ClientMessage::Hello {
-            protocol: PROTOCOL_VERSION,
-            worldgen: id.worldgen,
-            gravity: id.gravity,
-            law: id.law,
-            palette: id.palette,
-            name: name.into(),
-            password: password.into(),
-            mods: mods
-                .iter()
-                .map(|(id, version)| protocol::ModOffer { id: id.as_str().into(), version: version.as_str().into() })
-                .collect(),
-        };
-        rt.block_on(protocol::write_frame_async(&mut send, &hello.encode()))
-            .map_err(|e| ConnectError::plain(format!("send failed: {e}")))?;
+    let id = crate::net::content_id(&crate::block::BlockRegistry::with_builtins());
+    let hello = ClientMessage::Hello {
+        protocol: PROTOCOL_VERSION,
+        worldgen: id.worldgen,
+        gravity: id.gravity,
+        law: id.law,
+        palette: id.palette,
+        name: name.into(),
+        password: password.into(),
+        mods: mods
+            .iter()
+            .map(|(id, version)| protocol::ModOffer { id: id.as_str().into(), version: version.as_str().into() })
+            .collect(),
+    };
+    let hello_bytes = hello.encode();
+    with_stop(rt, stop, "connect timed out", async {
+        protocol::write_frame_async(&mut send, &hello_bytes)
+            .await
+            .map_err(|e| ConnectError::plain(format!("send failed: {e}")))
+    })?;
 
-        // The scratch Vec is reused across frames so the reader loop never allocates.
-        let mut frame = Vec::new();
-        rt.block_on(async {
-            tokio::time::timeout(CONNECT_TIMEOUT, protocol::read_frame_async(&mut recv, &mut frame))
-                .await
-                .map_err(|_| ConnectError::plain("no reply: timed out"))?
-                .map_err(|e| ConnectError::plain(format!("no reply: {e}")))
-        })?;
+    // The scratch Vec is reused across frames so the reader loop never allocates.
+    let mut frame = Vec::new();
+    with_stop(rt, stop, "no reply: timed out", async {
+        protocol::read_frame_async(&mut recv, &mut frame)
+            .await
+            .map_err(|e| ConnectError::plain(format!("no reply: {e}")))
+    })?;
         let decoded = ServerMessage::decode(&frame);
         if let Some(ServerMessage::ModsDenied { ids }) = &decoded {
             return Err(ConnectError {
@@ -426,11 +565,22 @@ fn connect_one(
             *reason_slot.lock().unwrap_or_else(PoisonError::into_inner) = connection_close_text(&watched);
         });
 
+        let (writer_tx, writer_rx) = mpsc::sync_channel::<Arc<[u8]>>(OUT_QUEUE);
+        let writer_rt = Arc::clone(rt);
+        let writer = thread::spawn(move || {
+            while let Ok(frame) = writer_rx.recv() {
+                if writer_rt.block_on(protocol::write_frame_async(&mut send, &frame)).is_err() {
+                    break;
+                }
+            }
+        });
+
         Ok(Connection {
             conn,
-            send,
             endpoint,
             rt: Arc::clone(rt),
+            writer_tx: Some(writer_tx),
+            writer: Some(writer),
             inbox,
             mod_in,
             player_id,
@@ -452,6 +602,9 @@ fn connect_one(
             pending_teleport: None,
             disconnect_emitted: false,
             close_reason,
+            last_pong: Instant::now(),
+            warned: false,
+            snapshot_ready: false,
         })
 }
 
@@ -501,6 +654,17 @@ impl Connection {
         self.ping_ms
     }
 
+    /// True after the join overlay's [`ServerMessage::SnapshotEnd`]. Later snapshots
+    /// are reaction batches and do not clear this.
+    pub fn snapshot_ready(&self) -> bool {
+        self.snapshot_ready
+    }
+
+    /// True while a silence warning is showing and the link has not been given up.
+    pub fn link_interrupted(&self) -> bool {
+        self.warned && self.alive
+    }
+
     /// Peer join/leave/move is applied to the local table here; edits and
     /// chat are returned for the game to handle.
     pub fn poll(&mut self) -> Vec<Incoming> {
@@ -527,6 +691,10 @@ impl Connection {
             }
         }
         expire_pending(&mut self.pending_edits, &self.cell_revs, Instant::now(), &mut out);
+        {
+            let mut reason = self.close_reason.lock().unwrap_or_else(PoisonError::into_inner);
+            consider_silence(self.last_pong, Instant::now(), &mut self.warned, &mut self.alive, &mut reason, &mut out);
+        }
         let reason = self.close_reason.lock().unwrap_or_else(PoisonError::into_inner).clone();
         emit_disconnect(&mut self.alive, &mut self.disconnect_emitted, &reason, &mut out);
         coalesce_positions(&mut out);
@@ -545,6 +713,9 @@ impl Connection {
             &mut self.ping_ms,
             &mut self.alive,
             &mut self.disconnect_emitted,
+            &mut self.last_pong,
+            &mut self.warned,
+            &mut self.snapshot_ready,
             out,
         );
     }
@@ -594,6 +765,50 @@ fn expire_pending(
     }
 }
 
+/// What a gap since the last `Pong` means. A later `Pong` clears `warned`.
+enum LinkFate {
+    Ok,
+    Warn,
+    GiveUp,
+}
+
+fn link_silence(last_pong: Instant, now: Instant, warned: bool) -> LinkFate {
+    let gap = now.saturating_duration_since(last_pong);
+    if gap >= SILENCE_GIVE_UP {
+        LinkFate::GiveUp
+    } else if gap >= SILENCE_WARN && !warned {
+        LinkFate::Warn
+    } else {
+        LinkFate::Ok
+    }
+}
+
+fn consider_silence(
+    last_pong: Instant,
+    now: Instant,
+    warned: &mut bool,
+    alive: &mut bool,
+    reason: &mut String,
+    out: &mut Vec<Incoming>,
+) {
+    match link_silence(last_pong, now, *warned) {
+        LinkFate::Ok => {}
+        LinkFate::Warn => {
+            *warned = true;
+            out.push(Incoming::Interrupted);
+        }
+        LinkFate::GiveUp => {
+            // A real close already recorded its reason. Do not overwrite it.
+            if *alive {
+                *alive = false;
+                if reason.is_empty() {
+                    *reason = INTERRUPTED.to_string();
+                }
+            }
+        }
+    }
+}
+
 fn emit_disconnect(alive: &mut bool, emitted: &mut bool, reason: &str, out: &mut Vec<Incoming>) {
     if !*alive && !*emitted {
         *emitted = true;
@@ -634,6 +849,9 @@ fn apply_server_message(
     ping_ms: &mut Option<u32>,
     alive: &mut bool,
     disconnect_emitted: &mut bool,
+    last_pong: &mut Instant,
+    warned: &mut bool,
+    snapshot_ready: &mut bool,
     out: &mut Vec<Incoming>,
 ) {
     match msg {
@@ -748,10 +966,15 @@ fn apply_server_message(
                 }
                 out.push(Incoming::PeerSwing { id });
             }
+            ServerMessage::SnapshotEnd => {
+                *snapshot_ready = true;
+            }
             ServerMessage::Pong { nonce } => {
                 if let Some((sent_nonce, at)) = *ping_sent && sent_nonce == nonce {
                     *ping_ms = Some(at.elapsed().as_millis() as u32);
                 }
+                *last_pong = Instant::now();
+                *warned = false;
             }
             ServerMessage::Reject { reason } => {
                 *alive = false;
@@ -909,21 +1132,35 @@ impl Connection {
         Some(req)
     }
 
-    /// Blocks the game thread on the client runtime — sends are tiny and
-    /// infrequent enough that this is fine.
+    /// Hands the frame to the writer thread. A full queue leaves the link up
+    /// (the caller keeps the edit pending). A gone writer is a dead link.
     fn dispatch(&mut self, msg: &ClientMessage) {
         if !self.alive {
             return;
         }
-        let encoded = msg.encode();
-        if self.rt.block_on(protocol::write_frame_async(&mut self.send, &encoded)).is_err() {
-            self.alive = false;
-        }
+        let frame: Arc<[u8]> = msg.encode().into();
+        let result = self.writer_tx.as_ref().map(|tx| tx.try_send(frame));
+        note_send(result, &mut self.alive);
+    }
+}
+
+fn note_send(result: Option<Result<(), TrySendError<Arc<[u8]>>>>, alive: &mut bool) {
+    match result {
+        Some(Ok(())) | Some(Err(TrySendError::Full(_))) => {}
+        None | Some(Err(TrySendError::Disconnected(_))) => *alive = false,
     }
 }
 
 impl Drop for Connection {
     fn drop(&mut self) {
+        // Close first so a writer blocked in a QUIC write unblocks, then drop
+        // the sender so `recv` returns, then join. Joining before the close
+        // deadlocks when the QUIC window is full.
+        self.conn.close(0u32.into(), b"bye");
+        drop(self.writer_tx.take());
+        if let Some(handle) = self.writer.take() {
+            let _ = handle.join();
+        }
         graceful_close(&self.conn, &self.endpoint, &self.rt);
     }
 }
@@ -1073,6 +1310,9 @@ mod tests {
         ping_ms: Option<u32>,
         alive: bool,
         disconnect_emitted: bool,
+        last_pong: Instant,
+        warned: bool,
+        snapshot_ready: bool,
     }
 
     impl View {
@@ -1087,6 +1327,9 @@ mod tests {
                 ping_ms: None,
                 alive: true,
                 disconnect_emitted: false,
+                last_pong: Instant::now(),
+                warned: false,
+                snapshot_ready: false,
             }
         }
 
@@ -1108,6 +1351,9 @@ mod tests {
                     &mut self.ping_ms,
                     &mut self.alive,
                     &mut self.disconnect_emitted,
+                    &mut self.last_pong,
+                    &mut self.warned,
+                    &mut self.snapshot_ready,
                     &mut out,
                 );
             }
@@ -1123,6 +1369,7 @@ mod tests {
         assert!(err.to_string().contains("unexpected"));
         let edit = ServerMessage::Edit { x: 0, y: 0, z: 0, rev: 1, spec: "air".into() };
         assert!(welcome_from(Some(edit)).unwrap_err().to_string().contains("unexpected"));
+        assert!(welcome_from(Some(ServerMessage::SnapshotEnd)).unwrap_err().to_string().contains("unexpected"));
     }
 
     #[test]
@@ -1421,5 +1668,92 @@ mod tests {
         if let Some(handle) = &owned {
             handle.stop();
         }
+    }
+
+    #[test]
+    fn connect_to_an_unreachable_address_can_be_cancelled() {
+        let pending = Connection::begin_connect("192.0.2.1", 9, "ada", "", &[]);
+        pending.cancel();
+        let started = Instant::now();
+        let err = match pending.wait() {
+            Err(err) => err,
+            Ok(_) => panic!("cancel should fail the attempt"),
+        };
+        assert!(started.elapsed() < Duration::from_millis(500), "cancel took {:?}", started.elapsed());
+        assert!(err.to_string().contains("cancelled"), "{err}");
+    }
+
+    #[test]
+    fn silence_warns_once_then_gives_up_at_the_idle_timeout() {
+        assert_eq!(INTERRUPTED, "connection interrupted");
+        let t0 = Instant::now();
+        assert!(matches!(link_silence(t0, t0 + SILENCE_WARN - Duration::from_nanos(1), false), LinkFate::Ok));
+        assert!(matches!(link_silence(t0, t0 + SILENCE_WARN, false), LinkFate::Warn));
+        assert!(matches!(link_silence(t0, t0 + SILENCE_WARN + Duration::from_secs(1), true), LinkFate::Ok));
+        assert!(matches!(link_silence(t0, t0 + SILENCE_GIVE_UP, true), LinkFate::GiveUp));
+
+        let mut warned = false;
+        let mut alive = true;
+        let mut reason = String::new();
+        let mut out = Vec::new();
+        consider_silence(t0, t0 + SILENCE_WARN, &mut warned, &mut alive, &mut reason, &mut out);
+        assert!(matches!(out.as_slice(), [Incoming::Interrupted]));
+        assert!(warned && alive && reason.is_empty());
+        out.clear();
+        consider_silence(t0, t0 + SILENCE_WARN + Duration::from_secs(1), &mut warned, &mut alive, &mut reason, &mut out);
+        assert!(out.is_empty(), "the same gap must not warn again");
+        consider_silence(t0, t0 + SILENCE_GIVE_UP, &mut warned, &mut alive, &mut reason, &mut out);
+        assert!(!alive);
+        assert_eq!(reason, INTERRUPTED);
+        reason = "server shutting down".into();
+        alive = false;
+        consider_silence(t0, t0 + SILENCE_GIVE_UP + Duration::from_secs(1), &mut warned, &mut alive, &mut reason, &mut out);
+        assert_eq!(reason, "server shutting down");
+    }
+
+    #[test]
+    fn a_pong_clears_the_silence_warning() {
+        let mut v = View::new();
+        v.warned = true;
+        v.last_pong = Instant::now() - SILENCE_WARN;
+        v.apply(ServerMessage::Pong { nonce: 1 });
+        assert!(!v.warned);
+        assert!(v.last_pong.elapsed() < Duration::from_millis(50));
+    }
+
+    #[test]
+    fn snapshot_end_marks_the_overlay_and_a_later_snapshot_does_not_clear_it() {
+        let mut v = View::new();
+        assert!(!v.snapshot_ready);
+        v.apply(ServerMessage::Snapshot { edits: vec![(1, 2, 3, 1, "air".into())] });
+        assert!(!v.snapshot_ready, "a snapshot batch is not the end of the overlay");
+        v.apply(ServerMessage::SnapshotEnd);
+        assert!(v.snapshot_ready);
+        v.apply(ServerMessage::Snapshot { edits: vec![(4, 5, 6, 2, "air".into())] });
+        assert!(v.snapshot_ready, "a reaction snapshot must not reopen the loading screen");
+
+        let handle = server::spawn(0, Config { seed: 1, ..Config::default() }).unwrap();
+        let mut conn = Connection::connect("127.0.0.1", handle.addr().port(), "ada", "").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !conn.snapshot_ready() && Instant::now() < deadline {
+            conn.poll();
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(conn.snapshot_ready(), "the server sends SnapshotEnd after the join overlay");
+        handle.stop();
+    }
+
+    #[test]
+    fn a_full_send_queue_keeps_the_link_and_a_dead_one_drops_it() {
+        let (tx, rx) = mpsc::sync_channel::<Arc<[u8]>>(1);
+        tx.try_send(Arc::from([0u8].as_slice())).unwrap();
+        let mut alive = true;
+        note_send(Some(tx.try_send(Arc::from([1u8].as_slice()))), &mut alive);
+        assert!(alive, "a full queue must not kill the link");
+        drop(rx);
+        note_send(Some(tx.try_send(Arc::from([2u8].as_slice()))), &mut alive);
+        assert!(!alive);
+        note_send(None, &mut alive);
+        assert!(!alive);
     }
 }

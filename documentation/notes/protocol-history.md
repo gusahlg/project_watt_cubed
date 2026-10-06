@@ -49,3 +49,6 @@ after the password. The server may answer `ModsDenied` (tag 16) with the
 ids it refuses, then close; an honest client turns those off for the
 session and joins once more. The list is what the client reports. Mixed
 v14/v15 peers must not join.
+v16: `SnapshotEnd` (tag 17) follows the join snapshot batches. The client
+holds its loading screen until that marker, so a later reaction `Snapshot`
+is not the overlay. Mixed v15/v16 peers must not join.

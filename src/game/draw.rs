@@ -459,7 +459,20 @@ impl Game {
         // Informational HUD text: coords, help, FPS, player count. Full mode
         // only — read from the `Game`-side caches `refresh_hud_text` maintains.
         // Loading covers Full and Minimal (not Off) until the spawn slab lands.
-        if !self.world.spawn_ready() && theme.hud.shows_world_ui() {
+        // A network join holds "Loading world…" until the edit overlay arrives.
+        let overlay_hold = self.net.as_ref().is_some_and(|net| !net.snapshot_ready());
+        if overlay_hold && theme.hud.shows_world_ui() {
+            ui::label(
+                f,
+                theme,
+                screen,
+                Anchor::Top,
+                (0, 12),
+                26,
+                ui::Role::Primary.color(),
+                "Loading world…",
+            );
+        } else if !self.world.spawn_ready() && theme.hud.shows_world_ui() {
             ui::label(
                 f,
                 theme,
@@ -487,6 +500,19 @@ impl Game {
             {
                 hud_label(f, theme, screen, Anchor::TopRight, (-12, 180), 20, ui::Role::Positive.color(), online_text);
             }
+        }
+
+        if self.net.as_ref().is_some_and(|net| net.link_interrupted()) && theme.hud.shows_world_ui() {
+            ui::label(
+                f,
+                theme,
+                screen,
+                Anchor::Top,
+                (0, 44),
+                22,
+                ui::Role::Warning.color(),
+                crate::net::client::INTERRUPTED,
+            );
         }
 
         // Enabled mods contribute their HUD as data; the core renders it over the
