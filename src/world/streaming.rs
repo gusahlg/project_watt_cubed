@@ -3299,18 +3299,40 @@ impl World {
         self.pending_fresh.set();
     }
 
-    /// `c` is still close enough that walking back across the seam would show its column.
-    /// The far edge of the near square is a view-radius inland; a view-radius on the next
-    /// chart puts that column `3 * horizontal + 1` away, counting the two edge chunks.
-    fn far_wait_reach(&self, center: Coord, c: Coord) -> bool {
+    /// `c` is still close enough that walking back across a seam would show its column. The far
+    /// edge of the near square is a view-radius inland; a view-radius on the next chart puts that
+    /// column `3 * horizontal + 1` away, counting the two edge chunks.
+    fn within_skirt(&self, center: Coord, c: Coord) -> bool {
         let up = self.live_up().unwrap_or(Face::PosY);
-        let reach = self.view.horizontal * 3 + 1;
-        self.fold.fold(c).across(center, up) <= reach
+        self.fold.fold(c).across(center, up) <= self.skirt()
     }
 
-    /// `c` is settled and still inside the turn-back skirt.
-    fn keeps_for_far(&self, center: Coord, c: Coord) -> bool {
-        self.chunks.get(&c).is_some_and(|l| l.state.settled()) && self.far_wait_reach(center, c)
+    fn skirt(&self) -> i32 {
+        self.view.horizontal * 3 + 1
+    }
+
+    /// `center` stands on a chart within the skirt of one of its edges, where a crossing and a
+    /// turn-back can bring the trailing rows back before a far section draws them.
+    fn near_a_seam(&self, center: Coord) -> bool {
+        let Some(seat) = self.seams.chart_seat(center) else { return false };
+        let cs = CHUNK_SIZE as i64;
+        let (x, z) = (i64::from(center.x), i64::from(center.z));
+        let inland = (x - seat.lo[0] / cs)
+            .min(seat.hi[0] / cs - 1 - x)
+            .min(z - seat.lo[2] / cs)
+            .min(seat.hi[2] / cs - 1 - z);
+        inland <= i64::from(self.skirt())
+    }
+
+    /// `c` is settled and inside the skirt, and either lies on a neighbour chart or the centre is
+    /// near a seam: it starts waiting for a turn-back. Away from every seam nothing waits: the
+    /// unload box and the far field already cover a turn-back there. Once waiting, a chunk stays
+    /// (through a crossing, when it may become home) until it is inside the unload box again or
+    /// past the skirt.
+    fn keeps_for_far(&self, center: Coord, c: Coord, near_seam: bool) -> bool {
+        (near_seam || self.fold.fold(c) != c)
+            && self.chunks.get(&c).is_some_and(|l| l.state.settled())
+            && self.within_skirt(center, c)
     }
 
     /// Coords in the previous unload box that have left `new_box`, or every
@@ -3356,24 +3378,25 @@ impl World {
         if let Some((kept, fold)) = self.retired {
             far.retain(|&c| !kept.contains(fold.fold(c)));
         }
-        // Keep a settled chunk out to the turn-back skirt. A section on screen is not a reason
-        // to drop it: that section unloads as the player walks on, and the column is bare on
-        // the way back. The skirt reaches across the seam.
+        // Keep a settled chunk across a seam out to the turn-back skirt. A section on screen is not
+        // a reason to drop it: that section unloads as the player walks on, and the column is bare
+        // on the way back.
         if self.lod2 && !self.fold.is_identity() && (!far.is_empty() || !self.far_wait.is_empty()) {
+            let near_seam = self.near_a_seam(center);
             let pending: Vec<Coord> = self.far_wait.drain().collect();
             let mut still = FastSet::default();
             for c in pending {
                 if !self.chunks.contains_key(&c) || self.view_contains(unload, c) {
                     continue;
                 }
-                if !self.far_wait_reach(center, c) {
+                if !self.within_skirt(center, c) {
                     far.push(c);
                 } else {
                     still.insert(c);
                 }
             }
             far.retain(|&c| {
-                if still.contains(&c) || self.keeps_for_far(center, c) {
+                if still.contains(&c) || self.keeps_for_far(center, c, near_seam) {
                     still.insert(c);
                     false
                 } else {
@@ -7145,10 +7168,11 @@ mod tests {
         }
     }
 
-    /// A settled chunk on a chart stays past the unload box out to the turn-back skirt, including
-    /// while a section is on screen over it. A chunk past the skirt unloads.
+    /// Far from every seam a trailing chunk unloads with the box, as on any world. Near a seam,
+    /// settled chunks past the unload box (home or across the seam) wait for a turn-back out to
+    /// the skirt, also while a section is on screen over them, and leave past it.
     #[test]
-    fn settled_chart_chunk_waits_for_a_far_section() {
+    fn chunks_wait_for_a_turn_back_only_near_a_seam() {
         use super::super::quadtree::QuadrantMask;
         use crate::ident::Detail;
         use crate::render_config::{RenderConfig, lod_for};
@@ -7156,11 +7180,14 @@ mod tests {
 
         let (lod_levels, lod_detail) = lod_for(6);
         let render = RenderConfig { lod2: true, occlusion: true, lod_levels, lod_detail, ..RenderConfig::default() };
-        let mut world = World::with_kind(42, render, WorldgenKind::Diffusion, false);
-        world.set_view_distances(6, 3);
-        let eye = world.home_eye(DVec3::new(0.0, 1.0, 1.0 - 6.5e-6), 100.0);
-        let (home, _, _, _) = world.begin_stream(eye, None);
-        assert!(!world.fold.is_identity(), "the eye is on a chart");
+        let world_at = |dir: DVec3| {
+            let mut world = World::with_kind(42, render, WorldgenKind::Diffusion, false);
+            world.set_view_distances(6, 3);
+            let eye = world.home_eye(dir, 100.0);
+            let (home, _, _, _) = world.begin_stream(eye, None);
+            assert!(!world.fold.is_identity(), "the eye is on a chart");
+            (world, home)
+        };
         let settle = |world: &mut World, c: Coord| {
             world.ensure_data(c);
             let loaded = world.chunks.get_mut(&c).expect("ensure_data stores the chunk");
@@ -7168,35 +7195,52 @@ mod tests {
                 loaded.state = MeshState::Air;
             }
         };
+        let walk = |world: &mut World, from: Coord, to: Coord| {
+            world.prev_unload_box = Some(world.unload_box(from));
+            world.center = Some(to);
+            world.unload_far_with(to, |state, _| drop(state));
+        };
+
+        // A face's middle: a straight walk holds nothing past the unload box.
+        let (mut world, home) = world_at(DVec3::new(0.0, 1.0, 0.0));
+        assert!(!world.near_a_seam(home), "the face middle is far from every seam");
         settle(&mut world, home);
-        let trail = Coord::new(home.x - 9, home.y, home.z);
-        settle(&mut world, trail);
-        world.prev_unload_box = Some(world.unload_box(home));
-        let away = Coord::new(home.x + 11, home.y, home.z);
-        world.center = Some(away);
-        world.unload_far_with(away, |state, _| drop(state));
-        assert!(world.chunks.contains_key(&home), "a settled column stays until a far section draws it");
-        assert!(!world.chunks.contains_key(&trail), "past the turn-back skirt the column unloads");
+        walk(&mut world, home, Coord::new(home.x, home.y, home.z - 11));
+        assert!(!world.chunks.contains_key(&home), "a trailing chunk unloads with the box");
+        assert!(world.far_wait.is_empty(), "nothing waits away from a seam");
+
+        // Beside the +Z seam: the home chunk and the chunk just across the seam both wait.
+        let (mut world, home) = world_at(DVec3::new(0.0, 1.0, 1.0 - 6.5e-6));
+        assert!(world.near_a_seam(home));
+        let seat = world.seams.chart_seat(home).expect("a chart seat");
+        let edge = Coord::new(home.x, home.y, (seat.hi[2] / 16) as i32 - 1);
+        let across = world.seams.across(edge, Face::PosZ).expect("a neighbour across +Z").chunk;
+        assert_ne!(world.fold.fold(across), across, "the neighbour chunk folds beyond the seam");
+        settle(&mut world, home);
+        settle(&mut world, across);
+        let folded = world.fold.fold(across);
+        let skirt = world.skirt();
+        let inland = Coord::new(home.x, home.y, home.z - 11);
+        assert!(folded.across(inland, Face::PosY) <= skirt);
+        walk(&mut world, home, inland);
+        assert!(world.chunks.contains_key(&home), "a home chunk near the seam waits");
+        assert!(world.chunks.contains_key(&across), "the chunk across the seam waits");
+        assert_eq!(world.far_wait.len(), 2);
+
         let span = 32;
         let (bx, bz) = (home.x * 16 + 8, home.z * 16 + 8);
-        let pos = SectionPos {
-            detail: Detail(0),
-            body: 0,
-            face: Face::PosY,
-            x: bx.div_euclid(span),
-            z: bz.div_euclid(span),
-        };
-        world.sections.insert(
-            pos,
-            SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None },
-        );
+        let pos = SectionPos { detail: Detail(0), body: 0, face: Face::PosY, x: bx.div_euclid(span), z: bz.div_euclid(span) };
+        world.sections.insert(pos, SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None });
         world.section_visible.push((pos, QuadrantMask::ALL));
-        world.unload_far_with(away, |state, _| drop(state));
-        assert!(world.chunks.contains_key(&home), "a section on screen does not drop the column");
-        let gone = Coord::new(home.x + 20, home.y, home.z);
+        world.unload_far_with(inland, |state, _| drop(state));
+        assert!(world.chunks.contains_key(&home), "a section on screen does not drop a waiting chunk");
+
+        let gone = Coord::new(home.x, home.y, home.z - skirt - 2);
         world.center = Some(gone);
         world.unload_far_with(gone, |state, _| drop(state));
-        assert!(!world.chunks.contains_key(&home), "past the turn-back skirt the column unloads");
+        assert!(!world.chunks.contains_key(&home), "past the skirt the home chunk unloads");
+        assert!(!world.chunks.contains_key(&across), "past the skirt the neighbour chunk unloads");
+        assert!(world.far_wait.is_empty());
     }
 
     /// Sync `ensure_data` (headless region, unclaimed boundary-cross centre)

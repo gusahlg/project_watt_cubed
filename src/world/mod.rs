@@ -1273,7 +1273,7 @@ pub struct World {
     /// the left shell (old ∖ new). `None` after a radius change, so the next
     /// cross scans every loaded chunk.
     prev_unload_box: Option<ChunkBox>,
-    /// Settled chart chunks kept past the unload box until they leave the turn-back
+    /// Settled chunks across a seam kept past the unload box until they leave the turn-back
     /// skirt. The shell diff would not see them on a later pass.
     far_wait: FastSet<Coord>,
     /// Loaded altitude-chunk indices per [`ColumnKey`], highest first. Empty
