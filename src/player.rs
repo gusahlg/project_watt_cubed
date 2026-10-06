@@ -334,17 +334,40 @@ pub fn feet_of(eye: DVec3, stance: Stance, up: Face) -> DVec3 {
 /// `up`. Built from the feet up, not the eye: the feet sit [`eye_offset`](Stance::eye_offset)
 /// below the eye, and the box rises the stance's full [`height`](Stance::height) from there, so a
 /// shorter (sneaking) box lowers both its top and — via the proportional eye offset — the eye.
+/// The ground face is held just inside the body, so feet planted on an integer do not round into
+/// the solid underneath.
 ///
 /// Free-standing (not a `Player` method) so the collision stepper, which advances a bare eye
 /// position, can test candidate boxes without a whole `Player`.
 pub fn collision_box(eye: DVec3, stance: Stance, up: Face) -> Aabb {
     let half_up = stance.height() / 2.0;
     let a = up.axis();
+    let sign = up.sign() as f64;
     let mut centre = eye;
-    centre[a] = eye[a] - up.sign() as f64 * stance.eye_offset() + up.sign() as f64 * half_up;
+    centre[a] = eye[a] - sign * stance.eye_offset() + sign * half_up;
     let mut half = DVec3::splat(PLAYER_HALF_WIDTH);
-    half[a] = half_up;
+    let (up_centre, up_half) = ground_safe(centre[a], half_up, sign);
+    centre[a] = up_centre;
+    half[a] = up_half;
     Aabb::new(centre, half)
+}
+
+/// Centre and half along up so the reconstructed ground face stays out of the solid under exact
+/// integer feet. The raw pair (`centre ± half`) rounds as much as two ULPs into that cell; a real
+/// overlap, a thousandth of a block, is far deeper and still collides. The horizontal extents are
+/// left alone.
+fn ground_safe(centre: f64, half: f64, sign: f64) -> (f64, f64) {
+    if sign > 0.0 {
+        let crown = centre + half;
+        let ground = (centre - half).next_up().next_up();
+        let h = ((crown - ground) * 0.5).next_down();
+        (crown - h, h)
+    } else {
+        let crown = centre - half;
+        let ground = (centre + half).next_down().next_down();
+        let h = ((ground - crown) * 0.5).next_down();
+        (crown + h, h)
+    }
 }
 
 impl Bounded for Player {
@@ -376,6 +399,62 @@ mod tests {
         loose.stand_in(DVec3::new(0.0, -0.01, 0.0));
         assert_eq!(loose.orientation.frame, DQuat::IDENTITY);
         assert_eq!(loose.up_axis, Face::PosY);
+    }
+
+    /// Feet on an integer used to round the ground face into the cell below (two ULPs at some
+    /// integers), so every horizontal step was rejected until a jump or a broken floor block.
+    #[test]
+    fn integer_feet_do_not_overlap_the_cell_underfoot() {
+        use crate::math::block_coord;
+
+        let mut feet_samples = Vec::with_capacity(8200);
+        for y in 0..8192 {
+            feet_samples.push(y as f64);
+        }
+        for e in 14..31 {
+            let b = (1i64 << e) as f64;
+            feet_samples.extend([-b, -b + 1.0, b - 1.0, b, b + 1.0]);
+        }
+
+        for stance in [Stance::Standing, Stance::Sneaking] {
+            for &up in &Face::ALL {
+                let a = up.axis();
+                let sign = up.sign();
+                for &feet in &feet_samples {
+                    let mut eye = DVec3::new(0.5, 0.5, 0.5);
+                    eye[a] = feet + sign as f64 * stance.eye_offset();
+                    let box_ = collision_box(eye, stance, up);
+                    // The cell on the ground side of an exact integer face. Positive up: the
+                    // voxel just below `feet`. Negative up: the voxel that begins at `feet`.
+                    let mut c = [0i32; 3];
+                    c[a] = if sign > 0 { block_coord(feet) - 1 } else { block_coord(feet) };
+                    let (x, y, z) = (c[0], c[1], c[2]);
+                    assert!(
+                        !box_.voxel_cells().any(|cell| cell == (x, y, z)),
+                        "feet {feet} stance-height {} on {up:?} overlaps ({x},{y},{z})",
+                        stance.height()
+                    );
+                }
+            }
+        }
+
+        // A thousandth of a block is a real overlap; the ground-face nudge must not hide it.
+        for &feet in &[256.0 - 0.001, 2.0 - 0.001, (1i64 << 30) as f64 - 0.001] {
+            let eye = DVec3::new(0.5, feet + Stance::Standing.eye_offset(), 0.5);
+            let box_ = collision_box(eye, Stance::Standing, Face::PosY);
+            let under = block_coord(feet);
+            assert!(
+                box_.voxel_cells().any(|(_, y, _)| y == under),
+                "feet {feet} should still reach cell {under}"
+            );
+        }
+
+        let far = DVec3::new(1.0e9, 40.0 + Stance::Standing.eye_offset(), -3.0);
+        let box_ = collision_box(far, Stance::Standing, Face::PosY);
+        assert_eq!(box_.half.x, PLAYER_HALF_WIDTH);
+        assert_eq!(box_.half.z, PLAYER_HALF_WIDTH);
+        assert_eq!(box_.center.x, far.x);
+        assert_eq!(box_.center.z, far.z);
     }
 
     #[test]

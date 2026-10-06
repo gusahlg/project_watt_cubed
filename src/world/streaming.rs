@@ -5579,6 +5579,8 @@ fn plan_texture_upload(
 
 #[cfg(test)]
 mod flight_bench;
+#[cfg(test)]
+mod ground_walk;
 
 #[cfg(test)]
 mod tests {

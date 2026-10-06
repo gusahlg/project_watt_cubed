@@ -54,6 +54,9 @@ const AXIS_HYSTERESIS: f64 = 0.05;
 /// this are split into substeps so a fast fall stops at the first solid cell
 /// instead of tunneling past thin terrain.
 const MAX_COLLISION_STEP: f64 = 0.5;
+/// How far an overlapping box may be pushed out in one step. Past a real clip,
+/// short of a body length, so a one-block ceiling cannot be cleared.
+const SEPARATE_LIMIT: f64 = 1.5;
 
 /// The movement intent gathered for a single frame.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -97,6 +100,14 @@ impl MoveInput {
     /// the same movement bindings a second time in the frame.
     pub(crate) fn freecam_axes(&self) -> (f64, f64, f64, bool) {
         (self.move_z as f64, self.move_x as f64, self.move_y as f64, self.sprint)
+    }
+}
+
+#[cfg(test)]
+impl MoveInput {
+    /// Keys for one test frame. `move_x` is strafe and `move_z` is forward, each in `[-1, 1]`.
+    pub(crate) fn keys(move_x: f32, move_z: f32, jump: bool, sprint: bool, sneak: bool) -> Self {
+        Self { move_x, move_y: 0.0, move_z, jump, sprint, sneak }
     }
 }
 
@@ -357,7 +368,8 @@ fn resolve_stance(player: &mut Player, world: &World, input: &MoveInput) {
 /// [`math::block_coord`](crate::math::block_coord) assumes. Axis deltas larger
 /// than [`MAX_COLLISION_STEP`] go through [`step_axis`] substeps.
 fn move_with_collision(player: &mut Player, world: &World, delta: DVec3, border: f64) -> f32 {
-    let mut pos = player.position;
+    let origin = player.position;
+    let mut pos = origin;
     let stance = player.stance;
     let up = player.up_axis;
     let (a, s) = (up.axis(), up.sign() as f64);
@@ -365,10 +377,34 @@ fn move_with_collision(player: &mut Player, world: &World, delta: DVec3, border:
     // the player passes through geometry; every axis then reports unblocked.
     let noclip = player.noclip();
 
+    // Tangents first, collision axis last (Y-up: X, Z, then Y).
+    let mut horiz = [0usize; 2];
+    let mut hn = 0;
+    for axis in [0usize, 2, 1] {
+        if axis != a {
+            horiz[hn] = axis;
+            hn += 1;
+        }
+    }
+
     let mut blocked = [false; 3];
-    for axis in [0, 2, 1].into_iter().filter(|&i| i != a).chain([a]) {
+    for &axis in &horiz {
         blocked[axis] = step_axis(&mut pos, axis, delta[axis], world, stance, up, noclip, border);
     }
+    // Free walking already queried each moving axis. An extra overlap query runs only when a
+    // tangent was rejected, or when both tangents are idle (a stuck player who is not walking
+    // yet). Open ground pays nothing more.
+    let tangents_idle = delta[horiz[0]] == 0.0 && delta[horiz[1]] == 0.0;
+    if !noclip && (blocked[horiz[0]] || blocked[horiz[1]] || tangents_idle) {
+        if let Some(freed) = separate(origin, world, stance, up) {
+            pos = freed;
+            blocked = [false; 3];
+            for &axis in &horiz {
+                blocked[axis] = step_axis(&mut pos, axis, delta[axis], world, stance, up, false, border);
+            }
+        }
+    }
+    blocked[a] = step_axis(&mut pos, a, delta[a], world, stance, up, noclip, border);
     player.position = pos;
 
     // A velocity component that ran into geometry is spent — zero it so the player
@@ -397,6 +433,99 @@ fn move_with_collision(player: &mut Player, world: &World, delta: DVec3, border:
         }
     }
     0.0
+}
+
+/// Push `pos` out of any solid it already overlaps. Up along `up` first, within [`SEPARATE_LIMIT`];
+/// otherwise the nearest free spot in that range. A ceiling cell — its centre lies above the box
+/// centre along up — forbids the upward push, and the search never moves down into the floor.
+/// `None` when `pos` is already free, or when every candidate is still blocked.
+fn separate(pos: DVec3, world: &World, stance: Stance, up: Face) -> Option<DVec3> {
+    let start = collision_box(pos, stance, up);
+    if !world.collides(&start) {
+        return None;
+    }
+    let (a, sign) = (up.axis(), up.sign() as f64);
+    let centre = start.center[a];
+    let ground = if sign > 0.0 { start.min()[a] } else { start.max()[a] };
+    let (bmin, bmax) = (start.min(), start.max());
+
+    let mut ceiling = false;
+    let mut need = 0.0;
+    let mut solids = [[0i32; 3]; 24];
+    let mut n = 0usize;
+    for (x, y, z) in start.voxel_cells() {
+        if !world.is_solid(x, y, z) {
+            continue;
+        }
+        if n < solids.len() {
+            solids[n] = [x, y, z];
+            n += 1;
+        }
+        let cell = [x, y, z][a];
+        let mid = cell as f64 + 0.5;
+        if (mid - centre) * sign > 0.0 {
+            ceiling = true;
+            continue;
+        }
+        let clearance = if sign > 0.0 { cell as f64 + 1.0 - ground } else { ground - cell as f64 };
+        if clearance > need {
+            need = clearance;
+        }
+    }
+
+    if !ceiling && need > 0.0 && need <= SEPARATE_LIMIT {
+        let mut lifted = pos;
+        lifted[a] += sign * need;
+        if let Some(p) = nudge_free(lifted, a, sign, world, stance, up) {
+            return Some(p);
+        }
+    }
+
+    let mut lifts = [0.0; 2];
+    let mut lift_n = 1usize;
+    if !ceiling && need > 0.0 && need <= SEPARATE_LIMIT {
+        lifts[1] = need;
+        lift_n = 2;
+    }
+    let limit2 = SEPARATE_LIMIT * SEPARATE_LIMIT;
+    let mut best: Option<(f64, DVec3)> = None;
+    for &lift in &lifts[..lift_n] {
+        for cell in &solids[..n] {
+            for axis in 0..3 {
+                if axis == a {
+                    continue;
+                }
+                let c = cell[axis];
+                let exits = [((c as f64 + 1.0) - bmin[axis], 1.0), (bmax[axis] - c as f64, -1.0)];
+                for (dist, dir) in exits {
+                    if !(dist > 0.0 && dist <= SEPARATE_LIMIT) {
+                        continue;
+                    }
+                    let d2 = dist * dist + lift * lift;
+                    if d2 > limit2 || best.as_ref().is_some_and(|(d, _)| *d <= d2) {
+                        continue;
+                    }
+                    let mut p = pos;
+                    p[a] += sign * lift;
+                    p[axis] += dir * dist;
+                    if let Some(q) = nudge_free(p, axis, dir, world, stance, up) {
+                        best = Some((d2, q));
+                    }
+                }
+            }
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+/// `pos`, or one ULP-pair further along `dir`, when that box is clear of solids.
+fn nudge_free(pos: DVec3, axis: usize, dir: f64, world: &World, stance: Stance, up: Face) -> Option<DVec3> {
+    if !world.collides(&collision_box(pos, stance, up)) {
+        return Some(pos);
+    }
+    let mut p = pos;
+    p[axis] = if dir > 0.0 { p[axis].next_up().next_up() } else { p[axis].next_down().next_down() };
+    if !world.collides(&collision_box(p, stance, up)) { Some(p) } else { None }
 }
 
 /// Move `pos` along one `axis` (0 = x, 1 = y, 2 = z) by `delta`, clamping to
@@ -1102,5 +1231,132 @@ mod tests {
         assert!(eased, "never neared terminal, last speed {speed}");
         assert!(speed < entry, "moved toward terminal: {entry} -> {speed}");
         assert!(speed <= TERMINAL_SPEED + 1.0);
+    }
+
+    fn flat() -> World {
+        World::new(1)
+    }
+
+    fn overlaps(world: &World, player: &Player) -> bool {
+        world.collides(&collision_box(player.position, player.stance, player.up_axis))
+    }
+
+    /// Stone whose top is the integer `surface`, with air for the body above it.
+    fn carve_floor(world: &mut World, surface: i32, x0: i32, x1: i32) {
+        let stone = world.registry().id_by_label("rock").unwrap();
+        let at = |x: i32| DVec3::new(x as f64 + 0.5, surface as f64 + 2.0, 0.5);
+        world.ensure_around(at(x0));
+        world.ensure_around(at(x1));
+        for x in x0..=x1 {
+            for z in -1..=1 {
+                world.set_block(x, surface - 1, z, stone);
+                for y in surface..surface + 5 {
+                    world.set_block(x, y, z, crate::block::AIR);
+                }
+            }
+        }
+    }
+
+    /// Feet a thousandth of a block into the ground: the next step walks, and the box is free.
+    #[test]
+    fn feet_clipped_into_the_ground_walk_on_the_next_step() {
+        let world = flat();
+        let start = DVec3::new(0.5, 12.0 - 0.001 + stand_eye(), 0.5);
+        let mut player = Player::new(start);
+        player.orientation.yaw = 0.0;
+        assert!(overlaps(&world, &player), "0.001 into the floor must overlap");
+        update_player(&mut player, &world, &walk_forward(), 1.0 / 60.0, down());
+        assert!(!overlaps(&world, &player), "the step must leave the box free");
+        assert!(player.position.x > start.x + 1.0e-4, "forward must move, x {}", player.position.x);
+        let feet = player.feet().y;
+        assert!(feet > 11.999 && feet < 12.05, "pushed onto the surface, feet {feet}");
+    }
+
+    /// A block placed in the lower body is pushed up, out of the solid, and walking continues.
+    #[test]
+    fn a_block_appearing_inside_the_player_pushes_up() {
+        let mut world = flat();
+        let start = DVec3::new(0.5, 12.0 + stand_eye(), 0.5);
+        let mut player = Player::new(start);
+        player.orientation.yaw = 0.0;
+        assert!(!overlaps(&world, &player), "standing on the flat ground starts free");
+        let stone = world.registry().id_by_label("rock").unwrap();
+        world.set_block(0, 12, 0, stone);
+        assert!(overlaps(&world, &player), "the new block occupies the legs");
+        update_player(&mut player, &world, &walk_forward(), 1.0 / 60.0, down());
+        assert!(!overlaps(&world, &player), "the step must clear the block");
+        let feet = player.feet().y;
+        assert!(feet >= 12.9 && feet < 13.5, "pushed up onto the block, feet {feet}");
+        assert!(player.position.x > start.x, "forward still moves");
+    }
+
+    /// One block of air under a ceiling. Pushing up would enter the room above; stay in the gap.
+    #[test]
+    fn a_one_block_gap_under_a_ceiling_does_not_push_through() {
+        let mut world = flat();
+        let stone = world.registry().id_by_label("rock").unwrap();
+        world.ensure_around(DVec3::new(0.5, 14.0, 0.5));
+        for x in -4..=4 {
+            for z in -4..=4 {
+                world.set_block(x, 13, z, stone);
+            }
+        }
+
+        // Standing on the gap floor. The body is taller than the gap, so the ceiling overlaps,
+        // and the room above the one-block ceiling is air.
+        let mut standing = Player::new(DVec3::new(0.5, 12.0 + stand_eye(), 0.5));
+        standing.orientation.yaw = 0.0;
+        assert!(overlaps(&world, &standing));
+        let y0 = standing.position.y;
+        update_player(&mut standing, &world, &walk_forward(), 1.0 / 60.0, down());
+        assert!(
+            (standing.position.y - y0).abs() < 1.0e-6,
+            "stayed on the gap floor, y {}",
+            standing.position.y
+        );
+        assert!(standing.feet().y < 13.0, "feet entered the ceiling");
+        assert!(overlaps(&world, &standing), "still in the gap, not the room above");
+
+        // Sneaking, high in the same gap: the free room above is within 1.5 blocks straight up.
+        // That push would cross the ceiling; it must be refused.
+        let sneak_feet = 12.6;
+        let mut sneaking = Player::new(DVec3::new(0.5, sneak_feet + Stance::Sneaking.eye_offset(), 0.5));
+        sneaking.stance = Stance::Sneaking;
+        sneaking.orientation.yaw = 0.0;
+        assert!(overlaps(&world, &sneaking), "head is in the ceiling");
+        update_player(&mut sneaking, &world, &walk_forward(), 1.0 / 60.0, down());
+        assert!(
+            sneaking.feet().y < sneak_feet + 0.05,
+            "pushed through the ceiling, feet {}",
+            sneaking.feet().y
+        );
+        assert!(sneaking.feet().y > 12.0, "fell out of the gap, feet {}", sneaking.feet().y);
+    }
+
+    /// Planted on the integers whose ground face used to round into the floor. Walking must move
+    /// and the box must be free at the start of every step.
+    #[test]
+    fn integer_feet_do_not_stick_on_a_bad_surface() {
+        let mut world = flat();
+        for surface in [2, 256, 512] {
+            carve_floor(&mut world, surface, -1, 16);
+            let start = DVec3::new(0.5, surface as f64 + stand_eye(), 0.5);
+            let mut player = Player::new(start);
+            player.orientation.yaw = 0.0;
+            for _ in 0..45 {
+                assert!(
+                    !overlaps(&world, &player),
+                    "surface {surface} overlaps at the start of a step, feet {}",
+                    player.feet().y
+                );
+                update_player(&mut player, &world, &walk_forward(), 1.0 / 60.0, down());
+            }
+            assert!(
+                player.position.x > start.x + 1.0,
+                "surface {surface} should walk, moved {}",
+                player.position.x - start.x
+            );
+            assert!(player.on_ground(), "surface {surface} left the floor");
+        }
     }
 }
