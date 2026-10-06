@@ -321,17 +321,29 @@ impl World {
     /// (unknown relief) is not stored: it moves with the eye.
     fn cached_tops(&mut self, s: SectionPos, eye_y: f64, in_cube: bool, pass: u32) -> (f64, f64) {
         let stamp = overlay_stamp(self, s);
-        if let Some(hit) = self.lod_relief.get_mut(&s)
+        let estimate = if let Some(hit) = self.lod_relief.get_mut(&s)
             && hit.stamp == stamp
         {
             hit.pass = pass;
-            return (hit.y0, hit.y1);
+            (hit.y0, hit.y1)
+        } else {
+            let (y0, y1, stable) = self.estimated_tops(s, eye_y, in_cube);
+            if stable {
+                self.lod_relief.insert(s, CachedTops { pass, stamp, y0, y1 });
+            }
+            (y0, y1)
+        };
+        self.narrowed(s, in_cube, estimate)
+    }
+
+    /// `tops` cut to the span the section's slabs draw, when both are known. Each bounds the
+    /// drawn vertices, so their overlap does too.
+    fn narrowed(&self, s: SectionPos, in_cube: bool, (y0, y1): (f64, f64)) -> (f64, f64) {
+        match self.drawn_span(s, in_cube) {
+            Some((d0, d1)) if d0.max(y0) < d1.min(y1) => (d0.max(y0), d1.min(y1)),
+            Some(drawn) => drawn,
+            None => (y0, y1),
         }
-        let (y0, y1, stable) = self.morph_relief_stable(s, eye_y, in_cube);
-        if stable {
-            self.lod_relief.insert(s, CachedTops { pass, stamp, y0, y1 });
-        }
-        (y0, y1)
     }
 
     /// Column tops in the section's frame, widened to the vertices that stand on them.
@@ -347,8 +359,28 @@ impl World {
         (y0, y1)
     }
 
-    /// `(lo, hi, stable)`. `stable` is false only for the eye slab, which moves with the camera.
+    /// The altitudes the section's uploaded slabs span, where they are storage y: a chart, or a
+    /// flat world's +Y window.
+    fn drawn_span(&self, s: SectionPos, in_cube: bool) -> Option<(f64, f64)> {
+        if s.body < CHART_BODY_BASE && (in_cube || s.face != Face::PosY) {
+            return None;
+        }
+        match self.sections.get(&s) {
+            Some(super::SectionState::Ready { alt: Some((lo, hi)), .. }) => Some((f64::from(*lo), f64::from(*hi))),
+            _ => None,
+        }
+    }
+
+    /// `(lo, hi, stable)`, narrowed to the drawn slabs. `stable` is false only for the eye slab,
+    /// which moves with the camera.
     fn morph_relief_stable(&self, s: SectionPos, eye_y: f64, in_cube: bool) -> (f64, f64, bool) {
+        let (y0, y1, stable) = self.estimated_tops(s, eye_y, in_cube);
+        let (y0, y1) = self.narrowed(s, in_cube, (y0, y1));
+        (y0, y1, stable)
+    }
+
+    /// Column tops from the overlay, the chart's ground window, the cube bake or the domain.
+    fn estimated_tops(&self, s: SectionPos, eye_y: f64, in_cube: bool) -> (f64, f64, bool) {
         let cell = s.cell_size();
         if let Some(cell_m) = self.section_overlay.get(&s) {
             let (y0, y1) = dress_tops(f64::from(cell_m.lo), f64::from(cell_m.hi), cell);
@@ -520,11 +552,14 @@ fn arm_drawn(world: &mut World, eye: DVec3) -> usize {
     if !held.is_empty() {
         world.section_desired.retain(|s| !held.contains(s));
     }
+    // Mesh each section on this thread for the altitudes its slabs span; the GPU meshes stay empty.
+    world.refresh_tables();
+    let tables = world.tables.get();
     for s in world.section_desired.clone() {
-        world.sections.insert(
-            s,
-            super::SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None },
-        );
+        let mesh = super::section::extract_section_mesh(s, world.generator.as_ref(), &[], &tables);
+        let detail = crate::ident::Detail(s.detail.0.saturating_add(mesh.shift as i8));
+        let alt = super::SectionState::slab_span(s, detail, mesh.altitude_floor, mesh.slabs.iter().map(|slab| slab.origin_y));
+        world.sections.insert(s, super::SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None, alt });
     }
     world.rebuild_section_visible(None);
     dropped

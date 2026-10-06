@@ -105,7 +105,7 @@ fn fake_drain(w: &mut World) {
         {
             adjust_count(&mut w.meshing_sections, true, false);
             bytes += b;
-            *state = SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None };
+            *state = SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None, alt: None };
             w.pending_sections.set();
             w.section_cover_dirty.set();
         }

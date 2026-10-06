@@ -7521,7 +7521,7 @@ mod tests {
             z: -3,
         };
         world.section_desired = vec![hole];
-        let empty = || SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None };
+        let empty = || SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None, alt: None };
         for i in 0..super::super::SECTION_SLOT_FLOOR {
             world.sections.insert(filler(i), empty());
         }
@@ -7701,7 +7701,7 @@ mod tests {
     }
 
     fn empty_ready() -> SectionState {
-        SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None }
+        SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None, alt: None }
     }
 
     /// Desired sections with no Ready self or ancestor.

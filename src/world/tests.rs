@@ -168,7 +168,7 @@ fn far_lane_admits_when_near_slots_exceed_the_cpu_cull_ceiling() {
     let held = |i: usize| SectionPos { body: 0, face: Face::PosY, detail: section::FINEST_DETAIL, x: 1 + i as i32, z: 0 };
     for i in 0..SECTION_SLOT_FLOOR - 1 {
         let state = if i % 2 == 0 {
-            SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None }
+            SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None, alt: None }
         } else {
             SectionState::Meshing { token: pipeline::ClaimToken(i as u64) }
         };
@@ -258,7 +258,7 @@ fn section_covering_gates_on_a_ready_ancestor_or_self() {
     let center = stand_on_twin(&mut world);
     let cell = world.desired_sections(center)[0];
     assert!(!world.section_covered(cell), "nothing loaded means uncovered");
-    let empty_ready = || SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None };
+    let empty_ready = || SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None, alt: None };
     world.sections.insert(cell, empty_ready());
     assert!(world.section_covered(cell), "a Ready self covers");
     world.sections.remove(&cell);
@@ -294,7 +294,7 @@ fn section_lane_stays_armed_while_desired_cells_are_uncovered() {
     // Everything Ready: converged — still no re-arm.
     world.pending_sections.take();
     for &cell in &world.section_desired.clone() {
-        world.sections.insert(cell, SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None });
+        world.sections.insert(cell, SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None, alt: None });
     }
     world.section_desired = world.desired_sections(center);
     world.rebuild_section_visible(None);
@@ -317,7 +317,7 @@ fn moving_far_lane_admits_a_hole_past_the_resident_nearest() {
     let at = |x: i32| SectionPos { body: 0, face: Face::PosY, detail: section::FINEST_DETAIL, x, z: 0 };
     world.section_desired = (0..40).map(at).collect();
     for x in 0..32 {
-        world.sections.insert(at(x), SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None });
+        world.sections.insert(at(x), SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None, alt: None });
     }
     let mut rank = Vec::new();
     let mut visited = Vec::new();
@@ -1683,7 +1683,7 @@ fn lod2_far_field_drives_to_covering_complete() {
             if let Some(s @ SectionState::Meshing { .. }) = world.sections.get_mut(&pos)
                 && matches!(s, SectionState::Meshing { token: t } if *t == token)
             {
-                *s = SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None };
+                *s = SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None, alt: None };
             }
         }
     }

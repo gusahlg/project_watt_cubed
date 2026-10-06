@@ -647,6 +647,9 @@ pub(in crate::world) enum SectionState {
         /// Last `(style, flat_rgba)` pushed via [`Self::push_style`], so a value
         /// re-observed next frame (the steady case) sends nothing.
         last_style: Option<(FadeStyle, u32)>,
+        /// Altitude span `[lo, hi)` in blocks that the uploaded slabs cover, in the section's
+        /// frame (storage y on a chart). `None` for an empty section.
+        alt: Option<(i32, i32)>,
     },
 }
 
@@ -665,6 +668,7 @@ impl SectionState {
         bend: Option<&ChartBend>,
     ) -> SectionState {
         let detail = Detail(pos.detail.0.saturating_add(mesh.shift as i8));
+        let alt = Self::slab_span(pos, detail, mesh.altitude_floor, mesh.slabs.iter().map(|slab| slab.origin_y));
         let mut cages = Vec::new();
         let meshes = mesh
             .slabs
@@ -680,7 +684,20 @@ impl SectionState {
                 }
             })
             .collect();
-        SectionState::Ready { meshes, cages, last_style: None }
+        SectionState::Ready { meshes, cages, last_style: None, alt }
+    }
+
+    /// Altitudes the slabs at `origins` span: the lowest slab's floor to the highest slab's top.
+    fn slab_span(pos: SectionPos, detail: Detail, floor_a: i32, origins: impl Iterator<Item = u32>) -> Option<(i32, i32)> {
+        let extent = (1i32 << detail.0).saturating_mul(16);
+        let cell = pos.cell_size();
+        let (mut lo, mut hi) = (i32::MAX, i32::MIN);
+        for o in origins {
+            let y0 = floor_a.saturating_add((o as i32).saturating_mul(cell));
+            lo = lo.min(y0);
+            hi = hi.max(y0.saturating_add(extent));
+        }
+        (lo < hi).then_some((lo, hi))
     }
 
     /// Flat placement, or a cage through the slab's eight embedded corners. `None` skips the slab
@@ -761,6 +778,7 @@ impl SectionState {
         bend: Option<&ChartBend>,
     ) -> SectionState {
         let detail = Detail(pos.detail.0.saturating_add(staged.shift as i8));
+        let alt = Self::slab_span(pos, detail, staged.altitude_floor, staged.slabs.iter().map(|slab| slab.origin_y));
         let mut cages = Vec::new();
         let meshes = staged
             .slabs
@@ -780,7 +798,7 @@ impl SectionState {
                 }
             })
             .collect();
-        SectionState::Ready { meshes, cages, last_style: None }
+        SectionState::Ready { meshes, cages, last_style: None, alt }
     }
 
     fn is_ready(&self) -> bool {
