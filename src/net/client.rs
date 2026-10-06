@@ -18,7 +18,7 @@ use glam::DQuat;
 use voxel_engine::{DVec3, Vec3};
 
 use crate::coord::Face;
-use crate::net::protocol::{self, ClientMessage, ServerMessage, VoicePayload};
+use crate::net::protocol::{self, ClientMessage, ModBytes, ServerMessage};
 use crate::net::{MAX_CHAT, MAX_SPEC, PROTOCOL_VERSION, quic};
 use crate::presence::{self, Eye, Stance, WireAction};
 use crate::sched::RateGate;
@@ -28,12 +28,15 @@ const MOVE_INTERVAL: Duration = Duration::from_millis(33);
 /// So the server's idle timeout never reaps an active-but-idle player.
 const HEARTBEAT: Duration = Duration::from_secs(1);
 const PING_INTERVAL: Duration = Duration::from_secs(2);
-/// Voice is loss-tolerant, so an overrun drops the OLDEST frame rather than
-/// blocking or growing — stale audio is worthless.
-const VOICE_RING_CAP: usize = 64;
+/// Mod-channel traffic is loss-tolerant, so an overrun drops the OLDEST frame
+/// on that channel rather than blocking or growing.
+const MOD_RING_CAP: usize = 64;
 
-/// `(speaker id, epoch, seq, opus payload)`.
-type VoiceFrame = (u32, u32, u32, VoicePayload);
+struct InboundMod {
+    sender: u32,
+    seq: u32,
+    bytes: ModBytes,
+}
 
 /// Snapshotted so we can interpolate between two.
 #[derive(Clone, Copy)]
@@ -222,10 +225,10 @@ pub struct Connection {
     endpoint: Endpoint,
     rt: Arc<Runtime>,
     inbox: Receiver<ServerMessage>,
-    /// Kept OUT of `inbox`: voice must not share the reliable, ordered event
-    /// channel. `Arc<Mutex<VecDeque>>` rather than a second `mpsc` because std
-    /// channels are unbounded and can't drop-oldest — the bound is the point.
-    voice_in: Arc<Mutex<VecDeque<VoiceFrame>>>,
+    /// Kept OUT of `inbox`. Each channel has its own drop-oldest ring, so one
+    /// channel cannot flush another. `HashMap::new` allocates nothing until the
+    /// first frame of a channel arrives.
+    mod_in: Arc<Mutex<HashMap<Arc<str>, VecDeque<InboundMod>>>>,
     player_id: u32,
     seed: i64,
     spawn: DVec3,
@@ -328,20 +331,22 @@ fn connect_one(rt: &Arc<Runtime>, addr: SocketAddr, name: &str, password: &str) 
             welcome_from(ServerMessage::decode(&frame))?;
 
         let (tx, inbox) = mpsc::channel();
-        let voice_in: Arc<Mutex<VecDeque<VoiceFrame>>> = Arc::new(Mutex::new(VecDeque::new()));
-        let voice_reader = voice_in.clone();
+        let mod_in: Arc<Mutex<HashMap<Arc<str>, VecDeque<InboundMod>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let mod_reader = mod_in.clone();
         let reader_rt = rt.clone();
         thread::spawn(move || {
             while reader_rt.block_on(protocol::read_frame_async(&mut recv, &mut frame)).is_ok() {
                 match ServerMessage::decode(&frame) {
-                    // A hung-up game side stops draining but voice just rolls
-                    // over; the connection close ends the loop.
-                    Some(ServerMessage::PeerVoice { id, epoch, seq, payload }) => {
-                        let mut ring = voice_reader.lock().unwrap_or_else(PoisonError::into_inner);
-                        if ring.len() >= VOICE_RING_CAP {
+                    // A hung-up game side stops draining but channel frames just
+                    // roll over; the connection close ends the loop.
+                    Some(ServerMessage::PeerModData { channel, sender, seq, bytes }) => {
+                        let mut map = mod_reader.lock().unwrap_or_else(PoisonError::into_inner);
+                        let ring = map.entry(channel.share()).or_default();
+                        if ring.len() >= MOD_RING_CAP {
                             ring.pop_front();
                         }
-                        ring.push_back((id, epoch, seq, payload));
+                        ring.push_back(InboundMod { sender, seq, bytes });
                     }
                     Some(msg) => {
                         if tx.send(msg).is_err() {
@@ -359,7 +364,7 @@ fn connect_one(rt: &Arc<Runtime>, addr: SocketAddr, name: &str, password: &str) 
             endpoint,
             rt: Arc::clone(rt),
             inbox,
-            voice_in,
+            mod_in,
             player_id,
             seed,
             spawn,
@@ -667,10 +672,9 @@ fn apply_server_message(
             }
             // A second Welcome is meaningless mid-session.
             ServerMessage::Welcome { .. } => {}
-            // Voice never reaches here: the reader thread routes PeerVoice into
-            // the dedicated ring (see `connect`), not the `inbox` this drains.
-            // The arm exists only to keep the match exhaustive.
-            ServerMessage::PeerVoice { .. } => {}
+            // Channel frames never reach here: the reader thread routes PeerModData
+            // into the per-channel rings, not the inbox this drains.
+            ServerMessage::PeerModData { .. } => {}
             ServerMessage::ToolResult { req, reacted, rev, cell_spec, tool_spec } => {
                 let Some(at) = pending_edits.iter().position(|p| p.req == req) else {
                     return;
@@ -755,17 +759,35 @@ impl Connection {
         self.dispatch(&ClientMessage::Cruise { speed: declared.unwrap_or(0.0) });
     }
 
-    /// `seq` orders the local stream for the receiver's jitter buffer. Not
-    /// throttled — capture already paces frames. An over-cap payload is
-    /// dropped rather than sent; capture never produces one.
-    pub fn send_voice(&mut self, seq: u32, payload: &[u8]) {
-        let Ok(payload) = VoicePayload::try_from(payload.to_vec()) else { return };
-        self.dispatch(&ClientMessage::Voice { seq, payload });
+    /// Send `bytes` on `channel`. False when the link is down, the name is illegal,
+    /// or the payload exceeds the cap. Not throttled: the caller paces itself.
+    /// The server stamps the sender.
+    pub fn send_channel(&mut self, channel: &str, seq: u32, bytes: &[u8]) -> bool {
+        if !self.alive {
+            return false;
+        }
+        let Some(channel) = protocol::Channel::parse(channel) else { return false };
+        let Ok(bytes) = ModBytes::try_from(bytes.to_vec()) else { return false };
+        self.dispatch(&ClientMessage::ModData { channel, seq, bytes });
+        true
     }
 
-    /// Frames that overran the ring were already dropped (oldest first).
-    pub fn drain_voice(&mut self) -> Vec<VoiceFrame> {
-        self.voice_in.lock().unwrap_or_else(PoisonError::into_inner).drain(..).collect()
+    /// True when `channel` has a frame waiting. A miss does not allocate.
+    pub fn channel_pending(&self, channel: &str) -> bool {
+        let map = self.mod_in.lock().unwrap_or_else(PoisonError::into_inner);
+        map.get(channel).is_some_and(|ring| !ring.is_empty())
+    }
+
+    /// Take every waiting frame on `channel`. An empty or unknown channel returns
+    /// an empty vec and allocates nothing.
+    pub fn drain_channel(&mut self, channel: &str) -> Vec<(u32, u32, Vec<u8>)> {
+        let mut map = self.mod_in.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(ring) = map.get_mut(channel) else { return Vec::new() };
+        let mut out = Vec::with_capacity(ring.len());
+        while let Some(frame) = ring.pop_front() {
+            out.push((frame.sender, frame.seq, frame.bytes.into_vec()));
+        }
+        out
     }
 
     pub fn send_chat(&mut self, channel: u8, text: &str) {

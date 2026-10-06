@@ -134,8 +134,7 @@ impl Catalog {
     }
 
     /// A catalog with no cues, for the muted `SoundSystem` (no disk, no device,
-    /// no `ClipStore`). Every `typed` lookup returns None, so the palette resolves
-    /// every role to silence.
+    /// no `ClipStore`). Every `typed` lookup returns None, so a cue play is silence.
     pub(crate) fn empty() -> (Self, CueSymbols) {
         (Catalog { cues: Box::new([]) }, CueSymbols(BTreeMap::new()))
     }
@@ -147,14 +146,14 @@ impl Catalog {
     /// Mint a mode-typed id for `name` iff it exists AND its cue-level mode is
     /// `M`. The sole typed-id constructor outside the loader: possession of a
     /// `CueId<M>` therefore proves both admission (loaded) and mode (matches the
-    /// sink). Used by the palette and by App's direct menu-cue lookup.
+    /// sink). The audio service is the only caller.
     pub fn typed<M: CueMode>(&self, symbols: &CueSymbols, name: &str) -> Option<CueId<M>> {
         let raw = symbols.raw(name)?;
         (self.cues[raw as usize].mode == M::MODE).then_some(CueId(raw, PhantomData))
     }
 
-    /// The cue-level mode behind a raw symbol index (for the palette's
-    /// mode-mismatch diagnostic).
+    /// The cue-level mode behind a raw symbol index.
+    #[cfg(test)]
     pub(crate) fn mode_of(&self, raw: u16) -> ClipMode {
         self.cues[raw as usize].mode
     }

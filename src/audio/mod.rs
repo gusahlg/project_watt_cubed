@@ -1,26 +1,25 @@
-//! Client audio facade: catalog, director, frame, and the [`SoundSystem`] runtime.
+//! Client audio. The device, mixer, codecs and acoustics stay here. Mods decide
+//! which cue plays and who hears voice, through [`service`].
 
-pub mod acoustics;
-pub mod assets;
-pub mod capture;
-pub mod content;
-pub mod director;
-pub mod frame;
+pub(crate) mod acoustics;
+mod assets;
+mod capture;
+mod content;
+mod frame;
 pub(crate) mod host;
-pub mod palette;
-pub mod voice;
+mod service;
+mod voice;
 
 pub(crate) mod backend;
 pub(crate) mod runtime;
 
-// Re-exports so callers name these through `crate::audio::*` (the seam surface).
-pub use acoustics::Listener;
-pub use assets::SoundConfig;
-pub use content::{CueSymbols, OneShot};
-pub use director::{AudioCtx, AudioDirector, PeerPose, PlayerPose, SoundEvent};
-pub use frame::{AudioFrame, Occurrence, OccurrenceId};
-pub use palette::{CuePalette, UiSound};
-pub use runtime::{Fault, MixChange, SoundSystem};
-pub use voice::{Epoch, Seq, SessionKey, VoicePacket};
-pub(crate) use runtime::Smoothed;
+pub(crate) use acoustics::Listener;
+pub(crate) use assets::SoundConfig;
+pub(crate) use content::CueSymbols;
+pub(crate) use runtime::{Fault, MixChange, Smoothed, SoundSystem};
 
+pub(crate) use service::StepPose;
+pub use service::{
+    AudioApi, AudioBench, AudioService, AudioView, BlockSound, CapturedFrame, GameEvent, ModFrame, ModLink, PeerAudio,
+    Play,
+};

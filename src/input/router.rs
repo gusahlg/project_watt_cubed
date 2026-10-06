@@ -51,6 +51,7 @@ impl Timers {
 struct ModBinding {
     chords: Vec<Chord>,
     repeat: bool,
+    held: bool,
 }
 
 /// Device edges the router samples. The engine is one; tests inject a bitset.
@@ -265,7 +266,7 @@ impl Router {
             }
             let chords = action.default.iter().copied().filter(|c| !core_claims(&self.bindings, *c)).collect();
             self.mod_ids.push(action.id);
-            self.mod_bindings.push(ModBinding { chords, repeat: action.repeat });
+            self.mod_bindings.push(ModBinding { chords, repeat: action.repeat, held: action.held });
             self.mod_timers.push(-1.0);
         }
     }
@@ -354,14 +355,18 @@ impl Router {
                     wheel = scroll_steps(probe.wheel());
                     let n = self.mod_bindings.len();
                     for i in 0..n {
-                        let repeat = self.mod_bindings[i].repeat.then_some(MOD_REPEAT);
-                        let hit = eval_event(
-                            &self.mod_bindings[i].chords,
-                            repeat,
-                            &mut self.mod_timers[i],
-                            probe,
-                            dt,
-                        );
+                        let hit = if self.mod_bindings[i].held {
+                            self.mod_bindings[i].chords.iter().any(|chord| probe.held(*chord))
+                        } else {
+                            let repeat = self.mod_bindings[i].repeat.then_some(MOD_REPEAT);
+                            eval_event(
+                                &self.mod_bindings[i].chords,
+                                repeat,
+                                &mut self.mod_timers[i],
+                                probe,
+                                dt,
+                            )
+                        };
                         if hit {
                             actions.insert(i);
                         }
@@ -594,6 +599,7 @@ mod tests {
                 label: "Slot 3",
                 default: CHORDS,
                 repeat: false,
+                held: false,
             }];
             ACTIONS
         }
@@ -615,6 +621,7 @@ mod tests {
                 label: "Fire",
                 default: BOTH,
                 repeat: false,
+                held: false,
             }];
             ACTIONS
         }
@@ -636,6 +643,7 @@ mod tests {
                 label: "Down",
                 default: DOWN,
                 repeat: false,
+                held: false,
             }];
             ACTIONS
         }
@@ -694,5 +702,52 @@ mod tests {
         let sample = router.sample(&Press::wheel(-1.0), 1.0 / 60.0, true, true);
         assert!(fired(&router, "wheel.down", sample.actions));
         assert_eq!(sample.wheel, -1);
+    }
+
+    struct Hold;
+
+    impl Mod for Hold {
+        fn name(&self) -> &str {
+            "Hold"
+        }
+        fn id(&self) -> &'static str {
+            "hold"
+        }
+        fn actions(&self) -> &[Action] {
+            const CHORDS: &[Chord] = &[Chord::key(Key::V)];
+            const ACTIONS: &[Action] = &[Action {
+                id: "voice.talk",
+                label: "Push to talk",
+                default: CHORDS,
+                repeat: false,
+                held: true,
+            }];
+            ACTIONS
+        }
+    }
+
+    /// A held action stays on while the key is down, including a frame with no press edge.
+    #[test]
+    fn a_held_action_stays_on_while_the_chord_is_down() {
+        let mut router = Router::new();
+        let mods = host(Box::new(Hold));
+        router.sync_actions(&mods);
+        let down = Press {
+            pressed_keys: 0,
+            down_keys: 1u128 << Key::V as u32,
+            pressed_mouse: 0,
+            down_mouse: 0,
+            wheel: 0.0,
+            mods: crate::input::intent::Mods::NONE,
+        };
+        let held = router.sample(&down, 1.0 / 60.0, true, true);
+        assert!(fired(&router, "voice.talk", held.actions));
+        let still = router.sample(&down, 1.0 / 60.0, true, true);
+        assert!(fired(&router, "voice.talk", still.actions), "the hold fires again with no new edge");
+        let up = router.sample(&Press::wheel(0.0), 1.0 / 60.0, true, true);
+        assert!(!fired(&router, "voice.talk", up.actions));
+        router.set_context(Context::Menu);
+        let menu = router.sample(&down, 1.0 / 60.0, true, true);
+        assert!(!fired(&router, "voice.talk", menu.actions), "menus do not sample gameplay holds");
     }
 }

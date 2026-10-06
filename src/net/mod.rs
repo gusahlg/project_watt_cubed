@@ -15,7 +15,10 @@
 //! the [`hooks`] seam (`ServerMod`) without changing the wire.
 pub(crate) mod client;
 pub(crate) mod hooks;
+mod pair;
 pub(crate) mod protocol;
+
+pub use pair::ChannelPair;
 
 // Deny a bare `.unwrap()` on production paths; server.rs's `lock_recover()`
 // is the one sanctioned recovery point. The tests module carries its own
@@ -151,7 +154,7 @@ pub(crate) mod quic {
 
 /// Wire revision. Client and server must match exactly at join. Bump on any
 /// incompatible frame change; history is `documentation/notes/protocol-history.md`.
-pub(crate) const PROTOCOL_VERSION: u32 = 13;
+pub(crate) const PROTOCOL_VERSION: u32 = 14;
 
 pub const DEFAULT_PORT: u16 = 5555;
 
@@ -165,12 +168,11 @@ pub(crate) const MAX_CHAT: usize = 256;
 /// (`1 + CAPACITY * D` bytes). A shorter cap rejects blocks the game can place.
 pub(crate) const MAX_SPEC: usize = 2 + 2 * (1 + material::CAPACITY * material::D);
 
-/// Largest accepted voice payload (bytes): one 20 ms opus frame at up to
-/// ~64 kbps with margin. `net` owns its own copy of the cap rather than
-/// depending on the `audio` crate: the two modules fan out in parallel and net
-/// must compile without it. The codec rejects any inbound voice frame past this
-/// cap, and callers guard outbound.
-pub(crate) const MAX_VOICE_PAYLOAD: usize = 400;
+/// Largest accepted mod-channel payload (bytes). One 20 ms opus frame at up to
+/// ~64 kbps fits, with margin, and the same cap bounds every channel. `net`
+/// owns its own copy rather than depending on `audio`. The codec rejects a
+/// longer frame before the bytes are trusted.
+pub(crate) const MAX_MOD_BYTES: usize = 400;
 
 /// What a join must share: generator version, gravity, material law, palette.
 /// Worldgen kind and terrain knobs are not in here — [`Welcome`](protocol::ServerMessage::Welcome)

@@ -256,19 +256,14 @@ pub enum GameplayState {
     Sprint,
     Sneak,
     Jump,
-    /// Push-to-talk transmit gate. Held (level), not an edge event: the voice
-    /// consumer needs both the press (start capture) and the release (stop) —
-    /// an edge event surfaces only the press. Mirrors Sneak/Sprint.
-    PushToTalk,
 }
 
 impl GameplayState {
-    pub const COUNT: usize = 4;
+    pub const COUNT: usize = 3;
     pub const ALL: [GameplayState; Self::COUNT] = [
         GameplayState::Sprint,
         GameplayState::Sneak,
         GameplayState::Jump,
-        GameplayState::PushToTalk,
     ];
 }
 

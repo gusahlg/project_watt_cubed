@@ -13,9 +13,21 @@
 //! calls every package's `register` in dependency order (see [`GameBuild`]).
 //!
 //! **Versioning.** This crate's version is the *mod API version* (`pwc-api` in `mod.toml`).
-//! Everything re-exported here is the API surface; breaking it requires a major version bump.
-//! The [`prelude`] covers what most mods need; the module re-exports give access to the game's
-//! subsystems a mod may read or drive.
+//! Everything re-exported here is the API surface; a break old mods cannot compile through
+//! requires a major version bump. The [`prelude`] covers what most mods need; the module
+//! re-exports give access to the game's subsystems a mod may read or drive.
+//!
+//! # 2.1.0
+//!
+//! Additive on 2.0.0 (`^2.0` still matches):
+//!
+//! - [`Action::held`] keeps an action on for every frame its chord is down. Menus do not sample
+//!   it. An `Action` literal names `held`; `repeat` is ignored while it is set.
+//! - [`Mod::on_game_event`] reports a block edit, a step, a swing, a menu click, the voice-test
+//!   cue, and entering or leaving a world. [`Mod::on_audio`] runs every frame, menus included,
+//!   with the listener and the peer roster.
+//! - [`audio`] plays catalog cues, reads the mix, and opens voice sessions and the microphone.
+//!   The device, the codecs and the mixer stay in the core.
 //!
 //! # 2.0.0
 //!
@@ -43,9 +55,16 @@
 //! granularity, never per voxel.
 
 pub use project_watt_cubed::modding::{
-    annotate_setting, forced_off_marker, Action, ChoicesFlush, Command, CommandContext, GameBuild, Group, Knob, Mod,
-    ModContext, ModDescriptor, ModRegistrar, Mods, ToolUse, VisualMask, ESSENTIALS, ESSENTIALS_GROUP,
+    annotate_setting, forced_off_marker, Action, ActionSet, ChoicesFlush, Command, CommandContext, GameBuild, Group,
+    Knob, Mod, ModContext, ModDescriptor, ModRegistrar, Mods, ToolUse, VisualMask, ESSENTIALS, ESSENTIALS_GROUP,
 };
+
+/// Catalog cues, the mix, voice sessions and the microphone. No device, codec or mixer type.
+pub mod audio {
+    pub use project_watt_cubed::audio::{
+        AudioApi, AudioBench, AudioView, BlockSound, CapturedFrame, GameEvent, ModFrame, ModLink, PeerAudio, Play,
+    };
+}
 
 /// The game's subsystems, as far as mods may use them.
 pub use project_watt_cubed::{

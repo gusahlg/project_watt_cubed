@@ -28,7 +28,6 @@ impl Default for Bindings {
         gameplay_state[GS::Sprint as usize] = vec![Source::Key(Key::LeftControl)];
         gameplay_state[GS::Sneak as usize] = vec![Source::Key(Key::LeftShift)];
         gameplay_state[GS::Jump as usize] = vec![Source::Key(Key::Space)];
-        gameplay_state[GS::PushToTalk as usize] = vec![Source::Key(Key::V)];
 
         let mut gameplay_event: [Vec<Chord>; GameplayEvent::COUNT] = Default::default();
         gameplay_event[GE::ToggleFly as usize] = vec![Chord::key(Key::F)];

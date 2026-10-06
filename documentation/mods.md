@@ -71,8 +71,9 @@ run time; disabled mods cost nothing.
 several enabled mods implement a hook:
 
 - Fan-out, in installation order: `update`, `on_toggle_fly`, `on_block_break`, `on_break_rejected`,
-  `on_place_rejected`, `on_tool_changed`, `on_tool_used`. `hud` uses the same order as z-order (later draws on
+  `on_place_rejected`, `on_tool_changed`, `on_tool_used`, `on_game_event`, `on_audio`. `hud` uses the same order as z-order (later draws on
   top), and `commands` lists concatenate in it. `actions` are collected from every enabled mod.
+  `on_audio` runs every frame, menus included.
 - First enabled wins: `menu_theme`, `start_screen`, `close_overlay` (first `true`), `tool`,
   `namer`, `appearance`, `worldgen`, `worldgen_config`, `run_command` (first `Some`).
 - Compose: `visual_group` bits OR into the render mask.
@@ -81,7 +82,9 @@ several enabled mods implement a hook:
 places it). With no mod answering, there is no tool and the primary action breaks the block into
 the inventory. `on_tool_changed(old, new)` tells every mod a tool reaction turned that unit into
 another configuration. `on_tool_used` reports what the law did; the core draws nothing for it.
-Mods declare input with `actions` (`Action { id, label, default, repeat }`). The core keeps the
+Mods declare input with `actions` (`Action { id, label, default, repeat, held }`). `held` stays on
+for every frame the chord is down; menus do not sample it, and `repeat` is ignored while it is set.
+The core keeps the
 chord table, a core binding wins a clash, and `ModContext::action` reports which ids fired.
 `ModContext::wheel` is the signed scroll. There is no controls screen: `Action::label` is what a
 future one will show, and rebinding is left for later. HUD output is data
@@ -108,17 +111,18 @@ With no mod answering a hook the core falls back to: the default menu theme and 
 screen, `FlatAppearance` (every texel the base colour), `describe` names read off the observation
 ("glowing clear hard solid"), the flat world generator, and no tool. The inventory still collects
 what you break; without the inventory mod it is simply not shown. The number keys select nothing
-unless the hotbar package is enabled.
+unless the hotbar package is enabled. Without the sounds mod the game plays no cues. Without the
+proximity-chat mod the microphone stays closed and voice is neither sent nor played.
 
 ## The mod API crate
 
 `crates/pwc-mod-api` is the one crate mods depend on. It re-exports the host types
 (`Mod`, `ModContext`, `ModRegistrar`, `GameBuild`, `ModDescriptor`, `Knob`, `Group`, …), the game
 modules mods may use (`block`, `world`, `player`, `ui`, `menu`, `settings`, `inventory`, `render_config`,
-`net`, `session`, `sim`, `input`, `derived`, `engine`, `material`) and a `prelude`. Its version is
+`net`, `session`, `sim`, `input`, `derived`, `engine`, `material`, `audio`) and a `prelude`. Its version is
 the **mod API version** a package's `mod.toml` requires (`pwc-api = "^2.0"`); a breaking change to
-what it re-exports needs a major version bump. The 2.0.0 breaks are listed at the top of
-`crates/pwc-mod-api/src/lib.rs`.
+what it re-exports needs a major version bump. The 2.1.0 additions and the 2.0.0 breaks are listed at the top of
+`crates/pwc-mod-api/src/lib.rs`. `audio` plays cues and voice; it does not expose the device.
 
 ## First-party mods
 
@@ -135,6 +139,9 @@ a package with its own README, licence (`Apache-2.0 OR MIT`) and tests:
 | `pwc.neural-textures` | `neural_textures` — per-configuration CPPN textures |
 | `pwc.material-names` | `material_names` — Markov-model names for blocks and tools |
 | `pwc.infinite-diffusion` | `diffusion` — selects the InfiniteDiffusion world generator and its knobs |
+| `pwc.game-ui` | `game_ui` — in-world HUD pieces, starting with the facing indicator |
+| `pwc.sounds` | `sounds` — footsteps, blocks, tools, swings and menu clicks |
+| `pwc.proximity-chat` | `proximity_chat` — push-to-talk voice for visible peers |
 | `pwc.essentials` | bundle of all of the above |
 
 The InfiniteDiffusion generator itself (`src/world/terrain`) stays in the core: the content

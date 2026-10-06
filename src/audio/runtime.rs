@@ -245,7 +245,7 @@ impl SoundSystem {
     /// A guaranteed-silent system: a `NullBackend` over an empty catalog, with no
     /// device probe and no disk access. Headless golden runs use this so they need
     /// neither an audio device nor the `assets/sounds` tree. Every cue lookup
-    /// yields None, so the palette resolves every role to silence. `reported_lost`
+    /// yields None, so a cue play is silence. `reported_lost`
     /// starts set: the silence is deliberate, not a device loss to surface.
     pub fn mute() -> (Self, CueSymbols) {
         let (catalog, symbols) = Catalog::empty();
@@ -304,8 +304,7 @@ impl SoundSystem {
         }
     }
 
-    /// The loaded catalog, so App can build the [`CuePalette`] once at startup
-    /// (the palette resolves every game fact's mode-typed cue up front).
+    /// The loaded catalog. Mods resolve cue names through the audio service.
     pub fn catalog(&self) -> &Catalog {
         &self.catalog
     }
@@ -834,6 +833,19 @@ impl SoundSystem {
         self.session_starved.remove(&session);
     }
 
+    pub(crate) fn mix(&self) -> MixChange {
+        self.mix
+    }
+
+    /// A recording backend plus an in-memory catalog. Mod tests drive this; the game does not.
+    pub(crate) fn assemble_recording(
+        backend: Box<dyn Backend>,
+        catalog: Catalog,
+        cfg: SoundConfig,
+    ) -> Self {
+        Self::assemble(backend, catalog, VecDeque::new(), false, cfg)
+    }
+
     pub fn set_mix(&mut self, mix: MixChange) {
         let mix = mix.normalized();
         self.mix = mix;
@@ -869,7 +881,7 @@ impl SoundSystem {
 
     /// UI one-shot outside the frame journal (menus have no AudioFrame cadence).
     /// Non-Ui cue ⇒ `Fault::BadUiCue` + no-op (fire-and-forget).
-    pub fn play_ui(&mut self, cue: CueId<OneShot>) {
+    pub fn play_ui(&mut self, cue: CueId<OneShot>, gain: f32) {
         let now = Instant::now();
         self.service();
 
@@ -895,7 +907,7 @@ impl SoundSystem {
             let draw = draw_layer(layer, id, li as u16);
             debug_assert_eq!(draw.delay, 0.0, "UI delay is rejected by the catalog");
             let dsp = Dsp {
-                gain: (ui_dsp.gain * draw.gain * self.mix.effects).clamp(0.0, 4.0),
+                gain: (ui_dsp.gain * draw.gain * self.mix.effects * gain).clamp(0.0, 4.0),
                 ..ui_dsp
             };
             // Budget-exempt (menus have no frame cadence) but retained, not leaked.
@@ -909,7 +921,7 @@ impl SoundSystem {
     }
 
     /// Edge-trigger `Fault::Starved` once per starvation burst per session.
-    /// Game still calls this on a skipped director commit so a live session's
+    /// Game still calls this on a skipped audio commit so a live session's
     /// decoder thread can surface starvation without a mixer frame.
     pub(crate) fn poll_starvation(&mut self) {
         for (key, (flag, last)) in self.session_starved.iter_mut() {
@@ -1293,7 +1305,7 @@ mod seam_tests {
             std::time::Instant::now() - std::time::Duration::from_millis(1),
         ));
 
-        sound.play_ui(cue);
+        sound.play_ui(cue, 1.0);
 
         assert!(
             rec.intents()
@@ -1465,45 +1477,24 @@ mod seam_tests {
     }
 
     #[test]
-    fn live_sources_block_the_director_skip() {
-        use crate::audio::director::{AudioCtx, AudioDirector, PlayerPose};
-        use crate::audio::palette::CuePalette;
+    fn live_sources_block_the_service_skip() {
+        use crate::audio::AudioService;
         use crate::console::Console;
         use crate::world::World;
 
         let (mut sound, syms, _rec) = system(32);
-        let (palette, _) = CuePalette::build(&syms, sound.catalog());
-        let mut dir = AudioDirector::new(palette);
+        let mut svc = AudioService::new();
         let world = World::generate();
         let mut console = Console::new();
         let pos = DVec3::ZERO;
-        dir.frame(
-            AudioCtx {
-                dt: 0.1,
-                player: PlayerPose {
-                    pos,
-                    feet: pos,
-                    yaw: 0.0,
-                    pitch: 0.0,
-                    velocity: DVec3::ZERO,
-                    on_ground: true,
-                    up: crate::coord::Face::PosY,
-                    frame: glam::DQuat::IDENTITY,
-                },
-                ptt: false,
-                voice_enabled: false,
-                events: Vec::new(),
-                peers: &[],
-                world: &world,
-                net: None,
-                console: &mut console,
-            },
-            &mut sound,
-        );
-        assert!(
-            dir.can_skip_commit(&sound, &[], pos, false),
-            "a silent still frame arms the skip"
-        );
+        let listener = crate::audio::Listener {
+            pos,
+            yaw: 0.0,
+            pitch: 0.0,
+            frame: glam::DQuat::IDENTITY,
+        };
+        svc.finish(&mut sound, &world, listener, 0.1, &mut console);
+        assert!(svc.can_skip(&sound, true, pos), "a silent still frame arms the skip");
 
         let cue = sound.catalog().typed::<OneShot>(&syms, "oneshot").unwrap();
         sound.submit(
@@ -1522,10 +1513,7 @@ mod seam_tests {
             .unwrap(),
         );
         assert!(sound.has_live_sources());
-        assert!(
-            !dir.can_skip_commit(&sound, &[], pos, false),
-            "a live clip voice must re-enable the commit"
-        );
+        assert!(!svc.can_skip(&sound, true, pos), "a live clip voice must re-enable the commit");
     }
 
     #[test]

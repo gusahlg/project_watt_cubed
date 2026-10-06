@@ -141,7 +141,10 @@ pub struct Action {
     /// Chords that fire the action, unless a core binding already uses that chord.
     pub default: &'static [crate::input::intent::Chord],
     /// When true, the action autofires with the same timing as breaking and placing.
+    /// Ignored when [`held`](Self::held) is set.
     pub repeat: bool,
+    /// When true, the action is on for every frame the chord is down, not only the press.
+    pub held: bool,
 }
 
 /// Which declared actions fired this frame. At most [`ActionSet::CAP`] actions;
@@ -435,6 +438,21 @@ pub trait Mod {
         let _ = outcome;
     }
 
+    /// A game fact the core cannot derive (a block edit, a step, a menu click). `audio` plays cues.
+    fn on_game_event(&mut self, ev: &crate::audio::GameEvent, audio: &mut crate::audio::AudioApi) {
+        let _ = (ev, audio);
+    }
+
+    /// Every frame, menus included. `view` is the listener and the roster; `link` is the mod channel.
+    fn on_audio(
+        &mut self,
+        view: &crate::audio::AudioView,
+        audio: &mut crate::audio::AudioApi,
+        link: &mut crate::audio::ModLink,
+    ) {
+        let _ = (view, audio, link);
+    }
+
     /// Optional material namer. First enabled mod that returns `Some` names every
     /// configuration; without one the core describes materials by their readings.
     fn namer(&self) -> Option<&dyn MaterialNamer> {
@@ -684,6 +702,21 @@ impl Mods {
     /// Fan a finished primary action out to every enabled mod.
     pub fn on_tool_used(&mut self, outcome: ToolUse) {
         self.each_enabled(|m| m.on_tool_used(outcome));
+    }
+
+    /// Fan one game fact out to every enabled mod.
+    pub fn on_game_event(&mut self, ev: &crate::audio::GameEvent, audio: &mut crate::audio::AudioApi) {
+        self.each_enabled(|m| m.on_game_event(ev, audio));
+    }
+
+    /// The per-frame audio hook. Runs even when the frame is otherwise idle.
+    pub fn on_audio(
+        &mut self,
+        view: &crate::audio::AudioView,
+        audio: &mut crate::audio::AudioApi,
+        link: &mut crate::audio::ModLink,
+    ) {
+        self.each_enabled(|m| m.on_audio(view, audio, link));
     }
 
     /// The configuration a primary action applies: the first enabled mod that answers.

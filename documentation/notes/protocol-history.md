@@ -36,3 +36,11 @@ palette) instead of one fingerprint that mixed in worldgen kind and terrain
 knobs. Kind and knobs stay in `Welcome`. `Cruise` declares a cruise speed
 (0 ends it) so the movement envelope can follow it. Mixed v12/v13 peers
 must not join.
+v14: tags 8 and 14 are generic mod channels. Client → server
+`ModData{channel, seq, bytes}`; server → client
+`PeerModData{channel, sender, seq, bytes}`, relayed only to the sender's
+visible interest set. The server stamps the sender, caps the payload at
+400 bytes and rate-limits each channel. There is no epoch. Quinn can send
+datagrams, but naming `bytes::Bytes` would add a dependency, so every
+channel stays on the reliable length-prefixed stream. Each channel has its
+own drop-oldest receive ring. Mixed v13/v14 peers must not join.

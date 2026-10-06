@@ -53,6 +53,8 @@ pub(crate) struct RecordingBackend {
 /// order) and controls the `alive` flag.
 pub(crate) struct Recorder {
     log: Arc<Mutex<Vec<Intent>>>,
+    /// Shared with the backend so a test can simulate device loss. Absent outside tests.
+    #[cfg(test)]
     alive: Arc<AtomicBool>,
 }
 
@@ -60,6 +62,7 @@ impl Recorder {
     pub fn intents(&self) -> Vec<Intent> {
         self.log.lock().unwrap().clone()
     }
+    #[cfg(test)]
     pub fn set_alive(&self, alive: bool) {
         self.alive.store(alive, Ordering::Relaxed);
     }
@@ -69,13 +72,10 @@ impl RecordingBackend {
     pub fn new() -> (Self, Recorder) {
         let log = Arc::new(Mutex::new(Vec::new()));
         let alive = Arc::new(AtomicBool::new(true));
-        let backend = Self {
-            log: log.clone(),
-            alive: alive.clone(),
-            next_voice: 0,
-            next_clip: 0,
-        };
-        (backend, Recorder { log, alive })
+        #[cfg(test)]
+        let recorder_alive = Arc::clone(&alive);
+        let backend = Self { log: Arc::clone(&log), alive, next_voice: 0, next_clip: 0 };
+        (backend, Recorder { log, #[cfg(test)] alive: recorder_alive })
     }
 
     fn record(&mut self, intent: Intent) {

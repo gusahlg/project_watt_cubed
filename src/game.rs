@@ -9,14 +9,12 @@ mod draw;
 
 use voxel_engine::{Color, DVec3, Engine, Vec2};
 
-use crate::audio::{
-    AudioCtx, AudioDirector, PeerPose, PlayerPose, SoundEvent, SoundSystem, UiSound,
-};
+use crate::audio::{AudioService, AudioView, CueSymbols, GameEvent, ModLink, PeerAudio, SoundSystem, StepPose};
 use crate::block::{BlockId, AIR};
 use crate::camera::{CameraMode, CameraPose, FlyAxes, GameCamera};
 use crate::console::{self, Console};
 use crate::derived::Revision;
-use crate::input::intent::{GameplayEvent, GameplayState, GlobalEvent, MenuEvent};
+use crate::input::intent::{GameplayEvent, GlobalEvent, MenuEvent};
 use crate::input::router::{Context, Router, View};
 use crate::input::{look, movement};
 use crate::interact;
@@ -87,8 +85,6 @@ struct FrameInput {
     open_console: bool,
     open_chat: bool,
     toggle_capture: bool,
-    /// Push-to-talk held this frame (level, not edge — see `GameplayState::PushToTalk`).
-    ptt: bool,
     g_escape: bool,
     g_hud: bool,
     g_shot: bool,
@@ -113,19 +109,21 @@ struct OverlayPhase<'a> {
     mods: &'a mut Mods,
     settings: &'a mut Settings,
     sound: &'a mut SoundSystem,
-    events: &'a mut Vec<SoundEvent>,
+    events: &'a mut Vec<GameEvent>,
 }
 
-/// Owned/read-only facts plus the two audio committers for the final update
-/// phase. In particular, `events` moves exactly once into the director.
+/// Facts for the audio hook. `events` is what this frame already knows; footsteps are added inside.
 struct AudioPhase<'a> {
     dt: f32,
     input: &'a FrameInput,
     sound: &'a mut SoundSystem,
-    audio: &'a mut AudioDirector,
+    audio: &'a mut AudioService,
+    cues: &'a CueSymbols,
     settings: &'a Settings,
-    events: Vec<SoundEvent>,
+    events: Vec<GameEvent>,
     active: bool,
+    mods: &'a mut Mods,
+    ids: &'a [&'static str],
 }
 
 /// Edge-triggered mod intents from one render frame, retained in order when
@@ -324,7 +322,9 @@ pub struct Game {
     // Retained-capacity scratch (cleared, never shrunk): stable frames do no
     // allocator work for these.
     placement_scratch: Vec<(i32, i32, i32, crate::block::registry::BlockId)>,
-    peer_pose_scratch: Vec<PeerPose>,
+    peer_pose_scratch: Vec<PeerAudio>,
+    /// Up-axes parallel to [`peer_pose_scratch`]. Kept off the public peer record.
+    peer_up_scratch: Vec<crate::coord::Face>,
     /// Last frame's named-phase durations, for the stall detector.
     phases: FramePhases,
     hud_scratch: Vec<HudElement>,
@@ -410,6 +410,7 @@ impl Game {
             drawing: draw::DrawState::new(),
             placement_scratch: Vec::new(),
             peer_pose_scratch: Vec::new(),
+            peer_up_scratch: Vec::new(),
             phases: FramePhases::default(),
             hud_scratch: Vec::new(),
         }
@@ -632,7 +633,8 @@ impl Game {
         mods: &mut Mods,
         settings: &mut Settings,
         sound: &mut SoundSystem,
-        audio: &mut AudioDirector,
+        audio: &mut AudioService,
+        cues: &CueSymbols,
     ) -> Signal {
         // Clamp dt so a stall (window minimized, world load hitch) becomes one
         // slightly-long step instead of a single giant physics step that would
@@ -671,10 +673,9 @@ impl Game {
             self.sky_gate.reset();
         }
 
-        // This frame's unrecoverable audio facts, accumulated across the
-        // phases and folded by the director. Everything else — footsteps, splash, the
-        // underwater bed, voice sessions — the director DERIVES from the readout.
-        let mut events: Vec<SoundEvent> = Vec::new();
+        // This frame's audio facts, accumulated across the phases. Footsteps are
+        // added at the audio commit; mods choose the cues and the voice sessions.
+        let mut events: Vec<GameEvent> = Vec::new();
 
         self.phases = FramePhases::default();
         let t = Instant::now();
@@ -688,9 +689,8 @@ impl Game {
         // The overlay may consume the frame (console typing, opening chat): movement
         // and interaction run only on an unconsumed frame. Streaming still runs
         // while a spawn/teleport slab is outstanding so loading progresses with
-        // the console open. Audio skips the director commit when nothing is
-        // sounding and the listener is still; only a real exit short-circuits
-        // the rest of the frame.
+        // the console open. A still singleplayer frame skips the mixer when
+        // nothing is sounding; only a real exit short-circuits the rest of the frame.
         let t = Instant::now();
         let overlay = self.overlay_phase(OverlayPhase {
             input: &input,
@@ -723,14 +723,18 @@ impl Game {
         }
         let active = !consumed;
         let t = Instant::now();
+        let ids = router.action_ids();
         self.commit_audio(AudioPhase {
             dt,
             input: &input,
             sound,
             audio,
+            cues,
             settings,
             events,
             active,
+            mods,
+            ids,
         });
         self.phases.audio = t.elapsed();
         Signal::Continue
@@ -755,7 +759,7 @@ impl Game {
     /// server dropped us. Runs before input so edits and chat keep flowing even
     /// while the console is open or the player stands still — and the move
     /// report doubles as the keepalive, so it too runs unconditionally.
-    fn net_phase(&mut self, mods: &mut Mods, events: &mut Vec<SoundEvent>) -> Option<Signal> {
+    fn net_phase(&mut self, mods: &mut Mods, events: &mut Vec<GameEvent>) -> Option<Signal> {
         // The overwhelmingly common singleplayer path should not even enter a
         // profiling scope or call through the event-poll seam.
         self.net.as_ref()?;
@@ -834,7 +838,6 @@ impl Game {
                 f.open_console = gp.event(GameplayEvent::OpenConsole);
                 f.open_chat = gp.event(GameplayEvent::OpenChat);
                 f.toggle_capture = gp.event(GameplayEvent::ToggleCapture);
-                f.ptt = gp.state(GameplayState::PushToTalk);
                 f.move_input = Some(move_input);
             }
             View::Text(t) => {
@@ -1036,9 +1039,9 @@ impl Game {
                             self.camera.fx.add_trauma(trauma);
                         }
                         // Advance the local walk cycle from horizontal travel so the
-                        // third-person body animates. The AUDIO gait (footstep
-                        // phase-crossings) is derived inside the director from the
-                        // same speed — this one drives rendering only.
+                        // third-person body animates. The audio gait (footstep
+                        // phase-crossings) is a separate integrator in the audio service;
+                        // this one drives rendering only.
                         let mut v = self.player.velocity();
                         v[self.player.up_axis.axis()] = 0.0;
                         self.local_gait += v.length() * step_dt as f64 * presence::STRIDE_FREQ;
@@ -1073,7 +1076,7 @@ impl Game {
         dt: f32,
         eng: &mut Engine,
         mods: &mut Mods,
-        events: &mut Vec<SoundEvent>,
+        events: &mut Vec<GameEvent>,
         action_ids: &[&'static str],
     ) {
         // Break is capture-gated in the query; freecam additionally can't act
@@ -1125,7 +1128,7 @@ impl Game {
         &mut self,
         (screen_w, screen_h): (i32, i32),
         mods: &mut Mods,
-        events: &mut Vec<SoundEvent>,
+        events: &mut Vec<GameEvent>,
         action_ids: &[&'static str],
     ) {
         let mut pending = std::mem::take(&mut self.pending_mod_input);
@@ -1245,7 +1248,8 @@ impl Game {
         dt: f32,
         router: &mut Router,
         sound: &mut SoundSystem,
-        audio: &mut AudioDirector,
+        audio: &mut AudioService,
+        cues: &CueSymbols,
         settings: &Settings,
         mods: &mut Mods,
     ) {
@@ -1258,7 +1262,7 @@ impl Game {
         } else {
             self.sky_gate.reset();
         }
-        let events: Vec<SoundEvent> = Vec::new();
+        let events: Vec<GameEvent> = Vec::new();
         if self.input_locked {
             router.drain_frame();
         }
@@ -1286,101 +1290,136 @@ impl Game {
             self.world
                 .pump(None, &mut self.sched, mods.appearance());
         }
+        let ids = router.action_ids();
         self.commit_audio(AudioPhase {
             dt,
             input: &input,
             sound,
             audio,
+            cues,
             settings,
             events,
             active: true,
+            mods,
+            ids,
         });
         self.compose_quiet(mods);
     }
 
-    /// Hand this frame's readout to the audio director: it folds
-    /// the drained `events`, derives the rest from the trace (footsteps, splash,
-    /// underwater bed, voice sessions), commits the [`AudioFrame`], and services the
-    /// voice/capture path. The window, medium, gait and session bookkeeping that used
-    /// to live here are the director's now.
+    /// Hand this frame to the mods. A still singleplayer frame still runs the hook,
+    /// on stack data, and skips the mixer unless the hook queued work.
     fn commit_audio(&mut self, phase: AudioPhase<'_>) {
         let AudioPhase {
             dt,
             input,
             sound,
             audio,
+            cues,
             settings,
-            events,
+            mut events,
             active,
+            mods,
+            ids,
         } = phase;
-        // Singleplayer idle: skip pose/peer/director/mixer construction. Voice
-        // ingest and capture need the full path (a new session is not yet live).
-        if self.net.is_none()
-            && audio.can_skip_commit(sound, &events, self.player.position, input.ptt)
-        {
-            sound.poll_starvation();
+        let idle = events.is_empty() && input.actions.is_empty();
+        let skip = self.net.is_none() && audio.can_skip(sound, idle, self.player.position);
+        if skip {
+            self.dispatch_audio(dt, input, sound, audio, cues, settings, mods, ids, &[], &events);
+            if !audio.dirty() {
+                sound.poll_starvation();
+                return;
+            }
+            self.submit_audio(dt, sound, audio);
             return;
         }
-        // THE per-frame peer sample: one `Instant`, consumed by the director for
-        // both remote footsteps and voice sessions. `peer_draws` in draw() keeps its
-        // own richer sample — it runs in the separate draw() call, steps each peer's
-        // animator, and needs render fields absent from `PeerPose`. The scratch
-        // vector retains capacity so stable multiplayer frames allocate nothing.
+
         let now = crate::sched::now();
         let mut peers = std::mem::take(&mut self.peer_pose_scratch);
+        let mut ups = std::mem::take(&mut self.peer_up_scratch);
         peers.clear();
+        ups.clear();
         if let Some(net) = &self.net {
-            peers.extend(net.peers().map(|p| {
-                let r = p.sample(now);
-                PeerPose {
-                    id: p.id(),
-                    at: r.pos.0,
-                    feet: r.pos.feet(r.stance, r.up).0,
-                    visible: p.visible(),
-                    phase: r.phase,
-                    speed: r.speed,
-                    up: r.up,
-                }
-            }));
+            for peer in net.peers() {
+                let rendered = peer.sample(now);
+                peers.push(PeerAudio {
+                    id: peer.id(),
+                    at: rendered.pos.0,
+                    feet: rendered.pos.feet(rendered.stance, rendered.up).0,
+                    visible: peer.visible(),
+                    gait: rendered.phase,
+                    speed: rendered.speed,
+                });
+                ups.push(rendered.up);
+            }
         }
+        // A console-owned frame does not step the player, so a stale walk speed
+        // must not fire a footstep.
+        let velocity = if active { self.player.velocity() } else { DVec3::ZERO };
+        audio.footsteps(
+            StepPose {
+                feet: self.player.feet(),
+                velocity,
+                on_ground: self.player.on_ground(),
+                up: self.player.up_axis,
+            },
+            &self.world,
+            dt,
+            &peers,
+            &ups,
+            &mut events,
+        );
+        self.dispatch_audio(dt, input, sound, audio, cues, settings, mods, ids, &peers, &events);
+        self.submit_audio(dt, sound, audio);
+        self.peer_pose_scratch = peers;
+        self.peer_up_scratch = ups;
+    }
 
-        // On a console-owned frame the player isn't stepped, so freeze the listener
-        // velocity: a stale walk speed would fire phantom footsteps in the director.
-        let velocity = if active {
-            self.player.velocity()
-        } else {
-            DVec3::ZERO
+    fn dispatch_audio(
+        &mut self,
+        dt: f32,
+        input: &FrameInput,
+        sound: &mut SoundSystem,
+        audio: &mut AudioService,
+        cues: &CueSymbols,
+        settings: &Settings,
+        mods: &mut Mods,
+        ids: &[&'static str],
+        peers: &[PeerAudio],
+        events: &[GameEvent],
+    ) {
+        let pos = self.player.position;
+        let view = AudioView {
+            dt,
+            pos,
+            peers,
+            in_world: true,
+            voice_enabled: settings.voice_enabled,
+            hear_voice: settings.voice_incoming,
+            actions: input.actions,
+            ids,
         };
-        let player = PlayerPose {
+        let mut link = ModLink::new(self.net.as_mut());
+        let mut api = audio.api(sound, cues, Some(&self.world), Some(&mut self.console));
+        for event in events {
+            mods.on_game_event(event, &mut api);
+        }
+        mods.on_audio(&view, &mut api, &mut link);
+    }
+
+    fn submit_audio(&mut self, dt: f32, sound: &mut SoundSystem, audio: &mut AudioService) {
+        let listener = crate::audio::Listener {
             pos: self.player.position,
-            feet: self.player.feet(),
             yaw: self.player.orientation.yaw,
             pitch: self.player.orientation.pitch,
-            velocity,
-            on_ground: self.player.on_ground(),
-            up: self.player.up_axis,
             frame: self.player.orientation.frame,
         };
-
-        let ctx = AudioCtx {
-            dt,
-            player,
-            ptt: input.ptt,
-            voice_enabled: settings.voice_enabled,
-            events,
-            peers: &peers,
-            world: &self.world,
-            net: self.net.as_mut(),
-            console: &mut self.console,
-        };
-        audio.frame(ctx, sound);
-        self.peer_pose_scratch = peers;
+        audio.finish(sound, &self.world, listener, dt, &mut self.console);
     }
 
     /// Drain queued server messages: apply world edits, resolve our own edit
     /// verdicts (rolling back rejected predictions), surface chat, and report
     /// a lost connection. Returns `true` if the server dropped us.
-    fn apply_net_events(&mut self, mods: &mut Mods, events: &mut Vec<SoundEvent>) -> bool {
+    fn apply_net_events(&mut self, mods: &mut Mods, events: &mut Vec<GameEvent>) -> bool {
         let incoming = match &mut self.net {
             Some(net) => net.poll(),
             None => return false,
@@ -1400,9 +1439,9 @@ impl Game {
                     self.world.note_cell_changed(x, y, z);
                     let at = sound_at(&self.world, x, y, z);
                     events.push(if id == AIR {
-                        SoundEvent::BlockBroken { at, block: prev }
+                        GameEvent::BlockBroken { at, block: prev, local: false }
                     } else {
-                        SoundEvent::BlockPlaced { at, block: id }
+                        GameEvent::BlockPlaced { at, block: id, local: false }
                     });
                 }
                 Incoming::Mutation { x, y, z, spec } => {
@@ -1490,7 +1529,7 @@ impl Game {
                     let new_tool = save::parse_block(self.world.registry_mut(), &tool_spec);
                     self.world.set_block(x, y, z, new_cell);
                     self.finish_tool_change(tool, new_tool, target, new_cell, mods);
-                    events.push(SoundEvent::BlockBroken { at: sound_at(&self.world, x, y, z), block: target });
+                    events.push(GameEvent::ToolReacted { at: sound_at(&self.world, x, y, z), block: target });
                 }
                 Incoming::PeerSwing { id } => {
                     // The swing edge → a whoosh at the peer's current position. The
@@ -1500,8 +1539,9 @@ impl Game {
                         .as_ref()
                         .and_then(|net| net.peers().find(|p| p.id() == id))
                     {
-                        events.push(SoundEvent::PeerSwing {
+                        events.push(GameEvent::PeerSwing {
                             at: peer.sample(Instant::now()).pos.0,
+                            peer: id,
                         });
                     }
                 }
@@ -1519,7 +1559,7 @@ impl Game {
         eng: &mut Engine,
         settings: &mut Settings,
         sound: &mut SoundSystem,
-        events: &mut Vec<SoundEvent>,
+        events: &mut Vec<GameEvent>,
         mods: &mut Mods,
     ) {
         if self.run_line(line, settings, events, mods) {
@@ -1533,7 +1573,7 @@ impl Game {
     /// multiplayer any other line is chat (a leading `!` sends it to global chat), while in
     /// singleplayer it stays a command. The first enabled mod that knows the command runs it, then
     /// the core follows up on the state it changed. Returns whether it changed the settings.
-    fn run_line(&mut self, line: String, settings: &mut Settings, events: &mut Vec<SoundEvent>, mods: &mut Mods) -> bool {
+    fn run_line(&mut self, line: String, settings: &mut Settings, events: &mut Vec<GameEvent>, mods: &mut Mods) -> bool {
         if !line.starts_with('/')
             && let Some(net) = &mut self.net
         {
@@ -1563,10 +1603,10 @@ impl Game {
         ctx.networked = self.net.is_some();
         ctx.commands = &commands;
         let out = mods.run_command(&mut ctx, cmd, &args);
-        // The test cue is a fact for the director (it runs this frame even though the console
+        // The test cue is a fact for the sounds mod (it runs this frame even though the console
         // owns input).
         if ctx.voice_test {
-            events.push(SoundEvent::Ui(UiSound::VoiceTest));
+            events.push(GameEvent::VoiceTest);
         }
         // Each output line already carries its role (output vs rejection): just show them.
         for line in out.unwrap_or_else(|| vec![console::unknown_command(cmd, &commands)]) {
@@ -1601,7 +1641,7 @@ impl Game {
 
     /// Left click: with a tool, a reaction between the tool and the targeted block; with
     /// no tool, breaking the block into the inventory.
-    fn primary_action(&mut self, mods: &mut Mods, events: &mut Vec<SoundEvent>) {
+    fn primary_action(&mut self, mods: &mut Mods, events: &mut Vec<GameEvent>) {
         let Some(hit) = interact::raycast(&self.world, self.player.position, self.player.forward(), interact::REACH)
         else {
             return;
@@ -1617,10 +1657,12 @@ impl Game {
     /// empty (the tool has absorbed it) and the tool may grow, shrink or change entirely. The
     /// changed cell wakes its contacts, so a disturbed block can start a cascade. On a server the
     /// law is the server's to run: the request goes out and [`Incoming::ToolResult`] applies it.
-    fn use_tool(&mut self, tool: BlockId, cell: (i32, i32, i32), mods: &mut Mods, events: &mut Vec<SoundEvent>) {
+    fn use_tool(&mut self, tool: BlockId, cell: (i32, i32, i32), mods: &mut Mods, events: &mut Vec<GameEvent>) {
         let (x, y, z) = cell;
         let target = self.world.block_at(x, y, z);
         self.local_anim.on_action(WireAction::Swing);
+        let at = sound_at(&self.world, x, y, z);
+        events.push(GameEvent::Swing { at });
         if let Some(net) = &mut self.net {
             let spec = save::block_spec(self.world.registry(), tool);
             if let Some(req) = net.send_tool_use(x, y, z, spec.into()) {
@@ -1634,7 +1676,7 @@ impl Game {
                 self.world.set_block(x, y, z, new_cell);
                 self.world.note_cell_changed(x, y, z);
                 self.finish_tool_change(tool, new_tool, target, new_cell, mods);
-                events.push(SoundEvent::BlockBroken { at: sound_at(&self.world, x, y, z), block: target });
+                events.push(GameEvent::ToolReacted { at, block: target });
                 self.camera.fx.add_trauma(0.08);
             }
             None => mods.on_tool_used(ToolUse::NoReaction),
@@ -1666,13 +1708,12 @@ impl Game {
     }
 
     /// No tool: break the block at `cell` into the inventory.
-    fn break_block(&mut self, cell: (i32, i32, i32), mods: &mut Mods, events: &mut Vec<SoundEvent>) {
+    fn break_block(&mut self, cell: (i32, i32, i32), mods: &mut Mods, events: &mut Vec<GameEvent>) {
         let (x, y, z) = cell;
         let id = self.world.block_at(x, y, z);
-        events.push(SoundEvent::BlockBroken {
-            at: sound_at(&self.world, x, y, z),
-            block: id,
-        });
+        let at = sound_at(&self.world, x, y, z);
+        events.push(GameEvent::Swing { at });
+        events.push(GameEvent::BlockBroken { at, block: id, local: true });
         self.world.set_block(x, y, z, AIR);
         self.world.note_cell_changed(x, y, z);
         let overflow = !self.player.inventory.add(id, 1);
@@ -1713,7 +1754,7 @@ impl Game {
     fn apply_placements(
         &mut self,
         placements: &mut Vec<(i32, i32, i32, crate::block::BlockId)>,
-        events: &mut Vec<SoundEvent>,
+        events: &mut Vec<GameEvent>,
         mods: &mut Mods,
     ) {
         for (x, y, z, id) in placements.drain(..) {
@@ -1730,11 +1771,9 @@ impl Game {
                 continue;
             }
             let prev = self.world.block_at(x, y, z);
-            // Report the placed block; the director derives its class-specific cue.
-            events.push(SoundEvent::BlockPlaced {
-                at: sound_at(&self.world, x, y, z),
-                block: id,
-            });
+            let at = sound_at(&self.world, x, y, z);
+            events.push(GameEvent::Swing { at });
+            events.push(GameEvent::BlockPlaced { at, block: id, local: true });
             self.world.set_block(x, y, z, id);
             self.world.note_cell_changed(x, y, z);
             self.local_anim.on_action(WireAction::Swing);
@@ -1840,7 +1879,7 @@ mod tests {
     use std::cell::Cell;
     use std::rc::Rc;
 
-    use crate::audio::{SoundEvent, UiSound};
+    use crate::audio::GameEvent;
     use crate::input::intent::Chord;
     use crate::input::router::{Press, Router};
     use crate::modding::{Action, Command, CommandContext, Mod, ModContext, Mods};
@@ -1898,7 +1937,7 @@ mod tests {
     }
 
     /// Run `line` as the console would; the scrollback's newest line and whether settings changed.
-    fn run(game: &mut Game, mods: &mut Mods, settings: &mut Settings, line: &str) -> (String, Role, bool, Vec<SoundEvent>) {
+    fn run(game: &mut Game, mods: &mut Mods, settings: &mut Settings, line: &str) -> (String, Role, bool, Vec<GameEvent>) {
         let mut events = Vec::new();
         let changed = game.run_line(line.to_string(), settings, &mut events, mods);
         let last = game.console.last().expect("the console printed a line");
@@ -1961,7 +2000,7 @@ mod tests {
         let (.., events) = run(&mut game, &mut mods, &mut settings, "/probe");
         assert!(events.is_empty());
         let (.., events) = run(&mut game, &mut mods, &mut settings, "/probe voice");
-        assert!(matches!(events.as_slice(), [SoundEvent::Ui(UiSound::VoiceTest)]));
+        assert!(matches!(events.as_slice(), [GameEvent::VoiceTest]));
     }
 
     /// F is not a core toggle: the first mod that offers flight takes it on the frame of the press
@@ -2006,7 +2045,7 @@ mod tests {
         assert!(!inert.toggle_capture);
         assert!(!inert.do_break);
         assert!(!inert.do_place);
-        assert!(!inert.ptt);
+        assert!(inert.actions.is_empty());
         assert!(!PendingModInput::capture(&inert, true, true, Some((1, 2, 3))).any());
     }
 
@@ -2030,6 +2069,7 @@ mod tests {
                     label: "Ping",
                     default: CHORDS,
                     repeat: false,
+                    held: false,
                 }];
                 ACTIONS
             }
@@ -2135,8 +2175,7 @@ mod tests {
     #[test]
     #[ignore]
     fn quiet_frame_fixed_costs() {
-        use crate::audio::{AudioCtx, AudioDirector, PlayerPose, SoundSystem};
-        use crate::audio::palette::CuePalette;
+        use crate::audio::{AudioService, SoundSystem};
         use crate::console::Console;
         use crate::input::router::Router;
         use std::hint::black_box;
@@ -2158,80 +2197,37 @@ mod tests {
         }
         let drain_ns = t0.elapsed().as_nanos() as f64 / f64::from(N);
 
-        let (mut sound, symbols) = SoundSystem::mute();
-        let (palette, _) = CuePalette::build(&symbols, sound.catalog());
-        let mut audio = AudioDirector::new(palette);
+        let (mut sound, _symbols) = SoundSystem::mute();
+        let mut audio = AudioService::new();
         let world = World::generate();
         let pos = DVec3::new(0.5, 80.0, 0.5);
         let mut console = Console::new();
-        let player = PlayerPose {
+        let listener = crate::audio::Listener {
             pos,
-            feet: DVec3::new(pos.x, pos.y - 1.6, pos.z),
             yaw: 0.0,
             pitch: 0.0,
-            velocity: DVec3::ZERO,
-            on_ground: true,
-            up: crate::coord::Face::PosY,
             frame: glam::DQuat::IDENTITY,
         };
-        audio.frame(
-            AudioCtx {
-                dt: 1.0 / 60.0,
-                player: PlayerPose { ..player },
-                ptt: false,
-                voice_enabled: false,
-                events: Vec::new(),
-                peers: &[],
-                world: &world,
-                net: None,
-                console: &mut console,
-            },
-            &mut sound,
-        );
+        audio.finish(&mut sound, &world, listener, 1.0 / 60.0, &mut console);
 
         let t0 = Instant::now();
         for _ in 0..N {
-            black_box(audio.can_skip_commit(&sound, &[], pos, false));
+            black_box(audio.can_skip(&sound, true, pos));
         }
         let skip_ns = t0.elapsed().as_nanos() as f64 / f64::from(N);
-
-        let t0 = Instant::now();
-        for _ in 0..N {
-            let mut console = Console::new();
-            audio.frame(
-                AudioCtx {
-                    dt: 1.0 / 60.0,
-                    player: PlayerPose { ..player },
-                    ptt: false,
-                    voice_enabled: false,
-                    events: Vec::new(),
-                    peers: &[],
-                    world: &world,
-                    net: None,
-                    console: &mut console,
-                },
-                &mut sound,
-            );
-        }
-        let director_ns = t0.elapsed().as_nanos() as f64 / f64::from(N);
 
         println!("quiet_frame_fixed_costs ({N} iters):");
         println!("  anything_in_flight:     {in_flight_ns:.1} ns");
         println!("  Router::drain_frame:    {drain_ns:.1} ns");
-        println!("  can_skip_commit (idle): {skip_ns:.1} ns  [after]");
-        println!("  AudioDirector::frame:   {director_ns:.1} ns  [before, still silent]");
-        assert!(
-            audio.can_skip_commit(&sound, &[], pos, false),
-            "the skip predicate must hold on the idle pose used above"
-        );
+        println!("  can_skip (idle):        {skip_ns:.1} ns");
+        assert!(audio.can_skip(&sound, true, pos), "the skip predicate must hold on the idle pose used above");
         assert!(!game.world().anything_in_flight());
     }
 
     #[test]
     fn quiet_minimum_frame_allocates_nothing_and_reads_the_clock_once() {
         use crate::alloc_count;
-        use crate::audio::palette::CuePalette;
-        use crate::audio::SoundSystem;
+        use crate::audio::{AudioService, SoundSystem};
         use crate::input::router::Router;
         use crate::settings::Settings;
         use crate::ui::HudMode;
@@ -2258,8 +2254,7 @@ mod tests {
         );
 
         let (mut sound, symbols) = SoundSystem::mute();
-        let (palette, _) = CuePalette::build(&symbols, sound.catalog());
-        let mut audio = crate::audio::AudioDirector::new(palette);
+        let mut audio = AudioService::new();
         let mut router = Router::new();
         let mut mods = crate::modding::testing::standard();
         const DT: f32 = 1.0 / 60.0;
@@ -2275,7 +2270,7 @@ mod tests {
         for i in 0..10 {
             alloc_count::reset();
             crate::sched::reset_clock();
-            game.tick_quiet(DT, &mut router, &mut sound, &mut audio, &settings, &mut mods);
+            game.tick_quiet(DT, &mut router, &mut sound, &mut audio, &symbols, &settings, &mut mods);
             if i >= 5 {
                 last_allocs = alloc_count::alloc_count();
                 last_bytes = alloc_count::alloc_bytes();
@@ -2300,7 +2295,7 @@ mod tests {
         for i in 0..4 {
             alloc_count::reset();
             crate::sched::reset_clock();
-            game.tick_quiet(DT, &mut router, &mut sound, &mut audio, &settings, &mut mods);
+            game.tick_quiet(DT, &mut router, &mut sound, &mut audio, &symbols, &settings, &mut mods);
             if i >= 2 {
                 assert_eq!(
                     alloc_count::alloc_bytes(),
@@ -2315,8 +2310,7 @@ mod tests {
     #[test]
     fn quiet_minimum_frame_after_draining_the_scheduler_allocates_nothing() {
         use crate::alloc_count;
-        use crate::audio::palette::CuePalette;
-        use crate::audio::SoundSystem;
+        use crate::audio::{AudioService, SoundSystem};
         use crate::input::router::Router;
         use crate::settings::Settings;
 
@@ -2363,15 +2357,14 @@ mod tests {
         );
 
         let (mut sound, symbols) = SoundSystem::mute();
-        let (palette, _) = CuePalette::build(&symbols, sound.catalog());
-        let mut audio = crate::audio::AudioDirector::new(palette);
+        let mut audio = AudioService::new();
         let mut router = Router::new();
         let mut mods = crate::modding::testing::standard();
         const DT: f32 = 1.0 / 60.0;
         for i in 0..10 {
             alloc_count::reset();
             crate::sched::reset_clock();
-            game.tick_quiet(DT, &mut router, &mut sound, &mut audio, &settings, &mut mods);
+            game.tick_quiet(DT, &mut router, &mut sound, &mut audio, &symbols, &settings, &mut mods);
             if i >= 5 {
                 assert_eq!(
                     alloc_count::alloc_bytes(),

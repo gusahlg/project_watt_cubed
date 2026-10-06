@@ -11,7 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use voxel_engine::{Color, DVec3, Engine};
 
-use crate::audio::{AudioDirector, CuePalette, CueSymbols, OneShot, SoundConfig, SoundSystem};
+use crate::audio::{AudioService, AudioView, CueSymbols, GameEvent, ModLink, PeerAudio, SoundConfig, SoundSystem};
 use crate::benchmark::{Benchmark, Step as BenchmarkStep};
 use crate::game::{Game, Signal};
 use crate::input::router::{Context, Router, View};
@@ -19,7 +19,7 @@ use crate::menu::menus::{ModsMenu, SettingsHub};
 use crate::menu::start::{StartFacts, StartRoot, VERSION};
 use crate::menu::theme::{DefaultTheme, MenuTheme};
 use crate::menu::{AppEffect, Ctx, Framed, HostInfo, JoinInfo, MenuStack, ModRow};
-use crate::modding::{ChoicesFlush, GameBuild, Mods};
+use crate::modding::{ActionSet, ChoicesFlush, GameBuild, Mods};
 use crate::net::client::Connection;
 use crate::net::server::{self, Config, ServerHandle};
 use crate::player::Player;
@@ -78,12 +78,10 @@ pub struct App {
     bench: Option<Benchmark>,
     /// Owns all playback continuation; enters/leaves world state as the screen changes.
     sound: SoundSystem,
-    /// Cue name → id table resolved once at catalog load; used here to mint the
-    /// menu-click UI cue (the director owns every in-world cue).
+    /// Cue name → id table resolved once at catalog load. Mods name cues through it.
     cues: CueSymbols,
-    /// Gameplay reports facts, this decides sounds. Owns the mic and all
-    /// trace-derived state.
-    audio: AudioDirector,
+    /// Gait, the acoustic window, capture and voice sessions. Mods decide what plays.
+    audio: AudioService,
     /// Last stall-detector log, so a hung frame names itself once per window.
     last_stall_log: Option<Instant>,
     /// Debounces `mods.cfg` writes (held Left/Right would otherwise rewrite ~22×/s).
@@ -174,13 +172,7 @@ impl App {
         // client never panics on audio, it just runs muted with a startup warning.
         let (mut sound, cues) = SoundSystem::with_graceful_degradation(SoundConfig::default());
         sound.set_mix(settings.mix_change());
-        // A missing or mode-mismatched cue role degrades that cue to silence with
-        // a startup warning, rather than failing catalog load.
-        let (palette, warnings) = CuePalette::build(&cues, sound.catalog());
-        for w in warnings {
-            eprintln!("{w}");
-        }
-        let audio = AudioDirector::new(palette);
+        let audio = AudioService::new();
         let screen = Screen::Menus(Self::start_stack(&mods, &saves, &session, None, false));
         Self {
             saves,
@@ -529,20 +521,15 @@ impl App {
             View::Menu(m) => crate::menu::gather(&m),
             _ => Vec::new(),
         };
-        // Menus have no per-frame audio cadence, so this is the one cue emission
-        // site outside the game.
-        if intents.iter().any(|i| {
-            matches!(
-                i,
-                crate::menu::Intent::Confirm | crate::menu::Intent::Nav(_)
-            )
-        }) && let Some(cue) = self
-            .sound
-            .catalog()
-            .typed::<OneShot>(&self.cues, "menu_click")
-        {
-            self.sound.play_ui(cue);
-        }
+        // One click: confirm wins when both a confirm and a navigation landed together.
+        let click = if intents.iter().any(|intent| matches!(intent, crate::menu::Intent::Confirm)) {
+            Some(GameEvent::UiConfirm)
+        } else if intents.iter().any(|intent| matches!(intent, crate::menu::Intent::Nav(_))) {
+            Some(GameEvent::UiNavigate)
+        } else {
+            None
+        };
+        self.fan_menu_audio(dt, click);
         // A per-frame snapshot so a menu never holds a live `&Mods`.
         let mods = ModRow::snapshot(&self.mods);
         let mods_save_error = self.mods_save_error.clone();
@@ -668,11 +655,59 @@ impl App {
         MenuStack::new(StartRoot::wrap(inner, hosting))
     }
 
+    /// Menus have no world. The hook still runs, so a mod can play a UI cue.
+    fn fan_menu_audio(&mut self, dt: f32, event: Option<GameEvent>) {
+        const EMPTY: &[PeerAudio] = &[];
+        const NO_IDS: &[&str] = &[];
+        let view = AudioView {
+            dt,
+            pos: DVec3::ZERO,
+            peers: EMPTY,
+            in_world: false,
+            voice_enabled: self.settings.voice_enabled,
+            hear_voice: self.settings.voice_incoming,
+            actions: ActionSet::NONE,
+            ids: NO_IDS,
+        };
+        let mut link = ModLink::idle();
+        {
+            let mut api = self.audio.api(&mut self.sound, &self.cues, None, None);
+            if let Some(event) = event.as_ref() {
+                self.mods.on_game_event(event, &mut api);
+            }
+            self.mods.on_audio(&view, &mut api, &mut link);
+        }
+        self.audio.settle_menu();
+    }
+
+    /// Tell the mods the world is changing, before the service drops its sessions.
+    fn fan_world_edge(&mut self, event: GameEvent) {
+        const EMPTY: &[PeerAudio] = &[];
+        const NO_IDS: &[&str] = &[];
+        let in_world = matches!(event, GameEvent::EnterWorld);
+        let view = AudioView {
+            dt: 0.0,
+            pos: DVec3::ZERO,
+            peers: EMPTY,
+            in_world,
+            voice_enabled: self.settings.voice_enabled,
+            hear_voice: self.settings.voice_incoming,
+            actions: ActionSet::NONE,
+            ids: NO_IDS,
+        };
+        let mut link = ModLink::idle();
+        {
+            let mut api = self.audio.api(&mut self.sound, &self.cues, None, None);
+            self.mods.on_game_event(&event, &mut api);
+            self.mods.on_audio(&view, &mut api, &mut link);
+        }
+        self.audio.settle_menu();
+    }
+
     /// Return to the start menu with an optional notice (e.g. a failed connect).
     fn return_to_menu(&mut self, notice: Option<String>) {
+        self.fan_world_edge(GameEvent::LeaveWorld);
         self.sound.leave_world();
-        // The director's trace-derived state and mic persist on App across worlds
-        // (unlike the old per-Game fields), so they need an explicit reset here.
         self.audio.enter_world();
         self.active = None;
         self.saves = save::list();
@@ -829,9 +864,8 @@ impl App {
         game.world_mut().prepare_around(pos);
         game.on_enter(eng, &mut self.router);
         self.sound.enter_world();
-        // The director's trace-derived state is world-scoped too, and must reset
-        // in lockstep with `sound`; its occurrence clock stays monotone.
         self.audio.enter_world();
+        self.fan_world_edge(GameEvent::EnterWorld);
         self.screen = Screen::Playing(Box::new(game));
     }
 
@@ -848,6 +882,7 @@ impl App {
             &mut self.settings,
             &mut self.sound,
             &mut self.audio,
+            &self.cues,
         );
         if let Signal::ExitToMenu = signal {
             self.flush_save();

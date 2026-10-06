@@ -82,9 +82,9 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const REJECT_DRAIN: Duration = Duration::from_secs(3);
 const RATE_LIMIT: u32 = 300;
 /// A 20 ms capture cadence is ~50 frames/s sustained; 100 leaves headroom for
-/// bursts while capping a voice flood under [`RATE_LIMIT`]. Excess frames are
-/// dropped silently — voice is loss-tolerant, never a kick trigger.
-const VOICE_RATE_LIMIT: u32 = 100;
+/// bursts while capping one channel under [`RATE_LIMIT`]. Excess frames are
+/// dropped silently — channel traffic is loss-tolerant, never a kick trigger.
+const CHANNEL_RATE_LIMIT: u32 = 100;
 /// Tool uses one connection may send per second: each one evaluates the law and may intern two
 /// configurations under the [`State`] lock, so the budget is a human's swing rate, not a flood.
 const TOOL_RATE_LIMIT: u32 = 12;
@@ -92,11 +92,6 @@ const TOOL_RATE_LIMIT: u32 = 12;
 /// A novel spec a client sends is interned only while at least this many ids stay free,
 /// so one client cannot fill the table (see [`take_novel_spec`]).
 const CLIENT_INTERN_RESERVE: usize = crate::block::registry::MAX_BLOCK_TYPES / 4;
-/// Player ids come from a strictly-incrementing `next_id` and are NEVER
-/// reused, so each id has exactly one incarnation and a constant epoch is
-/// sound. Reopen if ids ever become reusable: this must become a per-id join
-/// generation on `PlayerHandle`.
-const VOICE_EPOCH: u32 = 0;
 const INTEREST_RADIUS: f64 = 160.0 * crate::math::PER_METER;
 /// Squared once so the hot per-listener check in [`on_move`] needs no sqrt.
 const INTEREST_RADIUS_SQ: f64 = INTEREST_RADIUS * INTEREST_RADIUS;
@@ -159,6 +154,29 @@ impl Default for Config {
 /// would stall or desync the shared sky) and never a multi-day real-time cycle.
 fn clamp_day_secs(s: f32) -> f32 {
     if s.is_nan() { 600.0 } else { s.clamp(10.0, 86_400.0) }
+}
+
+/// One [`RateWindow`] per channel name. The first packet of a channel allocates
+/// the slot; later packets scan the small vec.
+struct ChannelBudget {
+    windows: Vec<(Arc<str>, RateWindow)>,
+}
+
+impl ChannelBudget {
+    fn new() -> Self {
+        Self { windows: Vec::new() }
+    }
+
+    fn allow(&mut self, channel: &protocol::Channel, now: Instant) -> bool {
+        let name = channel.as_str();
+        if let Some((_, window)) = self.windows.iter_mut().find(|(key, _)| key.as_ref() == name) {
+            return window.allow(now);
+        }
+        let mut window = RateWindow::new(CHANNEL_RATE_LIMIT);
+        let ok = window.allow(now);
+        self.windows.push((channel.share(), window));
+        ok
+    }
 }
 
 /// Sliding 1-second window: a stamp ages out once a full second has passed, so
@@ -962,10 +980,10 @@ fn client_loop(
     ctx: &Ctx,
     id: u32,
 ) {
-    // Voice carries a second, tighter per-second budget of its own: it is far
-    // chattier than any other message and must not eat a peer's general budget.
+    // Each mod channel carries a second, tighter per-second budget of its own:
+    // it is far chattier than any other message and must not eat the general budget.
     let mut rate = RateWindow::new(RATE_LIMIT);
-    let mut voice_rate = RateWindow::new(VOICE_RATE_LIMIT);
+    let mut channels = ChannelBudget::new();
     let mut tool_rate = RateWindow::new(TOOL_RATE_LIMIT);
     loop {
         // A kick (slow client) wakes this out of the blocking read so cleanup
@@ -1012,11 +1030,11 @@ fn client_loop(
                 on_chat(shared, ctx.hooks.as_ref(), id, channel, &text)
             }
             ClientMessage::SetTime { day } => on_set_time(shared, ctx, day),
-            ClientMessage::Voice { seq, payload } => {
-                if !voice_rate.allow(now) {
-                    continue; // Over the voice budget this second — drop silently.
+            ClientMessage::ModData { channel, seq, bytes } => {
+                if !channels.allow(&channel, now) {
+                    continue; // Over this channel's budget this second — drop silently.
                 }
-                on_voice(shared, id, seq, payload);
+                on_mod_data(shared, id, channel, seq, bytes);
             }
             // Clients ignore swings for unknown peers, so broadcast to
             // everyone-but-sender is safe.
@@ -1629,15 +1647,21 @@ fn on_chat(
     });
 }
 
-/// Voice is loss-tolerant: `try_send` and DROP on a full/closed queue, never
-/// counted toward the slow-client kick ([`kick_slow`]/[`OUT_CAPACITY`]) — a
-/// voice flood degrades only that listener's own audio.
-fn on_voice(shared: &Arc<Mutex<State>>, id: u32, seq: u32, payload: protocol::VoicePayload) {
+/// Channel traffic is loss-tolerant: `try_send` and DROP on a full/closed queue,
+/// never counted toward the slow-client kick ([`kick_slow`]/[`OUT_CAPACITY`]).
+/// Relayed only to the sender's visible interest set. The sender id is stamped
+/// here; the client's own message does not carry it. Size is capped by the codec.
+fn on_mod_data(
+    shared: &Arc<Mutex<State>>,
+    id: u32,
+    channel: protocol::Channel,
+    seq: u32,
+    bytes: protocol::ModBytes,
+) {
     let frame: Arc<[u8]> =
-        ServerMessage::PeerVoice { id, epoch: VOICE_EPOCH, seq, payload }.encode().into();
+        ServerMessage::PeerModData { channel, sender: id, seq, bytes }.encode().into();
     let state = shared.lock_recover();
     let Some(speaker) = state.players.get(&id) else { return };
-    // `visible` IS the interest audience; no separate distance scan needed.
     for &pid in &speaker.visible {
         if let Some(other) = state.players.get(&pid) && other.ready {
             let _ = other.out.try_send(frame.clone());
@@ -2292,11 +2316,10 @@ mod tests {
         }
     }
 
-    /// Voice relays to the speaker's interest set and nobody else, stamps the
-    /// server epoch, and — since it rides the shared queue with a plain
-    /// try_send — is simply absent from a peer who cannot hear the speaker.
+    /// A channel relays to the sender's interest set and nobody else, and the
+    /// server stamps the sender. A full queue simply drops the frame.
     #[test]
-    fn voice_relays_only_to_the_visible_set() {
+    fn mod_data_relays_only_to_the_visible_set() {
         let (out1, _rx1) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
         let (out2, rx2) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
         let (out3, rx3) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
@@ -2309,15 +2332,31 @@ mod tests {
         players.insert(3u32, test_player(DVec3::new(9e3, 20.0, 0.0), out3, test_kick()));
         let shared = Arc::new(Mutex::new(test_state(players)));
 
-        on_voice(&shared, 1, 42, vec![1, 2, 3].try_into().unwrap());
+        let channel = protocol::Channel::parse("voice").unwrap();
+        on_mod_data(&shared, 1, channel, 42, vec![1, 2, 3].try_into().unwrap());
 
         match ServerMessage::decode(&rx2.try_recv().expect("the visible peer hears it")) {
-            Some(ServerMessage::PeerVoice { id, epoch, seq, payload }) => {
-                assert_eq!((id, epoch, seq, payload.as_slice()), (1, VOICE_EPOCH, 42, &[1, 2, 3][..]));
+            Some(ServerMessage::PeerModData { channel, sender, seq, bytes }) => {
+                assert_eq!(channel.as_str(), "voice");
+                assert_eq!((sender, seq, bytes.as_slice()), (1, 42, &[1, 2, 3][..]));
             }
-            other => panic!("expected PeerVoice, got {other:?}"),
+            other => panic!("expected PeerModData, got {other:?}"),
         }
         assert!(rx3.try_recv().is_err(), "a peer outside interest hears nothing");
+    }
+
+    /// 100 frames on one channel, then the next is dropped. A second channel still has its own budget.
+    #[test]
+    fn channel_budget_is_per_channel_and_drops_the_overflow() {
+        let mut budget = ChannelBudget::new();
+        let voice = protocol::Channel::parse("voice").unwrap();
+        let other = protocol::Channel::parse("other").unwrap();
+        let now = Instant::now();
+        for _ in 0..CHANNEL_RATE_LIMIT {
+            assert!(budget.allow(&voice, now));
+        }
+        assert!(!budget.allow(&voice, now), "the 101st frame on one channel is dropped");
+        assert!(budget.allow(&other, now), "a second channel keeps its own budget");
     }
 
     /// A late joiner reads the CURRENT phase, not the last set value.

@@ -12,7 +12,7 @@ mod alloc_count;
 #[global_allocator]
 static ALLOC: alloc_count::Counting = alloc_count::Counting;
 pub mod app;
-pub(crate) mod audio;
+pub mod audio;
 pub(crate) mod avatar;
 pub(crate) mod benchmark;
 pub mod block;

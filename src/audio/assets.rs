@@ -128,9 +128,9 @@ impl Default for SoundConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::acoustics::Response;
     use crate::audio::backend::null::NullBackend;
-    use crate::audio::content::Catalog;
-    use crate::audio::palette::CuePalette;
+    use crate::audio::content::{Catalog, ClipMode};
 
     #[test]
     fn config_from_assets_keeps_sounds_and_music_as_siblings() {
@@ -161,8 +161,19 @@ mod tests {
         let mut backend = NullBackend::new();
         let (catalog, symbols) =
             Catalog::load(&root.join("sounds"), &mut backend).expect("packaged sound catalog");
-        let (_, warnings) = CuePalette::build(&symbols, &catalog);
-        assert!(warnings.is_empty(), "catalog role warnings: {warnings:?}");
+        let roles = [
+            ("break_default", Response::World),
+            ("place_default", Response::World),
+            ("step_default", Response::World),
+            ("swing", Response::World),
+            ("menu_click", Response::Ui),
+            ("voicetest", Response::Ui),
+        ];
+        for (name, response) in roles {
+            let raw = symbols.raw(name).unwrap_or_else(|| panic!("missing cue {name}"));
+            assert_eq!(catalog.response_of(raw), response, "{name}");
+            assert_eq!(catalog.mode_of(raw), ClipMode::OneShot, "{name}");
+        }
         assert!(root.join("music").is_dir());
     }
 }

@@ -420,9 +420,15 @@ impl BlockRegistry {
     }
 
     #[inline]
+    /// The acoustic class: absorption and the cue stem.
+    pub fn sound(&self, id: BlockId) -> SoundClass {
+        self.sound[id.0 as usize]
+    }
+
+    #[inline]
     /// The cue-catalog stem of the sound class.
     pub fn sound_class(&self, id: BlockId) -> &'static str {
-        self.sound[id.0 as usize].as_str()
+        self.sound(id).as_str()
     }
 
     #[inline]

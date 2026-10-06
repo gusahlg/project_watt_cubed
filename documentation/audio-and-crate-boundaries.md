@@ -12,13 +12,20 @@ The governing rule is:
 
 ## The current audio seam
 
-The audio path already has a strong snapshot boundary:
+The audio path has a snapshot boundary. Policy lives in mods; the core only
+carries it out.
 
 ```text
-game facts/events
+game facts
       |
       v
-AudioDirector -- policy and game adapters
+GameEvent fan-out + per-frame on_audio   (pwc.sounds, pwc.proximity-chat)
+      |
+      v
+AudioApi  --  cue plays, voice sessions, capture
+      |
+      v
+AudioService::finish
       |
       v
 AudioFrame -- validated, owned snapshot
@@ -27,37 +34,35 @@ AudioFrame -- validated, owned snapshot
 SoundSystem -- allocation, mixing, continuation
       |
       v
-backend -- Kira/device or silent fallback
+backend -- Kira/device, silent fallback, or the recording backend
 ```
 
-[`audio/frame.rs`](../src/audio/frame.rs) is the most important part of this
-shape. `AudioFrame::new` validates bounds, ordering, finite values, and stable
-IDs once; the runtime can then consume the frame without cloning or repeating
-validation. [`audio/acoustics.rs`](../src/audio/acoustics.rs) is also already a
-pure kernel. Content loading, runtime voice allocation, capture, Opus sessions,
-and device backends are cohesive audio concerns.
+[`audio/frame.rs`](../src/audio/frame.rs) is the commit boundary.
+`AudioFrame::new` validates bounds, ordering, finite values, and stable IDs
+once; the runtime then consumes the frame without cloning or repeating
+validation. [`audio/acoustics.rs`](../src/audio/acoustics.rs) is a pure kernel.
+Content loading, runtime voice allocation, capture, Opus sessions, and device
+backends stay in the core: a format-1 mod cannot depend on crates.io, and part
+of this code is AGPL-only.
 
-[`audio/director.rs`](../src/audio/director.rs) is different: it translates
-`World`, `Connection`, `Console`, player motion, and block facts into audio
-intent. That is client/game policy and should remain in the client when the
-runtime becomes a crate. The audio crate should accept facts and snapshots, not
-borrow the game.
+[`audio/service.rs`](../src/audio/service.rs) is the client adapter. It keeps
+the gait (a footstep is a `GameEvent`), the acoustic window, the microphone,
+and the voice-session wishes. It does not choose cues. `pwc.sounds` maps
+events to catalog cues. `pwc.proximity-chat` maps the roster and push-to-talk
+onto sessions and the `"voice"` mod channel. With those mods disabled the core
+plays nothing and never opens the microphone.
 
-Two dependencies must be corrected before extraction:
+[`world/query.rs`](../src/world/query.rs) still builds `audio::AcousticWindow`.
+Before an audio crate is extracted, move that snapshot vocabulary to a neutral
+leaf, or let the adapter build it from a generic occupancy query. `world` must
+not depend on the output system consuming the snapshot.
 
-- [`world/query.rs`](../src/world/query.rs) currently constructs
-  `audio::AcousticWindow`, while the director depends on `World`. Move the
-  acoustic snapshot vocabulary to a neutral leaf, or let a game-side adapter
-  build it from a generic world occupancy query. `world` must not depend on the
-  output system consuming the snapshot.
-- [`audio/palette.rs`](../src/audio/palette.rs) imports block `SoundClass`.
-  That enum is a presentation of `Observation` (`SoundClass::of` in
-  [`block/registry.rs`](../src/block/registry.rs)): hardness and
-  transparency — not authored per-element stats. Either keep the class next
-  to observations in content, or hand audio an audio-neutral material key.
+`SoundClass` stays next to observations (`SoundClass::of` in
+[`block/registry.rs`](../src/block/registry.rs)). Mods read it through
+`AudioApi::block_sound`. The cue table is the sounds mod.
 
-Settings may still produce an audio mix at the client composition root, but a
-future audio runtime should not know about `Settings`.
+Settings stay a core mix (`Settings::mix_change`). The service reads it; a
+future audio runtime should still not import `Settings`.
 
 ### Music ownership
 
@@ -108,9 +113,10 @@ unused code.
 ### Audio
 
 1. Break the `world`/audio snapshot dependency described above.
-2. Keep `AudioDirector` and the network/console/capture orchestration adapter in
-   the client; move only the runtime and pure kernels.
-3. Give material sound classification a domain-owned value or a narrow adapter.
+2. Keep `AudioService` (gait, window, capture, session wishes) in the client.
+   The mods own policy. Move only the runtime and pure kernels.
+3. Keep material sound classification next to observations. Mods read it; they
+   do not own the enum.
 4. Preserve `AudioFrame` as the only commit boundary and keep silent fallback a
    normal runtime state.
 

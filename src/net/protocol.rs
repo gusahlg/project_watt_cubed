@@ -24,7 +24,7 @@ use crate::presence::Stance;
 use crate::world::terrain::TerrainCfg;
 use crate::world::generation::WorldgenKind;
 
-use super::{MAX_FRAME, MAX_VOICE_PAYLOAD};
+use super::{MAX_FRAME, MAX_MOD_BYTES};
 
 pub(crate) fn law_stamp() -> [u8; material::STAMP_LEN] {
     let v = material::Law::current().stamp();
@@ -174,42 +174,78 @@ impl Wire for bool {
     }
 }
 
-/// Raw audio bytes already known to fit [`MAX_VOICE_PAYLOAD`] — the bound is
-/// checked once, in `TryFrom<Vec<u8>>` below, so nothing downstream (encode,
-/// relay) needs to re-check or trust a caller.
-#[derive(Clone, Debug, PartialEq)]
-pub struct VoicePayload(Vec<u8>);
+/// A mod channel name: 1..=16 bytes of UTF-8. The length prefix is a `u8`.
+/// Empty, over-long, and non-UTF-8 names reject the whole message.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Channel(Arc<str>);
 
-impl VoicePayload {
+impl Channel {
+    pub const MAX_LEN: usize = 16;
+
+    /// `None` when `name` is empty or longer than [`Self::MAX_LEN`].
+    pub fn parse(name: &str) -> Option<Self> {
+        (1..=Self::MAX_LEN).contains(&name.len()).then(|| Self(Arc::from(name)))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub(crate) fn share(&self) -> Arc<str> {
+        Arc::clone(&self.0)
+    }
+}
+
+impl Wire for Channel {
+    fn put(&self, w: &mut codec::Writer) {
+        w.u8(self.0.len() as u8);
+        w.raw(self.0.as_bytes());
+    }
+    fn get(r: &mut codec::Reader) -> Option<Self> {
+        let len = r.u8().ok()? as usize;
+        if !(1..=Self::MAX_LEN).contains(&len) {
+            return None;
+        }
+        let bytes = r.take(len).ok()?;
+        let name = std::str::from_utf8(bytes).ok()?;
+        Some(Self(Arc::from(name)))
+    }
+}
+
+/// Opaque bytes on a mod channel, already known to fit [`MAX_MOD_BYTES`].
+/// Empty is legal. The bound is checked once, in `TryFrom` and in [`Wire::get`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModBytes(Vec<u8>);
+
+impl ModBytes {
+    #[cfg(test)]
     pub fn as_slice(&self) -> &[u8] {
         &self.0
     }
 
-    pub fn into_boxed_slice(self) -> Box<[u8]> {
-        self.0.into_boxed_slice()
+    pub fn into_vec(self) -> Vec<u8> {
+        self.0
     }
 }
 
-/// `Err` if `bytes` exceeds [`MAX_VOICE_PAYLOAD`] — the only place that bound
-/// is enforced; every `VoicePayload` in the system is provably in range.
-impl TryFrom<Vec<u8>> for VoicePayload {
+/// `Err` if `bytes` exceeds [`MAX_MOD_BYTES`].
+impl TryFrom<Vec<u8>> for ModBytes {
     type Error = ();
     fn try_from(bytes: Vec<u8>) -> Result<Self, ()> {
-        (bytes.len() <= MAX_VOICE_PAYLOAD).then_some(Self(bytes)).ok_or(())
+        (bytes.len() <= MAX_MOD_BYTES).then_some(Self(bytes)).ok_or(())
     }
 }
 
 /// u16 length prefix, then the bytes. Decode rejects a length prefix past the
-/// cap before the bytes are trusted — a hostile peer can't smuggle an
-/// over-cap frame past the codec.
-impl Wire for VoicePayload {
+/// cap before the bytes are trusted.
+impl Wire for ModBytes {
     fn put(&self, w: &mut codec::Writer) {
         w.u16(self.0.len() as u16);
         w.raw(&self.0);
     }
     fn get(r: &mut codec::Reader) -> Option<Self> {
         let len = r.u16().ok()? as usize;
-        if len > MAX_VOICE_PAYLOAD {
+        if len > MAX_MOD_BYTES {
             return None;
         }
         Some(Self(r.take(len).ok()?.to_vec()))
@@ -303,7 +339,7 @@ mod tag {
     pub const SWING: u8 = 5;
     pub const PING: u8 = 6;
     pub const TELEPORT: u8 = 7;
-    pub const VOICE: u8 = 8;
+    pub const MOD_DATA: u8 = 8;
     pub const TOOL_USE: u8 = 9;
     pub const CRUISE: u8 = 10;
 
@@ -321,7 +357,7 @@ mod tag {
     pub const EDIT_ACK: u8 = 11;
     pub const POSITION: u8 = 12;
     pub const PEER_EXITED: u8 = 13;
-    pub const PEER_VOICE: u8 = 14;
+    pub const PEER_MOD_DATA: u8 = 14;
     pub const TOOL_RESULT: u8 = 15;
 }
 
@@ -361,11 +397,10 @@ messages! {
         Chat = tag::CHAT { channel: u8, text: Arc<str> },
         /// `day` is a `[0,1)` fraction.
         SetTime = tag::SET_TIME { day: f32 },
-        /// Part of a loss-tolerant journal: `seq` orders the sender's own stream so
-        /// the receiver's jitter buffer can reorder and detect gaps. The server
-        /// stamps speaker id + epoch on relay; the client never mints those.
-        /// `payload` is bounded by [`MAX_VOICE_PAYLOAD`](super::MAX_VOICE_PAYLOAD).
-        Voice = tag::VOICE { seq: u32, payload: VoicePayload },
+        /// Bytes on a named channel. `seq` orders the sender's own stream. The server
+        /// stamps the sender on relay; the client never names itself. `bytes` is
+        /// bounded by [`MAX_MOD_BYTES`](super::MAX_MOD_BYTES). Rides the reliable stream.
+        ModData = tag::MOD_DATA { channel: Channel, seq: u32, bytes: ModBytes },
         /// Use the held configuration `tool_spec` as a tool on the cell: the server runs ONE
         /// operation of the law between the cell (A) and the tool (B) and answers with
         /// [`ServerMessage::ToolResult`]. `req`/`expect` as for [`Edit`](Self::Edit).
@@ -416,11 +451,10 @@ messages! {
         /// `day` is a `[0,1)` fraction and `day_secs` the shared real-seconds
         /// length of a full cycle, so every clock advances in step.
         Time = tag::S_TIME { day: f32, day_secs: f32 },
-        /// `id` is the speaker's server-assigned player id (the runtime's
-        /// `SessionKey`); `epoch` distinguishes reconnections under a reused id —
-        /// constant `0` here because the server never reuses ids. `seq` and
-        /// `payload` are the sender's own [`ClientMessage::Voice`] values, unchanged.
-        PeerVoice = tag::PEER_VOICE { id: u32, epoch: u32, seq: u32, payload: VoicePayload },
+        /// A [`ClientMessage::ModData`] relayed to the sender's visible interest set.
+        /// `sender` is stamped by the server from the authenticated player id.
+        /// `seq` and `bytes` are the sender's own values, unchanged.
+        PeerModData = tag::PEER_MOD_DATA { channel: Channel, sender: u32, seq: u32, bytes: ModBytes },
         /// The outcome of the sender's [`ClientMessage::ToolUse`] `req`: whether the law moved
         /// anything, the cell's committed revision, and both configurations afterwards (unchanged
         /// specs when nothing reacted or the request was refused).
@@ -543,8 +577,16 @@ mod tests {
             },
             ClientMessage::Chat { channel: 1, text: "hello world".into() },
             ClientMessage::SetTime { day: 0.5 },
-            ClientMessage::Voice { seq: 5, payload: vec![1, 2, 3, 4].try_into().unwrap() },
-            ClientMessage::Voice { seq: 0, payload: Vec::new().try_into().unwrap() },
+            ClientMessage::ModData {
+                channel: Channel::parse("voice").unwrap(),
+                seq: 5,
+                bytes: vec![1, 2, 3, 4].try_into().unwrap(),
+            },
+            ClientMessage::ModData {
+                channel: Channel::parse("voice").unwrap(),
+                seq: 0,
+                bytes: Vec::new().try_into().unwrap(),
+            },
             ClientMessage::ToolUse { req: 3, x: 5, y: -60, z: 9, expect: 2, tool_spec: "c:0101020304".into() },
         ]
     }
@@ -604,8 +646,18 @@ mod tests {
                 text: "hi".into(),
             },
             ServerMessage::Time { day: 0.75, day_secs: 600.0 },
-            ServerMessage::PeerVoice { id: 3, epoch: 0, seq: 5, payload: vec![9, 8, 7].try_into().unwrap() },
-            ServerMessage::PeerVoice { id: 1, epoch: 2, seq: 0, payload: Vec::new().try_into().unwrap() },
+            ServerMessage::PeerModData {
+                channel: Channel::parse("voice").unwrap(),
+                sender: 3,
+                seq: 5,
+                bytes: vec![9, 8, 7].try_into().unwrap(),
+            },
+            ServerMessage::PeerModData {
+                channel: Channel::parse("voice").unwrap(),
+                sender: 1,
+                seq: 0,
+                bytes: Vec::new().try_into().unwrap(),
+            },
             ServerMessage::ToolResult {
                 req: 3,
                 reacted: true,
@@ -936,37 +988,60 @@ mod tests {
     }
 
     #[test]
-    fn voice_payload_at_the_cap_round_trips_both_directions() {
-        let payload: VoicePayload = (0..MAX_VOICE_PAYLOAD).map(|i| i as u8).collect::<Vec<u8>>().try_into().unwrap();
-        let cm = ClientMessage::Voice { seq: 99, payload: payload.clone() };
+    fn mod_bytes_at_the_cap_round_trip_both_directions() {
+        let bytes: ModBytes = (0..MAX_MOD_BYTES).map(|i| i as u8).collect::<Vec<u8>>().try_into().unwrap();
+        let channel = Channel::parse("voice").unwrap();
+        let cm = ClientMessage::ModData { channel: channel.clone(), seq: 99, bytes: bytes.clone() };
         assert_eq!(ClientMessage::decode(&cm.encode()), Some(cm));
-        let sm = ServerMessage::PeerVoice { id: 7, epoch: 0, seq: 99, payload };
+        let sm = ServerMessage::PeerModData { channel, sender: 7, seq: 99, bytes };
         assert_eq!(ServerMessage::decode(&sm.encode()), Some(sm));
     }
 
-    /// A frame whose length prefix claims more than [`MAX_VOICE_PAYLOAD`] is
-    /// refused by the decoder before the bytes are trusted — the encode path
-    /// can't build one (`VoicePayload::try_from` refuses it), so the frame is
-    /// forged directly, exactly as a hostile peer would.
+    /// A frame whose length prefix claims more than [`MAX_MOD_BYTES`] is refused
+    /// before the bytes are trusted. The encode path can't build one
+    /// (`ModBytes::try_from` refuses it), so the frame is forged, channel prefix included.
     #[test]
-    fn oversized_voice_frame_is_rejected_both_directions() {
-        let over = vec![0u8; MAX_VOICE_PAYLOAD + 1];
+    fn oversized_mod_frame_is_rejected_both_directions() {
+        let over = vec![0u8; MAX_MOD_BYTES + 1];
 
         let mut w = codec::Writer::new();
-        w.u8(super::tag::VOICE);
+        w.u8(super::tag::MOD_DATA);
+        w.u8(5);
+        w.raw(b"voice");
         w.u32(1);
         w.u16(over.len() as u16);
         w.raw(&over);
         assert_eq!(ClientMessage::decode(&w.into_inner()), None);
 
         let mut w = codec::Writer::new();
-        w.u8(super::tag::PEER_VOICE);
-        w.u32(2); // id
-        w.u32(0); // epoch
+        w.u8(super::tag::PEER_MOD_DATA);
+        w.u8(5);
+        w.raw(b"voice");
+        w.u32(2); // sender
         w.u32(1); // seq
         w.u16(over.len() as u16);
         w.raw(&over);
         assert_eq!(ServerMessage::decode(&w.into_inner()), None);
+    }
+
+    #[test]
+    fn a_bad_channel_name_rejects_the_message() {
+        fn forged(tag: u8, len: u8, name: &[u8]) -> Vec<u8> {
+            let mut w = codec::Writer::new();
+            w.u8(tag);
+            w.u8(len);
+            w.raw(name);
+            w.u32(1);
+            w.u16(0);
+            w.into_inner()
+        }
+        assert_eq!(ClientMessage::decode(&forged(super::tag::MOD_DATA, 0, b"")), None);
+        assert_eq!(ClientMessage::decode(&forged(super::tag::MOD_DATA, 17, &[b'a'; 17])), None);
+        assert_eq!(ClientMessage::decode(&forged(super::tag::MOD_DATA, 1, &[0xff])), None);
+        assert_eq!(ServerMessage::decode(&forged(super::tag::PEER_MOD_DATA, 0, b"")), None);
+        assert!(Channel::parse("").is_none());
+        assert!(Channel::parse(&"a".repeat(17)).is_none());
+        assert!(Channel::parse("voice").is_some());
     }
 
     #[test]

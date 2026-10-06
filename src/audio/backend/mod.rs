@@ -3,7 +3,6 @@
 
 pub(crate) mod kira;
 pub(crate) mod null;
-#[cfg(test)]
 pub(crate) mod recording;
 
 use std::io::Cursor;
