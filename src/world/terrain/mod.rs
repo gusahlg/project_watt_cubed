@@ -498,6 +498,16 @@ fn rel_box(centre: [i64; 3], lo: [i64; 3], hi: [i64; 3]) -> ([i64; 3], [i64; 3])
 /// Shared handle workers clone.
 pub type Generator = Arc<dyn TerrainGenerator>;
 
+/// Pay the process-wide first-use cost of [`generator`] (about 30 ms in release, shared by every
+/// seed) on a spare thread, so the first world built on the main thread does not stall a frame.
+/// Racing a real first build is harmless: the shared tables are built once.
+pub fn prewarm() {
+    let _ = std::thread::Builder::new().name("worldgen-prewarm".into()).spawn(|| {
+        let mut registry = BlockRegistry::with_builtins();
+        let _ = generator(&mut registry, 0, TerrainCfg::default());
+    });
+}
+
 /// Build the generator for `seed`, interning its materials into `registry`.
 pub fn generator(registry: &mut BlockRegistry, seed: i64, cfg: TerrainCfg) -> Generator {
     Arc::new(Terrain::with_cfg(registry, seed, cfg))
