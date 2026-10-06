@@ -933,14 +933,16 @@ fn covers_near(s: SectionPos, near: (i64, i64, i64, i64), across: Option<&super:
 /// Farthest and nearest distance from `(eu, ev)` to the closed span square of `s`.
 /// The farthest corner is what [`World::full_res_covers`](super::World::full_res_covers) tests.
 pub(in crate::world) fn span_reach(s: SectionPos, eu: i32, ev: i32) -> (f32, f32) {
-    let span = s.span();
-    let (x0, z0) = (s.min_x(), s.min_z());
+    // In f64: block distances to far tiles reach millions, and their squares overflow i32.
+    let span = f64::from(s.span());
+    let (x0, z0) = (f64::from(s.min_x()), f64::from(s.min_z()));
     let (x1, z1) = (x0 + span, z0 + span);
-    let fx = (x0 - eu).abs().max((x1 - eu).abs()) as f32;
-    let fz = (z0 - ev).abs().max((z1 - ev).abs()) as f32;
-    let dx = if eu < x0 { x0 - eu } else if eu > x1 { eu - x1 } else { 0 };
-    let dz = if ev < z0 { z0 - ev } else if ev > z1 { ev - z1 } else { 0 };
-    ((fx * fx + fz * fz).sqrt(), ((dx * dx + dz * dz) as f32).sqrt())
+    let (eu, ev) = (f64::from(eu), f64::from(ev));
+    let fx = (x0 - eu).abs().max((x1 - eu).abs());
+    let fz = (z0 - ev).abs().max((z1 - ev).abs());
+    let dx = (x0 - eu).max(eu - x1).max(0.0);
+    let dz = (z0 - ev).max(ev - z1).max(0.0);
+    (fx.hypot(fz) as f32, dx.hypot(dz) as f32)
 }
 
 /// Pieces of a cube-face section against the full-view skip disk. A tile that crosses the disk, or
@@ -8050,4 +8052,18 @@ mod tests {
             assert_eq!(uncovered(&world), 0, "{name}: sections left uncovered");
         }
     }
+
+    /// Far tiles: block distances in the millions, whose squares overflow i32.
+    #[test]
+    fn span_reach_holds_far_tiles_without_overflow() {
+        use super::super::section::SectionPos;
+        let s = SectionPos { body: 2, face: Face::PosY, detail: crate::ident::Detail(6), x: 1000, z: -1000 };
+        let (far, near) = span_reach(s, 0, 0);
+        let (x0, z1) = (f64::from(s.min_x()), f64::from(s.min_z() + s.span()));
+        let near_want = x0.hypot(z1) as f32;
+        assert!(near > 1.0e6 && (near - near_want).abs() < 1.0, "near {near} vs {near_want}");
+        assert!(far > near);
+        assert_eq!(span_reach(s, s.min_x() + 1, s.min_z() + 1).1, 0.0, "inside the tile");
+    }
+
 }
