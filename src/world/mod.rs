@@ -1424,7 +1424,8 @@ pub struct World {
     /// Surface bounds the near-window punch read, kept across frontier recomputes.
     near_bounds: streaming::NearBounds,
     /// Desired sections the near window holds whose ground has not all settled, with the chunk
-    /// layers that ground spans. They keep drawing until those chunks do; admission skips them.
+    /// layers that ground spans. They keep drawing until those chunks do. Admission skips one
+    /// only once a Ready section already draws it.
     section_held: FastMap<SectionPos, [i32; 2]>,
     /// A chunk settled since the held sections were last checked.
     held_recheck: Sticky,
@@ -2067,10 +2068,11 @@ impl World {
     ///
     /// Skip only if all backing chunks are settled (drawable or born-air, never
     /// in-flight), to avoid holes during fast descent. A chart section the near
-    /// window holds is not loaded either: whatever already draws it keeps drawing
-    /// until its chunks have settled, then the punch drops it.
+    /// window holds is not loaded either once something already draws it: that cover
+    /// stays until its chunks have settled, then the punch drops it. Until a cover
+    /// exists the section is a hole, and admission has to load it.
     fn coverage_skips(&self, center: Coord, key: SectionPos) -> bool {
-        self.section_held.contains_key(&key) || self.full_res_covers(center, key)
+        (self.section_held.contains_key(&key) && self.section_covered(key)) || self.full_res_covers(center, key)
     }
 
     /// The full-res chunks draw everything `key` would: its footprint lies well inside the near
@@ -2985,21 +2987,22 @@ impl StreamLane for SectionLane {
             visit(s);
         }
     }
-    fn order(_world: &World, center: Coord, key: SectionPos) -> u64 {
-        let cs = CHUNK_SIZE as i32;
-        let span = key.span();
-        let (psx, psz) = (
-            (center.x * cs).div_euclid(span),
-            (center.z * cs).div_euclid(span),
-        );
-        (key.x - psx).abs().max((key.z - psz).abs()) as u64
+    fn order(world: &World, center: Coord, key: SectionPos) -> u64 {
+        let span = key.span() as i64;
+        let (x, z) = world.net_column(center, key.min_x() as i64 + span / 2, key.min_z() as i64 + span / 2);
+        let cs = CHUNK_SIZE as i64;
+        let (psx, psz) = ((center.x as i64 * cs).div_euclid(span), (center.z as i64 * cs).div_euclid(span));
+        let (sx, sz) = (x.div_euclid(span), z.div_euclid(span));
+        (sx - psx).unsigned_abs().max((sz - psz).unsigned_abs())
     }
     fn dist2(world: &World, center: Coord, key: SectionPos) -> Option<u64> {
         // Sections are an XZ heightfield: pass the eye altitude as `wy` so
-        // `dy` is 0 and a vertical move does not reshuffle them.
+        // `dy` is 0 and a vertical move does not reshuffle them. A neighbour
+        // chart's column is measured where the net puts it, or its storage
+        // distance admits the far side of the box ahead of the seam.
         let span = key.span() as i64;
         let py = center.y as i64 * CHUNK_SIZE as i64 + CHUNK_SIZE as i64 / 2;
-        let (cx, cz) = (key.min_x() as i64 + span / 2, key.min_z() as i64 + span / 2);
+        let (cx, cz) = world.net_column(center, key.min_x() as i64 + span / 2, key.min_z() as i64 + span / 2);
         let base = player_dist2(center, cx, py, cz);
         // Bias by motion direction so leading edge fills first.
         let cs = CHUNK_SIZE as i64;

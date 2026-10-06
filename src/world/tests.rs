@@ -266,6 +266,44 @@ fn section_covering_gates_on_a_ready_ancestor_or_self() {
     assert!(world.section_covered(cell), "a Ready ancestor covers the finer cell");
 }
 
+/// A Ready finer tile keeps drawing while the coarser cut that replaces it is still meshing.
+/// The frame the coarser tile lands, it takes over.
+#[test]
+fn ready_finer_section_draws_while_its_cut_is_meshing() {
+    let mut world = lod2_world();
+    let center = stand_on_twin(&mut world);
+    let parent = SectionPos {
+        body: 0,
+        face: Face::PosY,
+        detail: Detail(section::FINEST_DETAIL.0 + 1),
+        x: 8_000,
+        z: -8_000,
+    };
+    let child = parent.child(section::Quadrant::ALL[0]);
+    let empty = || SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None };
+    world.section_desired = vec![parent];
+    world.sections.insert(child, empty());
+    world.sections.insert(parent, SectionState::Meshing { token: pipeline::ClaimToken(1) });
+    world.center = Some(center);
+    world.rebuild_section_visible(None);
+    assert!(world.section_visible.iter().any(|&(s, _)| s == child), "the ready child stopped drawing");
+    assert!(!world.section_visible.iter().any(|&(s, _)| s == parent), "a meshing parent drew");
+    world.sections.insert(parent, empty());
+    world.rebuild_section_visible(None);
+    assert!(world.section_visible.iter().any(|&(s, _)| s == parent), "the landed parent does not draw");
+    assert!(!world.section_visible.iter().any(|&(s, _)| s == child), "the child kept drawing over its ready parent");
+
+    // The child has left the visible set. Unload must keep it while the parent is meshing again,
+    // and drop it once the parent is Ready.
+    world.sections.insert(parent, SectionState::Meshing { token: pipeline::ClaimToken(1) });
+    world.section_visible.clear();
+    world.unload_sections_with(center, |_| {});
+    assert!(world.sections.contains_key(&child), "unload dropped the tile still covering the hole");
+    world.sections.insert(parent, empty());
+    world.unload_sections_with(center, |_| {});
+    assert!(!world.sections.contains_key(&child), "the child stayed after its parent could draw");
+}
+
 /// The fast-movement staleness fix (user report: flying far up left a
 /// couple of stale LOD cubes floating over a missing far field): the load
 /// lane is LEVEL-triggered — armed for as long as any desired cell is
@@ -790,8 +828,10 @@ fn failed_jobs_release_claims_then_quarantine_after_repeated_strikes() {
 }
 
 /// Descheduled (left-behind) jobs release their claims like panics do,
-/// but with NO strike, NO quarantine, and no forced requeue — coming back
-/// later must re-request the work as if it had never been claimed.
+/// but with NO strike and NO quarantine. This world has no streaming centre,
+/// so the mesh is outside the box and is not requeued — coming back later
+/// must re-request it. A mesh still inside the box is re-seeded
+/// ([`cancelled_in_box_mesh_is_reseeded`]).
 #[test]
 fn cancelled_jobs_release_claims_without_strikes() {
     let mut world = World::generate();
@@ -828,6 +868,40 @@ fn cancelled_jobs_release_claims_without_strikes() {
 
     assert!(world.quarantined.is_empty(), "cancellation is not a failure");
     assert!(world.job_strikes.is_empty(), "cancellation earns no strikes");
+}
+
+/// A cancelled mesh still inside the mesh box goes back on the worklist. One outside does not:
+/// the shell scan never revisits an interior chunk, and left-behind work stays unqueued.
+#[test]
+fn cancelled_in_box_mesh_is_reseeded() {
+    let mut world = World::generate();
+    let coord = *world.chunks.keys().next().unwrap();
+    world.set_view_distances(2, 2);
+    world.center = Some(coord);
+    world.stream_up = Some(Face::PosY);
+    world.stream_up_set = true;
+    // A missing neighbour keeps the re-seed from settling a buried solid as air.
+    world.chunks.remove(&world.neighbour(coord, Face::PosX));
+    assert!(!world.neighbours_have_data(coord));
+    world.chunks.get_mut(&coord).unwrap().state = MeshState::NeedsMesh { building: true, prev: None };
+    world.mesh_worklist.clear();
+    world.pending_fresh.take();
+    assert!(world.in_mesh_box(coord));
+    world.cancel_job(pipeline::JobKey::Mesh { coord });
+    assert!(matches!(world.chunks[&coord].state, MeshState::NeedsMesh { building: false, prev: None }));
+    assert!(world.mesh_worklist.contains(&coord), "the in-box mesh was not re-seeded");
+    assert!(world.pending_fresh.get(), "the re-seed did not arm admission");
+
+    let outside = ChunkCoord::new(coord.x + 8, coord.y, coord.z);
+    world.ensure_data(outside);
+    world.chunks.get_mut(&outside).unwrap().state = MeshState::NeedsMesh { building: true, prev: None };
+    world.mesh_worklist.remove(&outside);
+    world.pending_fresh.take();
+    assert!(!world.in_mesh_box(outside));
+    world.cancel_job(pipeline::JobKey::Mesh { coord: outside });
+    assert!(matches!(world.chunks[&outside].state, MeshState::NeedsMesh { building: false, prev: None }));
+    assert!(!world.mesh_worklist.contains(&outside), "an out-of-box cancel was requeued");
+    assert!(!world.pending_fresh.get(), "an out-of-box cancel armed admission");
 }
 
 /// The claim rule at the light-result consumption site: an unusable result
@@ -3702,7 +3776,10 @@ fn open_gen_cursor_drains_across_frames() {
         let pool = world.worker_pool();
         let cap = pool.worker_capacity();
         pool.set_pacing(cap, (cap * 4).max(8));
-        pool.set_view(center.x, center.y, center.z, pipeline::FarView::flat(center.x, center.z), 1, 0.0, 0.0, 0.0, 0.0, None);
+        pool.set_view(
+            center.x, center.y, center.z, pipeline::FarView::flat(center.x, center.z), 1, 0.0, 0.0, 0.0, 0.0, None,
+            super::seam::Unfold::IDENTITY,
+        );
     }
     let budget = voxel_engine::producer::Budget::Millis(0.0);
     world.request_region_data(center, budget);
@@ -3796,7 +3873,10 @@ fn buried_solid_mesh_is_air_and_an_edit_remeshes_it() {
         let pool = world.worker_pool();
         let cap = pool.worker_capacity();
         pool.set_pacing(cap, (cap * 4).max(8));
-        pool.set_view(center.x, center.y, center.z, pipeline::FarView::flat(center.x, center.z), 2, 0.0, 0.0, 0.0, 0.0, up);
+        pool.set_view(
+            center.x, center.y, center.z, pipeline::FarView::flat(center.x, center.z), 2, 0.0, 0.0, 0.0, 0.0, up,
+            super::seam::Unfold::IDENTITY,
+        );
     }
     admit::<MeshLane>(
         &mut world,
@@ -3902,7 +3982,10 @@ fn asteroid_entry_breakdown() {
         let cap = pool.worker_capacity();
         // Heavy entry frames stay unboosted: lookahead is `active * 4`.
         pool.set_pacing(cap, (cap * 4).max(8));
-        pool.set_view(center.x, center.y, center.z, pipeline::FarView::flat(center.x, center.z), VIEW_H, 0.0, 0.0, 0.0, 0.0, up);
+        pool.set_view(
+            center.x, center.y, center.z, pipeline::FarView::flat(center.x, center.z), VIEW_H, 0.0, 0.0, 0.0, 0.0, up,
+            super::seam::Unfold::IDENTITY,
+        );
         cap
     };
     // `None` up: every axis uses the horizontal radius. Data box adds one shell.

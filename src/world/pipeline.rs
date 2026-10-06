@@ -798,9 +798,12 @@ impl ViewGate {
         vel_y: f64,
         vel_z: f64,
         up: Option<Face>,
+        fold: super::seam::Unfold,
     ) {
-        // Stored ahead of the centre, so the one epoch bump below publishes the far centre and its
-        // net together: a re-key measuring from a centre in another chart's net deschedules it all.
+        // Stored ahead of the centres, so the one epoch bump below publishes each centre with its
+        // net. A re-key that measured the new net from the other chart's centre would deschedule
+        // every queued job: the charts' storage boxes do not overlap.
+        let near_net_moved = Self::store_fold(&self.fold, &self.folded, fold);
         let far_net_moved = Self::store_fold(&self.far_fold, &self.far_folded, far.fold);
         let far_bits = far_m.to_bits();
         let vx = vel_x.to_bits();
@@ -810,7 +813,8 @@ impl ViewGate {
             Some(face) => face as u8,
             None => UP_NONE,
         };
-        let same_center = !far_net_moved
+        let same_center = !near_net_moved
+            && !far_net_moved
             && self.cx.load(Ordering::Relaxed) == cx
             && self.cy.load(Ordering::Relaxed) == cy
             && self.cz.load(Ordering::Relaxed) == cz
@@ -898,7 +902,9 @@ impl ViewGate {
         Face::from_index(self.up.load(Ordering::Relaxed))
     }
 
-    /// Publish the chart net (bumps the epoch so queued work re-keys).
+    /// Publish the chart net alone, against the centre already published. A caller about to move
+    /// the centre passes the net to [`publish`](Self::publish) instead: publishing the net first
+    /// re-keys the new net from the old centre and deschedules every near job.
     fn set_fold(&self, fold: super::seam::Unfold) {
         if Self::store_fold(&self.fold, &self.folded, fold) {
             self.epoch.fetch_add(1, Ordering::Release);
@@ -1474,6 +1480,7 @@ impl Workers {
         vel_y: f64,
         vel_z: f64,
         up: Option<Face>,
+        fold: super::seam::Unfold,
     ) {
         self.view.publish(
             cx,
@@ -1489,6 +1496,7 @@ impl Workers {
             vel_y,
             vel_z,
             up,
+            fold,
         );
     }
 
@@ -1510,13 +1518,15 @@ impl Workers {
         vel_y: f64,
         vel_z: f64,
         up: Option<Face>,
+        fold: super::seam::Unfold,
     ) {
         self.view.publish(
-            cx, cy, cz, far, radius, v_radius, margin, heading, far_m, vel_x, vel_y, vel_z, up,
+            cx, cy, cz, far, radius, v_radius, margin, heading, far_m, vel_x, vel_y, vel_z, up, fold,
         );
     }
 
-    /// Publish the chart net around a storage centre to the job gate.
+    /// Publish the chart net alone, against the centre already published. Callers about to move
+    /// the centre pass the net to [`set_view`](Self::set_view) instead.
     pub(in crate::world) fn set_fold(&self, fold: super::seam::Unfold) {
         self.view.set_fold(fold);
     }
@@ -2291,6 +2301,7 @@ mod tests {
                 0.0,
                 0.0,
                 Some(Face::PosY),
+                crate::world::seam::Unfold::IDENTITY,
             )
         };
         let mut q = JobQueue::default();
@@ -2471,6 +2482,7 @@ mod tests {
             0.0,
             0.0,
             Some(Face::PosY),
+            crate::world::seam::Unfold::IDENTITY,
         );
         let mut cancelled = Vec::new();
         let popped = q.pop(&gate, &mut cancelled).expect("the section under the far centre survives");
@@ -2479,6 +2491,91 @@ mod tests {
             matches!(&cancelled[..], [JobKey::Section { pos, .. }] if pos.x == 50),
             "only the section beyond the far horizon is descheduled: {cancelled:?}"
         );
+    }
+
+    /// The +Y chart's +Z edge and the chunk across that seam, with the net each chart publishes.
+    fn seam_edge(generator: &Generator) -> (Coord, Coord, crate::world::seam::Unfold, crate::world::seam::Unfold) {
+        use crate::space::atlas::Patch;
+        let home = generator.cosmos().expect("cosmos").home();
+        let atlas = generator
+            .atlases()
+            .iter()
+            .find(|a| (a.centre - home.centre_f()).length() < 1.0)
+            .expect("the start world is charted");
+        let (origin, size) = atlas.storage_box(Patch::Shell { band: 0, face: Face::PosY });
+        let cs = CHUNK_SIZE as i64;
+        let lo = |a: usize| (origin[a] / cs) as i32;
+        let hi = |a: usize| ((origin[a] + size[a]) / cs) as i32;
+        // Middle of the +Z face, so the step across is a seam and not a corner.
+        let y_c = Coord::new(lo(0) + (hi(0) - lo(0)) / 2, lo(1) + (hi(1) - lo(1)) / 2, hi(2) - 1);
+        let seams = crate::world::seam::Seams::new(generator.atlases().to_vec());
+        let z_c = seams.across(y_c, Face::PosZ).expect("the +Z edge is a seam").chunk;
+        (y_c, z_c, seams.unfold_at(y_c), seams.unfold_at(z_c))
+    }
+
+    /// Publishing a chart net in the same epoch as its centre keeps queued work on both sides of
+    /// the seam. Publishing the net while the centre is still the previous chart's chunk
+    /// deschedules both: storage boxes do not overlap, so every job looks out of range.
+    #[test]
+    fn publishing_the_near_net_with_its_centre_keeps_the_seam() {
+        let terrain = generator(42);
+        let (y_c, z_c, y_fold, z_fold) = seam_edge(&terrain);
+        let up = Some(Face::PosY);
+        assert_ne!(y_fold, z_fold, "the two charts share a net");
+        assert_eq!(y_fold.fold(y_c), y_c, "the +Y chunk is home in its own net");
+        assert_eq!(z_fold.fold(z_c), z_c, "the +Z chunk is home in its own net");
+        let stored = crate::world::World::order(z_c, y_c, up);
+        assert!(stored > 6 + CANCEL_MARGIN, "storage distance {stored} fits inside the view");
+        let beside = crate::world::World::order(z_fold.fold(y_c), z_c, up);
+        assert!(beside <= 6, "the +Y chunk does not fold beside the +Z centre: {beside}");
+        assert!(crate::world::World::order(y_fold.fold(z_c), y_c, up) <= 6, "the seam is not one net from +Y");
+
+        let column = |c: Coord| Job::GenerateColumn {
+            key: ColumnKey { face: Face::PosY, a: c.x, b: c.z },
+            range: c.y..=c.y,
+            generator: terrain.clone(),
+            edits: Vec::new(),
+        };
+        let publish = |gate: &ViewGate, c: Coord, fold: crate::world::seam::Unfold| {
+            gate.publish(
+                c.x,
+                c.y,
+                c.z,
+                FarView::flat(c.x, c.z),
+                6,
+                i32::MAX,
+                CANCEL_MARGIN,
+                0,
+                f64::INFINITY,
+                0.0,
+                0.0,
+                0.0,
+                up,
+                fold,
+            );
+        };
+
+        let mut together = JobQueue::default();
+        let gate = ViewGate::new();
+        publish(&gate, y_c, y_fold);
+        assert!(together.push(column(y_c), &gate) && together.push(column(z_c), &gate));
+        publish(&gate, z_c, z_fold);
+        let mut cancelled = Vec::new();
+        let mut kept = 0;
+        while together.pop(&gate, &mut cancelled).is_some() {
+            kept += 1;
+        }
+        assert_eq!(kept, 2, "one publish keeps both sides of the seam: {cancelled:?}");
+        assert!(cancelled.is_empty());
+
+        let mut split = JobQueue::default();
+        let gate = ViewGate::new();
+        publish(&gate, y_c, y_fold);
+        assert!(split.push(column(y_c), &gate) && split.push(column(z_c), &gate));
+        gate.set_fold(z_fold);
+        cancelled.clear();
+        assert!(split.pop(&gate, &mut cancelled).is_none(), "the split publish runs nothing");
+        assert_eq!(cancelled.len(), 2, "both claims are descheduled: {cancelled:?}");
     }
 
     /// Worker→main channel throughput (structural-opportunities #8): floods the

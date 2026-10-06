@@ -1521,6 +1521,20 @@ impl World {
         pipeline::FarView { x: centre.x, z: centre.z, fold }
     }
 
+    /// Storage column `(x, z)` in the chart net around `center`. Home columns stay themselves and a
+    /// neighbour's lands just past the seam. A column outside the net stays put: it is far, and a
+    /// non-finite stand-in would collapse to distance zero and be kept.
+    pub(in crate::world) fn net_column(&self, center: Coord, x: i64, z: i64) -> (i64, i64) {
+        let fold = if self.far_center == Some(center) {
+            self.far_fold
+        } else if self.center == Some(center) {
+            self.fold
+        } else {
+            self.seams.unfold_at(center)
+        };
+        fold.fold_column(x, z).unwrap_or((x, z))
+    }
+
     /// Whether far-field centre `center` stands on a round world's chart: in or above a storage
     /// box that is not a warped cube's.
     fn section_on_chart(&self, center: Coord) -> bool {
@@ -1530,7 +1544,9 @@ impl World {
 
     /// Adopt the chart net around streaming centre `centre`; returns whether it changed. A new net
     /// drops the previous boxes' diffs (they were measured in the old net) and re-buckets the
-    /// worklists.
+    /// worklists. The worker gate hears the net with the centre, in that publish — not here.
+    /// Publishing the net while the centre is still the previous chart's chunk deschedules every
+    /// queued near job.
     pub(in crate::world) fn adopt_fold(&mut self, centre: Coord) -> bool {
         let fold = self.seams.unfold_at(centre);
         if fold == self.fold {
@@ -1541,9 +1557,6 @@ impl World {
         self.prev_unload_box = None;
         self.mesh_worklist.set_fold(fold);
         self.light_worklist.set_fold(fold);
-        if let Some(workers) = self.workers.as_ref() {
-            workers.set_fold(fold);
-        }
         true
     }
 
@@ -1877,6 +1890,7 @@ impl World {
         let section_vel = self.section_vel;
         let tight = !self.loading_full();
         let slab = self.spawn_slab;
+        let fold = self.fold;
         let workers = self.worker_pool();
         if let Some(stager) = stager {
             workers.set_stager(stager);
@@ -1901,6 +1915,7 @@ impl World {
                 travel.y,
                 travel.z,
                 up,
+                fold,
             );
         } else {
             workers.set_view(
@@ -1914,6 +1929,7 @@ impl World {
                 section_vel.y,
                 section_vel.z,
                 up,
+                fold,
             );
         }
         let capacity = workers.worker_capacity();
@@ -2806,11 +2822,11 @@ impl World {
     }
 
     /// A queued job was DESCHEDULED at the pool: its region left the live view
-    /// while it waited (fast movement). Release the exact claim with no strike
-    /// and no requeue — the work is unwanted where the player is now, and the
-    /// boundary-cross scans re-request it if the player ever returns. A
-    /// still-loaded chunk the loading window still wants is owed its light
-    /// settle, so that light claim re-seeds.
+    /// while it waited (fast movement). Release the exact claim with no strike.
+    /// Work the player has left is not requeued — the boundary-cross scans
+    /// re-request it on return. A mesh still inside the mesh box is re-seeded:
+    /// that scan misses a cancel that lands after it. A still-loaded chunk the
+    /// loading window still wants is owed its light settle, so that claim re-seeds.
     pub(in crate::world) fn cancel_job(&mut self, key: pipeline::JobKey) {
         self.resolve_claim(key, ClaimOutcome::Cancelled);
     }
@@ -2827,8 +2843,8 @@ impl World {
     /// The ONE payload-less claim-resolution path (cancel and fail shared the
     /// whole per-kind release; only the strike/re-arm policy differed).
     /// RELEASE is unconditional per kind; RE-ARM follows `outcome`: a
-    /// cancellation re-arms only the light settle it still owes, a
-    /// non-quarantined failure re-arms its lane for the retry.
+    /// cancellation re-arms the light settle it still owes and a mesh still
+    /// inside the mesh box, a non-quarantined failure re-arms its lane.
     fn resolve_claim(&mut self, key: pipeline::JobKey, outcome: ClaimOutcome) {
         let rearm = match outcome {
             ClaimOutcome::Cancelled => matches!(key, pipeline::JobKey::Light { .. }),
@@ -2879,7 +2895,9 @@ impl World {
                         super::adjust_count(&mut self.building_meshes, true, false);
                     }
                 }
-                if rearm {
+                // The shell scan cannot see a cancel that lands after it, and nothing else
+                // re-seeds an interior chunk. Outside the box the work stays unqueued.
+                if rearm || self.in_mesh_box(coord) {
                     self.seed_mesh(coord);
                     self.pending_fresh.set();
                 }
@@ -2954,8 +2972,9 @@ impl World {
         let slab = Self::collision_slab(c, up);
         let (far_m, far_view) = (self.far_horizon(), self.far_view(f));
         let view_r = self.view.horizontal;
+        let fold = self.fold;
         let workers = self.worker_pool();
-        workers.set_view(c.x, c.y, c.z, far_view, view_r, far_m, 0.0, 0.0, 0.0, up);
+        workers.set_view(c.x, c.y, c.z, far_view, view_r, far_m, 0.0, 0.0, 0.0, up, fold);
         workers.set_slab(Some(slab));
         self.submit_slab_columns(slab);
         self.pending_gen.set();
@@ -4449,6 +4468,59 @@ impl World {
         out
     }
 
+    /// `s` is a Ready tile strictly under a desired cell that nothing Ready draws yet.
+    /// Unload and reclaim would otherwise drop it in the frame before the visible set
+    /// can stand it back in.
+    fn stands_under_hole(&self, s: SectionPos, desired: &FastSet<SectionPos>) -> bool {
+        if !self.sections.get(&s).is_some_and(|st| st.is_ready()) {
+            return false;
+        }
+        let max = crate::ident::Detail(crate::render_config::LOD_COARSEST_DETAIL as i8);
+        let mut p = s;
+        while p.detail < max {
+            p = p.parent();
+            if desired.contains(&p) && !self.section_covered(p) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Ready sections strictly under a drawn cell that has no Ready self or ancestor.
+    /// [`resolve_covering`](quadtree::resolve_covering) only walks up, so a tile that just
+    /// left the cut would pop off before its replacement can draw.
+    fn ready_tiles_under(
+        sections: &FastMap<SectionPos, SectionState>,
+        drawn: &[SectionPos],
+        max: crate::ident::Detail,
+    ) -> Vec<SectionPos> {
+        let ready = |p: SectionPos| sections.get(&p).is_some_and(|s| s.is_ready());
+        let mut holes = FastSet::default();
+        for &c in drawn {
+            if quadtree::drawable_cover(c, max, &ready).is_none() {
+                holes.insert(c);
+            }
+        }
+        if holes.is_empty() {
+            return Vec::new();
+        }
+        let mut extra = Vec::new();
+        for (&s, state) in sections {
+            if !state.is_ready() {
+                continue;
+            }
+            let mut p = s;
+            while p.detail < max {
+                p = p.parent();
+                if holes.contains(&p) {
+                    extra.push(s);
+                    break;
+                }
+            }
+        }
+        extra
+    }
+
     /// True if the cell or a Ready ancestor covers it.
     pub(in crate::world) fn section_covered(&self, cell: SectionPos) -> bool {
         let max = crate::ident::Detail(crate::render_config::LOD_COARSEST_DETAIL as i8);
@@ -4498,7 +4570,11 @@ impl World {
         let max = crate::ident::Detail(crate::render_config::LOD_COARSEST_DETAIL as i8);
         let ready = |p: SectionPos| self.sections.get(&p).is_some_and(|s| s.is_ready());
         // A cell the settled full-res chunks already draw hands over at once, ahead of the clip.
-        let drawn: Vec<SectionPos> = desired.iter().copied().filter(|&c| !self.full_res_covers(center, c)).collect();
+        let mut drawn: Vec<SectionPos> = desired.iter().copied().filter(|&c| !self.full_res_covers(center, c)).collect();
+        // A finer Ready tile keeps drawing while the cut that replaces it is still meshing.
+        // Dropping it first opens a hole; the coarser tile takes over the frame it lands.
+        let standins = Self::ready_tiles_under(&self.sections, &drawn, max);
+        drawn.extend(standins);
         let cut = quadtree::resolve_covering(&drawn, max, &ready);
         let backlog = desired.iter().any(|&c| {
             !self.sections.contains_key(&c)
@@ -4569,7 +4645,7 @@ impl World {
                 if !matches!(state, SectionState::Ready { .. }) {
                     return None;
                 }
-                (!desired.contains(&s) && !covers.contains(&s)).then_some(s)
+                (!desired.contains(&s) && !covers.contains(&s) && !self.stands_under_hole(s, &desired)).then_some(s)
             })
             .collect();
         let mut victims: Vec<(u64, SectionPos)> = spare
@@ -4615,7 +4691,7 @@ impl World {
     }
 
     /// [`unload_sections`](Self::unload_sections) with the GPU release passed in.
-    fn unload_sections_with(&mut self, center: Coord, mut free: impl FnMut(SectionState)) {
+    pub(in crate::world) fn unload_sections_with(&mut self, center: Coord, mut free: impl FnMut(SectionState)) {
         // KEEP reads the frame's cached frontier (already velocity-unioned),
         // so sections stay kept even as a fast-moving eye passes.
         let desired: FastSet<SectionPos> = self.section_desired.iter().copied().collect();
@@ -4654,8 +4730,15 @@ impl World {
                     // Settled full-res chunks draw it: hand it over (a chart punches it instead).
                     return self.full_res_covers(center, *s);
                 }
-                let span = s.span();
-                let (cx, cz) = (s.x * span + span / 2, s.z * span + span / 2);
+                // A finer tile still drawing a hole. The visible rebuild stands it in after this.
+                if self.stands_under_hole(*s, &desired) {
+                    return false;
+                }
+                let span = s.span() as i64;
+                // In the chart net. A neighbour's own storage is a different box, so the raw
+                // column reads as past the horizon and the fold deletes a section the player
+                // is about to walk back onto.
+                let (cx, cz) = self.net_column(center, s.min_x() as i64 + span / 2, s.min_z() as i64 + span / 2);
                 // A section on another face is kept only while it is still desired.
                 let dist = if s.body == metric_body && s.face == metric_face {
                     metric.point(cx as f64, cz as f64)
@@ -7862,8 +7945,9 @@ mod tests {
             let (fold, far_view) = (world.fold, world.far_view(center));
             {
                 let workers = world.worker_pool();
-                workers.set_view(center.x, center.y, center.z, far_view, radius, far_m, 0.0, 0.0, 0.0, Some(Face::PosY));
-                workers.set_fold(fold);
+                workers.set_view(
+                    center.x, center.y, center.z, far_view, radius, far_m, 0.0, 0.0, 0.0, Some(Face::PosY), fold,
+                );
             }
             // Cold start: the bench once the near field has already taken the
             // surplus above the section floor, and nothing coarser is resident.
@@ -7878,8 +7962,8 @@ mod tests {
                 world.section_upload_queue.clear();
                 while world.workers.as_ref().and_then(pipeline::Workers::try_recv).is_some() {}
             }
-            // The wider frontier's storage-nearest floor is what admission loads
-            // first. After the cap drops, that set is not the chart-nearest one.
+            // Admission orders sections in the chart net, so this prefix is the
+            // ground beside the eye. Planting it must not leave the capped frontier open.
             let mut prefix = wide;
             prefix.sort_by_key(|s| <SectionLane as StreamLane>::order(&world, center, *s));
             prefix.truncate(tight_allowed.min(prefix.len()));
@@ -7982,8 +8066,7 @@ mod tests {
         let (far_m, radius, up) = (world.far_horizon(), world.view.horizontal, world.stream_up);
         let (fold, far_view) = (world.fold, world.far_view(far_c));
         let workers = world.worker_pool();
-        workers.set_view(near_c.x, near_c.y, near_c.z, far_view, radius, far_m, 0.0, 0.0, 0.0, up);
-        workers.set_fold(fold);
+        workers.set_view(near_c.x, near_c.y, near_c.z, far_view, radius, far_m, 0.0, 0.0, 0.0, up, fold);
         world.pending_sections.set();
         world.section_cover_dirty.set();
     }

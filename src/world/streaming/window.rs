@@ -522,7 +522,8 @@ impl World {
     }
 
     /// Keep drawing each held section whose ground has not all settled: it joins the desired
-    /// frontier, admission skips it, and whatever draws it (itself or an ancestor) stays drawn.
+    /// frontier. Admission skips it only once a Ready section already draws it; skipping earlier
+    /// leaves a hole. Whatever draws it (itself or an ancestor) stays drawn.
     pub(super) fn wait_held(&mut self, held: Vec<(SectionPos, [i32; 2])>) {
         self.section_held.clear();
         for (s, layers) in held {
@@ -1156,6 +1157,139 @@ mod tests {
         let end = at(&world, 1.0);
         let cols = near_columns(&world, world.center.expect("a centre"));
         settle(&mut world, end, &|w| bare(w, &cols), "past the seam");
+    }
+
+    /// Eye `t` of the way from the +Y chart across its seam into the +Z chart, 100 over the ground.
+    /// `t` of 0 and 1 sit off the seam; 0.5 is the seam itself.
+    fn seam_eye(world: &World, t: f64) -> DVec3 {
+        let e = 6.5e-6;
+        world.home_eye(DVec3::new(0.0, 1.0, 1.0 - e + 2.0 * e * t), 100.0)
+    }
+
+    /// `steps` samples from `from` to `to` that never land on the seam. `flight` plants an 80 m/s
+    /// sample so the loading window shrinks; the seam step drops its sample and must keep that speed.
+    fn cross_seam(world: &mut World, from: f64, to: f64, steps: i32, flight: bool) -> bool {
+        let mut crossed = false;
+        for k in 1..=steps {
+            let fold = world.fold;
+            let t = from + (to - from) * f64::from(k) / f64::from(steps + 1);
+            let eye = seam_eye(world, t);
+            if flight {
+                let storage = world.stream_eye(eye);
+                let prev = world.near_eye_prev.map(|(p, _)| p).unwrap_or(storage);
+                let delta = storage - prev;
+                let dir = if delta.length_squared() > 1.0 { delta.normalize() } else { DVec3::Z };
+                let dt = Duration::from_millis(100);
+                world.near_eye_prev = Some((storage - dir * 80.0 * dt.as_secs_f64(), crate::sched::now() - dt));
+            } else {
+                walk(world);
+            }
+            step(world, eye);
+            crossed |= world.fold != fold;
+            let cols = near_columns(world, world.center.expect("a centre"));
+            assert_eq!(bare(world, &cols), 0, "t {t}: bare ground");
+            if flight {
+                let speed = world.stream_pacer.speed_mps();
+                assert!(speed > FULL_EFFORT_SPEED_MPS && speed < 200.0, "t {t}: flight speed {speed}");
+                assert!(!world.loading_full(), "t {t}: flight kept the whole loading window");
+                if k >= 2 {
+                    assert!(!world.window.grounded, "t {t}: a reduced window still reached for the ground");
+                }
+            } else {
+                assert!(world.loading_full(), "t {t}: the walk shrank the loading window");
+                assert!(world.window.grounded, "t {t}: the window let go of the ground");
+            }
+        }
+        crossed
+    }
+
+    /// Walk the +Y/+Z seam three times, then fly back. No near column goes bare, the walk keeps the
+    /// whole loading window, and flight stays reduced across the seam (the step drops its sample).
+    #[test]
+    fn seam_crossings_at_walk_and_flight_speed_leave_no_bare_ground() {
+        let mut world = chart_world(6, 3);
+        let start = seam_eye(&world, 0.0);
+        world.prepare_around(start);
+        world.drive_spawn_ready();
+        settle(&mut world, start, NONE, "before the crossings");
+        assert!(world.window.grounded, "100 up holds the ground");
+        // Same pace as `seam_crossing_keeps_the_grown_window`: coarser steps cross the seam in one
+        // frame, before the new chart's chunks exist, and that frame is bare.
+        const STEPS: i32 = 40;
+        let edge = f64::from(STEPS) / f64::from(STEPS + 1);
+        for (from, to) in [(0.0, 1.0), (1.0, 0.0), (0.0, 1.0)] {
+            assert!(cross_seam(&mut world, from, to, STEPS, false), "walk {from} -> {to} did not cross");
+        }
+        let walked = seam_eye(&world, edge);
+        let cols = near_columns(&world, world.center.expect("a centre"));
+        settle(&mut world, walked, &|w| bare(w, &cols), "after the walks");
+        assert!(cross_seam(&mut world, 1.0, 0.0, STEPS, true), "the flight did not cross");
+        walk(&mut world);
+        let end = seam_eye(&world, 1.0 - edge);
+        let cols = near_columns(&world, world.center.expect("a centre"));
+        settle(&mut world, end, &|w| bare(w, &cols), "after the flight");
+        assert!(world.window.grounded, "stopping did not grow the window back over the ground");
+        assert!(world.loading_full(), "stopping left the loading window reduced");
+    }
+
+    /// A neighbour chart's section is millions of blocks away in its own storage and a few sections
+    /// away in the net. Unload keeps that section; a section at the storage origin goes. A punched
+    /// section is admitted until something draws it, and skipped once its ancestor does.
+    #[test]
+    fn neighbour_sections_are_measured_in_the_chart_net() {
+        let mut world = chart_world(6, 3);
+        let (_, far, _, _) = world.begin_stream(seam_eye(&world, 0.66), None);
+        world.update_lod_face(far);
+        world.refresh_frontier(far);
+        let seat = world.seams.chart_seat(far).expect("the eye stands on a chart");
+        let outside = |s: SectionPos| {
+            let span = s.span() as i64;
+            let (x, z) = (s.min_x() as i64, s.min_z() as i64);
+            x + span <= seat.lo[0] || x >= seat.hi[0] || z + span <= seat.lo[2] || z >= seat.hi[2]
+        };
+        let neighbour = world
+            .section_desired
+            .iter()
+            .copied()
+            .filter(|s| outside(*s) && s.detail.0 <= FINEST_DETAIL.0)
+            .min_by_key(|s| <SectionLane as StreamLane>::order(&world, far, *s))
+            .expect("a neighbour section in the frontier");
+        let span = neighbour.span() as i64;
+        let cs = 16i64;
+        let (psx, psz) = ((far.x as i64 * cs).div_euclid(span), (far.z as i64 * cs).div_euclid(span));
+        let (sx, sz) = (
+            (neighbour.min_x() as i64 + span / 2).div_euclid(span),
+            (neighbour.min_z() as i64 + span / 2).div_euclid(span),
+        );
+        let raw = (sx - psx).unsigned_abs().max((sz - psz).unsigned_abs());
+        let folded = <SectionLane as StreamLane>::order(&world, far, neighbour);
+        assert!(raw > 10_000, "raw grid gap {raw} of {neighbour:?}");
+        assert!(folded < 32, "folded order {folded} of {neighbour:?}");
+        let mut ancestor = neighbour;
+        while ancestor.detail.0 < FINEST_DETAIL.0 {
+            ancestor = ancestor.parent();
+        }
+        let ancestor_order = <SectionLane as StreamLane>::order(&world, far, ancestor);
+        assert!(ancestor_order < 32, "ancestor {ancestor:?} folds to order {ancestor_order}");
+        let ready = || SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None };
+        world.sections.insert(ancestor, ready());
+        world.section_desired.retain(|s| *s != ancestor);
+        world.section_visible.retain(|(s, _)| *s != ancestor);
+        world.section_held.remove(&ancestor);
+        world.unload_sections_with(far, |_| {});
+        assert!(world.sections.contains_key(&ancestor), "unload dropped near neighbour {ancestor:?}");
+        let origin = SectionPos { detail: ancestor.detail, body: ancestor.body, face: ancestor.face, x: 0, z: 0 };
+        assert_ne!(origin, ancestor);
+        world.sections.insert(origin, ready());
+        world.unload_sections_with(far, |_| {});
+        assert!(!world.sections.contains_key(&origin), "a section at the storage origin stayed resident");
+        assert!(world.sections.contains_key(&ancestor), "the second unload dropped the neighbour");
+        world.sections.remove(&ancestor);
+        world.section_held.insert(neighbour, [0, 0]);
+        assert!(!world.coverage_skips(far, neighbour), "a held section with nothing drawing it was skipped");
+        world.sections.insert(ancestor, ready());
+        assert!(world.section_covered(neighbour), "the ancestor does not cover {neighbour:?}");
+        assert!(world.coverage_skips(far, neighbour), "a held section already drawn was still a hole");
     }
 
     /// A pit dug 100 blocks down from the surface near spawn reaches below the window's natural
