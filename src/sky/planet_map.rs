@@ -437,9 +437,28 @@ fn map_key(
     let (body, seed, n) = home_chart_n(generator)?;
     let datum = home_datum(generator)?;
     let colors = registry.color_snapshot();
-    let fp = crate::net::fingerprint_kind_cfg(registry, kind, cfg);
+    let fp = world_fingerprint(registry, kind, cfg);
     let hash = fold_key(color_hash(&colors), fp, n, datum_hash(datum));
     Some(Key { seed, body, hash, version: BAKE_VERSION })
+}
+
+/// The world's content id (generator version, gravity, law, palette) folded with the worldgen kind
+/// and its knobs: the inputs that change the baked image.
+fn world_fingerprint(
+    registry: &crate::block::registry::BlockRegistry,
+    kind: crate::world::generation::WorldgenKind,
+    cfg: crate::world::terrain::TerrainCfg,
+) -> u64 {
+    let id = crate::net::content_id(registry);
+    let mut h = fnv_bytes(0xcbf2_9ce4_8422_2325, &id.worldgen.to_le_bytes());
+    for word in [id.gravity, id.law, id.palette] {
+        h = fnv_bytes(h, &word.to_le_bytes());
+    }
+    h = fnv_bytes(h, kind.id().as_bytes());
+    for v in cfg.clamp().to_wire() {
+        h = fnv_bytes(h, &v.to_le_bytes());
+    }
+    h
 }
 
 /// A benchmark or a scripted game does not bake. `WATT_BENCH_PLANET_MAP=1` opts a benchmark back in.
