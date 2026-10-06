@@ -20,6 +20,10 @@ const MESH_SHIFT: usize = 1;
 /// Storage-versus-physical slack (curvature and cages): 1% of the distance.
 const MARGIN: f32 = 0.01;
 
+/// The bands are measured from the centre chunk's middle and kept while the centre stays, but the
+/// shader measures from the camera, which can stand anywhere in that chunk: half its diagonal.
+const EYE_SLACK: f32 = CHUNK_SIZE as f32 * 0.5 * std::f32::consts::SQRT_2;
+
 /// One drawn detail's nearest and farthest camera distance, in blocks.
 #[derive(Clone, Copy)]
 struct LevelReach {
@@ -42,16 +46,16 @@ impl LevelReach {
     const OFF: Self = Self { near: f32::MAX, far: 0.0, on: false };
 }
 
-/// Lower limit of a band: the distance grown by the margin and one cell.
+/// Lower limit of a band: the distance grown by the margin, one cell and the eye slack.
 pub(in crate::world) fn grow_start(limit: f32, cell: f32) -> f32 {
-    let s = limit * (1.0 + MARGIN) + cell;
+    let s = limit * (1.0 + MARGIN) + cell + EYE_SLACK;
     if s.is_finite() && s >= 0.0 { s } else { f32::MAX }
 }
 
-/// Upper limit of a band: the distance shrunk by the margin and one cell.
-/// Negative when the next level reaches inside one cell of the eye; `end > start` then fails.
+/// Upper limit of a band: the distance shrunk by the margin, one cell and the eye slack.
+/// Negative when the next level reaches inside that of the eye; `end > start` then fails.
 pub(in crate::world) fn shrink_end(limit: f32, cell: f32) -> f32 {
-    let e = limit * (1.0 - MARGIN) - cell;
+    let e = limit * (1.0 - MARGIN) - cell - EYE_SLACK;
     if e.is_finite() { e } else { f32::MIN }
 }
 
