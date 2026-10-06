@@ -1273,6 +1273,9 @@ pub struct World {
     /// the left shell (old ∖ new). `None` after a radius change, so the next
     /// cross scans every loaded chunk.
     prev_unload_box: Option<ChunkBox>,
+    /// Settled chart chunks kept past the unload box until they leave the turn-back
+    /// skirt. The shell diff would not see them on a later pass.
+    far_wait: FastSet<Coord>,
     /// Loaded altitude-chunk indices per [`ColumnKey`], highest first. Empty
     /// vec is pruned so a column's cached ceiling drops exactly when its last
     /// chunk unloads. PosY altitudes are chunk Y. `Open` chunks are not entered.
@@ -1333,6 +1336,10 @@ pub struct World {
     section_mip_rx: Option<Receiver<HeightMip>>,
     /// Loaded sections.
     sections: FastMap<SectionPos, SectionState>,
+    /// Ready finer tiles under a desired cell nothing Ready draws yet. Counted at the
+    /// start of a section admission that has already filled [`sections_allowed`](Self::sections_allowed).
+    /// Those tiles hold slots the holes still need, so the lane may pass the floor by this many.
+    section_standin_slack: usize,
     /// Finished section meshes awaiting budgeted upload, tagged with the claim
     /// token that produced them (re-validated at the moment of upload) and the
     /// vertex-byte charge computed at queue time.
@@ -1631,6 +1638,7 @@ impl World {
             dirty_worklist: FastSet::default(),
             prev_mesh_box: None,
             prev_unload_box: None,
+            far_wait: FastSet::default(),
             column_chunks: FastMap::default(),
             occlusion_active: false,
             occlusion_forced: render.occlusion,
@@ -1652,6 +1660,7 @@ impl World {
             section_mip: None,
             section_mip_rx: None,
             sections: FastMap::default(),
+            section_standin_slack: 0,
             section_upload_queue: VecDeque::new(),
             gpu_live_slots: 0,
             slot_ceiling: CPU_CULL_MAX,
@@ -2462,6 +2471,9 @@ pub(in crate::world) trait StreamLane {
         let _ = (world, key);
         true
     }
+    /// Lane-specific budget refresh before geometry candidates are filtered.
+    /// Default: nothing. Runs only when the worker queue has a free slot.
+    fn prepare_admit(_world: &mut World) {}
     /// A worklist seed was evicted as BLOCKED by this pass's [`admit`] — the
     /// lane's chance to register it with an event source that will re-seed it
     /// (the mesh lane starts its light-degrade timer here). Default: no-op.
@@ -2547,6 +2559,7 @@ fn admit_geometry<S: StreamLane>(world: &mut World, center: Coord, budget: Budge
     }
     // A full section budget refuses every candidate. That is not a drained
     // backlog: clearing pending here left the holes disarmed on a still camera.
+    S::prepare_admit(world);
     let mut refused = false;
     S::for_each_geometry(world, center, &mut scratch.rank, |k| {
         if S::in_flight(world, k) {
@@ -3017,10 +3030,15 @@ impl StreamLane for SectionLane {
     fn in_flight(world: &World, key: SectionPos) -> bool {
         world.sections.contains_key(&key)
     }
+    fn prepare_admit(world: &mut World) {
+        world.section_standin_slack = world.count_section_standins();
+    }
     fn ready(world: &World, _key: SectionPos) -> bool {
         // Sections only. Near-field chunks never consume this budget; a large
-        // view must not starve covering. In-flight claims count now.
-        world.section_budget_used() < world.sections_allowed()
+        // view must not starve covering. In-flight claims count now. A Ready
+        // finer tile under a hole keeps its slot, and the hole is admitted
+        // past the floor by however many such tiles there are.
+        world.section_budget_used() < world.sections_allowed() + world.section_standin_slack
     }
     fn submit(world: &mut World, key: SectionPos) -> Option<pipeline::Job> {
         world.refresh_tables();

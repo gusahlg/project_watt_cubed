@@ -3299,6 +3299,20 @@ impl World {
         self.pending_fresh.set();
     }
 
+    /// `c` is still close enough that walking back across the seam would show its column.
+    /// The far edge of the near square is a view-radius inland; a view-radius on the next
+    /// chart puts that column `3 * horizontal + 1` away, counting the two edge chunks.
+    fn far_wait_reach(&self, center: Coord, c: Coord) -> bool {
+        let up = self.live_up().unwrap_or(Face::PosY);
+        let reach = self.view.horizontal * 3 + 1;
+        self.fold.fold(c).across(center, up) <= reach
+    }
+
+    /// `c` is settled and still inside the turn-back skirt.
+    fn keeps_for_far(&self, center: Coord, c: Coord) -> bool {
+        self.chunks.get(&c).is_some_and(|l| l.state.settled()) && self.far_wait_reach(center, c)
+    }
+
     /// Coords in the previous unload box that have left `new_box`, or every
     /// loaded chunk past `new_box` when there is no previous box (first pass
     /// or a radius change). Spawn-slab chunks stay.
@@ -3341,6 +3355,32 @@ impl World {
         let mut far = self.unload_leaving(unload);
         if let Some((kept, fold)) = self.retired {
             far.retain(|&c| !kept.contains(fold.fold(c)));
+        }
+        // Keep a settled chunk out to the turn-back skirt. A section on screen is not a reason
+        // to drop it: that section unloads as the player walks on, and the column is bare on
+        // the way back. The skirt reaches across the seam.
+        if self.lod2 && !self.fold.is_identity() && (!far.is_empty() || !self.far_wait.is_empty()) {
+            let pending: Vec<Coord> = self.far_wait.drain().collect();
+            let mut still = FastSet::default();
+            for c in pending {
+                if !self.chunks.contains_key(&c) || self.view_contains(unload, c) {
+                    continue;
+                }
+                if !self.far_wait_reach(center, c) {
+                    far.push(c);
+                } else {
+                    still.insert(c);
+                }
+            }
+            far.retain(|&c| {
+                if still.contains(&c) || self.keeps_for_far(center, c) {
+                    still.insert(c);
+                    false
+                } else {
+                    true
+                }
+            });
+            self.far_wait = still;
         }
         self.prev_unload_box = Some(unload);
         // A removed chunk changes what the BFS can reach — topology class.
@@ -4466,6 +4506,19 @@ impl World {
             push(0, local.z.signum() as i32);
         }
         out
+    }
+
+    /// Ready tiles under an uncovered desired cell, once the section floor is full.
+    /// Zero below the floor, so a quiet or under-budget admission does not scan.
+    pub(in crate::world) fn count_section_standins(&self) -> usize {
+        if self.section_budget_used() < self.sections_allowed() {
+            return 0;
+        }
+        let desired: FastSet<SectionPos> = self.section_desired.iter().copied().collect();
+        self.sections
+            .iter()
+            .filter(|&(&s, st)| st.is_ready() && self.stands_under_hole(s, &desired))
+            .count()
     }
 
     /// `s` is a Ready tile strictly under a desired cell that nothing Ready draws yet.
@@ -7092,6 +7145,60 @@ mod tests {
         }
     }
 
+    /// A settled chunk on a chart stays past the unload box out to the turn-back skirt, including
+    /// while a section is on screen over it. A chunk past the skirt unloads.
+    #[test]
+    fn settled_chart_chunk_waits_for_a_far_section() {
+        use super::super::quadtree::QuadrantMask;
+        use crate::ident::Detail;
+        use crate::render_config::{RenderConfig, lod_for};
+        use crate::world::generation::WorldgenKind;
+
+        let (lod_levels, lod_detail) = lod_for(6);
+        let render = RenderConfig { lod2: true, occlusion: true, lod_levels, lod_detail, ..RenderConfig::default() };
+        let mut world = World::with_kind(42, render, WorldgenKind::Diffusion, false);
+        world.set_view_distances(6, 3);
+        let eye = world.home_eye(DVec3::new(0.0, 1.0, 1.0 - 6.5e-6), 100.0);
+        let (home, _, _, _) = world.begin_stream(eye, None);
+        assert!(!world.fold.is_identity(), "the eye is on a chart");
+        let settle = |world: &mut World, c: Coord| {
+            world.ensure_data(c);
+            let loaded = world.chunks.get_mut(&c).expect("ensure_data stores the chunk");
+            if !loaded.state.settled() {
+                loaded.state = MeshState::Air;
+            }
+        };
+        settle(&mut world, home);
+        let trail = Coord::new(home.x - 9, home.y, home.z);
+        settle(&mut world, trail);
+        world.prev_unload_box = Some(world.unload_box(home));
+        let away = Coord::new(home.x + 11, home.y, home.z);
+        world.center = Some(away);
+        world.unload_far_with(away, |state, _| drop(state));
+        assert!(world.chunks.contains_key(&home), "a settled column stays until a far section draws it");
+        assert!(!world.chunks.contains_key(&trail), "past the turn-back skirt the column unloads");
+        let span = 32;
+        let (bx, bz) = (home.x * 16 + 8, home.z * 16 + 8);
+        let pos = SectionPos {
+            detail: Detail(0),
+            body: 0,
+            face: Face::PosY,
+            x: bx.div_euclid(span),
+            z: bz.div_euclid(span),
+        };
+        world.sections.insert(
+            pos,
+            SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None },
+        );
+        world.section_visible.push((pos, QuadrantMask::ALL));
+        world.unload_far_with(away, |state, _| drop(state));
+        assert!(world.chunks.contains_key(&home), "a section on screen does not drop the column");
+        let gone = Coord::new(home.x + 20, home.y, home.z);
+        world.center = Some(gone);
+        world.unload_far_with(gone, |state, _| drop(state));
+        assert!(!world.chunks.contains_key(&home), "past the turn-back skirt the column unloads");
+    }
+
     /// Sync `ensure_data` (headless region, unclaimed boundary-cross centre)
     /// also installs from `generate_column` heights, so `trivial_light` never
     /// calls `height()`.
@@ -7624,6 +7731,54 @@ mod tests {
         );
         assert!(world.pending_sections.get(), "freeing a slot re-arms admission");
         assert!(<SectionLane as StreamLane>::ready(&world, hole));
+    }
+
+    /// A Ready child under an uncovered desired parent fills a floor slot and the parent
+    /// is still admitted. The child stays: freeing it to make the slot is the bare-ground pop.
+    #[test]
+    fn standin_under_a_full_floor_still_admits_its_parent() {
+        use super::super::section::Quadrant;
+
+        let mut world = World::generate();
+        let center = Coord::new(0, 4, 0);
+        world.center = Some(center);
+        world.slot_ceiling = 1024;
+        world.gpu_live_slots = 6000;
+        let parent = SectionPos {
+            body: 0,
+            face: Face::PosY,
+            detail: crate::ident::Detail(super::super::section::FINEST_DETAIL.0 + 1),
+            x: 80,
+            z: -40,
+        };
+        let child = parent.child(Quadrant::ALL[0]);
+        let filler = |i: usize| SectionPos {
+            body: 0,
+            face: Face::PosY,
+            detail: super::super::section::FINEST_DETAIL,
+            x: 10_000 + i as i32,
+            z: -3,
+        };
+        world.section_desired = vec![parent];
+        let empty = || SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None };
+        for i in 0..super::super::SECTION_SLOT_FLOOR - 1 {
+            world.sections.insert(filler(i), empty());
+        }
+        world.sections.insert(child, empty());
+        assert_eq!(world.section_budget_used(), world.sections_allowed(), "the floor is full");
+        let desired: FastSet<SectionPos> = world.section_desired.iter().copied().collect();
+        assert!(world.stands_under_hole(child, &desired), "the child covers the parent's hole");
+        assert!(!world.section_covered(parent), "nothing Ready draws the parent");
+        world.pending_sections.set();
+        super::super::admit::<SectionLane>(&mut world, center, Budget::Millis(8.0));
+        assert!(
+            matches!(world.sections.get(&parent), Some(SectionState::Meshing { .. })),
+            "the parent is admitted while its child holds a floor slot"
+        );
+        assert!(
+            world.sections.get(&child).is_some_and(|s| s.is_ready()),
+            "the child keeps drawing until the parent can"
+        );
     }
 
     /// Only a chunk the mesh lane could admit takes a seed: an unloaded coord, a drawn chunk and
