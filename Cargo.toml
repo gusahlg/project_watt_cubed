@@ -42,7 +42,7 @@ bytemuck = { version = "1.23", default-features = false }
 quinn = { version = "0.11", default-features = false, features = ["bloom", "log", "runtime-tokio", "rustls-ring"] }
 rcgen = "0.14"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 # Dual-stack server socket (IPV6_V6ONLY off); already in the tree through quinn.
 socket2 = "0.6"
 

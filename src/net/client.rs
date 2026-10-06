@@ -195,8 +195,37 @@ pub enum Incoming {
     /// The server's verdict on our tool use `req` at `cell`: the cell's and the tool's
     /// configurations afterwards (the cell is already applied when `reacted`).
     ToolResult { req: u32, reacted: bool, cell: (i32, i32, i32), cell_spec: Arc<str>, tool_spec: Arc<str> },
-    Disconnected,
+    /// `reason` is the server's close phrase when it sent one (empty if the
+    /// peer just vanished). "server shutting down" means the process is exiting.
+    Disconnected { reason: String },
 }
+
+/// Why [`Connection::connect`] failed. `mods_denied` is empty unless the server
+/// answered [`ServerMessage::ModsDenied`](crate::net::protocol::ServerMessage::ModsDenied).
+#[derive(Debug)]
+pub struct ConnectError {
+    message: String,
+    /// Package ids the server refuses. The caller disables these and may retry once.
+    pub mods_denied: Vec<String>,
+}
+
+impl ConnectError {
+    fn plain(message: impl Into<String>) -> Self {
+        Self { message: message.into(), mods_denied: Vec::new() }
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl std::fmt::Display for ConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ConnectError {}
 
 /// How long an edit or tool request may sit unanswered before it rolls back.
 const PENDING_TTL: Duration = Duration::from_secs(3);
@@ -257,24 +286,39 @@ pub struct Connection {
     /// cannot freeze the client.
     pending_teleport: Option<Instant>,
     disconnect_emitted: bool,
+    /// Filled by the reader when the stream ends, before the inbox disconnects.
+    close_reason: Arc<Mutex<String>>,
 }
 
 impl Connection {
     /// `Err` carries a human-readable reason (bad address, refused, wrong
-    /// password, version mismatch).
-    pub fn connect(host: &str, port: u16, name: &str, password: &str) -> Result<Self, String> {
+    /// password, version mismatch). No mods are reported.
+    pub fn connect(host: &str, port: u16, name: &str, password: &str) -> Result<Self, ConnectError> {
+        Self::connect_with(host, port, name, password, &[])
+    }
+
+    /// As [`connect`](Self::connect), reporting `mods` as the enabled packages.
+    /// That list is the client's own word; the server does not trust it for
+    /// anything except the whitelist.
+    pub fn connect_with(
+        host: &str,
+        port: u16,
+        name: &str,
+        password: &str,
+        mods: &[(String, String)],
+    ) -> Result<Self, ConnectError> {
         let addrs: Vec<SocketAddr> = (host, port)
             .to_socket_addrs()
-            .map_err(|e| format!("bad address: {e}"))?
+            .map_err(|e| ConnectError::plain(format!("bad address: {e}")))?
             .collect();
         if addrs.is_empty() {
-            return Err("address resolved to nothing".into());
+            return Err(ConnectError::plain("address resolved to nothing"));
         }
-        let rt = Arc::new(Runtime::new().map_err(|e| format!("runtime: {e}"))?);
+        let rt = Arc::new(Runtime::new().map_err(|e| ConnectError::plain(format!("runtime: {e}")))?);
         quic::install_crypto();
-        let mut last = "could not connect".to_string();
+        let mut last = ConnectError::plain("could not connect");
         for addr in addrs {
-            match connect_one(&rt, addr, name, password) {
+            match connect_one(&rt, addr, name, password, mods) {
                 Ok(conn) => return Ok(conn),
                 Err(e) => last = e,
             }
@@ -283,7 +327,13 @@ impl Connection {
     }
 }
 
-fn connect_one(rt: &Arc<Runtime>, addr: SocketAddr, name: &str, password: &str) -> Result<Connection, String> {
+fn connect_one(
+    rt: &Arc<Runtime>,
+    addr: SocketAddr,
+    name: &str,
+    password: &str,
+    mods: &[(String, String)],
+) -> Result<Connection, ConnectError> {
     let bind = if addr.is_ipv4() {
         SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
     } else {
@@ -292,19 +342,19 @@ fn connect_one(rt: &Arc<Runtime>, addr: SocketAddr, name: &str, password: &str) 
     let mut endpoint = {
         // Must run inside the runtime: construction spawns quinn's UDP driver.
         let _guard = rt.enter();
-        Endpoint::client(bind).map_err(|e| format!("endpoint: {e}"))?
+        Endpoint::client(bind).map_err(|e| ConnectError::plain(format!("endpoint: {e}")))?
     };
     endpoint.set_default_client_config(quic::client_config());
 
     let conn = rt.block_on(async {
-        let connecting = endpoint.connect(addr, "watt").map_err(|e| e.to_string())?;
+        let connecting = endpoint.connect(addr, "watt").map_err(|e| ConnectError::plain(e.to_string()))?;
         tokio::time::timeout(CONNECT_TIMEOUT, connecting)
             .await
-            .map_err(|_| "connect timed out".to_string())?
-            .map_err(|e| format!("could not reach {addr}: {e}"))
+            .map_err(|_| ConnectError::plain("connect timed out"))?
+            .map_err(|e| ConnectError::plain(format!("could not reach {addr}: {e}")))
     })?;
         let (mut send, mut recv) =
-            rt.block_on(conn.open_bi()).map_err(|e| format!("stream: {e}"))?;
+            rt.block_on(conn.open_bi()).map_err(|e| ConnectError::plain(format!("stream: {e}")))?;
 
         let id = crate::net::content_id(&crate::block::BlockRegistry::with_builtins());
         let hello = ClientMessage::Hello {
@@ -315,26 +365,42 @@ fn connect_one(rt: &Arc<Runtime>, addr: SocketAddr, name: &str, password: &str) 
             palette: id.palette,
             name: name.into(),
             password: password.into(),
+            mods: mods
+                .iter()
+                .map(|(id, version)| protocol::ModOffer { id: id.as_str().into(), version: version.as_str().into() })
+                .collect(),
         };
         rt.block_on(protocol::write_frame_async(&mut send, &hello.encode()))
-            .map_err(|e| format!("send failed: {e}"))?;
+            .map_err(|e| ConnectError::plain(format!("send failed: {e}")))?;
 
         // The scratch Vec is reused across frames so the reader loop never allocates.
         let mut frame = Vec::new();
         rt.block_on(async {
             tokio::time::timeout(CONNECT_TIMEOUT, protocol::read_frame_async(&mut recv, &mut frame))
                 .await
-                .map_err(|_| "no reply: timed out".to_string())?
-                .map_err(|e| format!("no reply: {e}"))
+                .map_err(|_| ConnectError::plain("no reply: timed out"))?
+                .map_err(|e| ConnectError::plain(format!("no reply: {e}")))
         })?;
-        let (player_id, seed, spawn, worldgen, terrain) =
-            welcome_from(ServerMessage::decode(&frame))?;
+        let decoded = ServerMessage::decode(&frame);
+        if let Some(ServerMessage::ModsDenied { ids }) = &decoded {
+            return Err(ConnectError {
+                message: format!(
+                    "server refused mods: {}",
+                    ids.iter().map(|id| id.as_ref()).collect::<Vec<_>>().join(", ")
+                ),
+                mods_denied: ids.iter().map(|id| id.to_string()).collect(),
+            });
+        }
+        let (player_id, seed, spawn, worldgen, terrain) = welcome_from(decoded)?;
 
         let (tx, inbox) = mpsc::channel();
         let mod_in: Arc<Mutex<HashMap<Arc<str>, VecDeque<InboundMod>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let mod_reader = mod_in.clone();
         let reader_rt = rt.clone();
+        let close_reason = Arc::new(Mutex::new(String::new()));
+        let reason_slot = close_reason.clone();
+        let watched = conn.clone();
         thread::spawn(move || {
             while reader_rt.block_on(protocol::read_frame_async(&mut recv, &mut frame)).is_ok() {
                 match ServerMessage::decode(&frame) {
@@ -356,6 +422,8 @@ fn connect_one(rt: &Arc<Runtime>, addr: SocketAddr, name: &str, password: &str) 
                     None => continue, // Skip a junk frame rather than tear down.
                 }
             }
+            // Record the phrase before dropping `tx`, so `poll` sees it with the disconnect.
+            *reason_slot.lock().unwrap_or_else(PoisonError::into_inner) = connection_close_text(&watched);
         });
 
         Ok(Connection {
@@ -383,7 +451,25 @@ fn connect_one(rt: &Arc<Runtime>, addr: SocketAddr, name: &str, password: &str) 
             sent_cruise: None,
             pending_teleport: None,
             disconnect_emitted: false,
+            close_reason,
         })
+}
+
+/// The server's application close phrase, if quinn has it yet. A few retries
+/// cover the gap between the read error and the close frame being recorded.
+fn connection_close_text(conn: &quinn::Connection) -> String {
+    for _ in 0..20 {
+        if let Some(err) = conn.close_reason() {
+            return match err {
+                quinn::ConnectionError::ApplicationClosed(frame) => {
+                    String::from_utf8_lossy(&frame.reason).into_owned()
+                }
+                other => other.to_string(),
+            };
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    String::new()
 }
 
 impl Connection {
@@ -441,7 +527,8 @@ impl Connection {
             }
         }
         expire_pending(&mut self.pending_edits, &self.cell_revs, Instant::now(), &mut out);
-        emit_disconnect(&mut self.alive, &mut self.disconnect_emitted, &mut out);
+        let reason = self.close_reason.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        emit_disconnect(&mut self.alive, &mut self.disconnect_emitted, &reason, &mut out);
         coalesce_positions(&mut out);
         out
     }
@@ -465,16 +552,16 @@ impl Connection {
 
 fn welcome_from(
     msg: Option<ServerMessage>,
-) -> Result<(u32, i64, DVec3, crate::world::generation::WorldgenKind, crate::world::terrain::TerrainCfg), String> {
+) -> Result<(u32, i64, DVec3, crate::world::generation::WorldgenKind, crate::world::terrain::TerrainCfg), ConnectError> {
     match msg {
         Some(ServerMessage::Welcome { player_id, seed, spawn, worldgen, terrain, law }) => {
             if let Err(ServerMessage::Reject { reason }) = crate::net::protocol::handshake_law(&law) {
-                return Err(reason.to_string());
+                return Err(ConnectError::plain(reason.to_string()));
             }
             Ok((player_id, seed, spawn, worldgen, terrain))
         }
-        Some(ServerMessage::Reject { reason }) => Err(reason.to_string()),
-        _ => Err("unexpected reply from server".to_string()),
+        Some(ServerMessage::Reject { reason }) => Err(ConnectError::plain(reason.to_string())),
+        _ => Err(ConnectError::plain("unexpected reply from server")),
     }
 }
 
@@ -507,10 +594,10 @@ fn expire_pending(
     }
 }
 
-fn emit_disconnect(alive: &mut bool, emitted: &mut bool, out: &mut Vec<Incoming>) {
+fn emit_disconnect(alive: &mut bool, emitted: &mut bool, reason: &str, out: &mut Vec<Incoming>) {
     if !*alive && !*emitted {
         *emitted = true;
-        out.push(Incoming::Disconnected);
+        out.push(Incoming::Disconnected { reason: reason.to_string() });
     }
 }
 
@@ -666,9 +753,14 @@ fn apply_server_message(
                     *ping_ms = Some(at.elapsed().as_millis() as u32);
                 }
             }
-            ServerMessage::Reject { reason: _ } => {
+            ServerMessage::Reject { reason } => {
                 *alive = false;
-                emit_disconnect(alive, disconnect_emitted, out);
+                emit_disconnect(alive, disconnect_emitted, &reason, out);
+            }
+            ServerMessage::ModsDenied { ids } => {
+                *alive = false;
+                let list = ids.iter().map(|id| id.as_ref()).collect::<Vec<_>>().join(", ");
+                emit_disconnect(alive, disconnect_emitted, &format!("mods denied: {list}"), out);
             }
             // A second Welcome is meaningless mid-session.
             ServerMessage::Welcome { .. } => {}
@@ -967,7 +1059,7 @@ mod tests {
             Ok(_) => panic!("a wrong password must be refused"),
             Err(e) => e,
         };
-        assert!(err.to_lowercase().contains("password"), "got: {err}");
+        assert!(err.to_string().to_lowercase().contains("password"), "got: {err}");
         handle.stop();
     }
 
@@ -1028,9 +1120,9 @@ mod tests {
     fn snapshot_before_welcome_is_an_unexpected_handshake_reply() {
         let snap = ServerMessage::Snapshot { edits: vec![(1, 2, 3, 1, "air".into())] };
         let err = welcome_from(Some(snap)).unwrap_err();
-        assert!(err.contains("unexpected"));
+        assert!(err.to_string().contains("unexpected"));
         let edit = ServerMessage::Edit { x: 0, y: 0, z: 0, rev: 1, spec: "air".into() };
-        assert!(welcome_from(Some(edit)).unwrap_err().contains("unexpected"));
+        assert!(welcome_from(Some(edit)).unwrap_err().to_string().contains("unexpected"));
     }
 
     #[test]
@@ -1148,12 +1240,12 @@ mod tests {
                     }
                 }
             }
-            emit_disconnect(&mut alive, &mut emitted, &mut out);
+            emit_disconnect(&mut alive, &mut emitted, "", &mut out);
             out
         };
         let first = drain();
         assert_eq!(first.len(), 1);
-        assert!(matches!(first[0], Incoming::Disconnected));
+        assert!(matches!(first[0], Incoming::Disconnected { .. }));
         assert!(drain().is_empty(), "a second drain must not emit again");
         assert!(!alive);
     }
@@ -1167,7 +1259,7 @@ mod tests {
         let mut got = 0u32;
         while Instant::now() < deadline {
             for e in a.poll() {
-                if matches!(e, Incoming::Disconnected) {
+                if matches!(e, Incoming::Disconnected { .. }) {
                     got += 1;
                 }
             }
@@ -1179,7 +1271,7 @@ mod tests {
         assert_eq!(got, 1, "the drop must surface Disconnected once");
         for _ in 0..8 {
             assert!(
-                !a.poll().iter().any(|e| matches!(e, Incoming::Disconnected)),
+                !a.poll().iter().any(|e| matches!(e, Incoming::Disconnected { .. })),
                 "subsequent polls must stay quiet"
             );
         }

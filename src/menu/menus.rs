@@ -38,6 +38,8 @@ pub enum ModsAction {
     Toggle(usize),
     Knob { mod_index: usize, knob: usize },
     SetGroup { id: &'static str, on: bool },
+    /// Shown as "off (server)". Picking it does nothing.
+    ServerOff,
 }
 
 impl Menu for ModsMenu {
@@ -129,6 +131,7 @@ impl Menu for ModsMenu {
                     delta: Dir::Next.delta(),
                 })
             }
+            Msg::Step(ModsAction::ServerOff, _) | Msg::Pick(ModsAction::ServerOff) => Command::Stay,
             Msg::Back => Command::Pop,
             _ => Command::Stay,
         }
@@ -136,6 +139,17 @@ impl Menu for ModsMenu {
 }
 
 fn push_mod_rows(rows: &mut Vec<Row<ModsAction>>, i: usize, m: &crate::menu::ModRow) {
+    if m.server_off {
+        rows.push(
+            Row::value(
+                format!("  {}", m.name),
+                ValueView::Choice("off (server)".to_string()),
+                ModsAction::ServerOff,
+            )
+            .detail(m.description.clone()),
+        );
+        return;
+    }
     rows.push(
         Row::value(
             format!("  {}", m.name),
@@ -350,6 +364,7 @@ mod tests {
             visual_group: Some(VisualGroup::Post),
             worldgen: false,
             group: None,
+            server_off: false,
         }];
         let ctx = Ctx {
             settings: &mut settings,
@@ -438,6 +453,7 @@ mod tests {
             visual_group: None,
             worldgen: false,
             group: None,
+            server_off: false,
         };
         let installed = crate::modding::testing::standard();
         let mut snap = crate::menu::ModRow::snapshot(&installed);
@@ -486,6 +502,43 @@ mod tests {
             }
             _ => panic!("expected SetGroup"),
         }
+    }
+
+    #[test]
+    fn server_off_mod_shows_off_server_and_ignores_the_pick() {
+        let held = crate::menu::ModRow {
+            name: "Developer Toolkit".into(),
+            description: "commands".into(),
+            enabled: false,
+            knobs: vec![],
+            visual_group: None,
+            worldgen: false,
+            group: None,
+            server_off: true,
+        };
+        let mut settings = Settings::default();
+        let session = Session::default();
+        let mods = vec![held];
+        let mut ctx = Ctx {
+            settings: &mut settings,
+            saves: &[],
+            mods: &mods,
+            session: &session,
+            mods_save_error: None,
+        };
+        let view = ModsMenu.view(&ctx);
+        let row = view.rows.iter().find(|r| r.label.contains("Developer Toolkit")).expect("row");
+        match &row.kind {
+            crate::menu::RowKind::Value(ValueView::Choice(value)) => {
+                assert_eq!(value, "off (server)");
+            }
+            _ => panic!("expected off (server)"),
+        }
+        let mut menu = ModsMenu;
+        assert!(matches!(
+            menu.update(Msg::Pick(ModsAction::ServerOff), &mut ctx),
+            Command::Stay
+        ));
     }
 
     #[test]

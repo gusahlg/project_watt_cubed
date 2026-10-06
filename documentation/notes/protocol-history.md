@@ -44,3 +44,8 @@ visible interest set. The server stamps the sender, caps the payload at
 datagrams, but naming `bytes::Bytes` would add a dependency, so every
 channel stays on the reliable length-prefixed stream. Each channel has its
 own drop-oldest receive ring. Mixed v13/v14 peers must not join.
+v15: `Hello` carries the client's enabled mods (package id and version)
+after the password. The server may answer `ModsDenied` (tag 16) with the
+ids it refuses, then close; an honest client turns those off for the
+session and joins once more. The list is what the client reports. Mixed
+v14/v15 peers must not join.

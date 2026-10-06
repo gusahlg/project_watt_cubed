@@ -16,6 +16,7 @@
 pub(crate) mod client;
 pub(crate) mod hooks;
 mod pair;
+pub(crate) mod persist;
 pub(crate) mod protocol;
 
 pub use pair::ChannelPair;
@@ -154,7 +155,7 @@ pub(crate) mod quic {
 
 /// Wire revision. Client and server must match exactly at join. Bump on any
 /// incompatible frame change; history is `documentation/notes/protocol-history.md`.
-pub(crate) const PROTOCOL_VERSION: u32 = 14;
+pub(crate) const PROTOCOL_VERSION: u32 = 15;
 
 pub const DEFAULT_PORT: u16 = 5555;
 

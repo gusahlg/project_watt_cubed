@@ -17,6 +17,14 @@
 //! by [`protocol`]; every client is rate-limited; every edit is bounds- and
 //! reach-validated against the sender's own reported position.
 //!
+//! The mod list on `Hello` is what an honest client reports. A modified client
+//! can lie about it. What stops mod tools is enforced here: teleport permission,
+//! the speed cap (flight, and cruise when the cap is below the game maximum),
+//! operator-only time, edit reach, and the movement envelope. Moves through solid
+//! terrain are not collision-checked, so noclip is not stopped. Gravity is not
+//! simulated; the envelope's gravity bound is only a limit on how fast a reported
+//! velocity may grow.
+//!
 //! **Server mods.** [`Config::hooks`] is a [`ServerMod`] table (plain-data
 //! arguments, no protocol change). Calls run outside the [`State`] lock.
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -24,10 +32,11 @@ use std::io;
 use std::net::SocketAddr;
 #[cfg(test)]
 use std::net::Ipv4Addr;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use quinn::{Endpoint, Incoming, SendStream};
@@ -45,7 +54,8 @@ use crate::block::registry::{BlockId, BlockRegistry, AIR};
 use crate::net::hooks;
 use crate::sim::reactions::{self, CellStore, Mutation, Pos, ReactionScheduler};
 pub(crate) use crate::net::hooks::{ChatFacts, EditIntent, JoinFacts, ServerMod, Verdict};
-use crate::net::protocol::{self, ClientMessage, ServerMessage};
+use crate::net::persist::{self, Store};
+use crate::net::protocol::{self, ClientMessage, ModOffer, ServerMessage};
 use crate::net::{MAX_CHAT, MAX_FRAME, MAX_NAME, MAX_SPEC, PROTOCOL_VERSION, chat, quic};
 use crate::presence::Stance;
 use crate::world::terrain::TerrainCfg;
@@ -119,6 +129,15 @@ const MAX_SPEC_POOL: usize = 16_384;
 /// Snapshot payload: tag + u32 count, then each edit is 3×i32 + u32 rev + u16 length + spec.
 const SNAPSHOT_HEAD: usize = 1 + 4;
 const SNAPSHOT_EDIT_FIXED: usize = 12 + 4 + 2;
+/// Who may teleport. `All` is the integrated host and [`Config::default`], so
+/// existing sessions keep today's behaviour. A dedicated server passes [`Ops`](Self::Ops).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TeleportPolicy {
+    Off,
+    Ops,
+    All,
+}
+
 /// Matches the client's [`World`](crate::world::World::new) so server spawn
 /// heights land on real ground.
 pub struct Config {
@@ -126,14 +145,30 @@ pub struct Config {
     pub password: String,
     pub seed: i64,
     pub day_secs: f32,
-    /// Off, a teleport is answered with an authoritative snap-back.
-    pub allow_teleport: bool,
+    pub teleport: TeleportPolicy,
     pub worldgen: WorldgenKind,
     pub terrain: TerrainCfg,
     /// Server-side mods (`validate_edit`, join/leave, `on_chat`). Empty by
     /// default — this crate ships no implementations. Hook bodies run outside
     /// the roster lock.
     pub hooks: Vec<Box<dyn ServerMod>>,
+    /// Save file. `None` is an unsaved world (tests). A missing file is created
+    /// from the flags; an existing file's seed and generator replace them.
+    pub world: Option<PathBuf>,
+    /// Operator names. Compared case-insensitively after [`clean_name`].
+    pub ops: Vec<String>,
+    /// Movement-envelope cap, in world units per second. The default is
+    /// [`crate::player::MAX_SPEED`], which leaves cruise at its own ceiling.
+    /// A lower cap also bounds cruise.
+    pub max_speed: f64,
+    /// When non-empty, an enabled mod must be in this list.
+    pub mods_allow: Vec<String>,
+    /// Enabled mods in this list are refused.
+    pub mods_deny: Vec<String>,
+    /// Log when a stored seed or generator differs from the flags.
+    pub warn_world_overrides: bool,
+    /// How often a world file is written. Also written on shutdown.
+    pub autosave_every: Duration,
 }
 
 impl Default for Config {
@@ -142,10 +177,17 @@ impl Default for Config {
             password: String::new(),
             seed: 0,
             day_secs: 600.0, // matches the client's default DayLength
-            allow_teleport: true,
+            teleport: TeleportPolicy::All,
             worldgen: WorldgenKind::Diffusion,
             terrain: TerrainCfg::default(),
             hooks: Vec::new(),
+            world: None,
+            ops: Vec::new(),
+            max_speed: crate::player::MAX_SPEED,
+            mods_allow: Vec::new(),
+            mods_deny: Vec::new(),
+            warn_world_overrides: false,
+            autosave_every: Duration::from_secs(180),
         }
     }
 }
@@ -209,7 +251,7 @@ struct Ctx {
     seed: i64,
     content: crate::net::ContentId,
     day_secs: f32,
-    allow_teleport: bool,
+    teleport: TeleportPolicy,
     worldgen: WorldgenKind,
     terrain: TerrainCfg,
     generator: crate::world::terrain::Generator,
@@ -217,6 +259,11 @@ struct Ctx {
     /// touches a second lock. When `Some`, hook calls happen *outside* the
     /// [`State`] lock: collect facts under it, drop it, then run the table.
     hooks: Option<Mutex<hooks::Table>>,
+    /// Lowercased operator names.
+    ops: Vec<String>,
+    mods_allow: Vec<String>,
+    mods_deny: Vec<String>,
+    store: Option<Arc<Store>>,
 }
 
 struct PlayerHandle {
@@ -304,6 +351,8 @@ struct State {
     day_set: Instant,
     /// Server-authoritative reaction scheduler. Clients never run one.
     reactions: ReactionScheduler,
+    /// Envelope cap copied from [`Config::max_speed`] at spawn.
+    max_speed: f64,
 }
 
 impl State {
@@ -533,18 +582,23 @@ fn outside_world(pos: DVec3) -> bool {
         || pos.z.abs() > crate::math::WORLD_BORDER
 }
 
-/// A running server. [`stop`](ServerHandle::stop)ping it takes the listener down;
-/// existing clients finish on their own.
+/// A running server. [`stop`](ServerHandle::stop) saves the world, closes every
+/// connection, and joins the server threads so the port can be bound again.
+/// Dropping the handle does the same.
 pub(crate) struct ServerHandle {
     shutdown: Arc<AtomicBool>,
+    stopped: AtomicBool,
     addr: SocketAddr,
-    /// The runtime hosting quinn, held so it outlives the handle. The accept loop
-    /// and every client handler thread also hold clones, so a detached server keeps
-    /// running and existing clients finish even after the handle is dropped.
-    _rt: Arc<Runtime>,
-    /// Test-only window into the shared state, for grid-leak assertions.
-    #[cfg(test)]
+    /// Dropped at the end of [`stop`](Self::stop), after the endpoint, so quinn's
+    /// driver can release the socket while a runtime still exists.
+    rt: Mutex<Option<Arc<Runtime>>>,
+    endpoint: Mutex<Option<Endpoint>>,
+    accept: Mutex<Option<JoinHandle<()>>>,
+    reactions: Mutex<Option<JoinHandle<()>>>,
+    autosave: Mutex<Option<JoinHandle<()>>>,
+    save_gate: Arc<Mutex<()>>,
     state: Arc<Mutex<State>>,
+    ctx: Arc<Ctx>,
     /// Test-only window into the pre-auth handshake slot counter.
     #[cfg(test)]
     handshake_pending: Arc<AtomicUsize>,
@@ -557,9 +611,34 @@ impl ServerHandle {
         self.addr
     }
 
-    /// Stop accepting new connections. Existing clients finish on their own sockets.
+    /// Save, close every connection with "server shutting down", and join threads.
+    /// A second call does nothing.
     pub fn stop(&self) {
-        self.shutdown.store(true, Ordering::Relaxed);
+        if self.stopped.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        self.save_now();
+        self.shutdown.store(true, Ordering::SeqCst);
+        if let Some(endpoint) = self.endpoint.lock_recover().take() {
+            endpoint.close(0u32.into(), b"server shutting down");
+        }
+        if let Some(handle) = self.accept.lock_recover().take() {
+            let _ = handle.join();
+        }
+        if let Some(handle) = self.reactions.lock_recover().take() {
+            let _ = handle.join();
+        }
+        if let Some(handle) = self.autosave.lock_recover().take() {
+            let _ = handle.join();
+        }
+        // Last runtime clone: its drop finishes the driver and frees the port.
+        drop(self.rt.lock_recover().take());
+    }
+
+    /// Write the world file now. No file is configured, or a save is already
+    /// in progress, and this waits for that write then writes again.
+    pub fn save_now(&self) {
+        save_world(&self.state, &self.ctx, &self.save_gate);
     }
 
     /// Total player entries across every interest-grid bucket. Must always equal
@@ -582,8 +661,25 @@ impl ServerHandle {
     }
 }
 
+impl Drop for ServerHandle {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 /// Bind to port 0 to let the OS pick a free port.
 pub(crate) fn spawn(port: u16, config: Config) -> io::Result<ServerHandle> {
+    let terrain = config.terrain.clamp();
+    let flags = persist::Flags {
+        seed: config.seed,
+        worldgen: config.worldgen,
+        terrain,
+        warn: config.warn_world_overrides,
+    };
+    let loaded = match &config.world {
+        Some(path) => persist::load(path, &flags).map_err(|e| io::Error::other(e))?,
+        None => persist::fresh(&flags),
+    };
     let rt = Arc::new(Runtime::new()?);
     let endpoint = {
         // Must run inside the runtime: construction spawns quinn's UDP driver,
@@ -596,14 +692,37 @@ pub(crate) fn spawn(port: u16, config: Config) -> io::Result<ServerHandle> {
     };
     let addr = endpoint.local_addr()?;
     let shutdown = Arc::new(AtomicBool::new(false));
+    let endpoint_for_stop = endpoint.clone();
 
     // Doubles as spawn-height terrain, the content identity joins must match,
-    // and the edit-spec validator.
+    // and the edit-spec validator. Built from the loaded world, not the flags,
+    // once a file has replaced them.
     let mut registry = BlockRegistry::with_builtins();
-    let generator: crate::world::terrain::Generator = match config.worldgen {
-        WorldgenKind::Flat => Arc::new(crate::world::generation::FlatTerrain::new(&mut registry, config.seed)),
-        WorldgenKind::Diffusion => crate::world::terrain::generator(&mut registry, config.seed, config.terrain),
+    let generator: crate::world::terrain::Generator = match loaded.worldgen {
+        WorldgenKind::Flat => {
+            Arc::new(crate::world::generation::FlatTerrain::new(&mut registry, loaded.seed))
+        }
+        WorldgenKind::Diffusion => {
+            crate::world::terrain::generator(&mut registry, loaded.seed, loaded.terrain)
+        }
     };
+    let mut state = State {
+        edits: HashMap::new(),
+        spec_pool: HashMap::new(),
+        registry,
+        players: HashMap::new(),
+        grid: HashMap::new(),
+        next_id: 1,
+        day: loaded.day,
+        day_set: Instant::now(),
+        reactions: ReactionScheduler::new(),
+        max_speed: finite_speed(config.max_speed),
+    };
+    install_edits(&mut state, &loaded.edits);
+    let content = crate::net::content_id(&state.registry);
+    let shared = Arc::new(Mutex::new(state));
+    debug_assert_ne!(WORLD_PLAYER, 1, "player ids start at 1; 0 is the world");
+
     let hooks = if config.hooks.is_empty() {
         None
     } else {
@@ -611,60 +730,195 @@ pub(crate) fn spawn(port: u16, config: Config) -> io::Result<ServerHandle> {
     };
     let ctx = Arc::new(Ctx {
         password: config.password,
-        seed: config.seed,
-        content: crate::net::content_id(&registry),
+        seed: loaded.seed,
+        content,
         day_secs: clamp_day_secs(config.day_secs),
-        allow_teleport: config.allow_teleport,
-        worldgen: config.worldgen,
-        terrain: config.terrain.clamp(),
+        teleport: config.teleport,
+        worldgen: loaded.worldgen,
+        terrain: loaded.terrain,
         generator,
         hooks,
+        ops: canonical_ops(&config.ops),
+        mods_allow: config.mods_allow,
+        mods_deny: config.mods_deny,
+        store: loaded.store.map(Arc::new),
     });
-    let shared = Arc::new(Mutex::new(State {
-        edits: HashMap::new(),
-        spec_pool: HashMap::new(),
-        registry,
-        players: HashMap::new(),
-        grid: HashMap::new(),
-        next_id: 1,
-        day: 0.3,
-        day_set: Instant::now(),
-        reactions: ReactionScheduler::new(),
-    }));
-    debug_assert_ne!(WORLD_PLAYER, 1, "player ids start at 1; 0 is the world");
+    if let Some(store) = &ctx.store {
+        println!(
+            "world {}: seed {}, worldgen {}",
+            store.path().display(),
+            ctx.seed,
+            ctx.worldgen.id()
+        );
+    }
 
-    #[cfg(test)]
-    let state = shared.clone();
     let pending = Arc::new(AtomicUsize::new(0));
     #[cfg(test)]
     let handshake_pending = pending.clone();
+    let save_gate = Arc::new(Mutex::new(()));
     let accept_shutdown = shutdown.clone();
     let accept_rt = rt.clone();
     let tick_shutdown = shutdown.clone();
     let tick_shared = shared.clone();
     let tick_ctx = ctx.clone();
-    thread::spawn(move || reactions_loop(tick_shared, tick_ctx, tick_shutdown));
-    thread::spawn(move || accept_loop(endpoint, accept_rt, shared, ctx, accept_shutdown, pending));
+    let reactions = thread::spawn(move || reactions_loop(tick_shared, tick_ctx, tick_shutdown));
+    let autosave = ctx.store.as_ref().map(|_| {
+        let shared = shared.clone();
+        let ctx = ctx.clone();
+        let gate = save_gate.clone();
+        let shutdown = shutdown.clone();
+        let every = config.autosave_every.max(Duration::from_secs(1));
+        thread::spawn(move || autosave_loop(shared, ctx, gate, shutdown, every))
+    });
+    let accept_shared = shared.clone();
+    let accept_ctx = ctx.clone();
+    let accept = thread::spawn(move || {
+        accept_loop(endpoint, accept_rt, accept_shared, accept_ctx, accept_shutdown, pending)
+    });
 
     Ok(ServerHandle {
         shutdown,
+        stopped: AtomicBool::new(false),
         addr,
-        _rt: rt,
-        #[cfg(test)]
-        state,
+        rt: Mutex::new(Some(rt)),
+        endpoint: Mutex::new(Some(endpoint_for_stop)),
+        accept: Mutex::new(Some(accept)),
+        reactions: Mutex::new(Some(reactions)),
+        autosave: Mutex::new(autosave),
+        save_gate,
+        state: shared,
+        ctx,
         #[cfg(test)]
         handshake_pending,
     })
 }
 
-/// The dedicated server binary's entry point.
+fn finite_speed(v: f64) -> f64 {
+    if v.is_finite() && v >= 0.0 { v } else { crate::player::MAX_SPEED }
+}
+
+fn canonical_ops(names: &[String]) -> Vec<String> {
+    let mut ops = Vec::new();
+    for name in names {
+        let canon = canonical_name(name);
+        if canon.is_empty() || ops.iter().any(|op: &String| op == &canon) {
+            continue;
+        }
+        ops.push(canon);
+    }
+    ops
+}
+
+fn canonical_name(raw: &str) -> String {
+    clean_name(raw).to_ascii_lowercase()
+}
+
+fn is_operator(ctx: &Ctx, name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    ctx.ops.iter().any(|op| op == &name)
+}
+
+/// Skip a spec this build cannot parse. Revisions start at 1; the file has none.
+fn install_edits(state: &mut State, edits: &[(i32, i32, i32, String)]) {
+    for (x, y, z, spec) in edits {
+        let Some(id) = state.registry.parse_spec(spec) else {
+            eprintln!("skipping unknown block spec at {x},{y},{z}");
+            continue;
+        };
+        let canonical = state.registry.spec(id);
+        let Some(shared) = state.intern(&canonical) else { continue };
+        state.edits.insert((*x, *y, *z), Cell { spec: shared, rev: 1 });
+    }
+}
+
+fn save_world(state: &Mutex<State>, ctx: &Ctx, gate: &Mutex<()>) {
+    let Some(store) = &ctx.store else { return };
+    let _gate = gate.lock_recover();
+    let snap = {
+        let state = state.lock_recover();
+        let edits = state
+            .edits
+            .iter()
+            .map(|(&(x, y, z), cell)| (x, y, z, cell.spec.to_string()))
+            .collect();
+        persist::Snapshot {
+            seed: ctx.seed,
+            worldgen: ctx.worldgen,
+            terrain: ctx.terrain,
+            day: state.day_now(ctx.day_secs),
+            edits,
+        }
+    };
+    if let Err(e) = store.write(&snap) {
+        eprintln!("could not save {}: {e}", store.path().display());
+    }
+}
+
+fn autosave_loop(
+    state: Arc<Mutex<State>>,
+    ctx: Arc<Ctx>,
+    gate: Arc<Mutex<()>>,
+    shutdown: Arc<AtomicBool>,
+    every: Duration,
+) {
+    let mut next = Instant::now() + every;
+    while !shutdown.load(Ordering::SeqCst) {
+        thread::sleep(Duration::from_millis(200));
+        if shutdown.load(Ordering::SeqCst) {
+            break;
+        }
+        if Instant::now() < next {
+            continue;
+        }
+        save_world(&state, &ctx, &gate);
+        next = Instant::now() + every;
+    }
+}
+
+/// Union `ops.txt` and `mods.toml` beside [`Config::world`] into the flag lists.
+/// A missing file adds nothing. A `mods.toml` that is not `allow` / `deny`
+/// string arrays is an error, so a dedicated server refuses to start open.
+pub fn load_world_policy(config: &mut Config) -> Result<(), String> {
+    let Some(world) = config.world.clone() else {
+        return Ok(());
+    };
+    let side = persist::read_side_files(&world)?;
+    for name in side.ops {
+        if !config.ops.iter().any(|op| op.eq_ignore_ascii_case(&name)) {
+            config.ops.push(name);
+        }
+    }
+    push_unique(&mut config.mods_allow, side.allow);
+    push_unique(&mut config.mods_deny, side.deny);
+    Ok(())
+}
+
+fn push_unique(into: &mut Vec<String>, extra: Vec<String>) {
+    for id in extra {
+        if !into.iter().any(|have| have == &id) {
+            into.push(id);
+        }
+    }
+}
+
+/// The dedicated server binary's entry point. SIGINT and SIGTERM save and close.
 pub fn run(port: u16, config: Config) -> io::Result<()> {
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let (mut sigint, mut sigterm) = rt.block_on(async {
+        let sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+        let sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        io::Result::Ok((sigint, sigterm))
+    })?;
     let handle = spawn(port, config)?;
     println!("watt-cubed server listening on {}", handle.addr());
-    // The accept loop runs on its own thread; park this one so the process lives.
-    loop {
-        thread::sleep(Duration::from_secs(3600));
-    }
+    rt.block_on(async {
+        tokio::select! {
+            _ = sigint.recv() => {}
+            _ = sigterm.recv() => {}
+        }
+    });
+    handle.stop();
+    Ok(())
 }
 
 /// Decrements the pre-auth connection count when a handshake ends, however it
@@ -685,9 +939,11 @@ fn accept_loop(
     shutdown: Arc<AtomicBool>,
     pending: Arc<AtomicUsize>,
 ) {
+    let mut clients: Vec<JoinHandle<()>> = Vec::new();
     while !shutdown.load(Ordering::Relaxed) {
-        // Bounded wait so `stop()` (which only flips the flag) is noticed
-        // promptly between connections.
+        clients.retain(|handle| !handle.is_finished());
+        // Bounded wait so `stop()` is noticed between connections. Closing the
+        // endpoint makes `accept` return `None` and the loop joins every client.
         let incoming = match rt
             .block_on(async { tokio::time::timeout(Duration::from_millis(200), endpoint.accept()).await })
         {
@@ -708,10 +964,13 @@ fn accept_loop(
         let shared = shared.clone();
         let ctx = ctx.clone();
         let handler_rt = rt.clone();
-        thread::spawn(move || {
+        clients.push(thread::spawn(move || {
             // A dropped connection is routine; the error is the disconnect cause.
             let _ = handle_client(incoming, handler_rt, shared, ctx, slot);
-        });
+        }));
+    }
+    for handle in clients {
+        let _ = handle.join();
     }
 }
 
@@ -808,8 +1067,12 @@ fn handshake(
 
     let name = match hello_name(&frame, ctx) {
         Ok(name) => clean_name(&name),
-        Err(reason) => {
+        Err(HelloFail::Reject(reason)) => {
             reject(rt, &mut send, &conn, &reason);
+            return Ok(None);
+        }
+        Err(HelloFail::Mods(ids)) => {
+            deny_mods(rt, &mut send, &conn, ids);
             return Ok(None);
         }
     };
@@ -818,32 +1081,58 @@ fn handshake(
     Ok(Some((conn, send, recv, frame, name, addr)))
 }
 
+enum HelloFail {
+    Reject(String),
+    Mods(Vec<Arc<str>>),
+}
+
 /// Protocol number first, then the content parts. A tag or version mismatch is
 /// named without decoding the rest of the payload (a v12 `Hello` is a different shape).
-fn hello_name(frame: &[u8], ctx: &Ctx) -> Result<Arc<str>, String> {
+/// Password is checked before the mod list, so a scanner without the password
+/// learns nothing about the whitelist.
+fn hello_name(frame: &[u8], ctx: &Ctx) -> Result<Arc<str>, HelloFail> {
     let protocol = match protocol::peek_hello(frame) {
-        protocol::HelloPeek::NotHello => return Err("expected hello".into()),
-        protocol::HelloPeek::Truncated => return Err("malformed hello".into()),
+        protocol::HelloPeek::NotHello => return Err(HelloFail::Reject("expected hello".into())),
+        protocol::HelloPeek::Truncated => return Err(HelloFail::Reject("malformed hello".into())),
         protocol::HelloPeek::Protocol(v) => v,
     };
     if protocol != PROTOCOL_VERSION {
-        return Err(format!(
+        return Err(HelloFail::Reject(format!(
             "protocol version mismatch: server v{PROTOCOL_VERSION}, client v{protocol}"
-        ));
+        )));
     }
     match ClientMessage::decode(frame) {
-        Some(ClientMessage::Hello { worldgen, gravity, law, palette, name, password, .. }) => {
+        Some(ClientMessage::Hello { worldgen, gravity, law, palette, name, password, mods, .. }) => {
             let client = crate::net::ContentId { worldgen, gravity, law, palette };
             if let Some(why) = crate::net::content_mismatch(ctx.content, client) {
-                return Err(why);
+                return Err(HelloFail::Reject(why));
             }
             if *password != *ctx.password {
-                return Err("wrong password".into());
+                return Err(HelloFail::Reject("wrong password".into()));
+            }
+            let refused = refused_mods(ctx, &mods);
+            if !refused.is_empty() {
+                return Err(HelloFail::Mods(refused));
             }
             Ok(name)
         }
-        _ => Err("malformed hello".into()),
+        _ => Err(HelloFail::Reject("malformed hello".into())),
     }
+}
+
+/// Allow list (when set) admits only those ids. Deny always refuses. An id in
+/// both is refused. Ids match the registered package id, case-sensitive.
+fn refused_mods(ctx: &Ctx, mods: &[ModOffer]) -> Vec<Arc<str>> {
+    let mut refused = Vec::new();
+    for offer in mods {
+        let id = offer.id.as_ref();
+        let denied = ctx.mods_deny.iter().any(|d| d == id);
+        let blocked = !ctx.mods_allow.is_empty() && !ctx.mods_allow.iter().any(|a| a == id);
+        if (denied || blocked) && !refused.iter().any(|have: &Arc<str>| have.as_ref() == id) {
+            refused.push(Arc::clone(&offer.id));
+        }
+    }
+    refused
 }
 
 fn admit_player(
@@ -875,6 +1164,16 @@ fn admit_player(
     let snapshot: Vec<(i32, i32, i32, u32, Arc<str>)>;
     {
         let mut state = shared.lock_recover();
+        if name.eq_ignore_ascii_case("server") {
+            drop(state);
+            reject(rt, send, conn, "the name 'server' is reserved");
+            return None;
+        }
+        if state.players.values().any(|h| h.name.eq_ignore_ascii_case(name)) {
+            drop(state);
+            reject(rt, send, conn, "that name is already in use");
+            return None;
+        }
         if state.players.len() >= MAX_PLAYERS {
             drop(state);
             reject(rt, send, conn, "server full");
@@ -1029,7 +1328,7 @@ fn client_loop(
             ClientMessage::Chat { channel, text } => {
                 on_chat(shared, ctx.hooks.as_ref(), id, channel, &text)
             }
-            ClientMessage::SetTime { day } => on_set_time(shared, ctx, day),
+            ClientMessage::SetTime { day } => on_set_time(shared, ctx, id, day),
             ClientMessage::ModData { channel, seq, bytes } => {
                 if !channels.allow(&channel, now) {
                     continue; // Over this channel's budget this second — drop silently.
@@ -1172,13 +1471,15 @@ fn on_move(
     let mut sends = Vec::new();
     {
         let mut state = shared.lock_recover();
+        let max_speed = state.max_speed;
         let Some(h) = state.players.get(&id) else { return };
         // Envelope: the speed the client reports (and the one we last accepted),
-        // grown by gravity over the gap, capped by the game's own limits.
-        // Cruise raises that cap only after a `Cruise` message. Outside the
-        // border is refused either way.
+        // grown by gravity over the gap, capped by the server's speed limit.
+        // Cruise raises that cap only after a `Cruise` message, and only up to
+        // the game's cruise ceiling unless the server cap is tighter.
+        // Outside the border is refused either way. Solid terrain is not tested.
         let elapsed = h.last_move.elapsed().as_secs_f64().min(MOVE_WINDOW_CAP_SECS);
-        let allowed = move_allowance(h, velocity, elapsed);
+        let allowed = move_allowance(h, velocity, elapsed, max_speed);
         if outside_world(pos) || h.pos.distance_squared(pos) > allowed * allowed {
             h.correct_position(id, &mut sends);
         } else {
@@ -1199,19 +1500,29 @@ fn speed_of(v: Vec3) -> f64 {
     if s.is_finite() { s } else { 0.0 }
 }
 
-fn move_cap(h: &PlayerHandle) -> f64 {
-    if h.cruising {
-        h.cruise_speed.min(crate::player::CRUISE_MAX)
+/// Cruise ceiling. At or above [`crate::player::MAX_SPEED`] the declared cruise
+/// may reach [`crate::player::CRUISE_MAX`]. A tighter server cap bounds cruise too.
+fn cruise_limit(max_speed: f64) -> f64 {
+    if max_speed < crate::player::MAX_SPEED {
+        max_speed
     } else {
-        crate::player::MAX_SPEED
+        crate::player::CRUISE_MAX
+    }
+}
+
+fn move_cap(h: &PlayerHandle, max_speed: f64) -> f64 {
+    if h.cruising {
+        h.cruise_speed.min(cruise_limit(max_speed))
+    } else {
+        max_speed
     }
 }
 
 /// Blocks the client may have covered since `last_move`. `reported` is a cap
 /// input, not a grant: a cruise declaration does nothing until the velocity
 /// the client reports (bounded by that declaration) justifies the hop.
-fn move_allowance(h: &PlayerHandle, reported: Vec3, elapsed: f64) -> f64 {
-    let cap = move_cap(h);
+fn move_allowance(h: &PlayerHandle, reported: Vec3, elapsed: f64, max_speed: f64) -> f64 {
+    let cap = move_cap(h, max_speed);
     let speed = cap.min(speed_of(reported).max(speed_of(h.velocity)) + GRAVITY_BOUND * elapsed);
     MOVE_FLOOR.max(speed * (elapsed + MOVE_SLACK_SECS))
 }
@@ -1227,25 +1538,26 @@ fn clamp_velocity(v: Vec3, cap: f64) -> Vec3 {
 }
 
 /// `speed` 0 ends cruise. Non-finite or negative is ignored. The stored cap
-/// never exceeds [`crate::player::CRUISE_MAX`].
+/// never exceeds [`cruise_limit`].
 fn on_cruise(shared: &Arc<Mutex<State>>, id: u32, speed: f64) {
     if !speed.is_finite() || speed < 0.0 {
         return;
     }
     let mut state = shared.lock_recover();
+    let limit = cruise_limit(state.max_speed);
     let Some(h) = state.players.get_mut(&id) else { return };
     if speed == 0.0 {
         h.cruising = false;
         h.cruise_speed = 0.0;
     } else {
         h.cruising = true;
-        h.cruise_speed = speed.min(crate::player::CRUISE_MAX);
+        h.cruise_speed = speed.min(limit);
     }
 }
 
 /// An explicit `/tp` discontinuity: exempt from the movement envelope, still
-/// border-checked, and refused (with an authoritative snap-back) when the
-/// server configuration forbids client teleports.
+/// border-checked, and refused (Position, then a reason) when this player
+/// may not teleport.
 fn on_teleport(shared: &Arc<Mutex<State>>, ctx: &Ctx, id: u32, pos: DVec3) {
     if !pos.x.is_finite() || !pos.y.is_finite() || !pos.z.is_finite() {
         return;
@@ -1254,8 +1566,21 @@ fn on_teleport(shared: &Arc<Mutex<State>>, ctx: &Ctx, id: u32, pos: DVec3) {
     {
         let mut state = shared.lock_recover();
         let Some(h) = state.players.get(&id) else { return };
-        if outside_world(pos) || !ctx.allow_teleport {
+        let allowed = match ctx.teleport {
+            TeleportPolicy::All => true,
+            TeleportPolicy::Ops => is_operator(ctx, &h.name),
+            TeleportPolicy::Off => false,
+        };
+        if outside_world(pos) || !allowed {
             h.correct_position(id, &mut sends);
+            if !outside_world(pos) {
+                let reason = if ctx.teleport == TeleportPolicy::Off {
+                    "teleport is not permitted"
+                } else {
+                    "only an operator can teleport"
+                };
+                tell(h, id, reason, &mut sends);
+            }
         } else {
             commit_pose(&mut state, id, pos, None, &mut sends);
             // Echo so a client with an in-flight `/tp` can tell accept from a
@@ -1266,6 +1591,21 @@ fn on_teleport(shared: &Arc<Mutex<State>>, ctx: &Ctx, id: u32, pos: DVec3) {
         }
     }
     dispatch(shared, sends);
+}
+
+fn tell(h: &PlayerHandle, id: u32, text: &str, sends: &mut Vec<PendingSend>) {
+    if !h.ready {
+        return;
+    }
+    let frame = ServerMessage::Chat {
+        from_id: WORLD_PLAYER,
+        from_name: Arc::from("server"),
+        channel: chat::GLOBAL,
+        text: text.into(),
+    }
+    .encode()
+    .into();
+    sends.push((id, h.out.clone(), frame));
 }
 
 /// Must run under the state lock; the queued sends go out after it drops.
@@ -1280,11 +1620,12 @@ fn commit_pose(
     reported: Option<ReportedPose>,
     sends: &mut Vec<PendingSend>,
 ) {
+    let max_speed = state.max_speed;
     let Some(h) = state.players.get_mut(&id) else { return };
     let old = h.pos;
     h.pos = pos;
     if let Some(r) = reported {
-        let cap = move_cap(h);
+        let cap = move_cap(h, max_speed);
         h.yaw = r.yaw;
         h.pitch = r.pitch;
         h.frame = r.frame;
@@ -1670,16 +2011,27 @@ fn on_mod_data(
 }
 
 /// Anchors the shared clock so joiners inherit the CURRENT time. A non-finite
-/// value is ignored rather than poisoning the shared time.
-fn on_set_time(shared: &Arc<Mutex<State>>, ctx: &Ctx, day: f32) {
+/// value is ignored rather than poisoning the shared time. Only an operator
+/// may set it.
+fn on_set_time(shared: &Arc<Mutex<State>>, ctx: &Ctx, id: u32, day: f32) {
     if !day.is_finite() {
         return;
     }
     let day = day.rem_euclid(1.0);
-    let mut state = shared.lock_recover();
-    state.day = day;
-    state.day_set = Instant::now();
-    broadcast(&mut state, &ServerMessage::Time { day, day_secs: ctx.day_secs }, |_, _| true);
+    let mut sends = Vec::new();
+    {
+        let mut state = shared.lock_recover();
+        let Some(h) = state.players.get(&id) else { return };
+        if !is_operator(ctx, &h.name) {
+            tell(h, id, "only an operator can set the time", &mut sends);
+            drop(state);
+            dispatch(shared, sends);
+            return;
+        }
+        state.day = day;
+        state.day_set = Instant::now();
+        broadcast(&mut state, &ServerMessage::Time { day, day_secs: ctx.day_secs }, |_, _| true);
+    }
 }
 
 /// Encodes `msg` just once for every recipient. Players whose queue is full
@@ -1753,6 +2105,16 @@ fn reject(rt: &Runtime, send: &mut SendStream, conn: &quinn::Connection, reason:
         let _ = tokio::time::timeout(REJECT_DRAIN, conn.closed()).await;
     });
     println!("[x] rejected a connection: {reason}");
+}
+
+fn deny_mods(rt: &Runtime, send: &mut SendStream, conn: &quinn::Connection, ids: Vec<Arc<str>>) {
+    let listed = ids.iter().map(|id| id.as_ref()).collect::<Vec<_>>().join(", ");
+    rt.block_on(async {
+        let _ = protocol::write_frame_async(send, &ServerMessage::ModsDenied { ids }.encode()).await;
+        let _ = send.finish();
+        let _ = tokio::time::timeout(REJECT_DRAIN, conn.closed()).await;
+    });
+    println!("[x] refused mods: {listed}");
 }
 
 /// Scattered a little per id so players don't stack on the exact same block; scans outward for
@@ -1916,6 +2278,7 @@ mod tests {
             palette: content.palette,
             name: name.into(),
             password: password.into(),
+            mods: vec![],
         }
     }
 
@@ -1952,6 +2315,7 @@ mod tests {
             day: 0.3,
             day_set: Instant::now(),
             reactions: ReactionScheduler::new(),
+            max_speed: crate::player::MAX_SPEED,
         }
     }
 
@@ -1969,11 +2333,15 @@ mod tests {
             seed: 4242,
             content: crate::net::content_id(&BlockRegistry::with_builtins()),
             day_secs: 600.0,
-            allow_teleport,
+            teleport: if allow_teleport { TeleportPolicy::All } else { TeleportPolicy::Off },
             worldgen: WorldgenKind::Diffusion,
             terrain: TerrainCfg::default(),
             generator: test_generator(),
             hooks: None,
+            ops: Vec::new(),
+            mods_allow: Vec::new(),
+            mods_deny: Vec::new(),
+            store: None,
         }
     }
 
@@ -3611,5 +3979,376 @@ mod tests {
         assert!(local.is_alive());
         assert_ne!(v6.player_id(), local.player_id());
         handle.stop();
+    }
+
+    fn flat(config: Config) -> ServerHandle {
+        spawn(0, Config { seed: 1, worldgen: WorldgenKind::Flat, ..config }).unwrap()
+    }
+
+    fn drain(rx: &std::sync::mpsc::Receiver<Arc<[u8]>>) -> Vec<ServerMessage> {
+        let mut out = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            if let Some(msg) = ServerMessage::decode(&frame) {
+                out.push(msg);
+            }
+        }
+        out
+    }
+
+    /// `/tp` and `/time` are operator-only under [`TeleportPolicy::Ops`]. The
+    /// reason is a private chat from "server". The speed cap is the same
+    /// whether or not the client claimed a mod.
+    #[test]
+    fn non_operator_time_and_teleport_are_refused_with_a_reason() {
+        let (out, rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
+        let start = DVec3::new(8.5, 20.0, 8.5);
+        let mut players = HashMap::new();
+        players.insert(1u32, test_player(start, out, test_kick()));
+        let shared = Arc::new(Mutex::new(test_state(players)));
+        let mut ops = test_ctx(true);
+        ops.teleport = TeleportPolicy::Ops;
+        ops.ops = vec!["p".into()];
+
+        on_set_time(&shared, &ops, 1, 0.2);
+        assert!((shared.lock_recover().day - 0.2).abs() < 1e-6);
+        assert!(drain(&rx).iter().any(|m| matches!(m, ServerMessage::Time { day, .. } if (*day - 0.2).abs() < 1e-4)));
+
+        let far = DVec3::new(80.5, 20.0, 8.5);
+        on_teleport(&shared, &ops, 1, far);
+        assert_eq!(shared.lock_recover().players[&1].pos, far);
+
+        let mut guest = test_ctx(true);
+        guest.teleport = TeleportPolicy::Ops;
+        on_set_time(&shared, &guest, 1, 0.9);
+        assert!((shared.lock_recover().day - 0.2).abs() < 1e-6, "a guest does not move the clock");
+        assert!(
+            drain(&rx).iter().any(|m| matches!(
+                m,
+                ServerMessage::Chat { from_name, text, .. } if from_name.as_ref() == "server" && text.as_ref() == "only an operator can set the time"
+            ))
+        );
+
+        on_teleport(&shared, &guest, 1, start);
+        assert_eq!(shared.lock_recover().players[&1].pos, far, "a guest teleport is not committed");
+        let refused = drain(&rx);
+        assert!(refused.iter().any(|m| matches!(m, ServerMessage::Position { pos, .. } if *pos == far)));
+        assert!(refused.iter().any(|m| matches!(
+            m,
+            ServerMessage::Chat { text, .. } if text.as_ref() == "only an operator can teleport"
+        )));
+
+        let off = test_ctx(false);
+        on_teleport(&shared, &off, 1, start);
+        assert!(drain(&rx).iter().any(|m| matches!(
+            m,
+            ServerMessage::Chat { text, .. } if text.as_ref() == "teleport is not permitted"
+        )));
+    }
+
+    /// A cap below [`crate::player::MAX_SPEED`] bounds flight and cruise. `/tp`
+    /// stays refused when the policy is off. Noclip is not tested: moves are
+    /// not collision-checked.
+    #[test]
+    fn flyspeed_above_the_server_cap_is_snapped() {
+        let cap = 30.0 * crate::math::PER_METER;
+        let (out, rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
+        let start = DVec3::new(8.5, 40.0, 8.5);
+        let mut players = HashMap::new();
+        players.insert(1u32, test_player(start, out, test_kick()));
+        let shared = Arc::new(Mutex::new(test_state(players)));
+        shared.lock_recover().max_speed = cap;
+
+        let near = DVec3::new(start.x + 10.0 * crate::math::PER_METER, start.y, start.z);
+        on_move(
+            &shared, 1, near, 0.0, 0.0, DQuat::IDENTITY,
+            Vec3::new(cap as f32, 0.0, 0.0), Face::PosY, Stance::Standing,
+        );
+        assert_eq!(shared.lock_recover().players[&1].pos, near, "10 m under the cap commits");
+
+        age_move(&shared, 1);
+        let leap = DVec3::new(near.x + 500.0 * crate::math::PER_METER, near.y, near.z);
+        on_move(
+            &shared, 1, leap, 0.0, 0.0, DQuat::IDENTITY,
+            Vec3::new(cap as f32, 0.0, 0.0), Face::PosY, Stance::Standing,
+        );
+        assert_eq!(shared.lock_recover().players[&1].pos, near, "500 m over the cap snaps");
+        assert!(drain(&rx).iter().any(|m| matches!(m, ServerMessage::Position { .. })));
+
+        on_cruise(&shared, 1, crate::player::CRUISE_MAX);
+        assert!((shared.lock_recover().players[&1].cruise_speed - cap).abs() < 1e-6);
+        age_move(&shared, 1);
+        on_move(
+            &shared, 1, leap, 0.0, 0.0, DQuat::IDENTITY,
+            Vec3::new(crate::player::CRUISE_MAX as f32, 0.0, 0.0), Face::PosY, Stance::Standing,
+        );
+        assert_eq!(shared.lock_recover().players[&1].pos, near, "cruise cannot outrun a lower cap");
+
+        on_teleport(&shared, &test_ctx(false), 1, leap);
+        assert_eq!(shared.lock_recover().players[&1].pos, near);
+    }
+
+    #[test]
+    fn restarted_server_serves_the_same_edits() {
+        use crate::net::client::{Connection, Incoming};
+        let path = crate::save::store::test_temp_path("restart");
+        let _ = std::fs::remove_file(&path);
+        let handle = spawn(0, Config {
+            seed: 42,
+            worldgen: WorldgenKind::Flat,
+            world: Some(path.clone()),
+            ops: vec!["ada".into()],
+            ..Config::default()
+        }).unwrap();
+        let mut conn = Connection::connect("127.0.0.1", handle.addr().port(), "ada", "").unwrap();
+        let s = conn.spawn();
+        let (x, y, z) = (crate::math::block_coord(s.x), crate::math::block_coord(s.y), crate::math::block_coord(s.z));
+        let req = conn.send_edit(x, y, z, "air".into()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut accepted = false;
+        while !accepted && Instant::now() < deadline {
+            accepted = conn.poll().into_iter().any(|e| matches!(e, Incoming::EditAccepted { req: r } if r == req));
+            if !accepted {
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+        assert!(accepted, "the edit is committed before shutdown");
+        conn.send_set_time(0.2);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut day = None;
+        while day.is_none() && Instant::now() < deadline {
+            for event in conn.poll() {
+                if let Incoming::Time { day: d, .. } = event {
+                    day = Some(d);
+                }
+            }
+            if day.is_none() {
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+        assert!((day.expect("time reply") - 0.2).abs() < 0.02);
+        drop(conn);
+        handle.stop();
+
+        let again = spawn(0, Config {
+            seed: 99,
+            worldgen: WorldgenKind::Diffusion,
+            world: Some(path.clone()),
+            warn_world_overrides: true,
+            ..Config::default()
+        }).unwrap();
+        let mut bob = Connection::connect("127.0.0.1", again.addr().port(), "bob", "").unwrap();
+        assert_eq!(bob.seed(), 42);
+        assert_eq!(bob.worldgen(), WorldgenKind::Flat);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut saw_edit = false;
+        let mut saw_day = false;
+        while Instant::now() < deadline && !(saw_edit && saw_day) {
+            for event in bob.poll() {
+                match event {
+                    Incoming::Mutation { x: mx, y: my, z: mz, spec } if (mx, my, mz) == (x, y, z) && spec.as_ref() == "air" => {
+                        saw_edit = true;
+                    }
+                    Incoming::Time { day, .. } if (day - 0.2).abs() < 0.05 => saw_day = true,
+                    _ => {}
+                }
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(saw_edit, "the restarted world still has the edit");
+        assert!(saw_day, "the restarted world still has the clock");
+        again.stop();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn stop_closes_connections_and_frees_the_port() {
+        use crate::net::client::{Connection, Incoming};
+        let handle = flat(Config::default());
+        let port = handle.addr().port();
+        let mut conn = Connection::connect("127.0.0.1", port, "ada", "").unwrap();
+        handle.stop();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut reason = None;
+        while reason.is_none() && Instant::now() < deadline {
+            for event in conn.poll() {
+                if let Incoming::Disconnected { reason: text } = event {
+                    reason = Some(text);
+                }
+            }
+            if reason.is_none() {
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+        let reason = reason.expect("the close arrives before the idle timeout");
+        assert!(
+            reason.to_ascii_lowercase().contains("shutting down"),
+            "client saw {reason:?}"
+        );
+        drop(conn);
+        let mut rebound = None;
+        for _ in 0..50 {
+            match spawn(port, Config { seed: 1, worldgen: WorldgenKind::Flat, ..Config::default() }) {
+                Ok(handle) => {
+                    rebound = Some(handle);
+                    break;
+                }
+                Err(_) => thread::sleep(Duration::from_millis(20)),
+            }
+        }
+        rebound.expect("the port accepts a new server").stop();
+    }
+
+    #[test]
+    fn sigterm_saves_the_world() {
+        use crate::net::client::Connection;
+        let path = crate::save::store::test_temp_path("sigterm");
+        let _ = std::fs::remove_file(&path);
+        let port = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let server_path = path.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let result = run(port, Config {
+                seed: 42,
+                worldgen: WorldgenKind::Flat,
+                world: Some(server_path),
+                ..Config::default()
+            });
+            let _ = tx.send(result);
+        });
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut conn = None;
+        while conn.is_none() && Instant::now() < deadline {
+            if let Ok(result) = rx.try_recv() {
+                panic!("server exited before a client connected: {result:?}");
+            }
+            match Connection::connect("127.0.0.1", port, "ada", "") {
+                Ok(c) => conn = Some(c),
+                Err(_) => thread::sleep(Duration::from_millis(30)),
+            }
+        }
+        let _conn = conn.expect("server accepted a connection");
+        assert!(!path.exists(), "nothing is written until a save");
+        let _ = std::process::Command::new("kill")
+            .args(["-TERM", &std::process::id().to_string()])
+            .status();
+        match rx.recv_timeout(Duration::from_secs(8)) {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => panic!("server failed: {e}"),
+            Err(_) => panic!("SIGTERM did not stop the server"),
+        }
+        server.join().unwrap();
+        let bytes = std::fs::read(&path).expect("SIGTERM saved the world");
+        let doc = match crate::save::format::decode(&bytes).unwrap() {
+            crate::save::format::Decoded::Intact(doc) => doc,
+            crate::save::format::Decoded::Salvaged { .. } => panic!("shutdown save must be intact"),
+        };
+        assert_eq!(doc.meta.seed, 42);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn duplicate_and_reserved_names_are_rejected() {
+        use crate::net::client::Connection;
+        let handle = flat(Config::default());
+        let port = handle.addr().port();
+        let _ada = Connection::connect("127.0.0.1", port, "Ada", "").unwrap();
+        let dup = match Connection::connect("127.0.0.1", port, "ada", "") {
+            Ok(_) => panic!("duplicate name was admitted"),
+            Err(err) => err,
+        };
+        assert!(dup.to_string().contains("already in use"), "{dup}");
+        let reserved = match Connection::connect("127.0.0.1", port, "Server", "") {
+            Ok(_) => panic!("reserved name was admitted"),
+            Err(err) => err,
+        };
+        assert!(reserved.to_string().contains("reserved"), "{reserved}");
+        handle.stop();
+    }
+
+    #[test]
+    fn allow_list_admits_a_fully_listed_client() {
+        use crate::net::client::Connection;
+        let handle = flat(Config {
+            mods_allow: vec!["pwc.hotbar".into()],
+            ..Config::default()
+        });
+        let port = handle.addr().port();
+        let listed = [("pwc.hotbar".into(), "0.1.0".into())];
+        let ok = Connection::connect_with("127.0.0.1", port, "ada", "", &listed).expect("listed mod");
+        assert!(ok.is_alive());
+        drop(ok);
+        let extra = [
+            ("pwc.hotbar".into(), "0.1.0".into()),
+            ("pwc.dev-toolkit".into(), "1.0.0".into()),
+        ];
+        let err = match Connection::connect_with("127.0.0.1", port, "bea", "", &extra) {
+            Ok(_) => panic!("an unlisted mod was admitted"),
+            Err(err) => err,
+        };
+        assert_eq!(err.mods_denied, vec!["pwc.dev-toolkit".to_string()]);
+        let none = Connection::connect_with("127.0.0.1", port, "cy", "", &[]).expect("no mods enabled");
+        assert!(none.is_alive());
+        handle.stop();
+    }
+
+    #[test]
+    fn denied_mod_is_refused_then_admitted_when_off() {
+        use crate::net::client::Connection;
+        let handle = flat(Config {
+            mods_deny: vec!["pwc.dev-toolkit".into()],
+            ..Config::default()
+        });
+        let port = handle.addr().port();
+        let on = [("pwc.dev-toolkit".into(), "1.0.0".into())];
+        let err = match Connection::connect_with("127.0.0.1", port, "ada", "", &on) {
+            Ok(_) => panic!("a denied mod was admitted"),
+            Err(err) => err,
+        };
+        assert_eq!(err.mods_denied, vec!["pwc.dev-toolkit".to_string()]);
+        let retry = Connection::connect_with("127.0.0.1", port, "ada", "", &[]).expect("retry with the mod off");
+        assert!(retry.is_alive());
+        handle.stop();
+    }
+
+    #[test]
+    fn no_mod_restriction_admits_everyone() {
+        use crate::net::client::Connection;
+        let handle = flat(Config::default());
+        let port = handle.addr().port();
+        let mods = [("pwc.dev-toolkit".into(), "1.0.0".into()), ("pwc.hotbar".into(), "0.1.0".into())];
+        let conn = Connection::connect_with("127.0.0.1", port, "ada", "", &mods).expect("default is open");
+        assert!(conn.is_alive());
+        handle.stop();
+    }
+
+    #[test]
+    fn world_policy_unions_flags_with_side_files() {
+        let dir = crate::save::store::test_temp_path("policy");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("ops.txt"), "cara\n").unwrap();
+        std::fs::write(
+            dir.join("mods.toml"),
+            "allow = [\"pwc.hotbar\"]\ndeny = [\"pwc.dev-toolkit\"]\n",
+        ).unwrap();
+        let mut config = Config {
+            world: Some(dir.join("world.save")),
+            ops: vec!["Ada".into()],
+            mods_deny: vec!["pwc.other".into()],
+            ..Config::default()
+        };
+        load_world_policy(&mut config).unwrap();
+        assert!(config.ops.iter().any(|n| n.eq_ignore_ascii_case("ada")));
+        assert!(config.ops.iter().any(|n| n.eq_ignore_ascii_case("cara")));
+        assert_eq!(config.mods_allow, vec!["pwc.hotbar".to_string()]);
+        assert!(config.mods_deny.iter().any(|id| id == "pwc.dev-toolkit"));
+        assert!(config.mods_deny.iter().any(|id| id == "pwc.other"));
+
+        let bad = crate::save::store::test_temp_path("policy-bad");
+        std::fs::create_dir_all(&bad).unwrap();
+        std::fs::write(bad.join("mods.toml"), "allow = 1\n").unwrap();
+        let mut broken = Config { world: Some(bad.join("world.save")), ..Config::default() };
+        assert!(load_world_policy(&mut broken).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&bad);
     }
 }

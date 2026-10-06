@@ -583,6 +583,11 @@ pub struct Mods {
     /// Bumped when a mod is installed or enabled or disabled, so the input
     /// table can rebuild once instead of every frame.
     action_gen: u64,
+    /// Package ids the current server refused. Not written to `mods.cfg`.
+    server_packages: Vec<String>,
+    /// Module ids that were on when the server refused their package. Restored
+    /// on leave. The session disable itself is not saved.
+    server_held: Vec<String>,
 }
 
 impl Mods {
@@ -604,6 +609,8 @@ impl Mods {
             entries: Vec::new(),
             declared_groups: Vec::new(),
             action_gen: 0,
+            server_packages: Vec::new(),
+            server_held: Vec::new(),
         }
     }
 
@@ -846,7 +853,16 @@ impl Mods {
     }
 
     /// Flip the mod at `index` on or off, running the matching lifecycle hook.
-    pub fn toggle(&mut self, index: usize) {
+    /// False when the index is out of range or a server hold refuses the turn-on.
+    /// A refused turn-on does not change state and must not be written to `mods.cfg`.
+    pub fn toggle(&mut self, index: usize) -> bool {
+        if index >= self.entries.len() {
+            return false;
+        }
+        let turning_on = !self.entries[index].enabled;
+        if turning_on && self.server_off(index) {
+            return false;
+        }
         let entry = &mut self.entries[index];
         entry.enabled = !entry.enabled;
         if entry.enabled {
@@ -855,6 +871,7 @@ impl Mods {
             entry.module.on_disable();
         }
         self.bump_actions();
+        true
     }
 
     pub fn knobs(&self, index: usize) -> Vec<Knob> {
@@ -914,7 +931,7 @@ impl Mods {
     }
 
     /// Enable or disable a mod by [`Mod::id`] (case-insensitive). No-op if
-    /// already in that state or the id is unknown.
+    /// already in that state, the id is unknown, or a server hold refuses the turn-on.
     pub fn set_enabled(&mut self, id: &str, on: bool) {
         if let Some(i) = self
             .entries
@@ -922,18 +939,75 @@ impl Mods {
             .position(|e| e.module.id().eq_ignore_ascii_case(id))
             && self.entries[i].enabled != on
         {
-            self.toggle(i);
+            let _ = self.toggle(i);
         }
     }
 
     /// Enable or disable every installed member of `group_id`. Persists as
-    /// each member's `id=on|off` line — there is no group-level key.
-    pub fn set_group_enabled(&mut self, group_id: &str, on: bool) {
+    /// each member's `id=on|off` line — there is no group-level key. True when
+    /// at least one member changed. Members a server hold refuses stay off.
+    pub fn set_group_enabled(&mut self, group_id: &str, on: bool) -> bool {
+        let mut changed = false;
         for i in 0..self.entries.len() {
-            if self.entries[i].module.group() == group_id && self.entries[i].enabled != on {
-                self.toggle(i);
+            let member = self.entries[i].module.group() == group_id;
+            let differs = self.entries[i].enabled != on;
+            if member && differs && self.toggle(i) {
+                changed = true;
             }
         }
+        changed
+    }
+
+    /// Turn off every enabled module whose package is in `package_ids`, and
+    /// remember those module ids. Already-off siblings of a refused package
+    /// also show as server-off and cannot be enabled. This does not write
+    /// `mods.cfg`. The list is what the server said; it is not a proof the
+    /// client is unmodified.
+    pub fn hold_packages(&mut self, package_ids: &[String]) {
+        self.server_packages = package_ids.to_vec();
+        self.server_held.clear();
+        let mut turn_off = Vec::new();
+        for i in 0..self.entries.len() {
+            let Some(pkg) = self.entries[i].package else { continue };
+            if !package_ids.iter().any(|id| id == pkg) || !self.entries[i].enabled {
+                continue;
+            }
+            turn_off.push(self.entries[i].module.id().to_string());
+        }
+        for id in &turn_off {
+            self.set_enabled(id, false);
+        }
+        self.server_held = turn_off;
+    }
+
+    /// True when the mod at `index` belongs to a package the server refused.
+    pub fn server_off(&self, index: usize) -> bool {
+        self.entries.get(index).and_then(|e| e.package).is_some_and(|pkg| {
+            self.server_packages.iter().any(|id| id == pkg)
+        })
+    }
+
+    /// Re-enable only the modules [`hold_packages`](Self::hold_packages) turned off.
+    pub fn release_server(&mut self) {
+        let held = std::mem::take(&mut self.server_held);
+        self.server_packages.clear();
+        for id in held {
+            self.set_enabled(&id, true);
+        }
+    }
+
+    /// Enabled packages, as `(id, version)`, in build order. A package is
+    /// included when any of its modules is enabled. This is what an honest
+    /// client puts on `Hello`.
+    pub fn enabled_package_reports(&self, packages: &[ModDescriptor]) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for desc in packages {
+            let on = self.entries.iter().any(|e| e.enabled && e.package == Some(desc.id));
+            if on {
+                out.push((desc.id.to_string(), desc.version.to_string()));
+            }
+        }
+        out
     }
 
     /// Apply pins parsed by [`crate::benchmark::Benchmark::mod_pins_from_env`].
@@ -985,9 +1059,13 @@ impl Mods {
     pub fn choices_text(&self) -> String {
         let mut text = format!("version={CHOICES_VERSION}\n");
         for entry in &self.entries {
+            // A server hold is in-memory only. The saved choice stays what it
+            // was, so a flush during the session does not record the hold.
+            let held = self.server_held.iter().any(|id| id == entry.module.id());
+            let on = entry.enabled || held;
             text.push_str(entry.module.id());
             text.push('=');
-            text.push_str(if entry.enabled { "on" } else { "off" });
+            text.push_str(if on { "on" } else { "off" });
             text.push('\n');
             if let Some(payload) = entry.module.save_choice_state() {
                 text.push_str(entry.module.id());
@@ -1446,6 +1524,25 @@ mod tests {
                 "{id} should be on in:\n{on_text}"
             );
         }
+    }
+
+    #[test]
+    fn server_hold_turns_the_package_off_without_changing_saved_choices() {
+        let mut mods = Mods::empty();
+        const NONE: &[Command] = &[];
+        mods.install_from(Some("pwc.dev-toolkit"), Box::new(Lister("tools", NONE)), true);
+        let before = mods.choices_text();
+        assert!(before.contains("tools=on"));
+        mods.hold_packages(&["pwc.dev-toolkit".to_string()]);
+        assert!(!mods.is_enabled(0));
+        assert!(mods.server_off(0));
+        assert!(!mods.toggle(0), "a held mod cannot be turned back on");
+        assert!(!mods.is_enabled(0));
+        assert_eq!(mods.choices_text(), before, "the hold is not a saved choice");
+        mods.release_server();
+        assert!(mods.is_enabled(0));
+        assert!(!mods.server_off(0));
+        assert!(mods.toggle(0));
     }
 
     #[test]
