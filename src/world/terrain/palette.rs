@@ -180,10 +180,164 @@ pub struct Entry {
     pub config: Configuration,
 }
 
-/// The palette of the current law (computed once per process).
+/// The palette of the current law. Read from [`BAKED`] when the law and the role table are the
+/// ones it was baked from, else searched once per process (about half a second in release, on the
+/// thread that builds the first world).
 pub fn current() -> &'static [Entry] {
     static CURRENT: OnceLock<Vec<Entry>> = OnceLock::new();
-    CURRENT.get_or_init(|| search(&Law::current()))
+    CURRENT.get_or_init(|| {
+        let law = Law::current();
+        baked(&law).unwrap_or_else(|| search(&law))
+    })
+}
+
+/// The search's result, stored so a process does not search before its first world. Used only when
+/// `law` and `roles` match ([`roles_fingerprint`] covers the role table and the search constants).
+/// A change to the search itself is caught by `the_baked_palette_is_the_search`, which prints the
+/// table to paste.
+struct Baked {
+    law: u64,
+    roles: u64,
+    configs: &'static [&'static str],
+}
+
+/// The search's result for the current law, one hex configuration encoding per role in role order.
+const BAKED: Baked = Baked {
+    law: 0x04ce0caad622c6eb,
+    roles: 0x5ef1889bdc5b5090,
+    configs: &[
+        "05290514982ac9dbc82ccdddcb5e04df945e0515c9", // grass
+        "051a0f0dd41b0edc9c1e48d7d15048dc9c55120f9c", // meadow
+        "04046d7821086c3ff1cd327b25cf3344eb", // soil
+        "05213fc1a12209f7a0270ac5d45841fbd55c06c59e", // sand
+        "0607ae3e5e0a76765d0aab7699d377435fd37a7499d4ac3d98", // redsand
+        "053122ad913125ae913157e4cc6a57adc66c5ce895", // snow
+        "06bc70df17bd3fe414c070aa12c073e518c172e149f472df15", // ice
+        "052037cc81230002b72338c87c5501cbb559000182", // gravel
+        "053dc8ded33ecae1d23efe159c70fd16d674fde2a0", // rock
+        "04078639c60a876b02d04f36c8d0506dff", // rock1
+        "05176a0b4c176cd4881ca1d54f52690c8652a0d883", // rock2
+        "05284aadab294baeac2a1679765b14ad745c1479a9", // rock3
+        "05402693be4226cf8d77f4cec37b25988e7bf0cdc3", // sandstone
+        "051ae9645b1bed2925e0b26025e0b35e24e3ea2c55", // sandstone1
+        "067bd4b2637d0aae2c7d0de55eaed5e661b0d9ad2cb30ee42c", // sandstone2
+        "051bb1d0c41de8d0941eaf0a924fb20cc652e5d0c9", // sandstone3
+        "053d5aa3003d5ed8376d23d7ff6f5ba4397327d7fe", // deeprock
+        "05336ed370346805396ca2d13d6ca2d53b6f6d096f", // abyss
+        "052996e7102a5f1a0d5f98e543605d1d406562e30a", // timber
+        "0502045b0b03ff5d0c06c92443cccc5c44cccd2210", // leaves
+        "0505a3550e05db554907d78e12d2a58d4ad3db5412", // pine
+        "052664400e296006412a963e45ef9a3f10f465050e", // blossom
+        "05340a58ab380a1fdc6a0757dd6b3e1da56e3d1da6", // autumn
+        "06bb563f58bb8d428bbe907a56f157418df5577755f58d798d", // plank
+        "051337c9c4136f01fc1538c8c5466ecbfd487201c6", // rail
+        "0670104b6871134d317211153172154c2d72da4d32a7134c2e", // lamp
+        "051b32c6a91efcc7771ffffda84f32fc7751ffc3a9", // rubble
+        "05366dcbd83a6c01a46da3caa26e6805d871a0cda0", // bone
+        "0663af67b466ae68b567b3647e68ea65b069ae31b699ae68b6", // glowcap
+        "06182cd21c18f5d31e19f29c1e1af0d6541af2d51be3f6d320", // crystal
+        "053354c1e6338ef7ab6753c5b0698bc1e36c54f7e5", // copper
+        "051e252c1a1f5a601e205e2e53e4246154ea5c2f1f", // azurite
+        "051c9ce27d1e66a9b41e9cdd815367a97c5566e0b2", // gold
+        "0514bbe2cf1583e09c15b9159b5084e2cc50bd16d2", // regolith
+        "051e6ff65c20a0f994216fc48f536cf79156a0c359", // basalt
+        "052e272882325862b8635d2a8165245d82662226bb", // frost
+        "0502f9490b03f8450fc7bf7e0acac34441fdbd7c45", // moss
+        "05324fc7fb32878d3364548ff96587c1f76853c331", // ochre
+        "0523206bbe242131845b1e68885b5332bb5c5632ba", // violet
+        "066ee361366fb05c3770af5e3672ac5c6873b02933a9ad5f37", // magma
+        "06971347b4cb174b80cc1246b6cd1612b2cfe048b0d1164ab2", // core
+        "0699b6dbafcbb4dab3cceddab0cdb2d677ceb3d9aed0b512ad", // star
+        "053ec64dd472c64cd474ff4dd175c94d9b76ca17d4", // etch_rock
+        "0499196fc99a1837fe9c5236c8cf1b39c7", // etch_rock1
+        "04199fd315e06cd517e2a00a14e3a2d44b", // etch_rock2
+        "053f926c34715a6d36738e6d38748fa33574926bfe", // etch_deeprock
+        "0406a243eccda2411fce6e44e9d0a477e9", // etch_soil
+        "05425b5d8a74285b87755a5e88765b5dbc785d9486", // etch_sandstone
+        "052577aa6125aadc9926addf995d76ac965f73e263", // flower_red
+        "06037b385f03b16d5c06ab3c91cdae7197ce753a96ce76705d", // flower_yellow
+        "052f2abf7d2f2bc27d3264f64a6463c04c6562f780", // flower_blue
+        "051449574915452215177f5512de7f1f4ce1495714", // flower_white
+        "052a5acbee2b9390235d5bcc285d8dc6ee5e5a90ec", // cap_red
+        "051a6fad531ca8e51a1fa5e71b5075e353516fb01f", // cap_brown
+        "0537e5cac638e4c6c63aaeff936eaf01c573aec88f", // stem
+        "051262b01e1399e5e8159de2e74b62e3234d65b1ea", // ash
+        "051da0d6ec1e680b231f9bd7ef5366d82656680df0", // obsidian
+        "052644c3ba270ec47e280c8bb459428d7f5e0ac1b4", // salt
+        "0525fd2b53262e605526f95f1eecfe2a1cee315d1d", // clay
+        "053c650093409cc9957269fcca749ec6c97767c492", // limestone
+        "054006f38f43cfbac344d2bec47607bf907802f2c2", // marble
+        "06c09c8aa1c1688b6bc39f5666fa65556bfc648aa0fc9c539c", // jade
+        "05146613a6149cdba11562df6d4763dfa34b9d116d", // rust
+        "050dba4ee70df34a1a10ba7f1dd8bd4e1adaee80e9", // mud
+        "05183e485a1b724b1f1c701157e7394524e772151e", // lichen
+        "050b6de8dd0ba6e7140c731e163ca41bdf4171e512", // darkwood
+        "051d149a8c1e4ed1c4204cccc3531497c35618cd91", // bark
+        "051b59aebf20537def52217abe5356b4f5561f7bba", // amber
+        "067c05aa487dc9a7157fcddc47b3cedb17b400aa11b805dd48", // slate
+        "05362775d0385f3b9b3a2774d46b5d3ed26f63749e", // cinder
+        "052b067b0a2b3c46402b3e4a3cf60b470cf9087e3f", // petrified
+        "051946e3b21a46e5b31c11197f500e1baf5212e27a", // tundra
+        "06941cd5c3c91e0fc2ca1ad6c0cce4d5c1ce1cdabece1dd989", // glowshroom
+    ],
+};
+
+/// The baked palette when it was baked from `law` and this role table.
+fn baked(law: &Law) -> Option<Vec<Entry>> {
+    if BAKED.law != law.fingerprint() || BAKED.roles != roles_fingerprint() || BAKED.configs.len() != ROLES.len() {
+        return None;
+    }
+    ROLES
+        .iter()
+        .zip(BAKED.configs)
+        .map(|(r, hex)| Some(Entry { label: r.label, config: decode_hex(hex)? }))
+        .collect()
+}
+
+fn decode_hex(hex: &str) -> Option<Configuration> {
+    if hex.len() % 2 != 0 {
+        return None;
+    }
+    let bytes: Option<Vec<u8>> =
+        (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok()).collect();
+    Configuration::decode(&bytes?).ok()
+}
+
+/// FNV-1a over every input of [`search`] that is data: the roles, the underground set, and the
+/// search constants.
+fn roles_fingerprint() -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut feed = |bytes: &[u8]| {
+        for &b in bytes {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h ^= 0xff;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    };
+    for r in ROLES {
+        feed(r.label.as_bytes());
+        feed(&r.rgb);
+        match r.need {
+            Need::Plain => feed(&[0]),
+            Need::Glow(min) => feed(&[1, min]),
+            Need::Clear { min, glow } => feed(&[2, min, u8::from(glow)]),
+            Need::Reagent(target) => {
+                feed(&[3]);
+                feed(target.as_bytes());
+            }
+        }
+    }
+    for label in UNDERGROUND {
+        feed(label.as_bytes());
+    }
+    for shape in SHAPES {
+        feed(shape);
+    }
+    for k in [GAP, MAX_REAGENT_SPILL as u32, NEAREST as u32, PANEL as u32, SHORTLIST as u32, BANK as u32, BANK_SCAN, BASES, PROBE_BASES, u32::from(STEP)] {
+        feed(&k.to_le_bytes());
+    }
+    h
 }
 
 /// The palette of `law`.
@@ -765,6 +919,36 @@ mod tests {
         for label in ["clay", "limestone", "marble", "slate", "obsidian", "cinder", "petrified", "rust", "amber", "jade"] {
             assert!(UNDERGROUND.contains(&label), "{label} is a rock-hosted stratum");
         }
+    }
+
+    /// The stored palette is what the search finds, and `current()` actually uses it. On failure,
+    /// paste the printed table over [`BAKED`].
+    #[test]
+    fn the_baked_palette_is_the_search() {
+        let law = Law::current();
+        let searched = search(&law);
+        let fresh = Baked { law: law.fingerprint(), roles: roles_fingerprint(), configs: &[] };
+        let hex: Vec<String> = searched
+            .iter()
+            .map(|e| e.config.encode().as_bytes().iter().map(|b| format!("{b:02x}")).collect())
+            .collect();
+        let stale = BAKED.law != fresh.law
+            || BAKED.roles != fresh.roles
+            || BAKED.configs.len() != hex.len()
+            || BAKED.configs.iter().zip(&hex).any(|(a, b)| a != b);
+        if stale {
+            let mut table = format!(
+                "const BAKED: Baked = Baked {{\n    law: {:#018x},\n    roles: {:#018x},\n    configs: &[\n",
+                fresh.law, fresh.roles
+            );
+            for (e, h) in searched.iter().zip(&hex) {
+                table.push_str(&format!("        \"{h}\", // {}\n", e.label));
+            }
+            table.push_str("    ],\n};\n");
+            panic!("the baked palette is stale; replace BAKED with:\n{table}");
+        }
+        assert_eq!(baked(&law).as_deref(), Some(searched.as_slice()), "the baked table decodes to the search");
+        assert_eq!(current(), searched.as_slice());
     }
 
     #[test]

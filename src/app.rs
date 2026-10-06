@@ -139,6 +139,8 @@ impl App {
             None if build.packages().is_empty() => eprintln!("PWC: vanilla build (no mod packages)"),
             None => eprintln!("PWC: {} mod packages", build.packages().len()),
         }
+        // While the menu is up, so the first world's frame does not pay for it.
+        crate::world::terrain::prewarm();
         let mut mods = Mods::from_build(build);
         mods.load_choices();
         let pins = Benchmark::mod_pins_from_env();
@@ -1096,6 +1098,43 @@ mod tests {
         let ms = t.elapsed().as_secs_f64() * 1000.0;
         println!("spawn_player {ms:.2}ms");
         assert!(ms < 250.0, "spawn must stay under a frame, got {ms:.2}");
+    }
+
+    /// Probe for the engine's world-entry stall question: what the menu-to-world frame costs on the
+    /// game side, cold (first world in the process) and warm.
+    #[test]
+    #[ignore]
+    fn entry_cost_probe() {
+        use std::hint::black_box;
+        let ms = |a: Instant, b: Instant| (b - a).as_secs_f64() * 1000.0;
+        let a = Instant::now();
+        let _ = black_box(crate::block::BlockRegistry::with_builtins());
+        let b = Instant::now();
+        let _ = black_box(crate::world::terrain::palette::current());
+        let c = Instant::now();
+        let mut reg = crate::block::BlockRegistry::with_builtins();
+        let g = black_box(crate::world::terrain::generator(&mut reg, 1234, TerrainCfg::default()));
+        let d = Instant::now();
+        let _ = black_box(crate::gravity::Field::new(g.mass()));
+        let e = Instant::now();
+        println!("parts: registry {:.1}ms palette {:.1}ms generator {:.1}ms gravity {:.1}ms", ms(a, b), ms(b, c), ms(c, d), ms(d, e));
+        for round in ["cold", "warm"] {
+            let t0 = Instant::now();
+            let world = World::with_kind_cfg(1234, RenderConfig::default(), WorldgenKind::Diffusion, TerrainCfg::default(), false);
+            let t1 = Instant::now();
+            let p = black_box(spawn_player(&world));
+            let t2 = Instant::now();
+            let mut game = Game::new(world, p, "probe".into());
+            let t3 = Instant::now();
+            let pos = game.player().position;
+            game.world_mut().prepare_around(pos);
+            let t4 = Instant::now();
+            println!(
+                "entry {round}: world {:.1}ms spawn {:.1}ms game {:.1}ms prepare {:.1}ms total {:.1}ms",
+                ms(t0, t1), ms(t1, t2), ms(t2, t3), ms(t3, t4), ms(t0, t4)
+            );
+            drop(black_box(game));
+        }
     }
 
     #[test]
