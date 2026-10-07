@@ -3302,9 +3302,12 @@ impl World {
     /// `c` is still close enough that walking back across a seam would show its column. The far
     /// edge of the near square is a view-radius inland; a view-radius on the next chart puts that
     /// column `3 * horizontal + 1` away, counting the two edge chunks.
-    fn within_skirt(&self, center: Coord, c: Coord) -> bool {
+    /// Only inside the unload box's layers: the skirt is sideways, and a dig or a climb near a seam
+    /// unloads the layers it leaves as anywhere else.
+    fn within_skirt(&self, center: Coord, unload: ChunkBox, c: Coord) -> bool {
         let up = self.live_up().unwrap_or(Face::PosY);
-        self.fold.fold(c).across(center, up) <= self.skirt()
+        let folded = self.fold.fold(c);
+        folded.across(center, up) <= self.skirt() && unload.spans(folded, up.axis())
     }
 
     fn skirt(&self) -> i32 {
@@ -3329,10 +3332,10 @@ impl World {
     /// unload box and the far field already cover a turn-back there. Once waiting, a chunk stays
     /// (through a crossing, when it may become home) until it is inside the unload box again or
     /// past the skirt.
-    fn keeps_for_far(&self, center: Coord, c: Coord, near_seam: bool) -> bool {
+    fn keeps_for_far(&self, center: Coord, unload: ChunkBox, c: Coord, near_seam: bool) -> bool {
         (near_seam || self.fold.fold(c) != c)
             && self.chunks.get(&c).is_some_and(|l| l.state.settled())
-            && self.within_skirt(center, c)
+            && self.within_skirt(center, unload, c)
     }
 
     /// Coords in the previous unload box that have left `new_box`, or every
@@ -3381,29 +3384,35 @@ impl World {
         // Keep a settled chunk across a seam out to the turn-back skirt. A section on screen is not
         // a reason to drop it: that section unloads as the player walks on, and the column is bare
         // on the way back.
-        if self.lod2 && !self.fold.is_identity() && (!far.is_empty() || !self.far_wait.is_empty()) {
-            let near_seam = self.near_a_seam(center);
-            let pending: Vec<Coord> = self.far_wait.drain().collect();
-            let mut still = FastSet::default();
-            for c in pending {
+        // Waiting chunks leave once back inside the unload box (they stay loaded) or past the skirt.
+        // With the far field off, or off every chart, nothing waits: the rest unload now.
+        let holding = self.lod2 && !self.fold.is_identity();
+        if !self.far_wait.is_empty() {
+            let mut waiting = std::mem::take(&mut self.far_wait);
+            waiting.retain(|&c| {
                 if !self.chunks.contains_key(&c) || self.view_contains(unload, c) {
-                    continue;
+                    return false;
                 }
-                if !self.within_skirt(center, c) {
-                    far.push(c);
-                } else {
-                    still.insert(c);
+                if holding && self.within_skirt(center, unload, c) {
+                    return true;
                 }
-            }
+                far.push(c);
+                false
+            });
+            self.far_wait = waiting;
+        }
+        if holding && !far.is_empty() {
+            let near_seam = self.near_a_seam(center);
+            let mut waiting = std::mem::take(&mut self.far_wait);
             far.retain(|&c| {
-                if still.contains(&c) || self.keeps_for_far(center, c, near_seam) {
-                    still.insert(c);
+                if waiting.contains(&c) || self.keeps_for_far(center, unload, c, near_seam) {
+                    waiting.insert(c);
                     false
                 } else {
                     true
                 }
             });
-            self.far_wait = still;
+            self.far_wait = waiting;
         }
         self.prev_unload_box = Some(unload);
         // A removed chunk changes what the BFS can reach — topology class.
@@ -7240,6 +7249,54 @@ mod tests {
         world.unload_far_with(gone, |state, _| drop(state));
         assert!(!world.chunks.contains_key(&home), "past the skirt the home chunk unloads");
         assert!(!world.chunks.contains_key(&across), "past the skirt the neighbour chunk unloads");
+        assert!(world.far_wait.is_empty());
+    }
+
+    /// The skirt is sideways only: near a seam, a layer the player climbs or digs away from unloads
+    /// as anywhere else. And with the far field turned off, nothing keeps waiting.
+    #[test]
+    fn waiting_chunks_respect_the_layers_and_the_far_field_switch() {
+        use crate::render_config::{RenderConfig, lod_for};
+        use crate::world::generation::WorldgenKind;
+
+        let (lod_levels, lod_detail) = lod_for(6);
+        let render = RenderConfig { lod2: true, occlusion: true, lod_levels, lod_detail, ..RenderConfig::default() };
+        let mut world = World::with_kind(42, render, WorldgenKind::Diffusion, false);
+        world.set_view_distances(6, 3);
+        let eye = world.home_eye(DVec3::new(0.0, 1.0, 1.0 - 6.5e-6), 100.0);
+        let (home, _, _, _) = world.begin_stream(eye, None);
+        assert!(world.near_a_seam(home));
+        let settle = |world: &mut World, c: Coord| {
+            world.ensure_data(c);
+            let loaded = world.chunks.get_mut(&c).expect("ensure_data stores the chunk");
+            if !loaded.state.settled() {
+                loaded.state = MeshState::Air;
+            }
+        };
+        settle(&mut world, home);
+
+        // Dig 40 layers straight down with no held window stretching the box: the chunk left above
+        // is past the unload box's layers.
+        world.window = Window::default();
+        let down = Coord::new(home.x, home.y - 40, home.z);
+        let unload = world.unload_box(down);
+        assert!(!unload.spans(world.fold.fold(home), 1), "the start layer is outside the dug-down box");
+        world.prev_unload_box = Some(world.unload_box(home));
+        world.center = Some(down);
+        world.unload_far_with(down, |state, _| drop(state));
+        assert!(!world.chunks.contains_key(&home), "a layer left behind vertically unloads near a seam");
+        assert!(world.far_wait.is_empty());
+
+        // Walk inland so the home chunk waits, then turn the far field off: it unloads on the next pass.
+        settle(&mut world, home);
+        let inland = Coord::new(home.x, home.y, home.z - 11);
+        world.prev_unload_box = Some(world.unload_box(home));
+        world.center = Some(inland);
+        world.unload_far_with(inland, |state, _| drop(state));
+        assert!(world.chunks.contains_key(&home), "the home chunk waits near the seam");
+        world.lod2 = false;
+        world.unload_far_with(inland, |state, _| drop(state));
+        assert!(!world.chunks.contains_key(&home), "with the far field off a waiting chunk unloads");
         assert!(world.far_wait.is_empty());
     }
 
