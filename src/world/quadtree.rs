@@ -39,6 +39,9 @@ impl QuadrantMask {
     pub fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
     }
+    pub fn bits(self) -> u8 {
+        self.0
+    }
     pub fn is_empty(self) -> bool {
         self.0 == 0
     }

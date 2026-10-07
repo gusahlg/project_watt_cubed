@@ -7,11 +7,13 @@
 use voxel_engine::{DVec3, LodMorph};
 
 use super::chunk::CHUNK_SIZE;
-use super::section::{CHART_BODY_BASE, DOMAIN_H, LOD_CEIL_Y, LOD_FLOOR_Y, SectionPos};
+use super::quadtree::QuadrantMask;
+use super::section::{CHART_BODY_BASE, DOMAIN_H, LOD_CEIL_Y, LOD_FLOOR_Y, Quadrant, SectionPos, section_span};
 use super::seam::{ChartSeat, SeamAcross};
 use super::terrain::{DIG, LOD_DRESS_CELL, PLANT_REACH};
-use super::{Coord, World};
+use super::{Coord, FastMap, World};
 use crate::coord::Face;
+use crate::ident::Detail;
 
 /// Nesting uploads section detail `d` at engine detail `d + MESH_SHIFT`
 /// (`pack_shift` of a 32-column section is 1). Band index is that engine detail.
@@ -44,6 +46,30 @@ pub(in crate::world) struct CachedTops {
 
 impl LevelReach {
     const OFF: Self = Self { near: f32::MAX, far: 0.0, on: false };
+}
+
+/// One edge of a drawn quadrant where its level meets a coarser drawn level (`coarse`), or the
+/// full-res window (`coarse: None`). The segment lies in `fine`'s frame, at the shared boundary.
+#[derive(Clone, Copy)]
+pub(in crate::world) struct Frontier {
+    fine: SectionPos,
+    coarse: Option<SectionPos>,
+    x0: f64,
+    x1: f64,
+    z0: f64,
+    z1: f64,
+}
+
+/// Per engine detail: the farthest point where a finer level (or the full-res window) meets this
+/// one, and the nearest point where this one meets a coarser level.
+#[derive(Clone, Copy)]
+struct Meets {
+    finer_far: Option<f32>,
+    coarser_near: Option<f32>,
+}
+
+impl Meets {
+    const NONE: Self = Self { finer_far: None, coarser_near: None };
 }
 
 /// Lower limit of a band: the distance grown by the margin, one cell and the eye slack.
@@ -113,29 +139,26 @@ fn aabb_reach(ex: f64, ey: f64, ez: f64, x0: f64, x1: f64, y0: f64, y1: f64, z0:
 
 /// Widest bands inside the no-crack limits. Index is the engine mesh detail.
 ///
-/// `end_d` is the shrunk nearest point of drawn detail `d + 1`, so detail `d` is
-/// fully morphed on that frontier. `start_d` is the grown farthest point of drawn
-/// detail `d - 1` (and, for the finest drawn detail, of the full-res box). The
-/// coarsest drawn detail has no coarser neighbour on screen, so it stays unmorphed.
-fn bands_from_reaches(levels: &[LevelReach; 16], full_res_far: f32) -> [LodMorph; 16] {
+/// At every frontier the finer level is fully morphed and the coarser one unmoved: `end_d` is the
+/// shrunk nearest point where detail `d` meets a coarser level, `start_d` the grown farthest point
+/// where a finer level or the full-res window meets `d`. With no finer neighbour a level starts at
+/// its own nearest point (`full_res_far` adds the full-res window where its contact is not traced);
+/// with no coarser neighbour it stays unmorphed.
+fn bands_from_meets(levels: &[LevelReach; 16], meets: &[Meets; 16], full_res_far: Option<f32>) -> [LodMorph; 16] {
     let mut out = [LodMorph::default(); 16];
-    let Some(finest) = (0..16).find(|&d| levels[d].on) else {
-        return out;
-    };
+    let finest = (0..16).find(|&d| levels[d].on);
     for d in 0..16 {
         if !levels[d].on {
             continue;
         }
         let cell = (1u32 << d) as f32;
-        let mut start = if d == finest { grow_start(full_res_far, cell) } else { 0.0 };
-        if d > 0 && levels[d - 1].on {
-            start = start.max(grow_start(levels[d - 1].far, cell));
+        let mut start = grow_start(meets[d].finer_far.unwrap_or(levels[d].near), cell);
+        if let (Some(full), Some(f)) = (full_res_far, finest)
+            && f == d
+        {
+            start = start.max(grow_start(full, cell));
         }
-        let end = if d + 1 < 16 && levels[d + 1].on {
-            shrink_end(levels[d + 1].near, cell)
-        } else {
-            start
-        };
+        let end = meets[d].coarser_near.map_or(start, |near| shrink_end(near, cell));
         let k = d + MESH_SHIFT;
         if k < 16 {
             out[k] = LodMorph { start, end };
@@ -152,6 +175,31 @@ struct ChartEyes {
 }
 
 impl ChartEyes {
+    /// Storage `(x, z)` in the chart that holds it, starting from section `s`'s chart. `None` past
+    /// every known chart (no neighbour is traced there).
+    fn locate(&self, s: SectionPos, x: i64, z: i64) -> Option<(i64, i64)> {
+        let inside = |seat: &ChartSeat, x: i64, z: i64| x >= seat.lo[0] && x < seat.hi[0] && z >= seat.lo[2] && z < seat.hi[2];
+        if in_seat(s, self.seat.lo, self.seat.hi) {
+            if inside(&self.seat, x, z) {
+                return Some((x, z));
+            }
+            return self.seams.iter().find_map(|a| {
+                let (nx, nz) = a.storage_xz(x, z);
+                inside(&a.seat, nx, nz).then_some((nx, nz))
+            });
+        }
+        let across = self.seams.iter().find(|a| in_seat(s, a.seat.lo, a.seat.hi))?;
+        if inside(&across.seat, x, z) {
+            return Some((x, z));
+        }
+        let (hx, hz) = across.home_xz(x, z);
+        inside(&self.seat, hx, hz).then_some((hx, hz))
+    }
+
+    fn home(&self, s: SectionPos) -> bool {
+        in_seat(s, self.seat.lo, self.seat.hi)
+    }
+
     fn for_section(&self, s: SectionPos) -> (f64, f64, f64) {
         let (ex, ey, ez) = self.eye;
         if in_seat(s, self.seat.lo, self.seat.hi) {
@@ -165,6 +213,39 @@ impl ChartEyes {
         }
         (ex as f64, ey as f64, ez as f64)
     }
+}
+
+/// The drawn section whose drawn quadrant holds storage point `(x, z)`, at `s`'s detail or coarser,
+/// read in the chart that holds the point. `None` when nothing that coarse draws there.
+fn covering(
+    drawn: &FastMap<SectionPos, QuadrantMask>,
+    s: SectionPos,
+    x: i64,
+    z: i64,
+    chart: Option<&ChartEyes>,
+) -> Option<SectionPos> {
+    let (x, z) = match chart {
+        Some(c) => c.locate(s, x, z)?,
+        None => (x, z),
+    };
+    let coarsest = crate::render_config::LOD_COARSEST_DETAIL as i8;
+    for d in s.detail.0..=coarsest {
+        let span = i64::from(section_span(Detail(d)));
+        let half = span / 2;
+        let cell = SectionPos {
+            detail: Detail(d),
+            body: s.body,
+            face: s.face,
+            x: x.div_euclid(span) as i32,
+            z: z.div_euclid(span) as i32,
+        };
+        if let Some(&mask) = drawn.get(&cell)
+            && mask.contains(Quadrant::of_coords(x.div_euclid(half) as i32, z.div_euclid(half) as i32))
+        {
+            return Some(cell);
+        }
+    }
+    None
 }
 
 fn reach_box(ex: f64, ey: f64, ez: f64, s: SectionPos, y0: f64, y1: f64) -> (f32, f32) {
@@ -195,7 +276,8 @@ fn mix(h: u64, v: u64) -> u64 {
 }
 
 impl World {
-    /// Bands for the current cut. A still cut returns before any allocation.
+    /// Bands for the current cut. A still cut returns before any allocation; a moving eye over the
+    /// same cut reuses the traced frontier and only remeasures it.
     pub(in crate::world) fn recompute_lod_morph(&mut self) {
         let Some(center) = self.section_center() else {
             if self.lod_morph_set && self.lod_morph_key == 0 {
@@ -203,26 +285,34 @@ impl World {
             }
             self.lod_morph = [LodMorph::default(); 16];
             self.lod_morph_key = 0;
+            self.lod_frontier.clear();
+            self.lod_frontier_key = 0;
             self.lod_morph_set = true;
             return;
         };
-        let key = self.morph_key(center);
+        let cut = self.cut_key(center);
+        let key = mix(cut, self.section_eye_y.to_bits()) | 1;
         if self.lod_morph_set && self.lod_morph_key == key {
             return;
         }
-        let (levels, full) = self.gather_reaches(center);
-        self.lod_morph = bands_from_reaches(&levels, full);
+        let chart = if self.section_on_chart(center) { self.chart_eyes(center) } else { None };
+        if self.lod_frontier_key != cut {
+            self.trace_frontier(center, chart.as_ref());
+            self.lod_frontier_key = cut;
+        }
+        let (levels, meets, full) = self.gather_reaches(center, chart.as_ref());
+        self.lod_morph = bands_from_meets(&levels, &meets, full);
         self.lod_morph_key = key;
         self.lod_morph_set = true;
     }
 
-    /// Odd fingerprint, so a cleared world (`key == 0`) never matches a real cut.
-    fn morph_key(&self, center: Coord) -> u64 {
+    /// Fingerprint of the drawn cut and the window it meets (not the eye's height). Odd, so a
+    /// cleared world (`0`) never matches a real cut.
+    fn cut_key(&self, center: Coord) -> u64 {
         let mut h = 0x6D6F_7270_685F_6B31;
         h = mix(h, center.x as u64);
         h = mix(h, center.y as u64);
         h = mix(h, center.z as u64);
-        h = mix(h, self.section_eye_y.to_bits());
         h = mix(h, self.view.horizontal as u64);
         h = mix(h, self.view.vertical as u64);
         h = mix(h, self.live_up().map(|f| f as u64).unwrap_or(0xFF));
@@ -235,12 +325,13 @@ impl World {
         }
         h = mix(h, self.section_visible.len() as u64);
         let in_cube = self.lod_place(center).2;
-        for &(s, _) in &self.section_visible {
+        for &(s, mask) in &self.section_visible {
             h = mix(h, s.detail.0 as u64);
             h = mix(h, s.body as u64);
             h = mix(h, s.face as u64);
             h = mix(h, s.x as u64);
             h = mix(h, s.z as u64);
+            h = mix(h, mask.bits() as u64);
             if let Some((lo, hi)) = self.cover_band(s, in_cube) {
                 h = mix(h, lo.to_bits() as u64);
                 h = mix(h, hi.to_bits() as u64);
@@ -249,8 +340,60 @@ impl World {
         h | 1
     }
 
-    fn gather_reaches(&mut self, center: Coord) -> ([LevelReach; 16], f32) {
-        let chart = if self.section_on_chart(center) { self.chart_eyes(center) } else { None };
+    /// Every edge where a drawn quadrant meets a coarser drawn level or the full-res window. Rebuilt
+    /// only when the cut changes. Across a chart seam the neighbour is found in its own storage.
+    fn trace_frontier(&mut self, center: Coord, chart: Option<&ChartEyes>) {
+        let mut drawn: FastMap<SectionPos, QuadrantMask> = FastMap::default();
+        for &(s, mask) in &self.section_visible {
+            if !mask.is_empty() {
+                let e = drawn.entry(s).or_insert(QuadrantMask::EMPTY);
+                *e = e.union(mask);
+            }
+        }
+        // The full-res window, in the home frame, where its contact can be traced.
+        let near = (chart.is_some() || !self.lod_place(center).2).then(|| self.near_block_box(center));
+        let mut out = std::mem::take(&mut self.lod_frontier);
+        out.clear();
+        for (&s, &mask) in &drawn {
+            let half = i64::from(s.span()) / 2;
+            let mid = half / 2;
+            let home = chart.is_none_or(|c| c.home(s));
+            for q in mask.iter() {
+                let x0 = i64::from(s.min_x()) + i64::from(q.dx()) * half;
+                let z0 = i64::from(s.min_z()) + i64::from(q.dz()) * half;
+                let sides = [
+                    (x0 - 1, z0 + mid, x0, x0, z0, z0 + half),
+                    (x0 + half, z0 + mid, x0 + half, x0 + half, z0, z0 + half),
+                    (x0 + mid, z0 - 1, x0, x0 + half, z0, z0),
+                    (x0 + mid, z0 + half, x0, x0 + half, z0 + half, z0 + half),
+                ];
+                for (px, pz, ex0, ex1, ez0, ez1) in sides {
+                    let coarse = match covering(&drawn, s, px, pz, chart) {
+                        Some(c) if c.detail > s.detail => Some(c),
+                        Some(_) => continue,
+                        None => {
+                            let Some((nx0, nx1, nz0, nz1)) = near else { continue };
+                            if !(home && px >= nx0 && px < nx1 && pz >= nz0 && pz < nz1) {
+                                continue;
+                            }
+                            None
+                        }
+                    };
+                    out.push(Frontier {
+                        fine: s,
+                        coarse,
+                        x0: ex0 as f64,
+                        x1: ex1 as f64,
+                        z0: ez0 as f64,
+                        z1: ez1 as f64,
+                    });
+                }
+            }
+        }
+        self.lod_frontier = out;
+    }
+
+    fn gather_reaches(&mut self, center: Coord, chart: Option<&ChartEyes>) -> ([LevelReach; 16], [Meets; 16], Option<f32>) {
         let in_cube = self.lod_place(center).2;
         self.lod_relief_gen = self.lod_relief_gen.wrapping_add(1);
         let pass = self.lod_relief_gen;
@@ -265,14 +408,55 @@ impl World {
             if !(0..16).contains(&d) {
                 continue;
             }
-            let (near, far) = self.section_reach_cached(center, s, chart.as_ref(), in_cube, pass);
+            let (near, far) = self.section_reach_cached(center, s, chart, in_cube, pass);
             let slot = &mut levels[d as usize];
             slot.near = slot.near.min(near);
             slot.far = slot.far.max(far);
             slot.on = true;
         }
+        let mut meets = [Meets::NONE; 16];
+        let frontier = std::mem::take(&mut self.lod_frontier);
+        let (wy0, wy1) = self.near_y_range(center);
+        for f in &frontier {
+            let (near, far) = self.frontier_reach(center, f, chart, in_cube, pass, (wy0 as f64, wy1 as f64));
+            match f.coarse {
+                Some(c) => {
+                    let lo = &mut meets[f.fine.detail.0 as usize].coarser_near;
+                    *lo = Some(lo.map_or(near, |v| v.min(near)));
+                    let hi = &mut meets[c.detail.0 as usize].finer_far;
+                    *hi = Some(hi.map_or(far, |v| v.max(far)));
+                }
+                None => {
+                    let hi = &mut meets[f.fine.detail.0 as usize].finer_far;
+                    *hi = Some(hi.map_or(far, |v| v.max(far)));
+                }
+            }
+        }
+        self.lod_frontier = frontier;
         self.lod_relief.retain(|_, tops| tops.pass == pass);
-        (levels, self.full_res_far(center))
+        // On a cube the full-res contact is not traced: the finest level keeps the old bound.
+        let full = in_cube.then(|| self.full_res_far(center));
+        (levels, meets, full)
+    }
+
+    /// Nearest and farthest point of a frontier edge, over both sides' drawn heights (the window's
+    /// for the full-res side).
+    fn frontier_reach(
+        &mut self,
+        center: Coord,
+        f: &Frontier,
+        chart: Option<&ChartEyes>,
+        in_cube: bool,
+        pass: u32,
+        window: (f64, f64),
+    ) -> (f32, f32) {
+        let (ex, ey, ez) = self.section_eye(center, f.fine, chart);
+        let (a0, a1) = self.cached_tops(f.fine, ey, in_cube, pass);
+        let (b0, b1) = match f.coarse {
+            Some(c) => self.cached_tops(c, ey, in_cube, pass),
+            None => window,
+        };
+        aabb_reach(ex, ey, ez, f.x0, f.x1, a0.min(b0), a1.max(b1), f.z0, f.z1)
     }
 
     fn chart_eyes(&self, center: Coord) -> Option<ChartEyes> {
@@ -296,12 +480,6 @@ impl World {
             let (x, y, z) = self.section_metric_on(center, DVec3::ZERO, s.face, datum).pos();
             (x, y, z)
         }
-    }
-
-    fn section_reach(&self, center: Coord, s: SectionPos, chart: Option<&ChartEyes>, in_cube: bool) -> (f32, f32) {
-        let (ex, ey, ez) = self.section_eye(center, s, chart);
-        let (y0, y1) = self.morph_relief(s, ey, in_cube);
-        reach_box(ex, ey, ez, s, y0, y1)
     }
 
     fn section_reach_cached(
@@ -346,19 +524,6 @@ impl World {
         }
     }
 
-    /// Column tops in the section's frame, widened to the vertices that stand on them.
-    ///
-    /// An edit overlay wins. A chart takes its face's ground window: every column top
-    /// sits in it, and a surface walk would rerun the field for each section of a cut.
-    /// A cube without a bake takes its face window in bake height. The legacy `[0, 512]`
-    /// answer is a flat slab: the window floor up to the sampled top, not the whole domain.
-    /// Unknown relief is a slab around the eye, so the near distance stays 0 and the far
-    /// distance only grows.
-    fn morph_relief(&self, s: SectionPos, eye_y: f64, in_cube: bool) -> (f64, f64) {
-        let (y0, y1, _) = self.morph_relief_stable(s, eye_y, in_cube);
-        (y0, y1)
-    }
-
     /// The altitudes the section's uploaded slabs span, where they are storage y: a chart, or a
     /// flat world's +Y window.
     fn drawn_span(&self, s: SectionPos, in_cube: bool) -> Option<(f64, f64)> {
@@ -369,14 +534,6 @@ impl World {
             Some(super::SectionState::Ready { alt: Some((lo, hi)), .. }) => Some((f64::from(*lo), f64::from(*hi))),
             _ => None,
         }
-    }
-
-    /// `(lo, hi, stable)`, narrowed to the drawn slabs. `stable` is false only for the eye slab,
-    /// which moves with the camera.
-    fn morph_relief_stable(&self, s: SectionPos, eye_y: f64, in_cube: bool) -> (f64, f64, bool) {
-        let (y0, y1, stable) = self.estimated_tops(s, eye_y, in_cube);
-        let (y0, y1) = self.narrowed(s, in_cube, (y0, y1));
-        (y0, y1, stable)
     }
 
     /// Column tops from the overlay, the chart's ground window, the cube bake or the domain.
@@ -478,62 +635,39 @@ impl World {
     }
 }
 
-#[cfg(test)]
-fn ring_reach(inner: f64, outer: f64, y0: f64, y1: f64) -> (f32, f32) {
-    let boxes = [
-        (inner, outer, -outer, outer),
-        (-outer, -inner, -outer, outer),
-        (-outer, outer, inner, outer),
-        (-outer, outer, -outer, -inner),
-    ];
-    let mut near = f32::MAX;
-    let mut far = 0.0f32;
-    for (x0, x1, z0, z1) in boxes {
-        let (n, f) = aabb_reach(0.0, 0.0, 0.0, x0, x1, y0, y1, z0, z1);
-        near = near.min(n);
-        far = far.max(f);
-    }
-    (near, far)
-}
-
-/// Two box rings around the eye. The inner band sits on the margin limits; the outer
-/// level has no coarser neighbour, so its blend is 0. A crossed middle level pops.
+/// Two levels meeting at a frontier ring: the finer one is fully morphed where it meets the
+/// coarser one, which is unmoved there and has no coarser neighbour (blend 0). The full-res
+/// window starts the finer level. Crossed limits pop.
 #[test]
-fn lod_morph_bands_follow_synthetic_rings() {
-    let (n2, f2) = ring_reach(400.0, 800.0, -8.0, 8.0);
-    let (n3, f3) = ring_reach(800.0, 1600.0, -8.0, 8.0);
-    assert!((n2 - 400.0).abs() < 1e-3, "inner near {n2}");
-    assert!((n3 - 800.0).abs() < 1e-3, "outer near {n3}");
-    assert!(f2 > 800.0 && f3 > f2, "far grows with the ring: {f2} {f3}");
-
-    let full = aabb_reach(0.0, 0.0, 0.0, -200.0, 200.0, -32.0, 32.0, -200.0, 200.0).1;
+fn lod_morph_bands_follow_synthetic_frontiers() {
     let mut levels = [LevelReach::OFF; 16];
-    levels[2] = LevelReach { near: n2, far: f2, on: true };
-    levels[3] = LevelReach { near: n3, far: f3, on: true };
-    let bands = bands_from_reaches(&levels, full);
+    levels[2] = LevelReach { near: 400.0, far: 900.0, on: true };
+    levels[3] = LevelReach { near: 800.0, far: 1800.0, on: true };
+    let mut meets = [Meets::NONE; 16];
+    meets[2] = Meets { finer_far: Some(420.0), coarser_near: Some(800.0) };
+    meets[3] = Meets { finer_far: Some(870.0), coarser_near: None };
+    let bands = bands_from_meets(&levels, &meets, None);
     let (b2, b3) = (bands[2 + MESH_SHIFT], bands[3 + MESH_SHIFT]);
-    let cell2 = 4.0f32;
-    let cell3 = 8.0f32;
-    assert_eq!(b2.start, grow_start(full, cell2));
-    assert_eq!(b2.end, shrink_end(n3, cell2));
-    assert!(b2.end <= n3 && b2.start >= full && b2.end > b2.start, "inner band {b2:?}");
-    assert_eq!(b3.start, grow_start(f2, cell3));
-    assert_eq!(b3.end, b3.start, "coarsest stays unmorphed");
-    assert!(b3.start >= f2);
-    for d in [0.0, b3.start, b3.start + 10_000.0] {
-        assert_eq!(morph_a(b3.start, b3.end, d), 0.0, "empty at {d}");
-    }
-    assert_eq!(morph_a(b2.start, b2.end, b2.start), 0.0);
-    assert_eq!(morph_a(b2.start, b2.end, b2.end), 1.0);
+    assert_eq!(b2.start, grow_start(420.0, 4.0));
+    assert_eq!(b2.end, shrink_end(800.0, 4.0));
+    assert!(b2.end > b2.start, "inner band {b2:?}");
+    assert_eq!(morph_a(b2.start, b2.end, 800.0), 1.0, "fully morphed at its coarser frontier");
+    assert_eq!(morph_a(b2.start, b2.end, 420.0), 0.0, "unmoved where the window meets it");
+    assert_eq!(b3.start, grow_start(870.0, 8.0));
+    assert_eq!(b3.end, b3.start, "no coarser neighbour: unmorphed");
+    assert_eq!(morph_a(b3.start, b3.end, 870.0), 0.0, "unmoved at its finer frontier");
 
-    // The middle level's limits cross: it pops, and the stored limits still nest.
-    levels[4] = LevelReach { near: 80.0, far: 400.0, on: true };
-    levels[2].far = 10_000.0;
-    let bands = bands_from_reaches(&levels, full);
-    let mid = bands[3 + MESH_SHIFT];
+    // No traced finer neighbour: the level starts at its own nearest point.
+    meets[2].finer_far = None;
+    assert_eq!(bands_from_meets(&levels, &meets, None)[2 + MESH_SHIFT].start, grow_start(400.0, 4.0));
+    // An untraced full-res window still bounds the finest level.
+    assert_eq!(bands_from_meets(&levels, &meets, Some(600.0))[2 + MESH_SHIFT].start, grow_start(600.0, 4.0));
+
+    // Crossed limits: the level pops.
+    meets[2] = Meets { finer_far: Some(900.0), coarser_near: Some(700.0) };
+    let mid = bands_from_meets(&levels, &meets, None)[2 + MESH_SHIFT];
     assert!(mid.start >= mid.end, "no room: {mid:?}");
-    assert!(mid.end <= levels[4].near && mid.start >= levels[2].far);
-    for d in [0.0, 80.0, 10_000.0, mid.start] {
+    for d in [0.0, 700.0, 900.0, 10_000.0] {
         assert_eq!(morph_a(mid.start, mid.end, d), 0.0, "pop at {d}");
     }
 }
@@ -570,6 +704,7 @@ fn arm_drawn(world: &mut World, eye: DVec3) -> usize {
 fn time_recompute(world: &mut World, label: &str) {
     let n = world.section_visible.iter().filter(|(_, m)| !m.is_empty()).count();
     world.lod_relief.clear();
+    world.lod_frontier_key = 0;
     world.lod_morph_set = false;
     let started = std::time::Instant::now();
     world.recompute_lod_morph();
@@ -590,12 +725,32 @@ fn time_recompute(world: &mut World, label: &str) {
 #[cfg(test)]
 fn assert_lod_bands(world: &mut World, label: &str) {
     let center = world.section_center().unwrap_or_else(|| panic!("{label}: no centre"));
-    let (levels, full) = world.gather_reaches(center);
-    assert_eq!(world.lod_morph, bands_from_reaches(&levels, full), "{label}: stored bands");
+    let chart = if world.section_on_chart(center) { world.chart_eyes(center) } else { None };
+    let (levels, meets, full) = world.gather_reaches(center, chart.as_ref());
+    assert_eq!(world.lod_morph, bands_from_meets(&levels, &meets, full), "{label}: stored bands");
     let drawn = world.section_visible.iter().filter(|(_, m)| !m.is_empty()).count();
     assert!(drawn > 0, "{label}: nothing drawn");
-    let chart = if world.section_on_chart(center) { world.chart_eyes(center) } else { None };
+    assert!(!world.lod_frontier.is_empty(), "{label}: no frontier traced");
     let in_cube = world.lod_place(center).2;
+    let band = |w: &World, s: SectionPos| w.lod_morph[s.detail.0 as usize + MESH_SHIFT];
+    // The no-crack condition, edge by edge: the finer side fully morphed (or its level pops), the
+    // coarser side and the full-res side's neighbour unmoved.
+    let (wy0, wy1) = world.near_y_range(center);
+    let frontier = world.lod_frontier.clone();
+    let pass = world.lod_relief_gen;
+    for f in &frontier {
+        let (near, far) = world.frontier_reach(center, f, chart.as_ref(), in_cube, pass, (wy0 as f64, wy1 as f64));
+        let fine = band(world, f.fine);
+        match f.coarse {
+            Some(c) => {
+                let popped = !(fine.end > fine.start);
+                assert!(popped || morph_a(fine.start, fine.end, near) == 1.0, "{label}: {:?} not morphed at {near}", f.fine);
+                let coarse = band(world, c);
+                assert_eq!(morph_a(coarse.start, coarse.end, far), 0.0, "{label}: {c:?} moves at its finer frontier {far}");
+            }
+            None => assert_eq!(morph_a(fine.start, fine.end, far), 0.0, "{label}: {:?} moves at the window {far}", f.fine),
+        }
+    }
     let mut empty = 0usize;
     let mut shown = 0usize;
     for d in 0..16 {
@@ -603,55 +758,21 @@ fn assert_lod_bands(world: &mut World, label: &str) {
             continue;
         }
         shown += 1;
-        let band = world.lod_morph[d + MESH_SHIFT];
-        let popped = !(band.end > band.start);
-        if popped {
-            empty += 1;
-        }
+        let b = world.lod_morph[d + MESH_SHIFT];
+        let popped = !(b.end > b.start);
+        empty += usize::from(popped);
         println!(
-            "{label} detail {d} engine {} start {:.2} end {:.2} near {:.1} far {:.1} empty {popped}",
+            "{label} detail {d} engine {} start {:.1} end {:.1} near {:.1} far {:.1} finer_far {:?} coarser_near {:?} empty {popped}",
             d + MESH_SHIFT,
-            band.start,
-            band.end,
+            b.start,
+            b.end,
             levels[d].near,
-            levels[d].far
-        );
-        if d + 1 < 16 && levels[d + 1].on {
-            let next = world.lod_morph[d + 1 + MESH_SHIFT];
-            assert!(
-                band.end <= levels[d + 1].near,
-                "{label}: end_{d} {} > near_{} {}",
-                band.end,
-                d + 1,
-                levels[d + 1].near
-            );
-            assert!(
-                next.start >= levels[d].far,
-                "{label}: start_{} {} < far_{d} {}",
-                d + 1,
-                next.start,
-                levels[d].far
-            );
-        }
-    }
-    let finest = (0..16).find(|&d| levels[d].on).expect("a level");
-    let start = world.lod_morph[finest + MESH_SHIFT].start;
-    assert_eq!(start, grow_start(full, (1u32 << finest) as f32), "{label}: finest start");
-    for &(s, mask) in &world.section_visible {
-        if mask.is_empty() {
-            continue;
-        }
-        let (near, _) = world.section_reach(center, s, chart.as_ref(), in_cube);
-        let d = s.detail.0 as usize;
-        let band = world.lod_morph[d + MESH_SHIFT];
-        let a = morph_a(band.start, band.end, near);
-        assert!(
-            near + 1e-2 >= band.start || a == 0.0,
-            "{label}: {s:?} near {near} start {} a {a}",
-            band.start
+            levels[d].far,
+            meets[d].finer_far,
+            meets[d].coarser_near,
         );
     }
-    println!("{label}: empty {empty} of {shown}, {drawn} sections, full_res_far {full:.1}");
+    println!("{label}: empty {empty} of {shown}, {drawn} sections, {} frontier edges", frontier.len());
 }
 
 /// Chart, RD16/V5, the drawn far field after the near window has taken its columns.

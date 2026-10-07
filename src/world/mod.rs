@@ -1445,6 +1445,10 @@ pub struct World {
     lod_relief: FastMap<SectionPos, morph::CachedTops>,
     /// Generation stamped into [`lod_relief`](Self::lod_relief) by the latest sample.
     lod_relief_gen: u32,
+    /// Where drawn levels meet each other and the full-res window, for the morph bands.
+    lod_frontier: Vec<morph::Frontier>,
+    /// Cut fingerprint [`lod_frontier`](Self::lod_frontier) was traced from. `0` before any.
+    lod_frontier_key: u64,
     /// Drawn-coverage projection over successive LOD cuts (hard pop). Presentation
     /// only; never affects selection logic.
     section_fade: coverage::Coverage,
@@ -1702,6 +1706,8 @@ impl World {
             lod_morph_set: false,
             lod_relief: FastMap::default(),
             lod_relief_gen: 0,
+            lod_frontier: Vec::new(),
+            lod_frontier_key: 0,
             section_fade: coverage::Coverage::default(),
             section_frontier_key: None,
             near_bounds: streaming::NearBounds::default(),
