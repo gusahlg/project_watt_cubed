@@ -416,9 +416,8 @@ impl World {
         }
         let mut meets = [Meets::NONE; 16];
         let frontier = std::mem::take(&mut self.lod_frontier);
-        let (wy0, wy1) = self.near_y_range(center);
         for f in &frontier {
-            let (near, far) = self.frontier_reach(center, f, chart, in_cube, pass, (wy0 as f64, wy1 as f64));
+            let (near, far) = self.frontier_reach(center, f, chart, in_cube, pass);
             match f.coarse {
                 Some(c) => {
                     let lo = &mut meets[f.fine.detail.0 as usize].coarser_near;
@@ -439,24 +438,19 @@ impl World {
         (levels, meets, full)
     }
 
-    /// Nearest and farthest point of a frontier edge, over both sides' drawn heights (the window's
-    /// for the full-res side).
-    fn frontier_reach(
-        &mut self,
-        center: Coord,
-        f: &Frontier,
-        chart: Option<&ChartEyes>,
-        in_cube: bool,
-        pass: u32,
-        window: (f64, f64),
-    ) -> (f32, f32) {
+    /// The two distances a frontier edge constrains: the nearest of the finer side's vertices on it
+    /// (they must be fully morphed) and the farthest of the side that must stay unmoved, the coarser
+    /// level's vertices or, at the full-res window, the drawn level's own.
+    fn frontier_reach(&mut self, center: Coord, f: &Frontier, chart: Option<&ChartEyes>, in_cube: bool, pass: u32) -> (f32, f32) {
         let (ex, ey, ez) = self.section_eye(center, f.fine, chart);
         let (a0, a1) = self.cached_tops(f.fine, ey, in_cube, pass);
+        let near = aabb_reach(ex, ey, ez, f.x0, f.x1, a0, a1, f.z0, f.z1).0;
         let (b0, b1) = match f.coarse {
             Some(c) => self.cached_tops(c, ey, in_cube, pass),
-            None => window,
+            None => (a0, a1),
         };
-        aabb_reach(ex, ey, ez, f.x0, f.x1, a0.min(b0), a1.max(b1), f.z0, f.z1)
+        let far = aabb_reach(ex, ey, ez, f.x0, f.x1, b0, b1, f.z0, f.z1).1;
+        (near, far)
     }
 
     fn chart_eyes(&self, center: Coord) -> Option<ChartEyes> {
@@ -735,11 +729,10 @@ fn assert_lod_bands(world: &mut World, label: &str) {
     let band = |w: &World, s: SectionPos| w.lod_morph[s.detail.0 as usize + MESH_SHIFT];
     // The no-crack condition, edge by edge: the finer side fully morphed (or its level pops), the
     // coarser side and the full-res side's neighbour unmoved.
-    let (wy0, wy1) = world.near_y_range(center);
     let frontier = world.lod_frontier.clone();
     let pass = world.lod_relief_gen;
     for f in &frontier {
-        let (near, far) = world.frontier_reach(center, f, chart.as_ref(), in_cube, pass, (wy0 as f64, wy1 as f64));
+        let (near, far) = world.frontier_reach(center, f, chart.as_ref(), in_cube, pass);
         let fine = band(world, f.fine);
         match f.coarse {
             Some(c) => {
