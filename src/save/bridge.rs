@@ -265,15 +265,39 @@ fn kind_cfg_from_stamp(stamp: WorldgenStamp) -> (WorldgenKind, TerrainCfg) {
     (kind, TerrainCfg::from_wire(stamp.knobs))
 }
 
-/// Rebuild a ready-to-play world and player from a doc, restoring mod state
-/// into `mods` and the pending reaction work into the world's scheduler.
-/// Unknown specs degrade to air. A law stamp that does not match this game's
-/// law is a different universe and is refused, never a panic.
-pub fn from_doc(
+/// A save rebuilt up to its mod state and pending reactions, which wait for the live mods:
+/// [`finish`](Self::finish) adds them on the thread that owns them.
+pub struct Restored {
+    world: World,
+    player: Player,
+    meta: SaveMeta,
+    mods: Vec<(String, String)>,
+    pending: Vec<(u32, crate::sim::reactions::Contact)>,
+    unknown: UnknownMaterials,
+}
+
+impl Restored {
+    /// Restore mod state into `mods`, then the pending reaction work, in the order a save
+    /// always loaded them.
+    pub fn finish(mut self, mods: &mut Mods) -> (World, Player, SaveMeta) {
+        for (name, data) in &self.mods {
+            self.unknown.legacy_holdings += mods.load_state(name, data, &mut self.world);
+        }
+        self.world.restore_reactions(&self.pending);
+        if let Some(msg) = unknown_material_notice(self.unknown) {
+            eprintln!("{msg}");
+        }
+        (self.world, self.player, self.meta)
+    }
+}
+
+/// Rebuild the world and player from a doc, everything but what [`Restored::finish`] adds.
+/// Unknown specs degrade to air. A law stamp that does not match this game's law is a
+/// different universe and is refused, never a panic.
+fn rebuild(
     doc: SaveDoc,
-    mods: &mut Mods,
     make_world: impl FnOnce(i64, WorldgenKind, TerrainCfg) -> World,
-) -> Result<(World, Player, SaveMeta), SaveError> {
+) -> Result<Restored, SaveError> {
     if doc.law_stamp != material::Law::current().stamp() {
         return Err(SaveError::LawMismatch);
     }
@@ -347,20 +371,23 @@ pub fn from_doc(
         world.set_block(edit.x, edit.y, edit.z, block_ids[usize::from(edit.spec)]);
     }
 
-    for (name, data) in &doc.mods {
-        unknown.legacy_holdings += mods.load_state(name, data, &mut world);
-    }
-    let pending: Vec<(u32, crate::sim::reactions::Contact)> = doc
+    let pending = doc
         .pending
         .iter()
         .map(|c| (c.age, crate::sim::reactions::Contact { lo: (c.x, c.y, c.z), axis: c.axis }))
         .collect();
-    world.restore_reactions(&pending);
-    if let Some(msg) = unknown_material_notice(unknown) {
-        eprintln!("{msg}");
-    }
+    Ok(Restored { world, player, meta: doc.meta, mods: doc.mods, pending, unknown })
+}
 
-    Ok((world, player, doc.meta))
+/// Rebuild a ready-to-play world and player from a doc, restoring mod state into `mods` and
+/// the pending reaction work into the world's scheduler.
+#[cfg(test)]
+pub fn from_doc(
+    doc: SaveDoc,
+    mods: &mut Mods,
+    make_world: impl FnOnce(i64, WorldgenKind, TerrainCfg) -> World,
+) -> Result<(World, Player, SaveMeta), SaveError> {
+    Ok(rebuild(doc, make_world)?.finish(mods))
 }
 
 /// Snapshot straight to bytes — the synchronous encode the exit-flush path
@@ -389,14 +416,13 @@ pub fn save(
     Ok(())
 }
 
-/// Load a slot, laddering to the backup and salvaging a truncated tail if it
-/// comes to that. The report says how far down the ladder we went.
-/// `make_world` is forwarded straight to [`from_doc`].
-pub fn load(
+/// Read a slot, laddering to the backup and salvaging a truncated tail if it comes to that, and
+/// rebuild it up to [`Restored::finish`]. Needs no mods, so it runs on any thread. The report says
+/// how far down the ladder we went. `make_world` builds the world from the save's seed and generator.
+pub fn restore(
     id: &SlotId,
-    mods: &mut Mods,
     make_world: impl FnOnce(i64, WorldgenKind, TerrainCfg) -> World,
-) -> Result<(World, Player, SaveMeta, LoadReport), SaveError> {
+) -> Result<(Restored, LoadReport), SaveError> {
     let (decoded, source) = store::read(id)?;
     let (doc, salvage) = match decoded {
         format::Decoded::Intact(doc) => (doc, None),
@@ -404,6 +430,17 @@ pub fn load(
             (doc, Some((recovered, expected)))
         }
     };
-    let (world, player, meta) = from_doc(doc, mods, make_world)?;
-    Ok((world, player, meta, LoadReport { source, salvage }))
+    Ok((rebuild(doc, make_world)?, LoadReport { source, salvage }))
+}
+
+/// [`restore`] and [`Restored::finish`] in one go.
+#[cfg(test)]
+pub fn load(
+    id: &SlotId,
+    mods: &mut Mods,
+    make_world: impl FnOnce(i64, WorldgenKind, TerrainCfg) -> World,
+) -> Result<(World, Player, SaveMeta, LoadReport), SaveError> {
+    let (restored, report) = restore(id, make_world)?;
+    let (world, player, meta) = restored.finish(mods);
+    Ok((world, player, meta, report))
 }
