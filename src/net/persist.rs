@@ -56,6 +56,32 @@ pub(crate) struct Store {
     kept: Mutex<Vec<(i32, i32, i32, String)>>,
 }
 
+/// Why a world file cannot be served. Displays as `{path}: {reason}`.
+#[derive(Debug)]
+pub(crate) struct LoadError {
+    path: PathBuf,
+    reason: String,
+}
+
+impl LoadError {
+    fn new(path: &Path, reason: impl Into<String>) -> Self {
+        Self { path: path.to_path_buf(), reason: reason.into() }
+    }
+
+    /// The reason alone, without the path.
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
+impl std::fmt::Display for LoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.path.display(), self.reason)
+    }
+}
+
+impl std::error::Error for LoadError {}
+
 /// Live ledger captured for one save. Specs are the server's shared `Arc`s, so capturing under the
 /// state lock copies no strings.
 pub(crate) struct Snapshot {
@@ -153,7 +179,7 @@ pub(crate) fn fresh(flags: &Flags) -> Loaded {
 }
 
 /// Load `path`, or prepare a new file there when it does not exist yet.
-pub(crate) fn load(path: &Path, flags: &Flags) -> Result<Loaded, String> {
+pub(crate) fn load(path: &Path, flags: &Flags) -> Result<Loaded, LoadError> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == ErrorKind::NotFound => {
@@ -171,9 +197,9 @@ pub(crate) fn load(path: &Path, flags: &Flags) -> Result<Loaded, String> {
                 }),
             });
         }
-        Err(e) => return Err(format!("could not read {}: {e}", path.display())),
+        Err(e) => return Err(LoadError::new(path, e.to_string())),
     };
-    let mut doc = match format::decode(&bytes).map_err(|e| format!("{}: {e}", path.display()))? {
+    let mut doc = match format::decode(&bytes).map_err(|e| LoadError::new(path, e.to_string()))? {
         Decoded::Intact(doc) => doc,
         Decoded::Salvaged { doc, recovered, expected } => {
             eprintln!(
@@ -184,10 +210,7 @@ pub(crate) fn load(path: &Path, flags: &Flags) -> Result<Loaded, String> {
         }
     };
     if doc.law_stamp != material::Law::current().stamp() {
-        return Err(format!(
-            "{}: save belongs to a different universe (law stamp mismatch)",
-            path.display()
-        ));
+        return Err(LoadError::new(path, "save belongs to a different universe (law stamp mismatch)"));
     }
     if doc.worldgen_version != WORLDGEN_VERSION {
         eprintln!(
@@ -197,7 +220,7 @@ pub(crate) fn load(path: &Path, flags: &Flags) -> Result<Loaded, String> {
         );
     }
     let worldgen = WorldgenKind::from_wire(doc.worldgen.kind)
-        .ok_or_else(|| format!("{}: unknown worldgen kind {}", path.display(), doc.worldgen.kind))?;
+        .ok_or_else(|| LoadError::new(path, format!("unknown worldgen kind {}", doc.worldgen.kind)))?;
     let terrain = TerrainCfg::from_wire(doc.worldgen.knobs);
     if flags.warn && overrides(flags, doc.meta.seed, worldgen, terrain) {
         eprintln!(

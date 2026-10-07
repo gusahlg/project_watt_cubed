@@ -29,9 +29,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Outbound frames waiting on the writer thread. A full queue drops the new
 /// frame and leaves the link up; the edit stays pending and expires on its own.
 const OUT_QUEUE: usize = 64;
-/// No `Pong` for this long: tell the player the link has gone quiet.
+/// Nothing from the server for this long: tell the player the link has gone quiet.
 const SILENCE_WARN: Duration = Duration::from_secs(5);
-/// No `Pong` for this long: give up. Matches the QUIC idle timeout.
+/// Nothing from the server for this long: give up. Matches the QUIC idle timeout.
 const SILENCE_GIVE_UP: Duration = Duration::from_secs(12);
 /// HUD, console, and the disconnect reason share this phrase.
 pub const INTERRUPTED: &str = "connection interrupted";
@@ -209,7 +209,7 @@ pub enum Incoming {
     /// `reason` is the server's close phrase when it sent one (empty if the
     /// peer just vanished). "server shutting down" means the process is exiting.
     Disconnected { reason: String },
-    /// No `Pong` for [`SILENCE_WARN`]. Cleared by the next `Pong`.
+    /// Nothing from the server for [`SILENCE_WARN`]. Cleared by the next message.
     Interrupted,
 }
 
@@ -303,8 +303,8 @@ pub struct Connection {
     disconnect_emitted: bool,
     /// Filled by the reader when the stream ends, before the inbox disconnects.
     close_reason: Arc<Mutex<String>>,
-    /// Last evidence the server answered. Set at connect and on every `Pong`.
-    last_pong: Instant,
+    /// Last message from the server. Set at connect and on every message.
+    last_heard: Instant,
     /// [`Incoming::Interrupted`] already surfaced for the current gap.
     warned: bool,
     /// The join overlay has arrived ([`ServerMessage::SnapshotEnd`]). Stays set.
@@ -602,7 +602,7 @@ fn connect_one(
             pending_teleport: None,
             disconnect_emitted: false,
             close_reason,
-            last_pong: Instant::now(),
+            last_heard: Instant::now(),
             warned: false,
             snapshot_ready: false,
         })
@@ -693,7 +693,7 @@ impl Connection {
         expire_pending(&mut self.pending_edits, &self.cell_revs, Instant::now(), &mut out);
         {
             let mut reason = self.close_reason.lock().unwrap_or_else(PoisonError::into_inner);
-            consider_silence(self.last_pong, Instant::now(), &mut self.warned, &mut self.alive, &mut reason, &mut out);
+            consider_silence(self.last_heard, Instant::now(), &mut self.warned, &mut self.alive, &mut reason, &mut out);
         }
         let reason = self.close_reason.lock().unwrap_or_else(PoisonError::into_inner).clone();
         emit_disconnect(&mut self.alive, &mut self.disconnect_emitted, &reason, &mut out);
@@ -713,7 +713,7 @@ impl Connection {
             &mut self.ping_ms,
             &mut self.alive,
             &mut self.disconnect_emitted,
-            &mut self.last_pong,
+            &mut self.last_heard,
             &mut self.warned,
             &mut self.snapshot_ready,
             out,
@@ -765,15 +765,15 @@ fn expire_pending(
     }
 }
 
-/// What a gap since the last `Pong` means. A later `Pong` clears `warned`.
+/// What a gap since the last message means. A later message clears `warned`.
 enum LinkFate {
     Ok,
     Warn,
     GiveUp,
 }
 
-fn link_silence(last_pong: Instant, now: Instant, warned: bool) -> LinkFate {
-    let gap = now.saturating_duration_since(last_pong);
+fn link_silence(last_heard: Instant, now: Instant, warned: bool) -> LinkFate {
+    let gap = now.saturating_duration_since(last_heard);
     if gap >= SILENCE_GIVE_UP {
         LinkFate::GiveUp
     } else if gap >= SILENCE_WARN && !warned {
@@ -784,14 +784,14 @@ fn link_silence(last_pong: Instant, now: Instant, warned: bool) -> LinkFate {
 }
 
 fn consider_silence(
-    last_pong: Instant,
+    last_heard: Instant,
     now: Instant,
     warned: &mut bool,
     alive: &mut bool,
     reason: &mut String,
     out: &mut Vec<Incoming>,
 ) {
-    match link_silence(last_pong, now, *warned) {
+    match link_silence(last_heard, now, *warned) {
         LinkFate::Ok => {}
         LinkFate::Warn => {
             *warned = true;
@@ -849,11 +849,15 @@ fn apply_server_message(
     ping_ms: &mut Option<u32>,
     alive: &mut bool,
     disconnect_emitted: &mut bool,
-    last_pong: &mut Instant,
+    last_heard: &mut Instant,
     warned: &mut bool,
     snapshot_ready: &mut bool,
     out: &mut Vec<Incoming>,
 ) {
+    // Any message proves the link is alive. A long join's snapshot batches can
+    // hold the Pong back for many seconds.
+    *last_heard = Instant::now();
+    *warned = false;
     match msg {
             ServerMessage::Snapshot { edits } => {
                 // Authoritative world state (bootstrap ledger, reaction commits): not a
@@ -973,8 +977,6 @@ fn apply_server_message(
                 if let Some((sent_nonce, at)) = *ping_sent && sent_nonce == nonce {
                     *ping_ms = Some(at.elapsed().as_millis() as u32);
                 }
-                *last_pong = Instant::now();
-                *warned = false;
             }
             ServerMessage::Reject { reason } => {
                 *alive = false;
@@ -1310,7 +1312,7 @@ mod tests {
         ping_ms: Option<u32>,
         alive: bool,
         disconnect_emitted: bool,
-        last_pong: Instant,
+        last_heard: Instant,
         warned: bool,
         snapshot_ready: bool,
     }
@@ -1327,7 +1329,7 @@ mod tests {
                 ping_ms: None,
                 alive: true,
                 disconnect_emitted: false,
-                last_pong: Instant::now(),
+                last_heard: Instant::now(),
                 warned: false,
                 snapshot_ready: false,
             }
@@ -1351,7 +1353,7 @@ mod tests {
                     &mut self.ping_ms,
                     &mut self.alive,
                     &mut self.disconnect_emitted,
-                    &mut self.last_pong,
+                    &mut self.last_heard,
                     &mut self.warned,
                     &mut self.snapshot_ready,
                     &mut out,
@@ -1715,10 +1717,33 @@ mod tests {
     fn a_pong_clears_the_silence_warning() {
         let mut v = View::new();
         v.warned = true;
-        v.last_pong = Instant::now() - SILENCE_WARN;
+        v.last_heard = Instant::now() - SILENCE_WARN;
         v.apply(ServerMessage::Pong { nonce: 1 });
         assert!(!v.warned);
-        assert!(v.last_pong.elapsed() < Duration::from_millis(50));
+        assert!(v.last_heard.elapsed() < Duration::from_millis(50));
+    }
+
+    /// A long join over a slow link: snapshot batches keep arriving and the Pong waits
+    /// behind them. Every message is proof of life, so the link neither warns nor gives up.
+    #[test]
+    fn snapshot_batches_without_a_pong_keep_the_link_alive() {
+        let mut v = View::new();
+        let messages = [
+            ServerMessage::Snapshot { edits: vec![(1, 2, 3, 1, "air".into())] },
+            ServerMessage::Edit { x: 4, y: 5, z: 6, rev: 1, spec: "air".into() },
+            ServerMessage::Time { day: 0.5, day_secs: 600.0 },
+            ServerMessage::SnapshotEnd,
+        ];
+        for msg in messages {
+            v.warned = true;
+            v.last_heard = Instant::now() - (SILENCE_GIVE_UP - Duration::from_secs(1));
+            v.apply(msg);
+            assert!(!v.warned, "a message clears the silence warning");
+            let mut out = Vec::new();
+            let mut reason = String::new();
+            consider_silence(v.last_heard, Instant::now() + Duration::from_secs(2), &mut v.warned, &mut v.alive, &mut reason, &mut out);
+            assert!(v.alive && out.is_empty() && reason.is_empty(), "a link that just spoke is not silent");
+        }
     }
 
     #[test]
