@@ -3783,16 +3783,16 @@ fn open_gen_cursor_drains_across_frames() {
     }
     let budget = voxel_engine::producer::Budget::Millis(0.0);
     world.request_region_data(center, budget);
-    let queued = world.gen_columns.len();
+    let queued = world.gen_cursor.runs.len();
     let inflight = world.generating.len();
     assert!(inflight > 0, "first pass submits");
     assert!(queued > 0, "the rest of the box stays queued");
-    assert!(!world.gen_cursor_dirty);
+    assert!(!world.gen_cursor.dirty);
     world.pending_gen.set();
     world.request_region_data(center, budget);
     assert!(world.generating.len() > inflight, "second pass admits more");
-    assert!(world.gen_columns.len() < queued, "queue shrinks without a rebuild");
-    for (_, run) in &world.gen_columns {
+    assert!(world.gen_cursor.runs.len() < queued, "queue shrinks without a rebuild");
+    for (_, run) in &world.gen_cursor.runs {
         let streaming::GenRun::Open { coord } = *run else {
             panic!("open centre queues one chunk per run");
         };
@@ -3803,7 +3803,7 @@ fn open_gen_cursor_drains_across_frames() {
         for y in center.y - r..=center.y + r {
             for z in center.z - r..=center.z + r {
                 let coord = ChunkCoord::new(x, y, z);
-                let queued = world.gen_columns.iter().any(|(_, run)| {
+                let queued = world.gen_cursor.runs.iter().any(|(_, run)| {
                     matches!(run, streaming::GenRun::Open { coord: c } if *c == coord)
                 });
                 assert!(
@@ -3817,12 +3817,12 @@ fn open_gen_cursor_drains_across_frames() {
     }
     let lost = world.generating.iter().next().copied().expect("in flight");
     world.fail_job(pipeline::JobKey::Open { coord: lost });
-    assert!(world.gen_cursor_dirty, "a retryable failure invalidates the cursor");
+    assert!(world.gen_cursor.dirty, "a retryable failure invalidates the cursor");
     assert!(!world.generating.contains(&lost));
     world.request_region_data(center, budget);
-    assert!(!world.gen_cursor_dirty);
+    assert!(!world.gen_cursor.dirty);
     let back = world.generating.contains(&lost)
-        || world.gen_columns.iter().any(|(_, run)| {
+        || world.gen_cursor.runs.iter().any(|(_, run)| {
             matches!(run, streaming::GenRun::Open { coord } if *coord == lost)
         });
     assert!(back, "the failed chunk is gathered again");
@@ -4028,7 +4028,7 @@ fn asteroid_entry_breakdown() {
         progressed += world.generating.len().saturating_sub(generating_before);
         main_gen += t.elapsed();
         let t = Instant::now();
-        let admitted_before = world.light_admitted;
+        let admitted_before = world.counters.light_admitted;
         if world.lighting {
             admit::<LightLane>(
                 &mut world,
@@ -4036,7 +4036,7 @@ fn asteroid_entry_breakdown() {
                 voxel_engine::producer::Budget::Millis(1.0),
             );
         }
-        progressed += (world.light_admitted - admitted_before) as usize;
+        progressed += (world.counters.light_admitted - admitted_before) as usize;
         main_light += t.elapsed();
         let t = Instant::now();
         let building_before = world.building_meshes;
