@@ -577,8 +577,9 @@ impl World {
     }
 
     /// Advance the light-gate before the mesh lane runs: reap timers whose
-    /// chunk stopped waiting, promote `light_dirty` (and relit-degraded) chunks whose 27-neighbourhood
-    /// has no pending light work or whose degrade timer expired, and re-seed
+    /// chunk stopped waiting, promote `light_dirty` (and relit-degraded)
+    /// chunks whose 27-neighbourhood has no pending light work or whose
+    /// degrade timer expired, and re-seed
     /// exactly the chunks whose DEGRADE TIMER expired — expiry raises no event
     /// of its own, so this sweep (over ONLY the timed/dirty maps, never the
     /// world) is what un-strands them. Timers START at the admit loop's
@@ -588,8 +589,9 @@ impl World {
     pub(in crate::world) fn tick_light_gate(&mut self) {
         // `LightGate` is `Default`, so move it out to break the self-borrow while
         // the predicates below read the chunk map. Unload already dropped every
-        // gone chunk ([`forget_chunk`](Self::forget_chunk)). An empty map skips
-        // `retain` (it still walks capacity); a drained flood `shrink_to_fit`s once.
+        // gone chunk ([`forget_chunk`](Self::forget_chunk)). A drained flood
+        // `shrink_to_fit`s once; an empty timer map skips `retain` (it still
+        // walks capacity).
         let mut gate = std::mem::take(&mut self.light_gate);
         if gate.degraded.is_empty() && gate.degraded.capacity() > 0 {
             gate.degraded.shrink_to_fit();
