@@ -209,7 +209,7 @@ use admit::{
     motion_biased_dist2,
 };
 #[cfg(test)]
-use admit::player_dist2;
+use admit::{WorklistLane, player_dist2};
 use resident::{ChartBend, Loaded, MeshState, SectionState, adjust_count};
 #[cfg(test)]
 use resident::{ChunkMeshes, mesh_free_log, vis_log};
@@ -497,9 +497,6 @@ pub struct World {
     /// Chunks whose missing neighbour light will never arrive, so a mesh
     /// snapshot must read missing planes as settled dark (not open-sky).
     light_terminal: FastSet<Coord>,
-    /// Degraded-snapshot flag carried from mesh submit to claim, so a rejected
-    /// submit does not mutate the degraded or terminal sets.
-    mesh_pending_degraded: Option<(Coord, bool)>,
     /// Skylight ceiling per [`ColumnKey`] — the surface heightmap the settle
     /// pass seeds skylight from. A pure generator function (independent of
     /// altitude and of edits), so it is computed once per column and reused
@@ -713,10 +710,8 @@ pub struct World {
     /// in-flight worker result from a retired configuration can never land.
     section_epoch: u32,
     /// Monotone claim-token source for section jobs (see
-    /// [`pipeline::ClaimToken`]); `section_pending_claim` carries the
-    /// freshly minted token from the lane's `submit` to its `claim`.
+    /// [`pipeline::ClaimToken`]).
     section_claim_seq: u64,
-    section_pending_claim: Option<(SectionPos, pipeline::ClaimToken)>,
     /// Gameplay reaction events. Ticked by the sim `reactions` system when this
     /// instance is the authority (single-player or the dedicated server).
     reactions: crate::sim::reactions::ReactionScheduler,
@@ -874,7 +869,6 @@ impl World {
             light_gate: streaming::LightGate::default(),
             remesh_stats: streaming::RemeshStats::default(),
             light_terminal: FastSet::default(),
-            mesh_pending_degraded: None,
             job_strikes: FastMap::default(),
             quarantined: FastSet::default(),
             textures: textures::BlockTextures::new(),
@@ -935,7 +929,6 @@ impl World {
             lod_clip_shrunk: Sticky::raised(),
             section_epoch: 0,
             section_claim_seq: 0,
-            section_pending_claim: None,
             reactions: crate::sim::reactions::ReactionScheduler::new(),
             reactions_authority: true,
         };
@@ -996,9 +989,6 @@ impl World {
         // A queued settled grid is a TRANSFERRED light claim: the in-flight
         // entry must be held until `settle_light` releases it, or `light_ready`
         // would admit a mesh against a grid that is about to change.
-        // (`section_pending_claim` is deliberately NOT asserted `None` here: a
-        // far-cap-rejected submit leaves it set until the next submit
-        // overwrites it — a benign leftover, not a stranded claim.)
         for (coord, _) in &self.light_apply_queue {
             debug_assert!(
                 self.light_inflight.contains(coord),

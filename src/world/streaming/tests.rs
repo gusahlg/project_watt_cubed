@@ -445,7 +445,7 @@ fn degraded_ready_chunk_promotes_through_terminal_async_path() {
         "the sync dirty path is not involved"
     );
 
-    let job = <MeshLane as StreamLane>::submit(&mut world, c).expect("terminal mesh job");
+    let (job, degraded) = <MeshLane as StreamLane>::submit(&mut world, c).expect("terminal mesh job");
     let pipeline::Job::Mesh { snapshot, .. } = job else {
         panic!("expected a mesh job");
     };
@@ -464,7 +464,7 @@ fn degraded_ready_chunk_promotes_through_terminal_async_path() {
         "submit must not drop the terminal mark (a rejected submit retries)"
     );
 
-    <MeshLane as StreamLane>::claim(&mut world, c);
+    <MeshLane as StreamLane>::claim(&mut world, c, degraded);
     assert!(
         !world.light_gate.degraded.contains(&c),
         "claim marks the snapshot non-degraded"

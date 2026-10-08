@@ -226,10 +226,7 @@ fn section_lane_claim_and_integrate_parity() {
     let center = stand_on_twin(&mut world);
     let pos = world.desired_sections(center)[0];
     assert!(!<SectionLane as StreamLane>::in_flight(&world, pos));
-    // Claim without its paired submit would trip the debug assertion, so
-    // mirror the lane's real order: mint the pending token first.
-    world.section_pending_claim = Some((pos, pipeline::ClaimToken(7)));
-    <SectionLane as StreamLane>::claim(&mut world, pos);
+    <SectionLane as StreamLane>::claim(&mut world, pos, pipeline::ClaimToken(7));
     assert!(matches!(world.sections.get(&pos), Some(SectionState::Meshing { token: pipeline::ClaimToken(7) })));
     assert!(<SectionLane as StreamLane>::in_flight(&world, pos), "claim marks in-flight");
     <SectionLane as StreamLane>::integrate(
@@ -990,7 +987,8 @@ fn async_rebuild_claim_and_stale_release_preserve_the_drawn_mesh() {
     world.chunks.get_mut(&coord).unwrap().state =
         MeshState::NeedsMesh { building: false, prev: Some(meshes(h)) };
 
-    <MeshLane as StreamLane>::claim(&mut world, coord);
+    let degraded = !world.light_ready(coord) && !world.light_terminal.contains(&coord);
+    <MeshLane as StreamLane>::claim(&mut world, coord, degraded);
     let state = &world.chunks[&coord].state;
     assert!(matches!(state, MeshState::NeedsMesh { building: true, prev: Some(_) }));
     assert!(state.live_meshes().unwrap().draws(h), "still drawing through the claim");
@@ -1150,8 +1148,7 @@ fn section_upload_byte_accounting_matches_vertex_sizes() {
     assert!(expected > 0, "a default-seed section yields geometry");
     assert_eq!(meshes.vertex_bytes(), expected);
 
-    world.section_pending_claim = Some((pos, pipeline::ClaimToken(7)));
-    <SectionLane as StreamLane>::claim(&mut world, pos);
+    <SectionLane as StreamLane>::claim(&mut world, pos, pipeline::ClaimToken(7));
     <SectionLane as StreamLane>::integrate(
         &mut world,
         pipeline::Done::Section {
@@ -1727,9 +1724,9 @@ fn lod2_far_field_drives_to_covering_complete() {
             if <SectionLane as StreamLane>::in_flight(&world, pos) {
                 continue;
             }
-            if let Some(job) = <SectionLane as StreamLane>::submit(&mut world, pos) {
+            if let Some((job, token)) = <SectionLane as StreamLane>::submit(&mut world, pos) {
                 assert!(workers.submit(job), "worker pool admits the section job");
-                <SectionLane as StreamLane>::claim(&mut world, pos);
+                <SectionLane as StreamLane>::claim(&mut world, pos, token);
             }
         }
         // Drain finished jobs and yield briefly when the pool is empty.
@@ -2204,11 +2201,10 @@ fn transition_lighting_old_done_is_ignored_in_both_orders() {
     assert!(world.light_apply_queue.is_empty());
 }
 
-/// A far-cap rejection leaves `section_pending_claim` set; the next accepted
-/// submit for a *different* key overwrites it, and claiming that key must
-/// install its own token — never the leftover.
+/// A far-cap rejection claims nothing: each submit mints its own token, and claiming a later
+/// key installs that key's token, never the refused one's.
 #[test]
-fn section_pending_claim_is_not_stolen_by_a_later_key() {
+fn a_refused_section_submit_claims_nothing() {
     let mut world = lod2_world();
     let a = SectionPos { body: 0, face: Face::PosY,
         detail: section::FINEST_DETAIL,
@@ -2220,20 +2216,12 @@ fn section_pending_claim_is_not_stolen_by_a_later_key() {
         x: 3,
         z: 4,
     };
-    let job_a = <SectionLane as StreamLane>::submit(&mut world, a).expect("submit A");
-    let pipeline::Job::Section { token: token_a, .. } = job_a else {
-        panic!("expected a section job");
-    };
-    assert_eq!(world.section_pending_claim, Some((a, token_a)));
-    // Rejection: do not claim A. Submit B overwrites the leftover.
-    let job_b = <SectionLane as StreamLane>::submit(&mut world, b).expect("submit B");
-    let pipeline::Job::Section { token: token_b, .. } = job_b else {
-        panic!("expected a section job");
-    };
+    let (job_a, token_a) = <SectionLane as StreamLane>::submit(&mut world, a).expect("submit A");
+    assert!(matches!(job_a, pipeline::Job::Section { token, .. } if token == token_a));
+    // Rejection: A is never claimed.
+    let (_, token_b) = <SectionLane as StreamLane>::submit(&mut world, b).expect("submit B");
     assert_ne!(token_a, token_b);
-    assert_eq!(world.section_pending_claim, Some((b, token_b)));
-    <SectionLane as StreamLane>::claim(&mut world, b);
-    assert!(world.section_pending_claim.is_none());
+    <SectionLane as StreamLane>::claim(&mut world, b, token_b);
     assert!(matches!(
         world.sections.get(&b),
         Some(SectionState::Meshing { token }) if *token == token_b
@@ -2256,7 +2244,6 @@ fn late_section_done_after_epoch_bump_does_not_reinsert() {
     world.section_epoch = world.section_epoch.wrapping_add(1);
     world.sections.clear();
     world.section_upload_queue.clear();
-    world.section_pending_claim = None;
     <SectionLane as StreamLane>::integrate(
         &mut world,
         pipeline::Done::Section {
@@ -2365,10 +2352,8 @@ fn mesh_submit_without_claim_leaves_terminal_and_degraded_intact() {
     world.chunks.get_mut(&c).unwrap().state = MeshState::needs_mesh();
     world.mark_degraded(c, true);
     world.light_terminal.insert(c);
-    let _job = <MeshLane as StreamLane>::submit(&mut world, c).expect("job");
-    assert!(world.light_gate.degraded.contains(&c));
-    assert!(world.light_terminal.contains(&c));
-    assert_eq!(world.mesh_pending_degraded, Some((c, false)));
+    let (_job, degraded) = <MeshLane as StreamLane>::submit(&mut world, c).expect("job");
+    assert!(!degraded, "a terminal chunk's snapshot is final");
     assert!(world.light_terminal.contains(&c));
     assert!(world.light_gate.degraded.contains(&c));
 }
@@ -2478,7 +2463,8 @@ fn claim_sequence(seed: u64) {
                     Some(MeshState::NeedsMesh { building: false, .. })
                 ) {
                     let rev = world.chunks[&coord].rev;
-                    <MeshLane as StreamLane>::claim(&mut world, coord);
+                    let degraded = !world.light_ready(coord) && !world.light_terminal.contains(&coord);
+                    <MeshLane as StreamLane>::claim(&mut world, coord, degraded);
                     owed_mesh.insert(coord, rev);
                 }
             }
@@ -2501,7 +2487,7 @@ fn claim_sequence(seed: u64) {
             5 => {
                 if world.chunks.contains_key(&coord) && !world.light_inflight.contains(&coord) {
                     let light_gen = world.chunks[&coord].light_gen;
-                    <LightLane as StreamLane>::claim(&mut world, coord);
+                    <LightLane as StreamLane>::claim(&mut world, coord, ());
                     owed_light.insert(coord, light_gen);
                 }
             }
@@ -2554,11 +2540,8 @@ fn claim_sequence(seed: u64) {
                     z: coord.z,
                 };
                 if !world.sections.contains_key(&pos) {
-                    if let Some(job) = <SectionLane as StreamLane>::submit(&mut world, pos) {
-                        let pipeline::Job::Section { token, .. } = job else {
-                            panic!("section");
-                        };
-                        <SectionLane as StreamLane>::claim(&mut world, pos);
+                    if let Some((_, token)) = <SectionLane as StreamLane>::submit(&mut world, pos) {
+                        <SectionLane as StreamLane>::claim(&mut world, pos, token);
                         owed_section.insert(pos, token);
                     }
                 } else if let Some(&token) = owed_section.get(&pos) {
@@ -2795,11 +2778,11 @@ impl crate::world::generation::TerrainGenerator for OpenAir {
 fn drain_light(world: &mut World) {
     let mut n = 0u32;
     loop {
-        let Some(coord) = LightLane::seed_set(world).and_then(|s| s.iter().copied().next()) else {
+        let Some(coord) = LightLane::worklist(world).iter().copied().next() else {
             break;
         };
-        LightLane::seed_set(world).expect("worklist").remove(&coord);
-        if let Some(pipeline::Job::Light { snapshot, coord: c, .. }) = LightLane::submit(world, coord)
+        LightLane::worklist(world).remove(&coord);
+        if let Some((pipeline::Job::Light { snapshot, coord: c, .. }, ())) = LightLane::submit(world, coord)
         {
             let mut grid = light::LightGrid::dark();
             light::propagate(

@@ -6,13 +6,12 @@
 //! The lanes differ only in *where their state lives*, reached through a
 //! [`StreamLane`] of accessors so the admission loop ([`admit`]) is written once.
 //!
-//! Each lane is a `sched::Run` producer registered in [`lanes`]; the scheduler
-//! hands it its `Budget::Millis` and it derives its [`Deadline`](pipeline::Deadline)
-//! from that (never a private `pipeline::*_BUDGET` const — one budget locus, the
-//! manifest). The deadline is checked BETWEEN admitted items, and the forward-
-//! progress floor ([`admission_exhausted`]) is the single definition of "admit at
-//! least `MIN_ADMIT` before the clock can stop you", shared with the generation
-//! lane so no producer hand-rolls its own budget/floor.
+//! Each lane's `Budget::Millis` is its `BUDGET` in the [`lanes`] table, and it derives
+//! its [`Deadline`](pipeline::Deadline) from that (never a private `pipeline::*_BUDGET`
+//! const — one budget locus). The deadline is checked BETWEEN admitted items, and the
+//! forward-progress floor ([`admission_exhausted`]) is the single definition of "admit at
+//! least `MIN_ADMIT` before the clock can stop you", shared with the generation lane so
+//! no lane hand-rolls its own budget/floor.
 
 use super::*;
 
@@ -25,16 +24,6 @@ pub(in crate::world) fn admission_exhausted(
     deadline: pipeline::Deadline,
 ) -> bool {
     admitted >= min_admit && deadline.expired()
-}
-
-/// How a lane defines its work this frame. A geometry lane derives candidates
-/// from the player centre. A worklist lane reads an explicit dirty set
-/// accumulated on the `World` (mesh, light: coords marked dirty by loads/edits).
-pub(in crate::world) enum Candidates {
-    /// Walk the frame's derived candidate keys (see [`StreamLane::for_each_geometry`]).
-    Geometry,
-    /// Read the lane's seed set (`StreamLane::seed_set`) for candidates.
-    Worklist,
 }
 
 /// Reused gather buffers for one [`admit`] pass. Held on [`World`] so the
@@ -57,31 +46,31 @@ impl<K> Default for AdmitScratch<K> {
 }
 
 /// The accessor surface of one streaming lane. Zero-sized marker types
-/// (`MeshLane`, …) implement it AND `sched::Run` (in [`lanes`]); all mutable
-/// state lives on [`World`] behind these accessors, so the lane carries nothing
-/// and the shared [`admit`] loop stays allocation-free. This is *not* a
-/// scheduler: budget and forward-progress come from the scheduler that drives
-/// the producer, never from here.
+/// (`MeshLane`, …) implement it; all mutable state lives on [`World`] behind these
+/// accessors, so the lane carries nothing and the shared admission loops stay
+/// allocation-free. Budget and forward progress come from the lane's `BUDGET` in
+/// [`lanes`], never from here.
 pub(in crate::world) trait StreamLane {
     /// The lane's work key: chunk `Coord` or `SectionPos`.
-    /// Must be `Copy + Eq + Hash`.
     type Key: Copy + Eq + Hash;
+    /// What [`submit`](Self::submit) hands [`claim`](Self::claim) once the pool accepts the job.
+    type Claim;
 
     /// Minimum admissions before the deadline can stop the loop — the forward-
     /// progress floor, so setup cost (gather/sort) alone can't starve a lane
-    /// under a tight budget. One value per lane; enforced once, in [`admit`].
+    /// under a tight budget. One value per lane; enforced once, in [`submit_ranked`].
     const MIN_ADMIT: usize;
 
     /// Far LOD lanes enqueue through `submit_far`; everyone else is near.
     const FAR: bool = false;
 
-    /// The candidate keys for this frame (see [`Candidates`]).
-    fn candidates(world: &World, center: Coord) -> Candidates;
-    /// The worklist seed set, for worklist lanes (`None` for geometry lanes).
-    fn seed_set(world: &mut World) -> Option<&mut worklist::RingWorklist>;
-    /// Worklist-lane admission. Geometry lanes leave the default (unreachable).
-    fn admit_worklist(_world: &mut World, _center: Coord, _budget: Budget) {
-        debug_assert!(false, "geometry lane has no worklist");
+    /// One admission pass around `center`, after the pending gate. Default: the lane's
+    /// geometry candidates; worklist lanes admit from their seed set.
+    fn admit(world: &mut World, center: Coord, budget: Budget)
+    where
+        Self: Sized,
+    {
+        admit_geometry::<Self>(world, center, budget);
     }
     /// This lane's reusable gather buffers.
     fn scratch(world: &mut World) -> &mut AdmitScratch<Self::Key>;
@@ -101,14 +90,14 @@ pub(in crate::world) trait StreamLane {
     /// Lane-specific budget refresh before geometry candidates are filtered.
     /// Default: nothing. Runs only when the worker queue has a free slot.
     fn prepare_admit(_world: &mut World) {}
-    /// A worklist seed was evicted as BLOCKED by this pass's [`admit`] — the
-    /// lane's chance to register it with an event source that will re-seed it
-    /// (the mesh lane starts its light-degrade timer here). Default: no-op.
+    /// A worklist seed was evicted as BLOCKED by this pass — the lane's chance to
+    /// register it with an event source that will re-seed it (the mesh lane starts
+    /// its light-degrade timer here). Default: no-op.
     fn on_blocked(world: &mut World, key: Self::Key) {
         let _ = (world, key);
     }
-    /// Squared distance in metres from `key` to player, for far-lane distance ordering.
-    /// `None` (default) marks a near lane using FIFO ordering.
+    /// Squared distance in metres from `key` to the player: `Some` queues the job in the
+    /// far class, ordered by it. `None` (default) is the near class.
     fn dist2(world: &World, center: Coord, key: Self::Key) -> Option<u64> {
         let _ = (world, center, key);
         None
@@ -123,11 +112,12 @@ pub(in crate::world) trait StreamLane {
     ) {
         let _ = (world, center, rank, visit);
     }
-    /// Build the worker job for `key`, or `None` to drop it.
+    /// Build the worker job for `key` and what its claim needs, or `None` to drop it.
     /// May warm caches but must not mutate lane state.
-    fn submit(world: &mut World, key: Self::Key) -> Option<pipeline::Job>;
-    /// Mark `key` in flight: remove from seed set and claim it to prevent re-submission.
-    fn claim(world: &mut World, key: Self::Key);
+    fn submit(world: &mut World, key: Self::Key) -> Option<(pipeline::Job, Self::Claim)>;
+    /// Mark `key` in flight once the pool accepted its job: remove it from the seed set
+    /// and claim it to prevent re-submission.
+    fn claim(world: &mut World, key: Self::Key, claim: Self::Claim);
     /// Fold a finished result back into the world (upload a mesh, publish light).
     fn integrate(world: &mut World, done: pipeline::Done);
     /// Record how many jobs this pass admitted. Light counts it for the stress
@@ -135,6 +125,13 @@ pub(in crate::world) trait StreamLane {
     fn note_admitted(world: &mut World, n: usize) {
         let _ = (world, n);
     }
+}
+
+/// A lane whose candidates are an explicit seed set on the `World` (mesh, light: coords
+/// marked by loads and edits).
+pub(in crate::world) trait WorklistLane: StreamLane<Key = Coord> {
+    /// The lane's seed set.
+    fn worklist(world: &mut World) -> &mut worklist::RingWorklist;
 }
 
 fn queue_slots<S: StreamLane>(world: &World) -> usize {
@@ -148,25 +145,64 @@ fn queue_slots<S: StreamLane>(world: &World) -> usize {
     }
 }
 
-/// The shared admission loop: gather, filter unready/in-flight, select the
-/// nearest `want`, submit until the deadline expires (checked between items,
-/// never mid-item, and never before `MIN_ADMIT`), then claim. Worklist lanes
-/// walk ring buckets nearest-first and stop once they have `want` ready keys
-/// (far buckets are not visited). Clears the lane's pending gate once the
-/// ready backlog drains. `budget` becomes a [`pipeline::Deadline`] only after
-/// the pending gate, so an idle frame never samples `Instant::now`.
-pub(in crate::world) fn admit<S: StreamLane>(
+/// Run lane `S`'s admission around `center` if its pending gate is up. `budget`
+/// becomes a [`pipeline::Deadline`] only after the gate, so an idle frame never
+/// samples `Instant::now`.
+pub(in crate::world) fn admit<S: StreamLane>(world: &mut World, center: Coord, budget: Budget) {
+    if S::pending(world).get() {
+        S::admit(world, center, budget);
+    }
+}
+
+/// Rank `keys` nearest-first, keep the nearest `max(slots, min_admit)`, and submit them in
+/// order until the deadline has passed the forward-progress floor (unless a boost fills the
+/// free `slots`) or the pool refuses one; each accepted job is claimed. A key `submit` drops
+/// goes to `dropped`. Returns whether every key was submitted or dropped. `keys` must not be
+/// empty.
+fn submit_ranked<S: StreamLane>(
     world: &mut World,
     center: Coord,
-    budget: Budget,
-) {
-    if !S::pending(world).get() {
-        return;
+    keys: &mut [(u64, S::Key)],
+    slots: usize,
+    min_admit: usize,
+    deadline: pipeline::Deadline,
+    mut dropped: impl FnMut(&mut World, S::Key),
+) -> bool {
+    let n = keys.len();
+    let take = n.min(slots.max(min_admit));
+    if take < n {
+        keys.select_nth_unstable_by_key(take - 1, |e| e.0);
+        keys[..take].sort_by_key(|e| e.0);
+    } else {
+        keys.sort_by_key(|e| e.0);
     }
-    match S::candidates(world, center) {
-        Candidates::Worklist => S::admit_worklist(world, center, budget),
-        Candidates::Geometry => admit_geometry::<S>(world, center, budget),
+    let mut exhausted = take == n;
+    let mut admitted = 0usize;
+    let fill_slots = world.stream_pacer.boosting();
+    for &(_, key) in &keys[..take] {
+        if admission_exhausted(admitted, min_admit, deadline) && !(fill_slots && admitted < slots) {
+            exhausted = false;
+            break;
+        }
+        let Some((job, claim)) = S::submit(world, key) else {
+            dropped(world, key);
+            continue;
+        };
+        let far = S::dist2(world, center, key);
+        let workers = world.worker_pool();
+        let accepted = match far {
+            Some(dist2) => workers.submit_far(job, dist2),
+            None => workers.submit(job),
+        };
+        if !accepted {
+            exhausted = false;
+            break;
+        }
+        S::claim(world, key, claim);
+        admitted += 1;
     }
+    S::note_admitted(world, admitted);
+    exhausted
 }
 
 /// Geometry-lane admission: walk this frame's derived candidates, select the
@@ -199,52 +235,11 @@ fn admit_geometry<S: StreamLane>(world: &mut World, center: Coord, budget: Budge
         scratch.keys.push((S::order(world, center, k), k));
     });
 
-    let n = scratch.keys.len();
-    if n == 0 {
-        if !refused {
-            S::pending(world).take();
-        }
-        *S::scratch(world) = scratch;
-        return;
-    }
-
-    let want = n.min(slots.max(min_admit));
-    if want < n {
-        scratch.keys.select_nth_unstable_by_key(want - 1, |e| e.0);
-        scratch.keys[..want].sort_by_key(|e| e.0);
+    let exhausted = if scratch.keys.is_empty() {
+        !refused
     } else {
-        scratch.keys.sort_by_key(|e| e.0);
-    }
-
-    let mut exhausted = want == n;
-    let mut admitted = 0usize;
-    let fill_slots = world.stream_pacer.boosting();
-    for i in 0..want {
-        let key = scratch.keys[i].1;
-        if admission_exhausted(admitted, min_admit, deadline)
-            && !(fill_slots && admitted < slots)
-        {
-            exhausted = false;
-            break;
-        }
-        let Some(job) = S::submit(world, key) else {
-            continue;
-        };
-        let far = S::dist2(world, center, key);
-        let workers = world.worker_pool();
-        let accepted = match far {
-            Some(dist2) => workers.submit_far(job, dist2),
-            None => workers.submit(job),
-        };
-        if accepted {
-            S::claim(world, key);
-            admitted += 1;
-        } else {
-            exhausted = false;
-            break;
-        }
-    }
-    S::note_admitted(world, admitted);
+        submit_ranked::<S>(world, center, &mut scratch.keys, slots, min_admit, deadline, |_, _| {})
+    };
     if exhausted {
         S::pending(world).take();
     }
@@ -254,23 +249,19 @@ fn admit_geometry<S: StreamLane>(world: &mut World, center: Coord, budget: Budge
 /// Worklist-lane admission: walk ring buckets nearest-first, evict blocked
 /// seeds only in visited buckets, stop once `want` ready keys are in hand.
 /// Motion bias is the tie-break within those buckets (it never reorders rings).
-fn admit_coord_worklist<S: StreamLane<Key = Coord>>(
-    world: &mut World,
-    center: Coord,
-    budget: Budget,
-) {
+fn admit_worklist<S: WorklistLane>(world: &mut World, center: Coord, budget: Budget) {
     let deadline = lanes::paced_deadline(world, budget);
     let slots = queue_slots::<S>(world);
     let min_admit = world.stream_pacer.floor(S::MIN_ADMIT);
     let up = world.live_up();
     let rings = world.worklist_rings(center);
 
-    let mut list = std::mem::take(S::seed_set(world).expect("worklist"));
+    let mut list = std::mem::take(S::worklist(world));
     list.fit(center, rings, up);
 
     if slots == 0 {
         let empty = list.is_empty();
-        *S::seed_set(world).expect("worklist") = list;
+        *S::worklist(world) = list;
         if empty {
             S::pending(world).take();
         }
@@ -302,60 +293,14 @@ fn admit_coord_worklist<S: StreamLane<Key = Coord>>(
         list.remove(&k);
         S::on_blocked(world, k);
     }
-    *S::seed_set(world).expect("worklist") = list;
+    *S::worklist(world) = list;
 
-    let n = scratch.keys.len();
-    if n == 0 {
-        let drained = visited_all && S::seed_set(world).expect("worklist").is_empty();
-        if drained {
-            S::pending(world).take();
-        }
-        *S::scratch(world) = scratch;
-        return;
-    }
-
-    let take = n.min(want);
-    if take < n {
-        scratch.keys.select_nth_unstable_by_key(take - 1, |e| e.0);
-        scratch.keys[..take].sort_by_key(|e| e.0);
-    } else {
-        scratch.keys.sort_by_key(|e| e.0);
-    }
-
-    let mut exhausted = visited_all && take == n;
-    let mut admitted = 0usize;
-    let fill_slots = world.stream_pacer.boosting();
-    for i in 0..take {
-        let key = scratch.keys[i].1;
-        if admission_exhausted(admitted, min_admit, deadline)
-            && !(fill_slots && admitted < slots)
-        {
-            exhausted = false;
-            break;
-        }
-        let Some(job) = S::submit(world, key) else {
-            if let Some(set) = S::seed_set(world) {
-                set.remove(&key);
-            }
-            continue;
-        };
-        let far = S::dist2(world, center, key);
-        let workers = world.worker_pool();
-        let accepted = match far {
-            Some(dist2) => workers.submit_far(job, dist2),
-            None => workers.submit(job),
-        };
-        if accepted {
-            S::claim(world, key);
-            admitted += 1;
-        } else {
-            exhausted = false;
-            break;
-        }
-    }
-    S::note_admitted(world, admitted);
-    let drained = exhausted && S::seed_set(world).expect("worklist").is_empty();
-    if drained {
+    let exhausted = scratch.keys.is_empty()
+        || submit_ranked::<S>(world, center, &mut scratch.keys, slots, min_admit, deadline, |world, key| {
+            S::worklist(world).remove(&key);
+        });
+    // Drained: every bucket visited, every ready key tried, nothing left seeded.
+    if visited_all && exhausted && S::worklist(world).is_empty() {
         S::pending(world).take();
     }
     *S::scratch(world) = scratch;
@@ -382,31 +327,23 @@ const MOTION_BIAS_STRENGTH: f64 = 0.3;
 
 /// Bias priority by eye velocity: cells ahead sort sooner, behind later.
 /// Affects ordering only, never the desired set. Identity at rest.
-/// The Y component of `vel` is ignored (the +Y tangent plane is XZ).
-pub(super) fn motion_biased_dist2(base: u64, vel: DVec3, dx: f64, dz: f64) -> u64 {
-    let speed = (vel.x * vel.x + vel.z * vel.z).sqrt();
-    let disp = (dx * dx + dz * dz).sqrt();
-    if speed < MOTION_BIAS_MIN_SPEED || disp < 1.0 {
-        return base;
-    }
-    let align = (vel.x * dx + vel.z * dz) / (speed * disp); // cosine in [-1, 1]
-    (base as f64 * (1.0 - MOTION_BIAS_STRENGTH * align)).max(0.0) as u64
-}
-
-/// Same bias in all three axes. Used when the streaming volume has no up face.
 fn motion_biased_dist3(base: u64, vel: DVec3, dx: f64, dy: f64, dz: f64) -> u64 {
     let speed = (vel.x * vel.x + vel.y * vel.y + vel.z * vel.z).sqrt();
     let disp = (dx * dx + dy * dy + dz * dz).sqrt();
     if speed < MOTION_BIAS_MIN_SPEED || disp < 1.0 {
         return base;
     }
-    let align = (vel.x * dx + vel.y * dy + vel.z * dz) / (speed * disp);
+    let align = (vel.x * dx + vel.y * dy + vel.z * dz) / (speed * disp); // cosine in [-1, 1]
     (base as f64 * (1.0 - MOTION_BIAS_STRENGTH * align)).max(0.0) as u64
 }
 
+/// [`motion_biased_dist3`] in the XZ plane (the +Y tangent plane): `vel.y` is ignored.
+/// Adding the zeroed terms changes no bit of the 2-D sums.
+pub(super) fn motion_biased_dist2(base: u64, vel: DVec3, dx: f64, dz: f64) -> u64 {
+    motion_biased_dist3(base, DVec3::new(vel.x, 0.0, vel.z), dx, 0.0, dz)
+}
+
 /// Motion bias in the plane perpendicular to `up`. `None` biases in 3-D.
-/// Axis Y passes `(dx, dz)` and the raw velocity into [`motion_biased_dist2`]
-/// (which ignores `vel.y`), so a +Y caller stays bit-identical.
 pub(super) fn bias_order(base: u64, vel: DVec3, dx: f64, dy: f64, dz: f64, up: Option<Face>) -> u64 {
     match up {
         None => motion_biased_dist3(base, vel, dx, dy, dz),
@@ -440,18 +377,62 @@ fn near_motion_order(world: &World, center: Coord, key: Coord) -> u64 {
 /// Fresh full-res chunk meshing.
 pub(in crate::world) struct MeshLane;
 
+/// The [`MeshLane::ready`] gate that holds a chunk back, cheapest first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::world) enum Blocked {
+    /// Not awaiting a fresh mesh: unloaded, meshed, building or edited.
+    NotNeedsMesh,
+    /// Outside the mesh box, or a reduced loading window does not admit it.
+    OutOfView,
+    /// Its mesh job kept panicking.
+    Quarantined,
+    /// A face neighbour has no data yet.
+    NoNeighbourData,
+    /// Its neighbourhood light has not settled and its wait has not run out.
+    Unlit,
+}
+
+impl MeshLane {
+    /// Which gate holds `key` back from a fresh mesh job, `None` once it may submit.
+    pub(in crate::world) fn blocked(world: &World, key: Coord) -> Option<Blocked> {
+        if !world.is_needs_mesh(key) {
+            return Some(Blocked::NotNeedsMesh);
+        }
+        if !world.mesh_view_admits(key) {
+            return Some(Blocked::OutOfView);
+        }
+        if world.quarantined.contains(&streaming::FailKey::Mesh { coord: key }) {
+            return Some(Blocked::Quarantined);
+        }
+        // Terminal promotion is unconditional: missing neighbour planes
+        // read as dark/air, matching the old sync path. Snapshot already
+        // fills an absent neighbour that way (`Padded` → AIR, `PaddedLight`
+        // → DARK when not degraded).
+        let terminal = world.light_terminal.contains(&key);
+        if !(terminal || world.neighbours_have_data(key)) {
+            return Some(Blocked::NoNeighbourData);
+        }
+        if !(terminal || world.light_ready(key) || world.light_wait_expired(key)) {
+            return Some(Blocked::Unlit);
+        }
+        None
+    }
+}
+
+impl WorklistLane for MeshLane {
+    fn worklist(world: &mut World) -> &mut worklist::RingWorklist {
+        &mut world.mesh_worklist
+    }
+}
+
 impl StreamLane for MeshLane {
     type Key = Coord;
+    /// The snapshot's degraded flag.
+    type Claim = bool;
     /// Low floor: admits are relatively cheap.
     const MIN_ADMIT: usize = 4;
-    fn candidates(_world: &World, _center: Coord) -> Candidates {
-        Candidates::Worklist
-    }
-    fn seed_set(world: &mut World) -> Option<&mut worklist::RingWorklist> {
-        Some(&mut world.mesh_worklist)
-    }
-    fn admit_worklist(world: &mut World, center: Coord, budget: Budget) {
-        admit_coord_worklist::<Self>(world, center, budget);
+    fn admit(world: &mut World, center: Coord, budget: Budget) {
+        admit_worklist::<Self>(world, center, budget);
     }
     fn scratch(world: &mut World) -> &mut AdmitScratch<Coord> {
         &mut world.admit_coords
@@ -479,23 +460,9 @@ impl StreamLane for MeshLane {
         }
     }
     fn ready(world: &World, key: Coord) -> bool {
-        // Cheapest-first: hash, arithmetic, quarantine set, neighbours, light.
-        world.is_needs_mesh(key)
-            && world.in_mesh_box(key)
-            && world.admits_mesh(key)
-            && !world
-                .quarantined
-                .contains(&streaming::FailKey::Mesh { coord: key })
-            // Terminal promotion is unconditional: missing neighbour planes
-            // read as dark/air, matching the old sync path. Snapshot already
-            // fills an absent neighbour that way (`Padded` → AIR, `PaddedLight`
-            // → DARK when not degraded).
-            && (world.neighbours_have_data(key) || world.light_terminal.contains(&key))
-            && (world.light_ready(key)
-                || world.light_wait_expired(key)
-                || world.light_terminal.contains(&key))
+        Self::blocked(world, key).is_none()
     }
-    fn submit(world: &mut World, key: Coord) -> Option<pipeline::Job> {
+    fn submit(world: &mut World, key: Coord) -> Option<(pipeline::Job, bool)> {
         // Fully walled solid: the worker mesh would be empty. `None` drops the
         // seed; an edit turns `Air` back into `Dirty`.
         if world.bury_solid_mesh(key) {
@@ -507,31 +474,13 @@ impl StreamLane for MeshLane {
         // (missing neighbour light will never arrive: missing planes are dark).
         let degraded = !world.light_ready(key) && !world.light_terminal.contains(&key);
         let (rev, snapshot) = world.snapshot(key, degraded);
-        world.mesh_pending_degraded = Some((key, degraded));
-        Some(pipeline::Job::Mesh {
-            coord: key,
-            rev,
-            snapshot,
-        })
+        Some((pipeline::Job::Mesh { coord: key, rev, snapshot }, degraded))
     }
-    fn claim(world: &mut World, key: Coord) {
+    fn claim(world: &mut World, key: Coord, degraded: bool) {
         // Apply the snapshot's degraded flag now that the pool has accepted
         // the job — submit must not mutate lane state (a rejected submit
         // would otherwise park the chunk in `degraded` with nothing in flight,
         // or drop a terminal mark that the retry still needs).
-        let degraded = match world.mesh_pending_degraded.take() {
-            Some((coord, degraded)) if coord == key => degraded,
-            pending => {
-                if let Some(leftover) = pending {
-                    world.mesh_pending_degraded = Some(leftover);
-                }
-                debug_assert!(
-                    pending.is_none(),
-                    "mesh claim for {key:?} with pending for {pending:?}"
-                );
-                !world.light_ready(key) && !world.light_terminal.contains(&key)
-            }
-        };
         world.mark_degraded(key, degraded);
         let nhood_quiet = world.light_nhood_quiet(key);
         world.remesh_stats.note_mesh_job(key, nhood_quiet);
@@ -567,15 +516,11 @@ pub(in crate::world) struct SectionLane;
 
 impl StreamLane for SectionLane {
     type Key = SectionPos;
+    /// The claim token minted at submit.
+    type Claim = pipeline::ClaimToken;
     /// Modest floor: heavy work runs off-thread.
     const MIN_ADMIT: usize = 4;
     const FAR: bool = true;
-    fn candidates(_world: &World, _center: Coord) -> Candidates {
-        Candidates::Geometry
-    }
-    fn seed_set(_world: &mut World) -> Option<&mut worklist::RingWorklist> {
-        None
-    }
     fn scratch(world: &mut World) -> &mut AdmitScratch<SectionPos> {
         &mut world.admit_sections
     }
@@ -670,38 +615,23 @@ impl StreamLane for SectionLane {
         // past the floor by however many such tiles there are.
         world.section_budget_used() < world.sections_allowed() + world.section_standin_slack
     }
-    fn submit(world: &mut World, key: SectionPos) -> Option<pipeline::Job> {
+    fn submit(world: &mut World, key: SectionPos) -> Option<(pipeline::Job, pipeline::ClaimToken)> {
         world.refresh_tables();
-        // Mint the claim token here; `claim` (which always follows an accepted
-        // submit for the same key) installs it on the `Meshing` entry.
+        // Mint the claim token here; `claim` installs it on the `Meshing` entry
+        // once the pool accepts the job.
         world.section_claim_seq = world.section_claim_seq.wrapping_add(1);
         let token = pipeline::ClaimToken(world.section_claim_seq);
-        world.section_pending_claim = Some((key, token));
-        Some(pipeline::Job::Section {
+        let job = pipeline::Job::Section {
             pos: key,
             epoch: world.section_epoch,
             token,
             generator: world.generator.clone(),
             edits: world.edits_for_section(key),
             tables: world.tables.get(),
-        })
-    }
-    fn claim(world: &mut World, key: SectionPos) {
-        let token = match world.section_pending_claim.take() {
-            Some((pos, token)) if pos == key => token,
-            other => {
-                // A far-cap rejection leaves the pending token set; a later
-                // claim for a different key must not consume it.
-                if let Some(pending) = other {
-                    world.section_pending_claim = Some(pending);
-                }
-                debug_assert!(
-                    false,
-                    "section claim for {key:?} without its submit ({other:?})"
-                );
-                pipeline::ClaimToken(world.section_claim_seq)
-            }
         };
+        Some((job, token))
+    }
+    fn claim(world: &mut World, key: SectionPos, token: pipeline::ClaimToken) {
         world.dirty_sections.remove(&key);
         let prev = world.sections.insert(key, SectionState::Meshing { token });
         adjust_count(
@@ -737,18 +667,19 @@ impl StreamLane for SectionLane {
 /// Cross-chunk light settling.
 pub(in crate::world) struct LightLane;
 
+impl WorklistLane for LightLane {
+    fn worklist(world: &mut World) -> &mut worklist::RingWorklist {
+        &mut world.light_worklist
+    }
+}
+
 impl StreamLane for LightLane {
     type Key = Coord;
+    type Claim = ();
     /// High floor: settle must drain fast so meshing can start.
     const MIN_ADMIT: usize = 32;
-    fn candidates(_world: &World, _center: Coord) -> Candidates {
-        Candidates::Worklist
-    }
-    fn seed_set(world: &mut World) -> Option<&mut worklist::RingWorklist> {
-        Some(&mut world.light_worklist)
-    }
-    fn admit_worklist(world: &mut World, center: Coord, budget: Budget) {
-        admit_coord_worklist::<Self>(world, center, budget);
+    fn admit(world: &mut World, center: Coord, budget: Budget) {
+        admit_worklist::<Self>(world, center, budget);
     }
     fn scratch(world: &mut World) -> &mut AdmitScratch<Coord> {
         &mut world.admit_coords
@@ -769,7 +700,7 @@ impl StreamLane for LightLane {
         // Outside the reduced loading window: the chunk still owes this settle.
         world.owe_light(key);
     }
-    fn submit(world: &mut World, key: Coord) -> Option<pipeline::Job> {
+    fn submit(world: &mut World, key: Coord) -> Option<(pipeline::Job, ())> {
         // `trivial_light` is decided at store time. A worklist seed here is a
         // real re-settle (neighbour border / edit) and must run the flood.
         if !world.lighting
@@ -795,14 +726,15 @@ impl StreamLane for LightLane {
             alt0,
             tables: world.tables.get(),
         };
-        Some(pipeline::Job::Light {
+        let job = pipeline::Job::Light {
             coord: key,
             epoch: world.light_epoch,
             light_gen: world.chunks[&key].light_gen,
             snapshot: Box::new(snapshot),
-        })
+        };
+        Some((job, ()))
     }
-    fn claim(world: &mut World, key: Coord) {
+    fn claim(world: &mut World, key: Coord, (): ()) {
         world.light_worklist.remove(&key);
         world.light_inflight.insert(key);
     }

@@ -403,6 +403,16 @@ impl World {
             .is_none_or(|w| w.covers(self.fold.fold(coord), false))
     }
 
+    /// [`in_mesh_box`](Self::in_mesh_box) and [`admits_mesh`](Self::admits_mesh) at once,
+    /// folding `coord` and building each box once: the mesh lane's view gate.
+    pub(in crate::world) fn mesh_view_admits(&self, coord: Coord) -> bool {
+        let Some(center) = self.center else {
+            return false;
+        };
+        let folded = self.fold.fold(coord);
+        self.mesh_box(center).contains(folded) && self.load_window().is_none_or(|w| w.covers(folded, false))
+    }
+
     /// Whether a light settle for `coord` is worth running. Light covers the
     /// data box, so a mesh-box edge chunk sees lit neighbours.
     pub(in crate::world) fn admits_light(&self, coord: Coord) -> bool {
@@ -877,20 +887,19 @@ impl World {
             self.prune_admission_worklists();
         }
         let window = self.load_mesh_box(center);
-        let fresh: Vec<Coord> = match self.prev_mesh_box {
-            Some(prev) if !self.heading_changed => self
-                .view_shell(window, prev)
-                .filter(|&c| self.awaits_mesh(c) && self.admits_mesh(c))
-                .collect(),
-            _ => self
-                .view_coords(window)
-                .filter(|&c| self.awaits_mesh(c) && self.admits_mesh(c))
-                .collect(),
-        };
-        self.mesh_worklist.extend(fresh);
+        match self.prev_mesh_box {
+            Some(prev) if !self.heading_changed => self.seed_fresh(self.view_shell(window, prev)),
+            _ => self.seed_fresh(self.view_coords(window)),
+        }
         self.pending_fresh.set();
         self.prev_mesh_box = Some(window);
         self.reseed_owed_light();
+    }
+
+    /// Seed the chunks of `coords` that await a mesh the loading window admits.
+    fn seed_fresh(&mut self, coords: impl Iterator<Item = Coord>) {
+        let fresh: Vec<Coord> = coords.filter(|&c| self.awaits_mesh(c) && self.admits_mesh(c)).collect();
+        self.mesh_worklist.extend(fresh);
     }
 
     /// Drop queued mesh and light seeds the reduced window does not cover. A
