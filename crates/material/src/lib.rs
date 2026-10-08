@@ -21,7 +21,7 @@ mod law;
 mod observe;
 mod visual;
 
-pub use configuration::{ConfigError, Configuration, DecodeError, Encoding, CAPACITY};
+pub use configuration::{ConfigError, Configuration, DecodeError, Encoding, CAPACITY, MAX_ENCODING};
 pub use element::{Element, D};
 pub use fnv::{Fnv32, Fnv64};
 pub use kernel::{fit_raw, react_once, Block, Change, Contact, Operation, QUANTUM};

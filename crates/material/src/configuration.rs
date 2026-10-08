@@ -7,6 +7,9 @@ use crate::fnv::Fnv64;
 /// At most this many occurrences fit in one voxel (law constant).
 pub const CAPACITY: usize = 32;
 
+/// Bytes in the longest canonical encoding: the length byte and a full configuration.
+pub const MAX_ENCODING: usize = 1 + CAPACITY * D;
+
 /// A configuration of elements: the canonical (sorted) multiset. Empty is the void (air).
 #[derive(Clone, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
 pub struct Configuration(Box<[Element]>);
@@ -40,6 +43,17 @@ impl Encoding {
     /// The bytes.
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
+    }
+
+    /// The canonical bytes of sorted occurrences, written into `out` without allocating: the
+    /// filled prefix.
+    pub fn write<'a>(elements: &[Element], out: &'a mut [u8; MAX_ENCODING]) -> &'a [u8] {
+        debug_assert!(elements.is_sorted(), "occurrences out of canonical order");
+        out[0] = elements.len() as u8;
+        for (bytes, e) in out[1..].chunks_exact_mut(D).zip(elements) {
+            bytes.copy_from_slice(&e.0);
+        }
+        &out[..1 + elements.len() * D]
     }
 }
 
@@ -94,17 +108,19 @@ impl Configuration {
 
     /// Canonical bytes.
     pub fn encode(&self) -> Encoding {
-        let mut v = Vec::with_capacity(1 + self.0.len() * D);
-        v.push(self.0.len() as u8);
-        for e in self.0.iter() {
-            v.extend_from_slice(&e.0);
-        }
-        Encoding(v.into_boxed_slice())
+        let mut out = [0; MAX_ENCODING];
+        Encoding(Encoding::write(&self.0, &mut out).into())
     }
 
     /// Inverse of [`Configuration::encode`]. Occurrence order in the input does not matter (it is
     /// re-sorted); malformed input is rejected instead of guessed.
     pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        let mut out = [Element::default(); CAPACITY];
+        Ok(Self(Self::decode_into(bytes, &mut out)?.into()))
+    }
+
+    /// [`Configuration::decode`] into `out` without allocating: the occurrences, sorted.
+    pub fn decode_into<'a>(bytes: &[u8], out: &'a mut [Element; CAPACITY]) -> Result<&'a [Element], DecodeError> {
         let (&len, rest) = bytes.split_first().ok_or(DecodeError::Empty)?;
         let len = len as usize;
         if len > CAPACITY {
@@ -116,24 +132,18 @@ impl Configuration {
         if rest.len() > len * D {
             return Err(DecodeError::Trailing);
         }
-        let mut elements = Vec::with_capacity(len);
-        for chunk in rest.chunks_exact(D) {
-            let mut c = [0u8; D];
-            c.copy_from_slice(chunk);
-            elements.push(Element(c));
+        let elements = &mut out[..len];
+        for (e, bytes) in elements.iter_mut().zip(rest.chunks_exact(D)) {
+            e.0.copy_from_slice(bytes);
         }
         elements.sort_unstable();
-        Ok(Self(elements.into_boxed_slice()))
+        Ok(&*elements)
     }
 
     /// A 64-bit hash of the canonical bytes (FNV-1a): a stable seed for presentation and naming.
     pub fn digest(&self) -> u64 {
-        let mut h = Fnv64::new();
-        h.bytes(&[self.0.len() as u8]);
-        for e in self.0.iter() {
-            h.bytes(&e.0);
-        }
-        h.finish()
+        let mut out = [0; MAX_ENCODING];
+        Fnv64::new().bytes(Encoding::write(&self.0, &mut out)).finish()
     }
 }
 
@@ -144,8 +154,7 @@ mod pins {
     /// Saves and the wire carry the encoding; presentation and naming seed from the digest.
     #[test]
     fn the_encoding_and_digest_are_pinned() {
-        let c = Configuration::new(vec![Element::new([9, 200, 31, 4]), Element::new([1, 2, 3, 4]), Element::new([1, 2, 3, 4])])
-            .unwrap();
+        let c = Configuration::new([[9, 200, 31, 4], [1, 2, 3, 4], [1, 2, 3, 4]].map(Element::new)).unwrap();
         assert_eq!(c.encode().as_bytes(), [3, 1, 2, 3, 4, 1, 2, 3, 4, 9, 200, 31, 4], "the save and wire form");
         assert_eq!(Configuration::void().encode().as_bytes(), [0]);
         assert_eq!(Configuration::void().digest(), 0xaf63_bd4c_8601_b7df);

@@ -2,14 +2,16 @@
 //! [`BlockId`]; the table maps it to the exact configuration and its kernel record (the law's cached
 //! internal supports, so a reaction never rebuilds them), to the hot per-voxel readings the meshers,
 //! light, physics and audio consume (SoA, observed once per distinct configuration), to its own
-//! texture-array layer (every configuration has a unique look while the device has layers), and to
-//! the names a naming mod gave it.
+//! texture-array layer (every configuration has a unique look while the device has layers), to the
+//! names a naming mod gave it, and to its spec text (`air` or `c:<hex>`), spelled once at intern. A
+//! lookup writes its key on the stack, so a hit never allocates.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use material::{
-    observe, react_once, visual_with, Block, Configuration, Encoding, Law, Observation, Operation,
-    Visual,
+    observe, react_once, visual_with, Block, Configuration, Element, Encoding, Law, Observation, Operation,
+    Visual, CAPACITY, MAX_ENCODING,
 };
 use voxel_engine::{Color, Pass};
 
@@ -26,6 +28,8 @@ pub const AIR: BlockId = BlockId(0);
 pub const MAX_BLOCK_TYPES: usize = u16::MAX as usize;
 /// Texture-array layers the vertex format can address (14-bit layer field).
 pub const MAX_DESCRIPTORS: usize = 16_384;
+/// Longest spec: `c:` and the hex of a full configuration's encoding.
+const MAX_SPEC: usize = 2 + 2 * MAX_ENCODING;
 
 /// The acoustic class a configuration reads as (audio cue stems and occlusion absorption).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -191,7 +195,9 @@ pub struct BlockRegistry {
     configs: Vec<Configuration>,
     blocks: Vec<Block>,
     observations: Vec<Observation>,
-    intern: HashMap<Encoding, BlockId>,
+    // Keyed on the canonical bytes: one hash write per key (an element-slice key hashes each element).
+    intern: HashMap<Box<[u8]>, BlockId>,
+    specs: Vec<Arc<str>>,
     labels: HashMap<BlockId, Box<str>>,
     label_ids: HashMap<Box<str>, BlockId>,
     // hot SoA
@@ -221,6 +227,7 @@ impl BlockRegistry {
             blocks: Vec::new(),
             observations: Vec::new(),
             intern: HashMap::new(),
+            specs: Vec::new(),
             labels: HashMap::new(),
             label_ids: HashMap::new(),
             flags: Vec::new(),
@@ -265,25 +272,25 @@ impl BlockRegistry {
     /// Intern a configuration: the existing id if it was seen, else a new one with its kernel record,
     /// readings and texture layer computed once. `None` when the id space is exhausted.
     pub fn intern(&mut self, c: &Configuration) -> Option<BlockId> {
-        if let Some(&id) = self.intern.get(&c.encode()) {
-            return Some(id);
-        }
-        self.insert(c.clone(), Block::of(c))
+        self.intern_with(c.elements(), || (c.clone(), Block::of(c)))
     }
 
     /// Intern a canonical kernel record (a reaction result), keeping its cached supports.
     pub fn intern_block(&mut self, block: Block) -> Option<BlockId> {
-        let c = block.configuration();
-        if let Some(&id) = self.intern.get(&c.encode()) {
-            return Some(id);
-        }
-        self.insert(c, block)
+        self.intern_with(block.elements(), || (block.configuration(), block.clone()))
     }
 
-    fn insert(&mut self, c: Configuration, block: Block) -> Option<BlockId> {
+    /// The id of sorted occurrences; on a miss, `make` builds the entry.
+    fn intern_with(&mut self, sorted: &[Element], make: impl FnOnce() -> (Configuration, Block)) -> Option<BlockId> {
+        let mut key = [0; MAX_ENCODING];
+        let key = Encoding::write(sorted, &mut key);
+        if let Some(&id) = self.intern.get(key) {
+            return Some(id);
+        }
         if self.configs.len() >= MAX_BLOCK_TYPES {
             return None;
         }
+        let (c, block) = make();
         let id = BlockId(self.configs.len() as u16);
         let obs = observe(&self.law, &block);
         let vis = visual_with(&self.law, &block, &obs);
@@ -296,7 +303,9 @@ impl BlockRegistry {
         self.render_layer.push(layer);
         self.visuals.push(vis);
         self.observations.push(obs);
-        self.intern.insert(c.encode(), id);
+        self.intern.insert(key.into(), id);
+        let mut text = [0; MAX_SPEC];
+        self.specs.push(if c.is_empty() { "air".into() } else { spell(key, &mut text).into() });
         self.configs.push(c);
         self.blocks.push(block);
         self.names.push(None);
@@ -345,7 +354,13 @@ impl BlockRegistry {
 
     /// The id of a configuration already in the table.
     pub fn lookup(&self, c: &Configuration) -> Option<BlockId> {
-        self.intern.get(&c.encode()).copied()
+        self.find(c.elements())
+    }
+
+    /// The id of sorted occurrences already in the table.
+    fn find(&self, sorted: &[Element]) -> Option<BlockId> {
+        let mut key = [0; MAX_ENCODING];
+        self.intern.get(Encoding::write(sorted, &mut key)).copied()
     }
 
     /// The exact configuration behind an id.
@@ -540,16 +555,12 @@ impl BlockRegistry {
 
     /// Text form of an id for saves and the wire: `air` or `c:<hex of the encoding>`.
     pub fn spec(&self, id: BlockId) -> String {
-        if id == AIR {
-            return "air".to_string();
-        }
-        let bytes = self.encoding(id);
-        let mut s = String::with_capacity(2 + bytes.as_bytes().len() * 2);
-        s.push_str("c:");
-        for b in bytes.as_bytes() {
-            s.push_str(&format!("{b:02x}"));
-        }
-        s
+        self.spec_ref(id).to_string()
+    }
+
+    /// [`spec`](Self::spec) without a copy: the text spelled when the id was interned.
+    pub fn spec_ref(&self, id: BlockId) -> &Arc<str> {
+        &self.specs[id.0 as usize]
     }
 
     /// Inverse of [`BlockRegistry::spec`]: interns the configuration. `None` for malformed or legacy
@@ -568,30 +579,26 @@ impl BlockRegistry {
         if spec == "air" {
             return Some("air".to_string());
         }
-        if let Some(id) = self.lookup_spec(spec) {
-            return Some(self.spec(id));
-        }
-        let cfg = decode_spec(spec)?;
-        if cfg.is_empty() {
+        let mut elements = [Element::default(); CAPACITY];
+        let sorted = decode_spec(spec, &mut elements)?;
+        if sorted.is_empty() {
             return None;
         }
-        let bytes = cfg.encode();
-        let mut s = String::with_capacity(2 + bytes.as_bytes().len() * 2);
-        s.push_str("c:");
-        for b in bytes.as_bytes() {
-            s.push_str(&format!("{b:02x}"));
-        }
-        Some(s)
+        let (mut key, mut text) = ([0; MAX_ENCODING], [0; MAX_SPEC]);
+        Some(spell(Encoding::write(sorted, &mut key), &mut text).to_string())
     }
 
     /// Look up a spec already in the table without interning. `None` if the spec is malformed,
     /// `c:00`, or the configuration has not been interned yet.
     pub fn lookup_spec(&self, spec: &str) -> Option<BlockId> {
-        let c = decode_spec(spec)?;
-        if c.is_empty() {
-            return (spec == "air").then_some(AIR);
+        if spec == "air" {
+            return Some(AIR);
         }
-        self.lookup(&c)
+        let mut elements = [Element::default(); CAPACITY];
+        match decode_spec(spec, &mut elements)? {
+            [] => None,
+            sorted => self.find(sorted),
+        }
     }
 
     /// Classify a spec so the save loader can word its notice by cause.
@@ -599,19 +606,22 @@ impl BlockRegistry {
         if spec == "air" {
             return SpecKind::Ok(AIR);
         }
-        match decode_spec(spec) {
-            None => {
-                if spec.starts_with("c:") {
-                    SpecKind::Bad
-                } else {
-                    SpecKind::Legacy
+        let mut elements = [Element::default(); CAPACITY];
+        match decode_spec(spec, &mut elements) {
+            None if spec.starts_with("c:") => SpecKind::Bad,
+            None => SpecKind::Legacy,
+            Some([]) => SpecKind::Bad,
+            Some(sorted) => {
+                let make = || {
+                    let c = Configuration::new(sorted).expect("a decoded configuration fits");
+                    let block = Block::of(&c);
+                    (c, block)
+                };
+                match self.intern_with(sorted, make) {
+                    Some(id) => SpecKind::Ok(id),
+                    None => SpecKind::Full,
                 }
             }
-            Some(c) if c.is_empty() => SpecKind::Bad,
-            Some(c) => match self.intern(&c) {
-                Some(id) => SpecKind::Ok(id),
-                None => SpecKind::Full,
-            },
         }
     }
 }
@@ -628,28 +638,58 @@ pub(crate) enum SpecKind {
     Bad,
 }
 
-/// `air` or `c:<hex of the encoding>`. `None` for legacy names, odd nibbles, non-hex (including a
-/// leading `+`), non-ASCII, or a truncated/oversize payload — hostile wire/save input must not panic.
-fn decode_spec(spec: &str) -> Option<Configuration> {
-    if spec == "air" {
-        return Some(Configuration::void());
+/// The sorted occurrences of a `c:<hex of the encoding>` spec, decoded on the stack. `None` for legacy
+/// names, odd nibbles, non-hex (including a leading `+`), non-ASCII, or a truncated/oversize payload —
+/// hostile wire/save input must not panic.
+fn decode_spec<'a>(spec: &str, out: &'a mut [Element; CAPACITY]) -> Option<&'a [Element]> {
+    let mut bytes = [0; MAX_ENCODING];
+    Configuration::decode_into(read_hex(spec.strip_prefix("c:")?, &mut bytes)?, out).ok()
+}
+
+/// `c:` and the hex of canonical bytes, spelled into `out`.
+fn spell<'a>(encoding: &[u8], out: &'a mut [u8; MAX_SPEC]) -> &'a str {
+    out[..2].copy_from_slice(b"c:");
+    for (slot, digit) in out[2..].iter_mut().zip(hex_digits(encoding)) {
+        *slot = digit;
     }
-    let hex = spec.strip_prefix("c:")?;
-    if hex.len() % 2 != 0 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+    std::str::from_utf8(&out[..2 + 2 * encoding.len()]).expect("hex digits are ASCII")
+}
+
+const HEX: &[u8; 16] = b"0123456789abcdef";
+
+/// The lowercase hex digits of `bytes`, two per byte, read off a nibble table.
+pub(crate) fn hex_digits(bytes: &[u8]) -> impl Iterator<Item = u8> + '_ {
+    bytes.iter().flat_map(|&b| [HEX[usize::from(b >> 4)], HEX[usize::from(b & 15)]])
+}
+
+/// Hex digits of either case, decoded into the front of `out`. `None` for an odd count, a byte that
+/// is not a hex digit, or more bytes than `out` holds.
+pub(crate) fn read_hex<'a>(hex: &str, out: &'a mut [u8]) -> Option<&'a [u8]> {
+    let hex = hex.as_bytes();
+    let len = hex.len() / 2;
+    if hex.len() % 2 != 0 || len > out.len() {
         return None;
     }
-    let bytes: Option<Vec<u8>> = hex
-        .as_bytes()
-        .chunks_exact(2)
-        .map(|pair| std::str::from_utf8(pair).ok().and_then(|s| u8::from_str_radix(s, 16).ok()))
-        .collect();
-    Configuration::decode(&bytes?).ok()
+    for (byte, pair) in out.iter_mut().zip(hex.chunks_exact(2)) {
+        *byte = (nibble(pair[0])? << 4) | nibble(pair[1])?;
+    }
+    Some(&out[..len])
+}
+
+fn nibble(digit: u8) -> Option<u8> {
+    match digit {
+        b'0'..=b'9' => Some(digit - b'0'),
+        b'a'..=b'f' => Some(digit - b'a' + 10),
+        b'A'..=b'F' => Some(digit - b'A' + 10),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use material::Element;
+    use crate::alloc_count;
+    use crate::hash::TestRng;
 
     fn cfg(elems: &[[u8; 4]]) -> Configuration {
         Configuration::new(elems.iter().map(|c| Element::new(*c)).collect::<Vec<_>>()).unwrap()
@@ -770,6 +810,158 @@ mod tests {
         assert_eq!(r.lookup_spec("c:00"), None);
     }
 
+    /// The spelling the memo replaced, kept as the oracle.
+    fn old_spell(encoding: &Encoding) -> String {
+        let mut s = "c:".to_string();
+        for b in encoding.as_bytes() {
+            s.push_str(&format!("{b:02x}"));
+        }
+        s
+    }
+
+    /// The decoder the stack decoder replaced, kept as the oracle.
+    fn old_decode(spec: &str) -> Option<Configuration> {
+        if spec == "air" {
+            return Some(Configuration::void());
+        }
+        let hex = spec.strip_prefix("c:")?;
+        if hex.len() % 2 != 0 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let bytes: Option<Vec<u8>> = hex
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| std::str::from_utf8(pair).ok().and_then(|s| u8::from_str_radix(s, 16).ok()))
+            .collect();
+        Configuration::decode(&bytes?).ok()
+    }
+
+    /// Up to [`CAPACITY`] occurrences drawn from a small pool, so multiplicity shows up.
+    fn random_config(rng: &mut TestRng) -> Configuration {
+        let len = 1 + rng.below(CAPACITY as u64) as usize;
+        let pool: Vec<[u8; 4]> = (0..=rng.below(len as u64)).map(|_| (rng.next_u64() as u32).to_le_bytes()).collect();
+        let elements: Vec<Element> =
+            (0..len).map(|_| Element::new(pool[rng.below(pool.len() as u64) as usize])).collect();
+        Configuration::new(elements).unwrap()
+    }
+
+    #[test]
+    fn ids_and_specs_match_the_old_spelling_and_round_trip() {
+        let mut r = BlockRegistry::with_builtins();
+        crate::world::terrain::Materials::intern(&mut r);
+        let builtin = r.block_count();
+        let mut rng = TestRng::new(0x5bec);
+        let configs: Vec<Configuration> = (0..10_000).map(|_| random_config(&mut rng)).collect();
+        let ids: Vec<BlockId> = configs.iter().map(|c| r.intern(c).unwrap()).collect();
+        assert!(r.block_count() > builtin + 9_000, "few random configurations collide");
+        let mut fresh = BlockRegistry::with_builtins();
+        crate::world::terrain::Materials::intern(&mut fresh);
+        for i in 0..r.block_count() {
+            let id = BlockId(i as u16);
+            let spec = r.spec(id);
+            assert_eq!(spec, if id == AIR { "air".to_string() } else { old_spell(&r.encoding(id)) }, "id {i}");
+            assert_eq!(&**r.spec_ref(id), spec);
+            assert_eq!(r.lookup_spec(&spec), Some(id));
+            assert_eq!(r.parse_spec(&spec), Some(id));
+            assert_eq!(r.canonical_spec(&spec).as_deref(), Some(spec.as_str()));
+            assert_eq!(fresh.parse_spec(&spec), Some(id), "a fresh table assigns the same ids");
+            assert_eq!(fresh.spec(id), spec);
+            if id != AIR {
+                let upper = format!("c:{}", spec[2..].to_ascii_uppercase());
+                assert_eq!(r.canonical_spec(&upper).as_deref(), Some(spec.as_str()));
+                assert_eq!(r.lookup_spec(&upper), Some(id));
+            }
+        }
+        for (c, id) in configs.iter().zip(ids) {
+            assert_eq!(r.configuration(id), c);
+        }
+    }
+
+    /// Hostile and shuffled spec text decodes exactly as the old decoder did.
+    #[test]
+    fn spec_text_decodes_as_the_old_decoder_did() {
+        let digits: Vec<char> = "0123456789abcdefABCDEF+z é".chars().collect();
+        let odd = ["air", "c:00", "c:", "natural:Stone", "c:0", "+c:01", "c:01+f+f+f+f"];
+        let mut rng = TestRng::new(0xdec0de);
+        let (mut r, mut oracle) = (BlockRegistry::with_builtins(), BlockRegistry::with_builtins());
+        let mut seen_ok = 0;
+        for i in 0..20_000 {
+            let spec = match i % 4 {
+                // A real encoding with its occurrences in any order, in either case.
+                0 | 1 => {
+                    let len = rng.below(CAPACITY as u64 + 2) as usize;
+                    let extra = rng.below(3) as usize;
+                    let mut s = String::from(["c:", "c:", "c:", "C:", ""][rng.below(5) as usize]);
+                    let mut bytes = vec![len as u8];
+                    bytes.extend((0..(len * 4 + extra).saturating_sub(1)).map(|_| rng.next_u64() as u8));
+                    for b in bytes {
+                        let digits = format!("{b:02x}");
+                        s.push_str(&if rng.below(2) == 0 { digits } else { digits.to_ascii_uppercase() });
+                    }
+                    s
+                }
+                // Anything at all after the prefix.
+                2 => {
+                    let len = rng.below(270) as usize;
+                    let tail: String = (0..len).map(|_| digits[rng.below(digits.len() as u64) as usize]).collect();
+                    format!("c:{tail}")
+                }
+                _ => odd[rng.below(odd.len() as u64) as usize].to_string(),
+            };
+            let old = old_decode(&spec);
+            let old_canonical = match &old {
+                _ if spec == "air" => Some("air".to_string()),
+                Some(c) if !c.is_empty() => Some(old_spell(&c.encode())),
+                _ => None,
+            };
+            assert_eq!(r.canonical_spec(&spec), old_canonical, "{spec:?}");
+            let want = match old {
+                _ if spec == "air" => SpecKind::Ok(AIR),
+                None if spec.starts_with("c:") => SpecKind::Bad,
+                None => SpecKind::Legacy,
+                Some(c) if c.is_empty() => SpecKind::Bad,
+                Some(c) => SpecKind::Ok(oracle.intern(&c).unwrap()),
+            };
+            assert_eq!(r.read_spec(&spec), want, "{spec:?}");
+            let found = match want {
+                SpecKind::Ok(id) => Some(id),
+                _ => None,
+            };
+            assert_eq!(r.lookup_spec(&spec), found, "{spec:?}");
+            seen_ok += usize::from(found.is_some_and(|id| id != AIR));
+        }
+        assert!(seen_ok > 1_000, "only {seen_ok} specs decoded");
+    }
+
+    #[test]
+    fn hits_allocate_nothing() {
+        let mut r = BlockRegistry::with_builtins();
+        let a = r
+            .intern(&cfg(&[[73, 145, 162, 161], [71, 77, 157, 208], [34, 125, 217, 144], [8, 85, 210, 206]]))
+            .unwrap();
+        let e = r
+            .intern(&cfg(&[[83, 135, 211, 195], [51, 125, 144, 147], [11, 72, 167, 145], [25, 80, 211, 204]]))
+            .unwrap();
+        let react_out = |r: &mut BlockRegistry| {
+            let (mut ca, mut ce, mut ops) = (a, e, 0);
+            while let Some((_, na, ne)) = r.react(ca, ce) {
+                (ca, ce, ops) = (na, ne, ops + 1);
+            }
+            ops
+        };
+        assert_eq!(react_out(&mut r), 4);
+        let (c, spec, count) = (r.configuration(a).clone(), r.spec(a), r.block_count());
+        alloc_count::reset();
+        assert_eq!(react_out(&mut r), 4, "a reaction whose products are known");
+        assert_eq!(r.intern(&c), Some(a));
+        assert_eq!(r.lookup(&c), Some(a));
+        assert_eq!(r.lookup_spec(&spec), Some(a));
+        assert_eq!(r.parse_spec(&spec), Some(a));
+        assert_eq!(&**r.spec_ref(a), spec.as_str());
+        assert_eq!(alloc_count::alloc_count(), 0);
+        assert_eq!(r.block_count(), count);
+    }
+
     #[test]
     fn labels_are_annotations_only() {
         let mut r = BlockRegistry::with_builtins();
@@ -821,8 +1013,12 @@ mod tests {
         let ids: Vec<BlockId> = (1..r.block_count()).map(|i| BlockId(i as u16)).collect();
         let configs: Vec<Configuration> = ids.iter().map(|&id| r.configuration(id).clone()).collect();
         let specs: Vec<String> = ids.iter().map(|&id| r.spec(id)).collect();
-        let a = r.intern(&cfg(&[[73, 145, 162, 161], [71, 77, 157, 208], [34, 125, 217, 144], [8, 85, 210, 206]])).unwrap();
-        let e = r.intern(&cfg(&[[83, 135, 211, 195], [51, 125, 144, 147], [11, 72, 167, 145], [25, 80, 211, 204]])).unwrap();
+        let a = r
+            .intern(&cfg(&[[73, 145, 162, 161], [71, 77, 157, 208], [34, 125, 217, 144], [8, 85, 210, 206]]))
+            .unwrap();
+        let e = r
+            .intern(&cfg(&[[83, 135, 211, 195], [51, 125, 144, 147], [11, 72, 167, 145], [25, 80, 211, 204]]))
+            .unwrap();
         let reps = 2_000;
         let report = |label: &str, t: std::time::Instant, n: usize, acc: usize| {
             println!("{label}: {:.1} ns  ({acc})", t.elapsed().as_secs_f64() * 1e9 / n as f64);

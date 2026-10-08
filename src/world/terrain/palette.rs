@@ -22,10 +22,11 @@
 use std::sync::OnceLock;
 
 use material::{
-    centroid_q8, colour_at, fit_raw, observe, Block, Configuration, Contact, Element, Law, QUANTUM,
+    centroid_q8, colour_at, fit_raw, observe, Block, Configuration, Contact, Element, Law, MAX_ENCODING, QUANTUM,
 };
 
 use super::noise::hash2;
+use crate::block::registry::read_hex;
 use crate::hash::Fnv64;
 
 /// What a role needs from its configuration besides its colour.
@@ -296,12 +297,8 @@ fn baked(law: &Law) -> Option<Vec<Entry>> {
 }
 
 fn decode_hex(hex: &str) -> Option<Configuration> {
-    if hex.len() % 2 != 0 {
-        return None;
-    }
-    let bytes: Option<Vec<u8>> =
-        (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok()).collect();
-    Configuration::decode(&bytes?).ok()
+    let mut bytes = [0; MAX_ENCODING];
+    Configuration::decode(read_hex(hex, &mut bytes)?).ok()
 }
 
 /// FNV-1a over every input of [`search`] that is data: the roles, the underground set, and the
@@ -803,6 +800,7 @@ fn find_reagent(_law: &Law, taken: &[Block], neighbours: &[bool], target: usize,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::block::registry::hex_digits;
 
     /// [`BAKED`] is keyed on these two fingerprints: a change re-runs the search at every start.
     #[test]
@@ -934,7 +932,7 @@ mod tests {
         let fresh = Baked { law: law.fingerprint(), roles: roles_fingerprint(), configs: &[] };
         let hex: Vec<String> = searched
             .iter()
-            .map(|e| e.config.encode().as_bytes().iter().map(|b| format!("{b:02x}")).collect())
+            .map(|e| hex_digits(e.config.encode().as_bytes()).map(char::from).collect())
             .collect();
         let stale = BAKED.law != fresh.law
             || BAKED.roles != fresh.roles
