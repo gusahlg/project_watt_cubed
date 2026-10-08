@@ -1,11 +1,14 @@
 //! app.rs owns the top-level state machine: the start menu, an in-world
 //! [`Game`], the mod menu, the host/join forms, and the graphics settings
 //! screen. It routes each engine frame to the active screen, creates and
-//! loads worlds, and autosaves when leaving one.
+//! loads worlds (off the render thread, in `entry`), and autosaves when
+//! leaving one.
 //!
 //! The window itself belongs to the engine: [`App::run`] hands a per-frame
 //! closure to [`voxel_engine::run`], which is the moral equivalent of the old
 //! raylib `while !window_should_close()` loop.
+mod entry;
+
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -31,6 +34,7 @@ use crate::session::Session;
 use crate::settings::Settings;
 use crate::world::terrain::TerrainCfg;
 use crate::world::World;
+use entry::{Loading, Recipe};
 
 const STARTING_WINDOW_WIDTH: u32 = 1280;
 const STARTING_WINDOW_HEIGHT: u32 = 720;
@@ -87,6 +91,8 @@ pub struct App {
     /// Packages compiled into this executable. `Hello` reports the enabled ones.
     packages: Vec<ModDescriptor>,
     screen: Screen,
+    /// A world building off the render thread. The menu under it stays as it was; Esc drops it.
+    loading: Option<Loading>,
     /// The integrated server when hosting, kept alive for the session so friends can
     /// stay connected; stopping it frees the port for a later host.
     host: Option<ServerHandle>,
@@ -204,6 +210,7 @@ impl App {
             mods,
             packages,
             screen,
+            loading: None,
             host: None,
             settings,
             session,
@@ -295,6 +302,10 @@ impl App {
 
         let t_update = watch.then(Instant::now);
         let quit = match self.screen {
+            Screen::Menus(_) if self.loading.is_some() => {
+                self.update_loading(eng);
+                false
+            }
             Screen::Menus(_) => self.update_menus(eng),
             Screen::Connecting(_) => {
                 self.update_connecting(eng);
@@ -366,8 +377,9 @@ impl App {
             }
             Screen::Menus(_) => {
                 eprintln!(
-                    "frame stall {}ms update={update_ms:.1}ms draw={draw_ms:.1}ms (menus)",
-                    dt.as_millis()
+                    "frame stall {}ms update={update_ms:.1}ms draw={draw_ms:.1}ms ({})",
+                    dt.as_millis(),
+                    if self.loading.is_some() { "loading" } else { "menus" }
                 );
             }
             Screen::Connecting(_) => {
@@ -817,13 +829,7 @@ impl App {
     /// Poll the attempt. Cancel returns to the menu and stops a host we started.
     /// A mod refusal retries once; any other failure leaves a spawned host running.
     fn update_connecting(&mut self, eng: &mut Engine) {
-        let dt = eng.frame_time();
-        self.router.set_context(Context::Menu);
-        let cancel = match self.router.frame(eng, dt).view() {
-            View::Menu(menu) => crate::menu::gather(&menu).iter().any(|intent| matches!(intent, crate::menu::Intent::Cancel)),
-            _ => false,
-        };
-        if cancel {
+        if self.cancel_pressed(eng) {
             self.cancel_connect();
             return;
         }
@@ -837,7 +843,10 @@ impl App {
             return;
         };
         match result {
-            Ok(conn) => self.enter_net_game(eng, conn, job.notice),
+            Ok(conn) => {
+                let render = self.mods.effective_render(&self.settings);
+                self.begin_loading(eng, Loading::join(conn, render, job.notice, job.hosted));
+            }
             Err(err) if !err.mods_denied.is_empty() && !job.retried => {
                 let notice = mod_hold_notice(&self.packages, &err.mods_denied);
                 self.mods.hold_packages(&err.mods_denied);
@@ -886,28 +895,14 @@ impl App {
         Self::start_stack(&self.mods, &self.saves, &self.session, None, self.host.is_some())
     }
 
-    /// Join a remote world via an existing connection.
-    fn enter_net_game(&mut self, eng: &mut Engine, conn: Connection, notice: Option<String>) {
-        // Lazy construction: the collision-safe spawn slab is prepared in
-        // `enter_game`; streaming fills the remainder asynchronously.
-        let world = World::with_kind_cfg(
-            conn.seed(),
-            self.mods.effective_render(&self.settings),
-            conn.worldgen(),
-            conn.terrain(),
-            false,
-        );
-        let mut player = Player::new(conn.spawn());
-        player.stand_in(world.gravity_at(player.position).accel);
-        // A networked world is a live mirror, not a save — per-world mod state
-        // starts clean, but the player's enable/disable choices persist.
-        self.active = None;
-        self.mods.reset_state();
-        let mut game = Game::new(world, player, "multiplayer".to_string()).with_net(conn);
-        if let Some(notice) = notice {
-            game.notify(notice);
+    /// Esc on a waiting screen (connecting, loading).
+    fn cancel_pressed(&mut self, eng: &mut Engine) -> bool {
+        let dt = eng.frame_time();
+        self.router.set_context(Context::Menu);
+        match self.router.frame(eng, dt).view() {
+            View::Menu(menu) => crate::menu::gather(&menu).iter().any(|intent| matches!(intent, crate::menu::Intent::Cancel)),
+            _ => false,
         }
-        self.enter_game(eng, game);
     }
 
     /// Report a connection/host failure and return to the menu.
@@ -915,7 +910,7 @@ impl App {
         self.return_to_menu(Some(message));
     }
 
-    /// Create a fresh world with a time-seeded generator and enter it.
+    /// Start a fresh world with a time-seeded generator.
     fn start_new_world(&mut self, eng: &mut Engine) {
         // Benchmarks pin the seed (`WATT_BENCH_SEED`, default when benching) so
         // fps/rss deltas measure the code, not terrain-lottery variance.
@@ -927,58 +922,100 @@ impl App {
         // Lazy construction: `spawn_player` queries only a few surface columns
         // (generated on demand), and `enter_game` prepares the collision-safe
         // spawn slab — the previous eager default-volume generation is avoided.
-        let world = World::with_kind_cfg(
+        let recipe = Recipe {
             seed,
-            self.mods.effective_render(&self.settings),
-            self.mods.worldgen_kind(),
-            terrain_cfg_from_mods(&self.mods),
-            false,
-        );
-        let player = spawn_player(&world);
-        let id = save::fresh_id();
-        let now = save::unix_now();
-        self.active = Some(ActiveSlot::new(
-            id.clone(),
-            SaveMeta {
-                name: id.as_str().to_string(),
-                seed,
-                created: now,
-                last_played: now,
-                playtime_secs: 0,
-                edit_count: 0,
-            },
-        ));
-
-        // A new world starts from a clean default mod set (empty inventory, etc.);
-        // the mod menu's enable/disable choices persist.
-        self.mods.reset_state();
-        self.enter_game(eng, Game::new(world, player, id.as_str().to_string()));
+            render: self.mods.effective_render(&self.settings),
+            kind: self.mods.worldgen_kind(),
+            cfg: terrain_cfg_from_mods(&self.mods),
+        };
+        self.begin_loading(eng, Loading::new_world(recipe));
     }
 
-    /// Load an existing save and enter it. Stays on the menu if loading fails.
+    /// Start loading a save. A save that fails to load returns to the menu.
     fn load_world(&mut self, eng: &mut Engine, id: &SlotId) {
-        self.mods.reset_state();
+        // The save header names the generator; the InfiniteDiffusion mod's
+        // enabled flag only chooses the next *new* world.
         let render = self.mods.effective_render(&self.settings);
-        match save::load(id, &mut self.mods, |seed, kind, cfg| {
-            // The save header names the generator; the InfiniteDiffusion mod's
-            // enabled flag only chooses the next *new* world.
-            World::with_kind_cfg(seed, render, kind, cfg, false)
-        }) {
-            Ok((world, player, meta, report)) => {
-                self.active = Some(ActiveSlot::new(id.clone(), meta));
-                let mut game = Game::new(world, player, id.as_str().to_string());
-                // Degraded loads still enter the world, but say so.
-                if report.source == save::Source::Backup {
-                    game.notify("* save was unreadable — restored from the backup");
+        self.begin_loading(eng, Loading::load(id.clone(), render));
+    }
+
+    /// Benchmarks wait for the world here, so they enter on this frame as they always did.
+    fn begin_loading(&mut self, eng: &mut Engine, loading: Loading) {
+        if self.bench.is_some() {
+            self.arrive(eng, loading);
+        } else {
+            self.loading = Some(loading);
+        }
+    }
+
+    /// Poll the world job. Esc drops it: nothing was entered or saved. A join being cancelled
+    /// also closes the connection and stops a host we started, as cancelling the connect does.
+    fn update_loading(&mut self, eng: &mut Engine) {
+        if self.cancel_pressed(eng) {
+            if let Some(Loading::Join { hosted, .. }) = self.loading.take() {
+                if hosted && let Some(host) = self.host.take() {
+                    host.stop();
                 }
-                if let Some((recovered, expected)) = report.salvage {
-                    game.notify(format!(
-                        "* save was damaged — recovered {recovered} of {expected} edits"
-                    ));
-                }
-                self.enter_game(eng, game)
+                self.return_to_menu(None);
             }
-            Err(e) => self.fail_to_menu(format!("could not load {id}: {e}")),
+            return;
+        }
+        if self.loading.as_ref().is_some_and(Loading::done) {
+            let loading = self.loading.take().expect("a landed world");
+            self.arrive(eng, loading);
+        }
+    }
+
+    /// Swap a built world in: fresh mod state, the save's mod state for a load, then the game.
+    fn arrive(&mut self, eng: &mut Engine, loading: Loading) {
+        // Every world starts from a clean default mod set (empty inventory, etc.);
+        // the mod menu's enable/disable choices persist.
+        self.mods.reset_state();
+        match loading {
+            Loading::New(job) => {
+                let (world, player, id) = job.wait();
+                let now = save::unix_now();
+                self.active = Some(ActiveSlot::new(
+                    id.clone(),
+                    SaveMeta {
+                        name: id.as_str().to_string(),
+                        seed: world.seed(),
+                        created: now,
+                        last_played: now,
+                        playtime_secs: 0,
+                        edit_count: 0,
+                    },
+                ));
+                self.enter_game(eng, Game::new(world, player, id.as_str().to_string()));
+            }
+            Loading::Load(id, job) => match job.wait() {
+                Ok((restored, report)) => {
+                    let (world, player, meta) = restored.finish(&mut self.mods);
+                    self.active = Some(ActiveSlot::new(id.clone(), meta));
+                    let mut game = Game::new(world, player, id.as_str().to_string());
+                    // Degraded loads still enter the world, but say so.
+                    if report.source == save::Source::Backup {
+                        game.notify("* save was unreadable — restored from the backup");
+                    }
+                    if let Some((recovered, expected)) = report.salvage {
+                        game.notify(format!(
+                            "* save was damaged — recovered {recovered} of {expected} edits"
+                        ));
+                    }
+                    self.enter_game(eng, game)
+                }
+                Err(e) => self.fail_to_menu(format!("could not load {id}: {e}")),
+            },
+            Loading::Join { job, conn, notice, .. } => {
+                let (world, player) = job.wait();
+                // A networked world is a live mirror, not a save.
+                self.active = None;
+                let mut game = Game::new(world, player, "multiplayer".to_string()).with_net(conn);
+                if let Some(notice) = notice {
+                    game.notify(notice);
+                }
+                self.enter_game(eng, game);
+            }
         }
     }
 
@@ -1104,7 +1141,12 @@ impl App {
             game.draw(eng, &mut self.mods, fov, shake);
             return;
         }
-        if let Screen::Connecting(_) = &self.screen {
+        let waiting = match &self.screen {
+            Screen::Connecting(_) => Some("Connecting…"),
+            _ if self.loading.is_some() => Some("Loading…"),
+            _ => None,
+        };
+        if let Some(title) = waiting {
             let mut f = eng.begin_frame(MENU_CLEAR.to_linear());
             let theme = ui::Theme::new();
             let screen = (w as i32, h as i32);
@@ -1116,7 +1158,7 @@ impl App {
                 (0, -16),
                 28,
                 ui::Role::Primary.color(),
-                "Connecting…",
+                title,
             );
             ui::label(
                 &mut f,
@@ -1437,8 +1479,46 @@ mod tests {
         assert!(ms < 250.0, "spawn must stay under a frame, got {ms:.2}");
     }
 
-    /// Probe for the engine's world-entry stall question: what the menu-to-world frame costs on the
-    /// game side, cold (first world in the process) and warm.
+    /// Enter one world the way the app does, timing what starting the job costs the clicking
+    /// frame, how long the job runs, and what the switching frame still does on the render thread
+    /// (all of `arrive` but the engine calls of `enter_game`).
+    fn probe_entry(label: &str, mods: &mut Mods, start: impl FnOnce() -> Loading) {
+        let ms = |a: Instant, b: Instant| (b - a).as_secs_f64() * 1000.0;
+        let t0 = Instant::now();
+        let loading = start();
+        let t1 = Instant::now();
+        while !loading.done() {
+            std::thread::sleep(Duration::from_micros(100));
+        }
+        let t2 = Instant::now();
+        mods.reset_state();
+        let mut game = match loading {
+            Loading::New(job) => {
+                let (world, player, id) = job.wait();
+                Game::new(world, player, id.as_str().to_string())
+            }
+            Loading::Load(id, job) => {
+                let (world, player, _) = job.wait().unwrap().0.finish(mods);
+                Game::new(world, player, id.as_str().to_string())
+            }
+            Loading::Join { job, conn, .. } => {
+                let (world, player) = job.wait();
+                Game::new(world, player, "multiplayer".into()).with_net(conn)
+            }
+        };
+        let t3 = Instant::now();
+        let pos = game.player().position;
+        game.world_mut().prepare_around(pos);
+        let t4 = Instant::now();
+        println!(
+            "{label}: start {:.2}ms job {:.1}ms | switch frame {:.2}ms (land {:.2}ms prepare {:.2}ms)",
+            ms(t0, t1), ms(t1, t2), ms(t2, t4), ms(t2, t3), ms(t3, t4)
+        );
+        drop(std::hint::black_box(game));
+    }
+
+    /// Probe for the world-entry stall: each entry path (new, small and ~100k-edit saves, a local
+    /// server) through the job, cold (first world in the process) and warm.
     #[test]
     #[ignore]
     fn entry_cost_probe() {
@@ -1455,23 +1535,40 @@ mod tests {
         let _ = black_box(crate::gravity::Field::new(g.mass()));
         let e = Instant::now();
         println!("parts: registry {:.1}ms palette {:.1}ms generator {:.1}ms gravity {:.1}ms", ms(a, b), ms(b, c), ms(c, d), ms(d, e));
-        for round in ["cold", "warm"] {
-            let t0 = Instant::now();
-            let world = World::with_kind_cfg(1234, RenderConfig::default(), WorldgenKind::Diffusion, TerrainCfg::default(), false);
-            let t1 = Instant::now();
-            let p = black_box(spawn_player(&world));
-            let t2 = Instant::now();
-            let mut game = Game::new(world, p, "probe".into());
-            let t3 = Instant::now();
-            let pos = game.player().position;
-            game.world_mut().prepare_around(pos);
-            let t4 = Instant::now();
-            println!(
-                "entry {round}: world {:.1}ms spawn {:.1}ms game {:.1}ms prepare {:.1}ms total {:.1}ms",
-                ms(t0, t1), ms(t1, t2), ms(t2, t3), ms(t3, t4), ms(t0, t4)
-            );
-            drop(black_box(game));
+        let render = RenderConfig::default();
+        let recipe = Recipe { seed: 1234, render, kind: WorldgenKind::Diffusion, cfg: TerrainCfg::default() };
+        let mut mods = crate::modding::testing::standard();
+        for label in ["new cold", "new warm"] {
+            probe_entry(label, &mut mods, || Loading::new_world(recipe));
         }
+        for (label, edits) in [("load small", 100), ("load 100k", 100_000)] {
+            let id = SlotId::new(&format!("__probe_{edits}__")).unwrap();
+            let mut world = World::with_kind_cfg(1234, render, WorldgenKind::Diffusion, TerrainCfg::default(), false);
+            let player = spawn_player(&world);
+            let soil = world.registry().id_by_label("soil").unwrap();
+            let spawn = world.chart_spawn().expect("charted start");
+            let cell = world.terrain().atlases().iter().find_map(|a| a.storage_of(spawn)).expect("spawn storage");
+            let side = (edits as f64).cbrt().ceil() as i32;
+            let [x0, y0, z0] = cell.map(|v| v as i32 - side / 2);
+            for i in 0..edits as i32 {
+                let (x, y, z) = (x0 + i % side, y0 + i / (side * side), z0 + (i / side) % side);
+                let id = if world.terrain().voxel_at(x, y, z) == crate::block::AIR { soil } else { crate::block::AIR };
+                world.set_block(x, y, z, id);
+            }
+            assert_eq!(world.edits().count(), edits);
+            let meta = SaveMeta { name: label.into(), seed: 0, created: 0, last_played: 0, playtime_secs: 0, edit_count: 0 };
+            save::save(&id, &world, &player, &mods, meta).unwrap();
+            drop(world);
+            let t = Instant::now();
+            let _ = black_box(save::store::read(&id).unwrap());
+            println!("{label}: read and decode alone {:.1}ms", ms(t, Instant::now()));
+            probe_entry(label, &mut mods, || Loading::load(id.clone(), render));
+            let _ = std::fs::remove_file(save::file_path(&id));
+        }
+        let handle = server::spawn(0, Config { seed: 1234, worldgen: WorldgenKind::Diffusion, ..Config::default() }).unwrap();
+        let conn = join_server("127.0.0.1", handle.addr().port(), "probe", "").expect("join");
+        probe_entry("join", &mut mods, || Loading::join(conn, render, None, false));
+        handle.stop();
     }
 
     #[test]
