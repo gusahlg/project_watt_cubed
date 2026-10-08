@@ -60,31 +60,9 @@ impl World {
         };
         match key {
             pipeline::JobKey::Column { key, range } => {
-                // A cancelled spawn-slab column must be re-requested even when
-                // the pool dropped it as out-of-view: physics is frozen on it.
-                let in_slab = self.spawn_slab.is_some_and(|slab| {
-                    range.clone().any(|alt| slab.contains(key.chunk(alt)))
-                });
-                for alt in range {
-                    self.generating.remove(&key.chunk(alt));
-                }
-                // Freed generate claims are otherwise only re-requested on a
-                // boundary cross; a retryable failure re-arms the lane so a
-                // standing-still player still converges.
-                if rearm || in_slab {
-                    self.pending_gen.set();
-                    // The run already left the queue when it was submitted.
-                    self.gen_cursor.dirty = true;
-                }
+                self.release_run(GenRun::Column { key, lo: *range.start(), hi: *range.end() }, rearm);
             }
-            pipeline::JobKey::Open { coord } => {
-                let in_slab = self.spawn_slab.is_some_and(|slab| slab.contains(coord));
-                self.generating.remove(&coord);
-                if rearm || in_slab {
-                    self.pending_gen.set();
-                    self.gen_cursor.dirty = true;
-                }
-            }
+            pipeline::JobKey::Open { coord } => self.release_run(GenRun::Open { coord }, rearm),
             pipeline::JobKey::Mesh { coord } => {
                 if let Some(loaded) = self.chunks.get_mut(&coord) {
                     if loaded.state.release_build() {
@@ -127,6 +105,24 @@ impl World {
                     self.pending_sections.set();
                 }
             }
+        }
+    }
+
+    /// Release a generate run's claims.
+    fn release_run(&mut self, run: GenRun, rearm: bool) {
+        // A cancelled spawn-slab run must be re-requested even when the pool
+        // dropped it as out-of-view: physics is frozen on it.
+        let in_slab = self.spawn_slab.is_some_and(|slab| run.coords().any(|c| slab.contains(c)));
+        for c in run.coords() {
+            self.generating.remove(&c);
+        }
+        // Freed generate claims are otherwise only re-requested on a
+        // boundary cross; a retryable failure re-arms the lane so a
+        // standing-still player still converges.
+        if rearm || in_slab {
+            self.pending_gen.set();
+            // The run already left the queue when it was submitted.
+            self.gen_cursor.dirty = true;
         }
     }
 }

@@ -217,16 +217,7 @@ impl World {
         let Some(chunks) = self.section_edit_chunks.get(&pos) else {
             return Vec::new();
         };
-        chunks
-            .iter()
-            .filter_map(|&c| {
-                let cells = self.edits.get(&c)?;
-                if cells.is_empty() {
-                    return None;
-                }
-                Some((c, cells.iter().map(|(&i, &b)| (i, b)).collect()))
-            })
-            .collect()
+        chunks.iter().filter_map(|&c| Some((c, self.chunk_edits(c)?))).collect()
     }
 
     /// Rebuild the visible set every frame; as sections become Ready, the covering
