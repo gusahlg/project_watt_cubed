@@ -16,6 +16,11 @@
 //!   r6_200mps   settle 0.21s  flight p50 4.20 / p95 12.04 / p99 13.08 ms
 //!   r20_200mps  settle 0.32s  flight p50 12.47 / p95 18.25 / p99 20.02 ms
 //!                             (peaks: upload_queue 45, light_apply 1793)
+//!
+//! 2026-10-08: frame p50/p95/p99 and the drop_stale p95 are the bench's nearest
+//! rank, the value at rank ⌈n·q⌉; they were the one at index round((n−1)·q).
+//! The two can differ by one sample at small n. The remesh p95s keep the old
+//! index.
 
 use project_watt_cubed::harness::{StressSpec, run_stress};
 
@@ -66,77 +71,64 @@ fn main() {
             "  settle frames: n={} p50={:.2}ms p95={:.2}ms p99={:.2}ms max={:.2}ms",
             o.settle.frames, o.settle.p50, o.settle.p95, o.settle.p99, o.settle.max
         );
+        let (p, stop, end, r) = (&o.peaks, &o.at_stop, &o.at_end, &o.remesh);
         println!(
             "  peaks: upload_queue={} light_apply={} mesh_worklist={} worker_near={} worker_far={} chunks={} section_upload_bytes={}",
-            o.max_upload_queue,
-            o.max_light_apply,
-            o.max_mesh_worklist,
-            o.max_worker_near_queue,
-            o.max_worker_far_queue,
-            o.max_chunks,
-            o.max_section_upload_bytes
+            p.max_upload_queue,
+            p.max_light_apply_queue,
+            p.max_mesh_worklist,
+            p.max_worker_near_queue,
+            p.max_worker_far_queue,
+            p.max_chunks,
+            p.max_section_upload_bytes
         );
-        println!(
-            "  adaptive floor: effort={:.2}",
-            o.min_stream_effort
-        );
+        println!("  adaptive floor: effort={:.2}", p.min_effort);
         println!(
             "  at stop: light_worklist={} chunks={} seeds={} seeds/chunk={:.2}",
-            o.light_worklist_at_stop,
-            o.chunks_at_stop,
-            o.light_seed_inserts_at_stop,
-            o.seeds_per_chunk
+            stop.light_worklist,
+            stop.chunks,
+            stop.light_seed_inserts,
+            o.seeds_per_chunk()
         );
-        let s = o.light_seed_split_at_stop;
+        let s = stop.light_seed_split;
         println!(
             "  seeds: store={} border={} edit={} degrade={} terminal={} remesh={}",
             s.store, s.border, s.edit, s.degrade, s.terminal, s.remesh
         );
-        println!(
-            "  settle light admit/s={:.0}",
-            o.settle_light_admit_per_s
-        );
+        println!("  settle light admit/s={:.0}", o.settle_light_admit_per_s());
         println!(
             "  remesh_async/coord between uploads: mean={:.2} p95={:.2} n={}",
-            o.remesh_between_upload_mean, o.remesh_between_upload_p95, o.remesh_between_upload_n
+            r.remesh_between_upload_mean, r.remesh_between_upload_p95, r.remesh_between_upload_n
         );
         println!(
             "  mesh jobs/chunk before light fixpoint: mean={:.2} p95={:.2} n={}",
-            o.mesh_jobs_before_fixpoint_mean,
-            o.mesh_jobs_before_fixpoint_p95,
-            o.mesh_jobs_before_fixpoint_n
+            r.mesh_jobs_before_fixpoint_mean, r.mesh_jobs_before_fixpoint_p95, r.mesh_jobs_before_fixpoint_n
         );
         println!(
             "  drop_stale/frame (flight): mean={:.2} p95={:.2}  totals: remesh_async={} drop_stale={}",
             o.drop_stale_per_frame_mean,
             o.drop_stale_per_frame_p95,
-            o.remesh_async_calls,
-            o.drop_stale_uploads
+            end.remesh_async_calls,
+            end.drop_stale_uploads
         );
-        let mesh_jobs = o.mesh_staged + o.mesh_fallback;
-        let section_jobs = o.section_staged + o.section_fallback;
-        let mesh_full = if mesh_jobs == 0 {
-            0.0
-        } else {
-            100.0 * o.mesh_ring_full as f64 / mesh_jobs as f64
-        };
-        let section_full = if section_jobs == 0 {
-            0.0
-        } else {
-            100.0 * o.section_ring_full as f64 / section_jobs as f64
+        let share = |part: u64, whole: u64| {
+            if whole == 0 { 0.0 } else { 100.0 * part as f64 / whole as f64 }
         };
         println!(
             "  mesh staging: staged={} fallback={} ring_full={} ({:.2}%)",
-            o.mesh_staged, o.mesh_fallback, o.mesh_ring_full, mesh_full
+            end.mesh_staged,
+            end.mesh_fallback,
+            end.mesh_ring_full,
+            share(end.mesh_ring_full, end.mesh_staged + end.mesh_fallback)
         );
         println!(
             "  section staging: staged={} fallback={} ring_full={} ({:.2}%)",
-            o.section_staged, o.section_fallback, o.section_ring_full, section_full
+            end.section_staged,
+            end.section_fallback,
+            end.section_ring_full,
+            share(end.section_ring_full, end.section_staged + end.section_fallback)
         );
-        println!(
-            "  peak drain upload bytes/frame: {}",
-            o.max_drain_upload_bytes
-        );
+        println!("  peak drain upload bytes/frame: {}", p.max_drain_upload_bytes);
         for s in &o.settle_samples {
             println!(
                 "  t={}s admit/s={:.0} effort={:.2} light_worklist={}",

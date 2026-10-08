@@ -14,10 +14,13 @@ use std::time::{Duration, Instant};
 use voxel_engine::skeleton::Screenshot;
 use voxel_engine::{Color, DVec3};
 
+pub use crate::benchmark::StreamPeaks;
+use crate::benchmark::percentile;
 use crate::camera::CameraPose;
 use crate::game::{DebugView, Game, SKY_KEY, TERRAIN_KEY};
 use crate::modding::{GameBuild, Mods};
 use crate::settings::Settings;
+use crate::world::{RemeshDistribution, StreamGauges};
 
 /// The one seed every golden shot and metric uses.
 pub const GOLDEN_SEED: u64 = 0xC0FFEE;
@@ -346,17 +349,14 @@ pub struct FrameStats {
     pub max: f32,
 }
 
-fn mean_p95_u32(samples: &[u32]) -> (f32, f32) {
+/// Mean and nearest-rank p95 of `samples` (sorts them).
+fn mean_p95(samples: &mut [u32]) -> (f32, f32) {
     if samples.is_empty() {
         return (0.0, 0.0);
     }
-    let n = samples.len();
     let sum: u64 = samples.iter().map(|&v| u64::from(v)).sum();
-    let mean = sum as f32 / n as f32;
-    let mut sorted = samples.to_vec();
-    sorted.sort_unstable();
-    let p95 = sorted[((n - 1) as f32 * 0.95).round() as usize] as f32;
-    (mean, p95)
+    samples.sort_unstable();
+    (sum as f32 / samples.len() as f32, percentile(samples, 0.95) as f32)
 }
 
 impl FrameStats {
@@ -366,12 +366,11 @@ impl FrameStats {
             return FrameStats::default();
         }
         ms.sort_by(f32::total_cmp);
-        let at = |q: f64| ms[((ms.len() - 1) as f64 * q).round() as usize];
         FrameStats {
             frames: ms.len(),
-            p50: at(0.50),
-            p95: at(0.95),
-            p99: at(0.99),
+            p50: percentile(ms, 0.50),
+            p95: percentile(ms, 0.95),
+            p99: percentile(ms, 0.99),
             max: *ms.last().expect("non-empty"),
         }
     }
@@ -392,50 +391,40 @@ pub struct StressOutcome {
     pub settle_time: Option<Duration>,
     /// `entry_debug()` at the cap (empty when settled) — names the stuck stage.
     pub stuck: String,
-    /// Peak queue depths observed across the whole run.
-    pub max_upload_queue: usize,
-    pub max_light_apply: usize,
-    pub max_mesh_worklist: usize,
-    pub max_chunks: usize,
-    pub max_worker_near_queue: usize,
-    pub max_worker_far_queue: usize,
-    /// Peak per-frame section (LOD tile) upload vertex bytes.
-    pub max_section_upload_bytes: usize,
-    pub min_stream_effort: f32,
-    /// Light worklist size and loaded-chunk count at the moment of stop.
-    pub light_worklist_at_stop: usize,
-    pub chunks_at_stop: usize,
-    /// Cumulative light-worklist inserts at stop, and inserts / chunks.
-    pub light_seed_inserts_at_stop: u64,
-    pub seeds_per_chunk: f32,
-    /// Insert attempts by source at stop.
-    pub light_seed_split_at_stop: crate::world::LightSeedSplit,
-    /// Mean light jobs admitted per second between stop and settle (or cap).
-    pub settle_light_admit_per_s: f32,
+    /// Peak gauges across the whole run, observed every frame.
+    pub peaks: StreamPeaks,
+    /// The gauges at the moment of stop and on the last frame.
+    pub at_stop: StreamGauges,
+    pub at_end: StreamGauges,
+    /// Remesh counts per chunk over the whole run.
+    pub remesh: RemeshDistribution,
     /// Per-second snapshots after stop: admit rate, effort, worklist.
     pub settle_samples: Vec<SettleSample>,
-    /// `remesh_async` calls per coord between uploads (whole run).
-    pub remesh_between_upload_mean: f32,
-    pub remesh_between_upload_p95: f32,
-    pub remesh_between_upload_n: u64,
-    /// Mesh jobs claimed per chunk before its 27-neighbourhood light fixpoint.
-    pub mesh_jobs_before_fixpoint_mean: f32,
-    pub mesh_jobs_before_fixpoint_p95: f32,
-    pub mesh_jobs_before_fixpoint_n: u64,
     /// `drop_stale_upload` hits per flight frame.
     pub drop_stale_per_frame_mean: f32,
     pub drop_stale_per_frame_p95: f32,
-    pub remesh_async_calls: u64,
-    pub drop_stale_uploads: u64,
-    /// Worker mesh jobs that wrote into the staging ring vs the Vec fallback.
-    pub mesh_staged: u64,
-    pub mesh_fallback: u64,
-    pub mesh_ring_full: u64,
-    pub section_staged: u64,
-    pub section_fallback: u64,
-    pub section_ring_full: u64,
-    /// Peak per-frame chunk+section upload vertex bytes (drain).
-    pub max_drain_upload_bytes: usize,
+}
+
+impl StressOutcome {
+    /// Light-worklist inserts per loaded chunk at stop.
+    pub fn seeds_per_chunk(&self) -> f32 {
+        let at = &self.at_stop;
+        if at.chunks == 0 {
+            0.0
+        } else {
+            at.light_seed_inserts as f32 / at.chunks as f32
+        }
+    }
+
+    /// Mean light jobs admitted per second between stop and settle (or the cap).
+    pub fn settle_light_admit_per_s(&self) -> f32 {
+        let dt = self.settle_time.unwrap_or(STRESS_SETTLE_CAP).as_secs_f32();
+        if dt <= 0.0 {
+            0.0
+        } else {
+            self.at_end.light_admitted.saturating_sub(self.at_stop.light_admitted) as f32 / dt
+        }
+    }
 }
 
 /// One second of post-stop streaming (the light-drain counters).
@@ -458,39 +447,12 @@ struct StressRun {
     stopped: Option<Instant>,
     flight_ms: Vec<f32>,
     settle_ms: Vec<f32>,
-    max_upload: usize,
-    max_apply: usize,
-    max_worklist: usize,
-    max_chunks: usize,
-    max_worker_near: usize,
-    max_worker_far: usize,
-    max_section_upload_bytes: usize,
-    min_effort: f32,
-    stop_admitted: u64,
-    stop_worklist: usize,
-    stop_chunks: usize,
-    stop_seeds: u64,
-    stop_split: crate::world::LightSeedSplit,
+    peaks: StreamPeaks,
+    at_stop: StreamGauges,
     sample_sec: u32,
     sample_admitted: u64,
-    end_admitted: u64,
     samples: Vec<SettleSample>,
     drop_stale_flight: Vec<u32>,
-    remesh_between_upload_mean: f32,
-    remesh_between_upload_p95: f32,
-    remesh_between_upload_n: u64,
-    mesh_jobs_before_fixpoint_mean: f32,
-    mesh_jobs_before_fixpoint_p95: f32,
-    mesh_jobs_before_fixpoint_n: u64,
-    remesh_async_calls: u64,
-    drop_stale_uploads: u64,
-    mesh_staged: u64,
-    mesh_fallback: u64,
-    mesh_ring_full: u64,
-    section_staged: u64,
-    section_fallback: u64,
-    section_ring_full: u64,
-    max_drain_upload_bytes: usize,
 }
 
 impl StressRun {
@@ -500,92 +462,35 @@ impl StressRun {
             stopped: None,
             flight_ms: Vec::new(),
             settle_ms: Vec::new(),
-            max_upload: 0,
-            max_apply: 0,
-            max_worklist: 0,
-            max_chunks: 0,
-            max_worker_near: 0,
-            max_worker_far: 0,
-            max_section_upload_bytes: 0,
-            min_effort: 1.0,
-            stop_admitted: 0,
-            stop_worklist: 0,
-            stop_chunks: 0,
-            stop_seeds: 0,
-            stop_split: crate::world::LightSeedSplit::default(),
+            peaks: StreamPeaks::default(),
+            at_stop: StreamGauges::default(),
             sample_sec: 0,
             sample_admitted: 0,
-            end_admitted: 0,
             samples: Vec::new(),
             drop_stale_flight: Vec::new(),
-            remesh_between_upload_mean: 0.0,
-            remesh_between_upload_p95: 0.0,
-            remesh_between_upload_n: 0,
-            mesh_jobs_before_fixpoint_mean: 0.0,
-            mesh_jobs_before_fixpoint_p95: 0.0,
-            mesh_jobs_before_fixpoint_n: 0,
-            remesh_async_calls: 0,
-            drop_stale_uploads: 0,
-            mesh_staged: 0,
-            mesh_fallback: 0,
-            mesh_ring_full: 0,
-            section_staged: 0,
-            section_fallback: 0,
-            section_ring_full: 0,
-            max_drain_upload_bytes: 0,
         }
     }
 
-    fn finish(mut self, settle_time: Option<Duration>, stuck: String) -> StressOutcome {
-        let (drop_mean, drop_p95) = mean_p95_u32(&self.drop_stale_flight);
+    fn finish(
+        mut self,
+        settle_time: Option<Duration>,
+        stuck: String,
+        at_end: StreamGauges,
+        remesh: RemeshDistribution,
+    ) -> StressOutcome {
+        let (drop_mean, drop_p95) = mean_p95(&mut self.drop_stale_flight);
         StressOutcome {
             flight: FrameStats::from_ms(&mut self.flight_ms),
             settle: FrameStats::from_ms(&mut self.settle_ms),
             settle_time,
             stuck,
-            max_upload_queue: self.max_upload,
-            max_light_apply: self.max_apply,
-            max_mesh_worklist: self.max_worklist,
-            max_chunks: self.max_chunks,
-            max_worker_near_queue: self.max_worker_near,
-            max_worker_far_queue: self.max_worker_far,
-            max_section_upload_bytes: self.max_section_upload_bytes,
-            min_stream_effort: self.min_effort,
-            light_worklist_at_stop: self.stop_worklist,
-            chunks_at_stop: self.stop_chunks,
-            light_seed_inserts_at_stop: self.stop_seeds,
-            seeds_per_chunk: if self.stop_chunks == 0 {
-                0.0
-            } else {
-                self.stop_seeds as f32 / self.stop_chunks as f32
-            },
-            light_seed_split_at_stop: self.stop_split,
-            settle_light_admit_per_s: {
-                let dt = settle_time.unwrap_or(STRESS_SETTLE_CAP).as_secs_f32();
-                if dt <= 0.0 {
-                    0.0
-                } else {
-                    (self.end_admitted.saturating_sub(self.stop_admitted)) as f32 / dt
-                }
-            },
+            peaks: self.peaks,
+            at_stop: self.at_stop,
+            at_end,
+            remesh,
             settle_samples: self.samples,
-            remesh_between_upload_mean: self.remesh_between_upload_mean,
-            remesh_between_upload_p95: self.remesh_between_upload_p95,
-            remesh_between_upload_n: self.remesh_between_upload_n,
-            mesh_jobs_before_fixpoint_mean: self.mesh_jobs_before_fixpoint_mean,
-            mesh_jobs_before_fixpoint_p95: self.mesh_jobs_before_fixpoint_p95,
-            mesh_jobs_before_fixpoint_n: self.mesh_jobs_before_fixpoint_n,
             drop_stale_per_frame_mean: drop_mean,
             drop_stale_per_frame_p95: drop_p95,
-            remesh_async_calls: self.remesh_async_calls,
-            drop_stale_uploads: self.drop_stale_uploads,
-            mesh_staged: self.mesh_staged,
-            mesh_fallback: self.mesh_fallback,
-            mesh_ring_full: self.mesh_ring_full,
-            section_staged: self.section_staged,
-            section_fallback: self.section_fallback,
-            section_ring_full: self.section_ring_full,
-            max_drain_upload_bytes: self.max_drain_upload_bytes,
         }
     }
 }
@@ -873,30 +778,7 @@ fn execute(stages: Vec<Stage>, build: &GameBuild) -> Outcomes {
             let work = frame_started.elapsed();
             let ms = work.as_secs_f32() * 1000.0;
             let gauges = g.world().stream_gauges();
-            run.max_upload = run.max_upload.max(gauges.upload_queue);
-            run.max_apply = run.max_apply.max(gauges.light_apply_queue);
-            run.max_worklist = run.max_worklist.max(gauges.mesh_worklist);
-            run.max_chunks = run.max_chunks.max(gauges.chunks);
-            run.max_worker_near = run.max_worker_near.max(gauges.worker_near_queue);
-            run.max_worker_far = run.max_worker_far.max(gauges.worker_far_queue);
-            run.max_section_upload_bytes =
-                run.max_section_upload_bytes.max(gauges.section_upload_bytes);
-            run.min_effort = run.min_effort.min(gauges.effort);
-            run.remesh_between_upload_mean = gauges.remesh_between_upload_mean;
-            run.remesh_between_upload_p95 = gauges.remesh_between_upload_p95;
-            run.remesh_between_upload_n = gauges.remesh_between_upload_n;
-            run.mesh_jobs_before_fixpoint_mean = gauges.mesh_jobs_before_fixpoint_mean;
-            run.mesh_jobs_before_fixpoint_p95 = gauges.mesh_jobs_before_fixpoint_p95;
-            run.mesh_jobs_before_fixpoint_n = gauges.mesh_jobs_before_fixpoint_n;
-            run.remesh_async_calls = gauges.remesh_async_calls;
-            run.drop_stale_uploads = gauges.drop_stale_uploads;
-            run.mesh_staged = gauges.mesh_staged;
-            run.mesh_fallback = gauges.mesh_fallback;
-            run.mesh_ring_full = gauges.mesh_ring_full;
-            run.section_staged = gauges.section_staged;
-            run.section_fallback = gauges.section_fallback;
-            run.section_ring_full = gauges.section_ring_full;
-            run.max_drain_upload_bytes = run.max_drain_upload_bytes.max(gauges.drain_upload_bytes);
+            run.peaks.observe(&gauges);
             let finished = match run.stopped {
                 None => {
                     run.flight_ms.push(ms);
@@ -908,13 +790,8 @@ fn execute(stages: Vec<Stage>, build: &GameBuild) -> Outcomes {
                     g.player_mut().position.x += speed_mps * dt;
                     if run.flight_start.elapsed().as_secs_f64() >= *secs {
                         run.stopped = Some(Instant::now());
-                        run.stop_admitted = gauges.light_admitted;
-                        run.stop_worklist = gauges.light_worklist;
-                        run.stop_chunks = gauges.chunks;
-                        run.stop_seeds = gauges.light_seed_inserts;
-                        run.stop_split = gauges.light_seed_split;
+                        run.at_stop = gauges;
                         run.sample_admitted = gauges.light_admitted;
-                        run.end_admitted = gauges.light_admitted;
                         eprintln!(
                             "stress {name}: flight over — settling… light_worklist={} chunks={} seeds/chunk={:.2}",
                             gauges.light_worklist,
@@ -949,7 +826,6 @@ fn execute(stages: Vec<Stage>, build: &GameBuild) -> Outcomes {
                             gauges.light_worklist
                         );
                     }
-                    run.end_admitted = gauges.light_admitted;
                     if g.world().entry_complete() {
                         Some((Some(stopped.elapsed()), String::new()))
                     } else if stopped.elapsed() >= STRESS_SETTLE_CAP {
@@ -964,10 +840,11 @@ fn execute(stages: Vec<Stage>, build: &GameBuild) -> Outcomes {
             };
             frame += 1;
             if let Some((settle_time, stuck)) = finished {
+                let remesh = g.world().remesh_distribution();
                 let outcome = stress
                     .take()
                     .expect("run is live")
-                    .finish(settle_time, stuck);
+                    .finish(settle_time, stuck, gauges, remesh);
                 sink.borrow_mut().stress.insert(name.clone(), outcome);
                 idx += 1;
                 game = None;

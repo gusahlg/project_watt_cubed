@@ -47,7 +47,7 @@ mod sections;
 mod unload;
 mod window;
 
-pub use gauges::StreamGauges;
+pub use gauges::{RemeshDistribution, StreamGauges};
 pub(in crate::world) use far::{NearBounds, span_reach};
 pub(in crate::world) use gauges::StreamCounters;
 pub(in crate::world) use generate::{FailKey, GenCursor};

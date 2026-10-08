@@ -6,7 +6,9 @@ use super::super::LightSeedSplit;
 /// Live streaming-queue depths — the numeric twin of
 /// [`entry_debug`](World::entry_debug)'s formatted counters, for the harness's
 /// stress metrics (peak backlog depths, settle progress) where parsing a
-/// debug string would be absurd.
+/// debug string would be absurd. Cheap enough to sample every frame; the
+/// remesh distributions, which sort, are a separate [`RemeshDistribution`]
+/// taken at report time.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StreamGauges {
     pub chunks: usize,
@@ -55,6 +57,15 @@ pub struct StreamGauges {
     pub drop_stale_uploads: u64,
     /// Stale drops during the current stream/pump frame.
     pub drop_stale_this_frame: u32,
+    /// Reaction-event scheduler queue depth at sample time.
+    pub reactions_pending: usize,
+    /// Cumulative reaction mutations committed by the scheduler.
+    pub reactions_mutations: u64,
+}
+
+/// Per-chunk remesh counts over the world's life ([`World::remesh_distribution`]).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RemeshDistribution {
     /// `remesh_async` calls per coord between successful uploads.
     pub remesh_between_upload_mean: f32,
     pub remesh_between_upload_p95: f32,
@@ -63,10 +74,6 @@ pub struct StreamGauges {
     pub mesh_jobs_before_fixpoint_mean: f32,
     pub mesh_jobs_before_fixpoint_p95: f32,
     pub mesh_jobs_before_fixpoint_n: u64,
-    /// Reaction-event scheduler queue depth at sample time.
-    pub reactions_pending: usize,
-    /// Cumulative reaction mutations committed by the scheduler.
-    pub reactions_mutations: u64,
 }
 
 /// Cumulative counters the flight bench and the stress gauges read.
@@ -206,8 +213,6 @@ impl World {
             .as_ref()
             .map(pipeline::Workers::staging_snapshot)
             .unwrap_or_default();
-        let (ru_mean, ru_p95, ru_n) = self.remesh_stats.between_upload_mean_p95();
-        let (jf_mean, jf_p95, jf_n) = self.remesh_stats.jobs_before_fixpoint_mean_p95();
         super::StreamGauges {
             chunks: self.chunks.len(),
             generating: self.generating.len(),
@@ -235,12 +240,6 @@ impl World {
             remesh_async_calls: self.remesh_stats.remesh_async_calls,
             drop_stale_uploads: self.remesh_stats.drop_stale_uploads,
             drop_stale_this_frame: self.remesh_stats.drop_stale_this_frame,
-            remesh_between_upload_mean: ru_mean,
-            remesh_between_upload_p95: ru_p95,
-            remesh_between_upload_n: ru_n,
-            mesh_jobs_before_fixpoint_mean: jf_mean,
-            mesh_jobs_before_fixpoint_p95: jf_p95,
-            mesh_jobs_before_fixpoint_n: jf_n,
             section_upload_bytes: self.counters.section_upload_bytes,
             drain_upload_bytes: self.counters.drain_upload_bytes,
             mesh_staged: staging.chunk_staged,
@@ -251,6 +250,21 @@ impl World {
             section_ring_full: staging.section_ring_full,
             reactions_pending: self.reactions.pending(),
             reactions_mutations: self.reactions.operations,
+        }
+    }
+
+    /// The remesh distributions so far. Sorts up to 65,536 samples per
+    /// distribution, so it belongs at report time, not in a frame.
+    pub fn remesh_distribution(&self) -> RemeshDistribution {
+        let (ru_mean, ru_p95, ru_n) = self.remesh_stats.between_upload_mean_p95();
+        let (jf_mean, jf_p95, jf_n) = self.remesh_stats.jobs_before_fixpoint_mean_p95();
+        RemeshDistribution {
+            remesh_between_upload_mean: ru_mean,
+            remesh_between_upload_p95: ru_p95,
+            remesh_between_upload_n: ru_n,
+            mesh_jobs_before_fixpoint_mean: jf_mean,
+            mesh_jobs_before_fixpoint_p95: jf_p95,
+            mesh_jobs_before_fixpoint_n: jf_n,
         }
     }
 
@@ -386,5 +400,28 @@ impl World {
             }
         }
         "entry complete".into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The per-frame gauge snapshot neither sorts nor allocates, however many remesh samples the
+    /// world holds: the distributions come from `remesh_distribution`, at report time.
+    #[test]
+    fn stream_gauges_do_not_allocate() {
+        let mut world = World::with_config_lazy(1, crate::render_config::RenderConfig::default());
+        for x in 0..1000 {
+            let c = Coord::new(x, 0, 0);
+            world.remesh_stats.note_upload(c);
+            world.remesh_stats.note_mesh_job(c, true);
+        }
+        crate::alloc_count::reset();
+        let gauges = world.stream_gauges();
+        assert_eq!(crate::alloc_count::alloc_count(), 0, "a gauge snapshot allocated");
+        assert_eq!(gauges.chunks, 0);
+        let remesh = world.remesh_distribution();
+        assert_eq!((remesh.remesh_between_upload_n, remesh.mesh_jobs_before_fixpoint_n), (1000, 1000));
     }
 }

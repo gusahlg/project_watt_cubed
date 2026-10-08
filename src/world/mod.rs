@@ -201,7 +201,7 @@ impl LightSeedSplit {
 }
 
 pub use census::MemoryCensus;
-pub use streaming::StreamGauges;
+pub use streaming::{RemeshDistribution, StreamGauges};
 use admit::{
     AdmitScratch, LightLane, MeshLane, SectionLane, StreamLane, admission_exhausted, admit, bias_order,
     motion_biased_dist2,

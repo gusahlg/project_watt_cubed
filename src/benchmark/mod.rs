@@ -33,7 +33,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use voxel_engine::{DVec3, Engine};
 
 use crate::settings::Settings;
-use crate::world::{MemoryCensus, StreamGauges, World};
+use crate::world::{MemoryCensus, RemeshDistribution, StreamGauges, World};
 
 use json::Json;
 use system::{SystemInfo, display_json, resident_bytes, settings_json, software_json};
@@ -105,8 +105,12 @@ pub struct Benchmark {
     ready_before_measure: bool,
     warmup_elapsed: Duration,
     samples: Vec<f32>,
-    first_gauges: Option<StreamGauges>,
+    /// Gauges and remesh counts at the first measured frame.
+    first_gauges: Option<(StreamGauges, RemeshDistribution)>,
     last_gauges: StreamGauges,
+    /// The remesh counts at the last warmup sample. Sorted only while warming:
+    /// the measured window never pays for it.
+    warm_remesh: RemeshDistribution,
     peaks: StreamPeaks,
     system: Option<SystemInfo>,
     started_unix_ms: u128,
@@ -208,6 +212,7 @@ impl Benchmark {
             samples: Vec::with_capacity(reserve),
             first_gauges: None,
             last_gauges: StreamGauges::default(),
+            warm_remesh: RemeshDistribution::default(),
             peaks: StreamPeaks::default(),
             system: None,
             started_unix_ms: unix_millis(),
@@ -353,6 +358,9 @@ impl Benchmark {
             self.world_sampled_at = Some(Instant::now());
             self.cached_ready = world.entry_complete();
             self.last_gauges = world.stream_gauges();
+            if self.phase == Phase::Warming {
+                self.warm_remesh = world.remesh_distribution();
+            }
             if self.cached_ready {
                 self.stamp_ready();
                 if self.census_ready.is_none() {
@@ -379,7 +387,7 @@ impl Benchmark {
         frames_coalesced: u64,
     ) -> Step {
         self.last_gauges = gauges;
-        self.peaks.observe(gauges);
+        self.peaks.observe(&gauges);
         self.poll_rss();
         match self.phase {
             Phase::WaitingToStart => Step::Warming,
@@ -400,7 +408,7 @@ impl Benchmark {
                 self.warmup_elapsed = elapsed;
                 self.phase = Phase::Measuring;
                 self.measure_started = Some(Instant::now());
-                self.first_gauges = Some(gauges);
+                self.first_gauges = Some((gauges, self.warm_remesh));
                 self.engine_frames_start = Some((frames_rendered, frames_coalesced));
                 if timed_out && !world_ready {
                     eprintln!(
@@ -575,9 +583,9 @@ impl Benchmark {
                 Json::object(vec![
                     (
                         "start",
-                        self.first_gauges.map_or(Json::Null, stream_gauges_json),
+                        self.first_gauges.map_or(Json::Null, |(g, r)| stream_gauges_json(&g, &r)),
                     ),
-                    ("end", stream_gauges_json(self.last_gauges)),
+                    ("end", stream_gauges_json(&self.last_gauges, &world.remesh_distribution())),
                     ("peaks", self.peaks.to_json()),
                     ("peaks_sample_hz", Json::from(WORLD_SAMPLE_HZ)),
                 ]),
@@ -810,106 +818,65 @@ impl FrameStats {
     }
 }
 
-fn percentile(sorted: &[f64], q: f64) -> f64 {
+/// Nearest-rank `q` quantile of non-empty `sorted`: the value at rank
+/// `⌈n·q⌉`. The one percentile the bench and the stress harness report.
+pub(crate) fn percentile<T: Copy>(sorted: &[T], q: f64) -> T {
     let index = ((sorted.len() as f64 * q).ceil() as usize)
         .saturating_sub(1)
         .min(sorted.len() - 1);
     sorted[index]
 }
 
-/// Peak stream gauges observed during the run. Values are 4 Hz wall-clock
-/// samples (see [`WORLD_SAMPLE_HZ`]), not per-frame maxima.
-#[derive(Clone, Copy, Debug)]
-struct StreamPeaks {
-    max_chunks: usize,
-    max_generating: usize,
-    max_mesh_worklist: usize,
-    max_upload_queue: usize,
-    max_light_worklist: usize,
-    max_light_inflight: usize,
-    max_light_apply_queue: usize,
-    max_worker_near_queue: usize,
-    max_worker_far_queue: usize,
-    max_worker_capacity: usize,
-    max_speed_mps: f64,
-    min_effort: f32,
-    max_mesh_slots: usize,
-    max_section_ready: usize,
-    slot_ceiling: usize,
-    max_section_upload_bytes: usize,
-    max_reactions_pending: usize,
-    max_reactions_mutations: u64,
-}
-
-impl Default for StreamPeaks {
-    fn default() -> Self {
-        Self {
-            max_chunks: 0,
-            max_generating: 0,
-            max_mesh_worklist: 0,
-            max_upload_queue: 0,
-            max_light_worklist: 0,
-            max_light_inflight: 0,
-            max_light_apply_queue: 0,
-            max_worker_near_queue: 0,
-            max_worker_far_queue: 0,
-            max_worker_capacity: 0,
-            max_speed_mps: 0.0,
-            min_effort: 1.0,
-            max_mesh_slots: 0,
-            max_section_ready: 0,
-            slot_ceiling: 0,
-            max_section_upload_bytes: 0,
-            max_reactions_pending: 0,
-            max_reactions_mutations: 0,
+/// One row per peak stream gauge: the field, its type and first value, the
+/// [`StreamGauges`] field it folds with `max` or `min`, and its key in the bench
+/// JSON's `streaming.peaks` (rows without one stay out of the JSON).
+macro_rules! peaks {
+    ($($field:ident: $ty:ty = $init:expr, $fold:ident($gauge:ident) $(=> $key:literal)?;)*) => {
+        /// Peak stream gauges over a run. The bench observes its 4 Hz wall-clock
+        /// samples (see [`WORLD_SAMPLE_HZ`]); the stress harness every frame.
+        #[derive(Clone, Copy, Debug)]
+        pub struct StreamPeaks {
+            $(pub $field: $ty,)*
         }
-    }
+
+        impl Default for StreamPeaks {
+            fn default() -> Self {
+                Self { $($field: $init,)* }
+            }
+        }
+
+        impl StreamPeaks {
+            pub(crate) fn observe(&mut self, g: &StreamGauges) {
+                $(self.$field = self.$field.$fold(g.$gauge);)*
+            }
+
+            fn to_json(self) -> Json {
+                Json::object(vec![$($(($key, Json::from(self.$field)),)?)*])
+            }
+        }
+    };
 }
 
-impl StreamPeaks {
-    fn observe(&mut self, g: StreamGauges) {
-        self.max_chunks = self.max_chunks.max(g.chunks);
-        self.max_generating = self.max_generating.max(g.generating);
-        self.max_mesh_worklist = self.max_mesh_worklist.max(g.mesh_worklist);
-        self.max_upload_queue = self.max_upload_queue.max(g.upload_queue);
-        self.max_light_worklist = self.max_light_worklist.max(g.light_worklist);
-        self.max_light_inflight = self.max_light_inflight.max(g.light_inflight);
-        self.max_light_apply_queue = self.max_light_apply_queue.max(g.light_apply_queue);
-        self.max_worker_near_queue = self.max_worker_near_queue.max(g.worker_near_queue);
-        self.max_worker_far_queue = self.max_worker_far_queue.max(g.worker_far_queue);
-        self.max_worker_capacity = self.max_worker_capacity.max(g.worker_capacity);
-        self.max_speed_mps = self.max_speed_mps.max(g.travel_speed_mps);
-        self.min_effort = self.min_effort.min(g.effort);
-        self.max_mesh_slots = self.max_mesh_slots.max(g.mesh_slots);
-        self.max_section_ready = self.max_section_ready.max(g.section_ready);
-        self.slot_ceiling = self.slot_ceiling.max(g.slot_ceiling);
-        self.max_section_upload_bytes = self.max_section_upload_bytes.max(g.section_upload_bytes);
-        self.max_reactions_pending = self.max_reactions_pending.max(g.reactions_pending);
-        self.max_reactions_mutations = self.max_reactions_mutations.max(g.reactions_mutations);
-    }
-
-    fn to_json(self) -> Json {
-        Json::object(vec![
-            ("chunks", Json::from(self.max_chunks)),
-            ("generating", Json::from(self.max_generating)),
-            ("mesh_worklist", Json::from(self.max_mesh_worklist)),
-            ("upload_queue", Json::from(self.max_upload_queue)),
-            ("light_worklist", Json::from(self.max_light_worklist)),
-            ("light_inflight", Json::from(self.max_light_inflight)),
-            ("light_apply_queue", Json::from(self.max_light_apply_queue)),
-            ("worker_near_queue", Json::from(self.max_worker_near_queue)),
-            ("worker_far_queue", Json::from(self.max_worker_far_queue)),
-            ("worker_capacity", Json::from(self.max_worker_capacity)),
-            ("travel_speed_mps", Json::number(self.max_speed_mps)),
-            ("minimum_effort", Json::number(f64::from(self.min_effort))),
-            ("mesh_slots", Json::from(self.max_mesh_slots)),
-            ("section_ready", Json::from(self.max_section_ready)),
-            ("slot_ceiling", Json::from(self.slot_ceiling)),
-            ("section_upload_bytes", Json::from(self.max_section_upload_bytes)),
-            ("reactions.pending", Json::from(self.max_reactions_pending)),
-            ("reactions.mutations", Json::from(self.max_reactions_mutations)),
-        ])
-    }
+peaks! {
+    max_chunks: usize = 0, max(chunks) => "chunks";
+    max_generating: usize = 0, max(generating) => "generating";
+    max_mesh_worklist: usize = 0, max(mesh_worklist) => "mesh_worklist";
+    max_upload_queue: usize = 0, max(upload_queue) => "upload_queue";
+    max_light_worklist: usize = 0, max(light_worklist) => "light_worklist";
+    max_light_inflight: usize = 0, max(light_inflight) => "light_inflight";
+    max_light_apply_queue: usize = 0, max(light_apply_queue) => "light_apply_queue";
+    max_worker_near_queue: usize = 0, max(worker_near_queue) => "worker_near_queue";
+    max_worker_far_queue: usize = 0, max(worker_far_queue) => "worker_far_queue";
+    max_worker_capacity: usize = 0, max(worker_capacity) => "worker_capacity";
+    max_speed_mps: f64 = 0.0, max(travel_speed_mps) => "travel_speed_mps";
+    min_effort: f32 = 1.0, min(effort) => "minimum_effort";
+    max_mesh_slots: usize = 0, max(mesh_slots) => "mesh_slots";
+    max_section_ready: usize = 0, max(section_ready) => "section_ready";
+    slot_ceiling: usize = 0, max(slot_ceiling) => "slot_ceiling";
+    max_section_upload_bytes: usize = 0, max(section_upload_bytes) => "section_upload_bytes";
+    max_reactions_pending: usize = 0, max(reactions_pending) => "reactions.pending";
+    max_reactions_mutations: u64 = 0, max(reactions_mutations) => "reactions.mutations";
+    max_drain_upload_bytes: usize = 0, max(drain_upload_bytes);
 }
 
 fn census_json(c: MemoryCensus) -> Json {
@@ -932,7 +899,7 @@ fn census_json(c: MemoryCensus) -> Json {
     ])
 }
 
-fn stream_gauges_json(g: StreamGauges) -> Json {
+fn stream_gauges_json(g: &StreamGauges, r: &RemeshDistribution) -> Json {
     Json::object(vec![
         ("chunks", Json::from(g.chunks)),
         ("generating", Json::from(g.generating)),
@@ -963,24 +930,24 @@ fn stream_gauges_json(g: StreamGauges) -> Json {
         ("drop_stale_this_frame", Json::from(g.drop_stale_this_frame as u64)),
         (
             "remesh_between_upload_mean",
-            Json::number(f64::from(g.remesh_between_upload_mean)),
+            Json::number(f64::from(r.remesh_between_upload_mean)),
         ),
         (
             "remesh_between_upload_p95",
-            Json::number(f64::from(g.remesh_between_upload_p95)),
+            Json::number(f64::from(r.remesh_between_upload_p95)),
         ),
-        ("remesh_between_upload_n", Json::from(g.remesh_between_upload_n)),
+        ("remesh_between_upload_n", Json::from(r.remesh_between_upload_n)),
         (
             "mesh_jobs_before_fixpoint_mean",
-            Json::number(f64::from(g.mesh_jobs_before_fixpoint_mean)),
+            Json::number(f64::from(r.mesh_jobs_before_fixpoint_mean)),
         ),
         (
             "mesh_jobs_before_fixpoint_p95",
-            Json::number(f64::from(g.mesh_jobs_before_fixpoint_p95)),
+            Json::number(f64::from(r.mesh_jobs_before_fixpoint_p95)),
         ),
         (
             "mesh_jobs_before_fixpoint_n",
-            Json::from(g.mesh_jobs_before_fixpoint_n),
+            Json::from(r.mesh_jobs_before_fixpoint_n),
         ),
         ("section_upload_bytes", Json::from(g.section_upload_bytes)),
         ("reactions.pending", Json::from(g.reactions_pending)),
@@ -1076,6 +1043,87 @@ mod tests {
         assert!(stats.avg_fps.is_some_and(|fps| fps > 45.0 && fps < 46.0));
     }
 
+    /// The keys of a flat rendered JSON object, in order.
+    fn keys(json: &Json) -> Vec<String> {
+        let text = json.render();
+        text[1..text.len() - 1]
+            .split(',')
+            .map(|kv| kv.split(':').next().expect("a key").trim_matches('"').to_string())
+            .collect()
+    }
+
+    /// The streaming JSON keys downstream tooling reads: the stream gauges and their peaks.
+    #[test]
+    fn streaming_json_keys_are_pinned() {
+        let peaks = StreamPeaks::default().to_json();
+        assert_eq!(
+            keys(&peaks),
+            [
+                "chunks",
+                "generating",
+                "mesh_worklist",
+                "upload_queue",
+                "light_worklist",
+                "light_inflight",
+                "light_apply_queue",
+                "worker_near_queue",
+                "worker_far_queue",
+                "worker_capacity",
+                "travel_speed_mps",
+                "minimum_effort",
+                "mesh_slots",
+                "section_ready",
+                "slot_ceiling",
+                "section_upload_bytes",
+                "reactions.pending",
+                "reactions.mutations",
+            ]
+        );
+        assert!(peaks.render().contains("\"minimum_effort\":1,"), "{}", peaks.render());
+        let gauges = stream_gauges_json(&StreamGauges::default(), &RemeshDistribution::default());
+        assert_eq!(
+            keys(&gauges),
+            [
+                "chunks",
+                "generating",
+                "mesh_worklist",
+                "upload_queue",
+                "light_worklist",
+                "light_inflight",
+                "light_apply_queue",
+                "worker_near_queue",
+                "worker_far_queue",
+                "worker_capacity",
+                "travel_speed_mps",
+                "effort",
+                "light_admitted",
+                "light_admitted_last",
+                "light_seed_inserts",
+                "mesh_slots",
+                "section_ready",
+                "slot_ceiling",
+                "light_seed_store",
+                "light_seed_border",
+                "light_seed_edit",
+                "light_seed_degrade",
+                "light_seed_terminal",
+                "light_seed_remesh",
+                "remesh_async_calls",
+                "drop_stale_uploads",
+                "drop_stale_this_frame",
+                "remesh_between_upload_mean",
+                "remesh_between_upload_p95",
+                "remesh_between_upload_n",
+                "mesh_jobs_before_fixpoint_mean",
+                "mesh_jobs_before_fixpoint_p95",
+                "mesh_jobs_before_fixpoint_n",
+                "section_upload_bytes",
+                "reactions.pending",
+                "reactions.mutations",
+            ]
+        );
+    }
+
     #[test]
     fn empty_statistics_emit_nulls_instead_of_nan_or_infinity() {
         let stats = FrameStats::from_samples(&[], Duration::ZERO, None);
@@ -1128,6 +1176,7 @@ mod tests {
             samples: Vec::new(),
             first_gauges: None,
             last_gauges: StreamGauges::default(),
+            warm_remesh: RemeshDistribution::default(),
             peaks: StreamPeaks::default(),
             system: None,
             started_unix_ms: 0,
