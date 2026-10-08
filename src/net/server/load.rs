@@ -578,8 +578,10 @@ fn cluster(rt: &Runtime, bots: usize, pace: Pace, warm: Duration, window: Durati
     Run {
         bots,
         secs,
-        server_cpu: (server1 - server0) as f64 / 1e9 / secs,
-        bot_cpu: (bots1 - bots0) as f64 / 1e9 / secs,
+        // Threads that exit between the samples (other tests in a parallel run) take their time
+        // with them, so a total can shrink: saturate rather than underflow.
+        server_cpu: server1.saturating_sub(server0) as f64 / 1e9 / secs,
+        bot_cpu: bots1.saturating_sub(bots0) as f64 / 1e9 / secs,
         joining,
         lock,
         queue,
