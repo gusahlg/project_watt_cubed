@@ -12,10 +12,10 @@ pub mod slot;
 pub mod store;
 
 pub use autosave::{Autosaver, Tick};
-pub use bridge::{encode_current, load, snapshot, unix_now};
+pub use bridge::{LoadReport, Restored, encode_current, restore, snapshot, unix_now};
 pub use slot::{SaveMeta, Slot, SlotId};
 #[cfg(test)]
-pub use bridge::save;
+pub use bridge::{load, save};
 #[cfg(test)]
 pub use slot::SaveError;
 pub use store::{Source, delete, file_path, fresh_id, list, write_atomic_file};

@@ -124,6 +124,11 @@ const TELEPORT_RATE: u32 = 4;
 /// A 20 ms capture cadence is ~50 frames/s sustained; 100 leaves headroom for
 /// bursts. Excess frames are dropped silently — channel traffic is loss-tolerant.
 const CHANNEL_RATE_LIMIT: u32 = 100;
+/// Mod frames one connection may send per second over all its channels, charged before
+/// the channel's own window, so switching names buys no extra rate.
+const MOD_DATA_RATE: u32 = 2 * CHANNEL_RATE_LIMIT;
+/// Distinct channel names one connection may use. A new name past this is dropped.
+const MAX_CHANNELS: usize = 32;
 /// Tool uses one connection may send per second: each one evaluates the law and may intern two
 /// configurations under the [`State`] lock, so the budget is a human's swing rate, not a flood.
 const TOOL_RATE_LIMIT: u32 = 12;
@@ -144,15 +149,20 @@ const FAR_EVERY: u64 = 4;
 const _: () = assert!(protocol::POSES_HEAD + MAX_PLAYERS * protocol::POSE_MAX <= MAX_FRAME);
 /// A little past the client's own reach constant.
 const EDIT_REACH: f64 = 8.0 * crate::math::PER_METER;
-/// So jitter between a client's send cadence and our receive time never
-/// rejects honest movement.
+/// The distance budget's burst, in seconds at the envelope speed, so a stalled
+/// stream that lands several moves at once still drains at speed.
 const MOVE_SLACK_SECS: f64 = 0.3;
 /// Past this, elapsed time stops buying displacement (an idle client can't
 /// bank a cross-map jump allowance).
 const MOVE_WINDOW_CAP_SECS: f64 = 2.0;
-/// A couple of blocks still fit when the reported speed is zero and the window
-/// has not opened: the old 80 m/s slack, so a standing step is not a teleport.
+/// The smallest burst: the old 80 m/s slack, so a standing step is not a teleport.
+/// It is spent once, not granted per move.
 const MOVE_FLOOR: f64 = 80.0 * crate::math::PER_METER * MOVE_SLACK_SECS;
+/// The swept body check samples the path at most this far apart, the client collision's substep.
+const SWEEP_STEP: f64 = 0.5;
+/// Longest path the swept body check walks. A longer move fails closed, except a cruise move,
+/// which passes through everything on the client and is checked at its destination only.
+const SWEEP_LIMIT: f64 = 512.0;
 /// How fast a reported velocity may grow between moves, above the speed the
 /// client already has. Vacuum falls have no terminal speed; this is several
 /// times surface gravity so an honest fall fits and a forged one does not.
@@ -203,6 +213,9 @@ pub struct Config {
     pub world: Option<PathBuf>,
     /// Operator names. Compared case-insensitively after [`clean_name`].
     pub ops: Vec<String>,
+    /// Operators who prove it with the chat line `/op <secret>`: (name, secret).
+    /// A name here needs its secret even when [`ops`](Self::ops) lists it too.
+    pub op_secrets: Vec<(String, String)>,
     /// Movement-envelope cap, in world units per second. The default is
     /// [`crate::player::MAX_SPEED`], which leaves cruise at its own ceiling.
     /// A lower cap also bounds cruise.
@@ -230,6 +243,7 @@ impl Default for Config {
             hooks: Vec::new(),
             world: None,
             ops: Vec::new(),
+            op_secrets: Vec::new(),
             max_speed: crate::player::MAX_SPEED,
             mods_allow: Vec::new(),
             mods_deny: Vec::new(),
@@ -245,21 +259,29 @@ fn clamp_day_secs(s: f32) -> f32 {
     if s.is_nan() { 600.0 } else { s.clamp(10.0, 86_400.0) }
 }
 
-/// One [`RateWindow`] per channel name. The first packet of a channel allocates
-/// the slot; later packets scan the small vec.
+/// The connection's [`MOD_DATA_RATE`] window, then one [`RateWindow`] per channel name.
+/// The first packet of a channel allocates the slot, up to [`MAX_CHANNELS`]; later
+/// packets scan the small vec.
 struct ChannelBudget {
+    total: RateWindow,
     windows: Vec<(Arc<str>, RateWindow)>,
 }
 
 impl ChannelBudget {
     fn new() -> Self {
-        Self { windows: Vec::new() }
+        Self { total: RateWindow::new(MOD_DATA_RATE), windows: Vec::new() }
     }
 
     fn allow(&mut self, channel: &protocol::Channel, now: Instant) -> bool {
+        if !self.total.allow(now) {
+            return false;
+        }
         let name = channel.as_str();
         if let Some((_, window)) = self.windows.iter_mut().find(|(key, _)| key.as_ref() == name) {
             return window.allow(now);
+        }
+        if self.windows.len() >= MAX_CHANNELS {
+            return false;
         }
         let mut window = RateWindow::new(CHANNEL_RATE_LIMIT);
         let ok = window.allow(now);
@@ -363,6 +385,8 @@ struct Ctx {
     hooks: Option<Mutex<hooks::Table>>,
     /// Lowercased operator names.
     ops: Vec<String>,
+    /// Lowercased names and their `/op` secrets.
+    op_secrets: Vec<(String, String)>,
     mods_allow: Vec<String>,
     mods_deny: Vec<String>,
     store: Option<Arc<Store>>,
@@ -381,6 +405,10 @@ struct PlayerHandle {
     stance: Stance,
     /// The movement envelope's time anchor.
     last_move: Instant,
+    /// Distance banked at `last_move`, spent by moves and refilled at the envelope speed.
+    budget: f64,
+    /// Proved an operator secret with `/op`.
+    op: bool,
     /// Ids inside mutual interest range (`a.visible.contains(b) ==
     /// b.visible.contains(a)`). Maintained by [`on_move`]'s diff; drives
     /// PeerExited/re-entry pose events.
@@ -399,8 +427,8 @@ struct PlayerHandle {
     /// onto the wire or interleave between snapshot batches — so they buffer
     /// into `backlog` instead, drained in order once the bootstrap is done.
     ready: bool,
-    /// Frames held until bootstrap finishes, with the instant they were queued.
-    backlog: Vec<Queued>,
+    /// Frames held until bootstrap finishes, with the instant they were queued, oldest first.
+    backlog: VecDeque<Queued>,
     backlog_bytes: usize,
     /// Set by [`kick_slow`] and by a bootstrap send that misses its deadline.
     /// The reader is not in [`client_loop`] yet during bootstrap, so the kick
@@ -581,8 +609,9 @@ impl PlayerHandle {
 
 /// A joining client buffers broadcasts until Welcome and the overlay are queued.
 /// The bound is bytes and age, not a frame count: cosmetic frames are dropped
-/// first, and only an essential frame that still does not fit kicks.
-const BACKLOG_BYTES: usize = 64 * 1024;
+/// first, and an essential frame that does not fit or outlives the age kicks.
+/// Several full frames fit, so one large reaction batch never kicks on its own.
+const BACKLOG_BYTES: usize = 4 * MAX_FRAME;
 const BACKLOG_AGE: Duration = Duration::from_secs(15);
 /// How long a bootstrap send may wait for queue space before the joiner is dropped.
 const SEND_DEADLINE: Duration = Duration::from_secs(8);
@@ -605,6 +634,8 @@ struct Cell {
     block: BlockId,
     spec: Arc<str>,
     rev: u32,
+    /// An edit put back the generated block: kept for its revision, left out of the world file.
+    natural: bool,
 }
 
 struct State {
@@ -751,19 +782,32 @@ impl TerrainCache {
     }
 
     fn get(&self, pos: Pos, generate: impl FnOnce() -> BlockId) -> BlockId {
+        if let Some(id) = self.peek(pos) {
+            return id;
+        }
+        let id = generate();
+        self.store(pos, id);
+        id
+    }
+
+    fn peek(&self, pos: Pos) -> Option<BlockId> {
+        let (set, _) = Self::slot(pos);
+        let cache = self.0.borrow();
+        cache[set..set + TERRAIN_WAYS].iter().find_map(|w| w.filter(|(at, _)| *at == pos).map(|(_, id)| id))
+    }
+
+    fn store(&self, pos: Pos, id: BlockId) {
+        let (set, way) = Self::slot(pos);
+        self.0.borrow_mut()[set + way] = Some((pos, id));
+    }
+
+    /// The set's first slot, and the way a new entry takes.
+    fn slot(pos: Pos) -> (usize, usize) {
         let h = u64::from(pos.0 as u32).wrapping_mul(0x9E37_79B9_7F4A_7C15)
             ^ u64::from(pos.1 as u32).wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
             ^ u64::from(pos.2 as u32).wrapping_mul(0x1656_67B1_9E37_79F9);
         let sets = (TERRAIN_SLOTS / TERRAIN_WAYS).trailing_zeros();
-        let set = (h >> (64 - sets)) as usize * TERRAIN_WAYS;
-        let mut cache = self.0.borrow_mut();
-        let ways = &mut cache[set..set + TERRAIN_WAYS];
-        if let Some(&Some((_, id))) = ways.iter().find(|w| matches!(w, Some((at, _)) if *at == pos)) {
-            return id;
-        }
-        let id = generate();
-        ways[h as usize % TERRAIN_WAYS] = Some((pos, id));
-        id
+        ((h >> (64 - sets)) as usize * TERRAIN_WAYS, h as usize % TERRAIN_WAYS)
     }
 }
 
@@ -782,7 +826,7 @@ impl CellStore for ServerCells<'_> {
         let canonical = crate::save::block_spec(&self.state.registry, id);
         let spec = self.state.intern(&canonical)?;
         let rev = self.state.edits.get(&pos).map_or(0, |c| c.rev).saturating_add(1);
-        if let Some(old) = self.state.edits.insert(pos, Cell { block: id, spec, rev }) {
+        if let Some(old) = self.state.edits.insert(pos, Cell { block: id, spec, rev, natural: false }) {
             self.state.release(old.spec);
         }
         Some(prev)
@@ -1002,8 +1046,8 @@ fn outside_world(pos: DVec3) -> bool {
         || pos.z.abs() > crate::math::WORLD_BORDER
 }
 
-/// A running server. [`stop`](ServerHandle::stop) saves the world, closes every
-/// connection, and joins the server threads so the port can be bound again.
+/// A running server. [`stop`](ServerHandle::stop) closes every connection, saves
+/// the world, and joins the server threads so the port can be bound again.
 /// Dropping the handle does the same.
 pub(crate) struct ServerHandle {
     shutdown: Arc<AtomicBool>,
@@ -1031,17 +1075,18 @@ impl ServerHandle {
         self.addr
     }
 
-    /// Save, close every connection with "server shutting down", and join threads.
-    /// A second call does nothing.
+    /// Close every connection with "server shutting down", save, and join threads.
+    /// Closing first means no edit is acknowledged after the save captures the ledger:
+    /// once the endpoint is closed, no ack reaches a client. A second call does nothing.
     pub fn stop(&self) {
         if self.stopped.swap(true, Ordering::SeqCst) {
             return;
         }
-        self.save_now();
         self.shutdown.store(true, Ordering::SeqCst);
         if let Some(endpoint) = self.endpoint.lock_recover().take() {
             endpoint.close(0u32.into(), b"server shutting down");
         }
+        self.save_now();
         if let Some(handle) = self.accept.lock_recover().take() {
             let _ = handle.join();
         }
@@ -1155,6 +1200,8 @@ pub(crate) fn spawn(port: u16, config: Config) -> io::Result<ServerHandle> {
     } else {
         Some(Mutex::new(hooks::Table::new(config.hooks)))
     };
+    let op_secrets: Vec<(String, String)> =
+        config.op_secrets.iter().map(|(name, secret)| (canonical_name(name), secret.clone())).collect();
     let ctx = Arc::new(Ctx {
         password: config.password,
         seed: loaded.seed,
@@ -1167,7 +1214,8 @@ pub(crate) fn spawn(port: u16, config: Config) -> io::Result<ServerHandle> {
         seams: Seams::new(generator.atlases().to_vec()),
         generator,
         hooks,
-        ops: canonical_ops(&config.ops),
+        ops: canonical_ops(&config.ops, &op_secrets),
+        op_secrets,
         mods_allow: config.mods_allow,
         mods_deny: config.mods_deny,
         store: loaded.store.map(Arc::new),
@@ -1227,11 +1275,13 @@ fn finite_speed(v: f64) -> f64 {
     if v.is_finite() && v >= 0.0 { v } else { crate::player::MAX_SPEED }
 }
 
-fn canonical_ops(names: &[String]) -> Vec<String> {
+/// Name-only operators, minus any name that has a secret.
+fn canonical_ops(names: &[String], secrets: &[(String, String)]) -> Vec<String> {
     let mut ops = Vec::new();
     for name in names {
         let canon = canonical_name(name);
-        if canon.is_empty() || ops.iter().any(|op: &String| op == &canon) {
+        let listed = ops.iter().any(|op: &String| op == &canon) || secrets.iter().any(|(have, _)| have == &canon);
+        if canon.is_empty() || listed {
             continue;
         }
         ops.push(canon);
@@ -1243,15 +1293,15 @@ fn canonical_name(raw: &str) -> String {
     clean_name(raw).to_ascii_lowercase()
 }
 
-/// `ctx.ops` holds lowercased names, so this matches without allocating.
-fn is_operator(ctx: &Ctx, name: &str) -> bool {
-    ctx.ops.iter().any(|op| op.eq_ignore_ascii_case(name))
+fn is_operator(ctx: &Ctx, h: &PlayerHandle) -> bool {
+    h.op || ctx.ops.iter().any(|op| op.eq_ignore_ascii_case(&h.name))
 }
 
-/// Skip a spec this build cannot parse, and return those cells so the next save
-/// writes them back. Revisions start at 1; the file has none.
+/// Skip a spec this build cannot parse or the pool cannot hold, and return those cells
+/// so the next save writes them back. Revisions start at 1; the file has none.
 fn install_edits(state: &mut State, edits: &[(i32, i32, i32, String)]) -> Vec<(i32, i32, i32, String)> {
     let mut kept = Vec::new();
+    let mut over = 0usize;
     for (x, y, z, spec) in edits {
         let Some(id) = state.registry.parse_spec(spec) else {
             eprintln!("skipping unknown block spec at {x},{y},{z}");
@@ -1259,8 +1309,15 @@ fn install_edits(state: &mut State, edits: &[(i32, i32, i32, String)]) -> Vec<(i
             continue;
         };
         let canonical = state.registry.spec(id);
-        let Some(shared) = state.intern(&canonical) else { continue };
-        state.edits.insert((*x, *y, *z), Cell { block: id, spec: shared, rev: 1 });
+        let Some(shared) = state.intern(&canonical) else {
+            over += 1;
+            kept.push((*x, *y, *z, spec.clone()));
+            continue;
+        };
+        state.edits.insert((*x, *y, *z), Cell { block: id, spec: shared, rev: 1, natural: false });
+    }
+    if over > 0 {
+        eprintln!("warning: {over} edits name more than {MAX_SPEC_POOL} distinct blocks; they stay in the file but are not served");
     }
     kept
 }
@@ -1280,6 +1337,7 @@ fn save_world(state: &Mutex<State>, ctx: &Ctx, gate: &Mutex<()>) {
         let edits = state
             .edits
             .iter()
+            .filter(|(_, cell)| !cell.natural)
             .map(|(&(x, y, z), cell)| (x, y, z, Arc::clone(&cell.spec)))
             .collect();
         let pending = state
@@ -1330,8 +1388,9 @@ fn autosave_loop(
 }
 
 /// Union `ops.txt` and `mods.toml` beside [`Config::world`] into the flag lists.
-/// A missing file adds nothing. A `mods.toml` that is not `allow` / `deny`
-/// string arrays is an error, so a dedicated server refuses to start open.
+/// An `ops.txt` line with a secret goes to [`Config::op_secrets`]. A missing file
+/// adds nothing. A `mods.toml` that is not `allow` / `deny` string arrays is an
+/// error, so a dedicated server refuses to start open.
 pub fn load_world_policy(config: &mut Config) -> Result<(), String> {
     let Some(world) = config.world.clone() else {
         return Ok(());
@@ -1340,6 +1399,11 @@ pub fn load_world_policy(config: &mut Config) -> Result<(), String> {
     for name in side.ops {
         if !config.ops.iter().any(|op| op.eq_ignore_ascii_case(&name)) {
             config.ops.push(name);
+        }
+    }
+    for (name, secret) in side.op_secrets {
+        if !config.op_secrets.iter().any(|(have, _)| have.eq_ignore_ascii_case(&name)) {
+            config.op_secrets.push((name, secret));
         }
     }
     push_unique(&mut config.mods_allow, side.allow);
@@ -1435,6 +1499,12 @@ fn accept_once(
         Err(_elapsed) => return false,
     };
 
+    // A stateless retry first: a source must prove it receives our packets before it
+    // takes a slot, so spoofed Initials cannot hold the handshake slots.
+    if !incoming.remote_address_validated() {
+        let _ = incoming.retry();
+        return false;
+    }
     // A QUIC CONNECTION_REFUSED past the cap, before any handshake, so a
     // flood of silent connects can't squat handler threads. The accept
     // loop is the only adder, so load-then-add can't overshoot the cap.
@@ -1634,7 +1704,7 @@ fn admit_player(
     let snapshot: Overlay;
     {
         let mut state = shared.lock_recover();
-        if name.eq_ignore_ascii_case("server") {
+        if reserved_name(name) {
             drop(state);
             reject(rt, send, conn, "the name 'server' is reserved");
             return None;
@@ -1675,13 +1745,15 @@ fn admit_player(
                 up,
                 stance: Stance::Standing,
                 last_move: Instant::now(),
+                budget: MOVE_FLOOR,
+                op: false,
                 visible: HashSet::default(),
                 body,
                 moved: 0,
                 out: out.clone(),
                 kick: kick.clone(),
                 ready: false,
-                backlog: Vec::new(),
+                backlog: VecDeque::new(),
                 backlog_bytes: 0,
                 kicked: Arc::new(AtomicBool::new(false)),
                 occupied: Vec::new(),
@@ -1801,11 +1873,12 @@ fn client_loop(
             }
             ClientMessage::Teleport { pos } => on_teleport(shared, ctx, id, pos),
             ClientMessage::Edit { req, x, y, z, expect, spec } => {
-                on_edit(shared, ctx.hooks.as_ref(), ctx.generator.atlases(), id, req, x, y, z, expect, &spec)
+                on_edit(shared, ctx.hooks.as_ref(), &ctx.generator, id, req, x, y, z, expect, &spec)
             }
-            ClientMessage::Chat { channel, text } => {
-                on_chat(shared, ctx.hooks.as_ref(), id, channel, &text)
-            }
+            ClientMessage::Chat { channel, text } => match op_secret(&text) {
+                Some(secret) => on_op_login(shared, ctx, id, &secret),
+                None => on_chat(shared, ctx.hooks.as_ref(), id, channel, &text),
+            },
             ClientMessage::SetTime { day } => on_set_time(shared, ctx, id, day),
             ClientMessage::ModData { channel, seq, bytes } => {
                 if !channels.allow(&channel, now) {
@@ -1889,9 +1962,9 @@ fn depart(
     println!("[-] {name} (#{id}) left ({} online)", online(shared));
 }
 
-/// Validation is a plausibility ENVELOPE, not full physics. The allowance follows
-/// the reported speed, capped at [`crate::player::MAX_SPEED`] or the declared cruise,
-/// plus [`GRAVITY_BOUND`] over the elapsed window, and at least [`MOVE_FLOOR`].
+/// Validation is a plausibility ENVELOPE, not full physics. Each player spends a
+/// distance budget ([`move_allowance`]) that refills at the envelope speed and holds
+/// at most one burst, so splitting a move into many messages gains nothing.
 /// An implausible move is not committed — the server keeps its last accepted
 /// position (which edit reach reads), and the client is snapped back with an
 /// authoritative [`ServerMessage::Position`]. `/tp` discontinuities arrive as
@@ -1949,21 +2022,23 @@ fn on_move(
         // grown by gravity over the gap, capped by the server's speed limit.
         // Cruise raises that cap only after a `Cruise` message, and only up to
         // the game's cruise ceiling unless the server cap is tighter.
-        // Outside the border is refused either way. Solid ground is tested unless
-        // this player's noclip policy allows the pass.
-        let (free, too_far, occupied, occupied_n) = {
+        // Outside the border is refused either way. Solid ground is tested along the
+        // path unless this player's noclip policy allows the pass.
+        let (free, too_far, left, from, cruising, occupied, occupied_n) = {
             let Some(h) = state.players.get(&id) else { return };
-            let free = noclip_allowed(ctx, &h.name);
+            let free = noclip_allowed(ctx, h);
             let elapsed = h.last_move.elapsed().as_secs_f64().min(MOVE_WINDOW_CAP_SECS);
-            let allowed = move_allowance(h, velocity, elapsed, max_speed);
-            let too_far = outside_world(pos) || h.pos.distance_squared(pos) > allowed * allowed;
+            let available = move_allowance(h, velocity, elapsed, max_speed);
+            let distance = h.pos.distance(pos);
+            let too_far = outside_world(pos) || distance > available;
             let mut occupied = [(0i32, 0, 0); BODY_CELL_CAP];
             let occupied_n = h.occupied.len().min(BODY_CELL_CAP);
             occupied[..occupied_n].copy_from_slice(&h.occupied[..occupied_n]);
-            (free, too_far, occupied, occupied_n)
+            (free, too_far, available - distance, h.pos, h.cruising, occupied, occupied_n)
         };
-        let blocked =
-            !free && !too_far && body_blocked(&state, &ctx.generator, &ctx.seams, pos, stance, up, &occupied[..occupied_n]);
+        let blocked = !free
+            && !too_far
+            && move_blocked(&state, ctx, from, pos, cruising, stance, up, &occupied[..occupied_n]);
         if too_far || blocked {
             let Some(h) = state.players.get(&id) else { return };
             h.correct_position(id, &mut sends);
@@ -1975,8 +2050,11 @@ fn on_move(
                 Some(ReportedPose { yaw, pitch, frame, velocity, up, stance }),
                 &mut sends,
             );
-            if !free && let Some(h) = state.players.get_mut(&id) {
-                remember_occupied(h, pos, stance, up);
+            if let Some(h) = state.players.get_mut(&id) {
+                h.budget = left;
+                if !free {
+                    remember_occupied(h, pos, stance, up);
+                }
             }
         }
         queue(&state, sends)
@@ -1984,10 +2062,10 @@ fn on_move(
     drop(wake);
 }
 
-fn noclip_allowed(ctx: &Ctx, name: &str) -> bool {
+fn noclip_allowed(ctx: &Ctx, h: &PlayerHandle) -> bool {
     match ctx.noclip {
         NoclipPolicy::All => true,
-        NoclipPolicy::Ops => is_operator(ctx, name),
+        NoclipPolicy::Ops => is_operator(ctx, h),
         NoclipPolicy::Off => false,
     }
 }
@@ -2026,31 +2104,67 @@ fn remember_occupied(h: &mut PlayerHandle, pos: DVec3, stance: Stance, up: Face)
     h.occupied.extend_from_slice(&cells[..n]);
 }
 
-/// True when a newly entered body cell is solid in the edit overlay or the generator.
-/// Cells already in `occupied` are not queried again. Cells are read the way the client's
-/// collision reads them: in storage, with a cell just past a chart's box glued to the
-/// neighbour chart's cell.
-fn body_blocked(
+/// The body's path from the last accepted pose meets solid ground. A path longer than
+/// [`SWEEP_LIMIT`] fails closed, except under cruise, whose destination alone is tested.
+#[allow(clippy::too_many_arguments)] // the move's pose fields, passed separately like on_move's
+fn move_blocked(
     state: &State,
-    generator: &crate::world::terrain::Generator,
-    seams: &Seams,
-    pos: DVec3,
+    ctx: &Ctx,
+    from: DVec3,
+    to: DVec3,
+    cruising: bool,
     stance: Stance,
     up: Face,
     occupied: &[(i32, i32, i32)],
 ) -> bool {
-    let mut cells = [(0i32, 0, 0); BODY_CELL_CAP];
-    let Some(n) = fill_body_cells(pos, stance, up, &mut cells) else {
+    let from = if from.distance(to) <= SWEEP_LIMIT {
+        from
+    } else if cruising {
+        to
+    } else {
         return true;
     };
-    for &(x, y, z) in &cells[..n] {
-        if occupied.contains(&(x, y, z)) {
-            continue;
-        }
-        let query = seams.glue_cell(BlockCoord::new(x, y, z)).map_or((x, y, z), |g| (g.x, g.y, g.z));
-        if state.registry.is_solid(server_block(state, generator, query)) {
+    body_blocked(state, &ctx.generator, &ctx.seams, from, to, stance, up, occupied)
+}
+
+/// True when the body, swept from `from` to `to` in steps of at most [`SWEEP_STEP`], newly
+/// enters a cell that is solid in the edit overlay or the generator. Each step queries only
+/// the cells the step before did not hold; the first skips `occupied`, the cells of the last
+/// accepted pose. A straight path never re-enters a cell it left, so one step back is enough.
+/// Cells are read the way the client's collision reads them: in storage, with a cell just
+/// past a chart's box glued to the neighbour chart's cell.
+#[allow(clippy::too_many_arguments)] // the move's pose fields, passed separately like on_move's
+fn body_blocked(
+    state: &State,
+    generator: &crate::world::terrain::Generator,
+    seams: &Seams,
+    from: DVec3,
+    to: DVec3,
+    stance: Stance,
+    up: Face,
+    occupied: &[(i32, i32, i32)],
+) -> bool {
+    let steps = (from.distance(to) / SWEEP_STEP).ceil().max(1.0) as u32;
+    let mut held = [(0i32, 0, 0); BODY_CELL_CAP];
+    let mut held_n = occupied.len().min(BODY_CELL_CAP);
+    held[..held_n].copy_from_slice(&occupied[..held_n]);
+    let mut cells = [(0i32, 0, 0); BODY_CELL_CAP];
+    for step in 1..=steps {
+        let at = if step == steps { to } else { from.lerp(to, f64::from(step) / f64::from(steps)) };
+        let Some(n) = fill_body_cells(at, stance, up, &mut cells) else {
             return true;
+        };
+        for &(x, y, z) in &cells[..n] {
+            if held[..held_n].contains(&(x, y, z)) {
+                continue;
+            }
+            let query = seams.glue_cell(BlockCoord::new(x, y, z)).map_or((x, y, z), |g| (g.x, g.y, g.z));
+            if state.registry.is_solid(server_block(state, generator, query)) {
+                return true;
+            }
         }
+        std::mem::swap(&mut held, &mut cells);
+        held_n = n;
     }
     false
 }
@@ -2092,13 +2206,17 @@ fn move_cap(h: &PlayerHandle, max_speed: f64) -> f64 {
     }
 }
 
-/// Blocks the client may have covered since `last_move`. `reported` is a cap
-/// input, not a grant: a cruise declaration does nothing until the velocity
-/// the client reports (bounded by that declaration) justifies the hop.
+/// Distance this move may cover: the banked budget, at most one burst, plus what `elapsed`
+/// refills at the envelope speed. That speed is the reported one (or the last accepted one)
+/// grown by gravity over the gap, capped by [`move_cap`]. `reported` is a cap input, not a
+/// grant: a cruise declaration does nothing until the velocity the client reports (bounded by
+/// that declaration) justifies the hop. The burst is [`MOVE_FLOOR`], or [`MOVE_SLACK_SECS`] at
+/// that speed when larger, so over any window the total stays within one burst plus the
+/// speed times the window, however the client splits it.
 fn move_allowance(h: &PlayerHandle, reported: Vec3, elapsed: f64, max_speed: f64) -> f64 {
     let cap = move_cap(h, max_speed);
     let speed = cap.min(speed_of(reported).max(speed_of(h.velocity)) + GRAVITY_BOUND * elapsed);
-    MOVE_FLOOR.max(speed * (elapsed + MOVE_SLACK_SECS))
+    h.budget.min(MOVE_FLOOR.max(speed * MOVE_SLACK_SECS)) + speed * elapsed
 }
 
 fn clamp_velocity(v: Vec3, cap: f64) -> Vec3 {
@@ -2142,7 +2260,7 @@ fn on_teleport(shared: &Arc<Mutex<State>>, ctx: &Ctx, id: u32, pos: DVec3) {
         let Some(h) = state.players.get(&id) else { return };
         let allowed = match ctx.teleport {
             TeleportPolicy::All => true,
-            TeleportPolicy::Ops => is_operator(ctx, &h.name),
+            TeleportPolicy::Ops => is_operator(ctx, h),
             TeleportPolicy::Off => false,
         };
         if outside_world(pos) || !allowed {
@@ -2159,8 +2277,11 @@ fn on_teleport(shared: &Arc<Mutex<State>>, ctx: &Ctx, id: u32, pos: DVec3) {
             commit_pose(&mut state, id, pos, None, &mut sends);
             // Echo so a client with an in-flight `/tp` can tell accept from a
             // stale movement snap-back: the last Position is the committed pose.
-            if let Some(h) = state.players.get(&id) {
+            // The destination's cells are the held ones the next swept move starts from.
+            if let Some(h) = state.players.get_mut(&id) {
                 h.correct_position(id, &mut sends);
+                let (stance, up) = (h.stance, h.up);
+                remember_occupied(h, pos, stance, up);
             }
         }
         queue(&state, sends)
@@ -2321,7 +2442,9 @@ fn take_novel_spec(state: &mut State, id: u32, spec: &str) -> Option<BlockId> {
 /// revision, installed [`ServerMod::validate_edit`] hooks, the revision again,
 /// then — only if it is still the winner — interning a novel spec under the
 /// per-client quota and the world's reserve. A stale novel spec never enters
-/// the registry. When two players race one cell, the loser rolls back.
+/// the registry. When two players race one cell, the loser rolls back. An edit that
+/// puts back the generated block is a [`Cell::natural`] entry: it keeps the revision
+/// but stays out of the world file, so no-op edits cannot grow it.
 ///
 /// A hook [`Verdict::Deny`] uses this same reject path (no ledger write, one
 /// `EditAck { accepted: false }`, no broadcast), so the client's
@@ -2329,13 +2452,14 @@ fn take_novel_spec(state: &mut State, id: u32, spec: &str) -> Option<BlockId> {
 /// on the cell — identical to a lost race.
 ///
 /// Hook bodies run **outside** the [`State`] lock: facts are collected under
-/// it, the lock is dropped, then the table is called. With no hooks installed
-/// the lock is never dropped, matching the pre-seam path.
+/// it, the lock is dropped, then the table is called. The generated block, when
+/// the terrain cache does not hold it, is read the same way; the revision is
+/// checked again after either.
 #[allow(clippy::too_many_arguments)] // edit validation takes each protocol field separately
 fn on_edit(
     shared: &Arc<Mutex<State>>,
     hooks: Option<&Mutex<hooks::Table>>,
-    atlases: &[Arc<crate::space::atlas::Atlas>],
+    generator: &crate::world::terrain::Generator,
     id: u32,
     req: u32,
     x: i32,
@@ -2362,7 +2486,7 @@ fn on_edit(
     // playable border are still reach-checked (a player AT the border can
     // mine the slack column) but a forged i32::MAX coord is out of reach.
     // A round world's storage cell is judged where its chart embeds it.
-    let target = crate::space::atlas::embed_cell(atlases, (x, y, z))
+    let target = crate::space::atlas::embed_cell(generator.atlases(), (x, y, z))
         .unwrap_or(DVec3::new(x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5));
     if spec.len() > MAX_SPEC || h.pos.distance(target) > EDIT_REACH {
         return reject(&state, ack_to.as_ref());
@@ -2376,6 +2500,21 @@ fn on_edit(
     if expect != current {
         return reject(&state, ack_to.as_ref());
     }
+    // The generated block says whether the edit is natural. A generator read can take
+    // a while, so a cache miss reads it with the lock released, as the hooks do below.
+    let generated = match state.terrain.peek((x, y, z)) {
+        Some(block) => block,
+        None => {
+            drop(state);
+            let block = generator.voxel_at(x, y, z);
+            state = shared.lock_recover();
+            if !state.players.contains_key(&id) {
+                return;
+            }
+            state.terrain.store((x, y, z), block);
+            block
+        }
+    };
     if let (Some(hooks), Some(name)) = (hooks, name) {
         let intent = EditIntent {
             player: id,
@@ -2410,7 +2549,8 @@ fn on_edit(
     let Some(spec) = state.intern(&canonical) else {
         return reject(&state, ack_to.as_ref()); // pool at cap: refuse new content
     };
-    if let Some(old) = state.edits.insert((x, y, z), Cell { block, spec: spec.clone(), rev }) {
+    let natural = block == generated;
+    if let Some(old) = state.edits.insert((x, y, z), Cell { block, spec: spec.clone(), rev, natural }) {
         state.release(old.spec);
     }
     // Placed or removed: the cell's contacts wake.
@@ -2496,7 +2636,7 @@ fn on_tool_use(
         return reply(&state, false, current, unchanged);
     };
     let rev = current + 1;
-    if let Some(old) = state.edits.insert(pos, Cell { block: new_cell, spec: spec.clone(), rev }) {
+    if let Some(old) = state.edits.insert(pos, Cell { block: new_cell, spec: spec.clone(), rev, natural: false }) {
         state.release(old.spec);
     }
     state.reactions.wake_cell(pos);
@@ -2565,6 +2705,34 @@ fn on_chat(
     drop(wake);
 }
 
+/// The secret of a `/op <secret>` chat line. Such a line is never relayed, logged, or shown to hooks.
+fn op_secret(text: &str) -> Option<Arc<str>> {
+    let text = clean_chat(text);
+    let rest = text.strip_prefix("/op")?;
+    (rest.is_empty() || rest.starts_with(char::is_whitespace)).then(|| rest.trim().into())
+}
+
+/// An operator listed with a secret proves it. Either way only the sender hears the answer.
+fn on_op_login(shared: &Arc<Mutex<State>>, ctx: &Ctx, id: u32, secret: &str) {
+    let mut sends = Vec::new();
+    let wake = {
+        let mut state = shared.lock_recover();
+        let Some(h) = state.players.get_mut(&id) else { return };
+        let proved = !secret.is_empty()
+            && ctx.op_secrets.iter().any(|(name, want)| name.eq_ignore_ascii_case(&h.name) && want == secret);
+        h.op |= proved;
+        let (reply, log) = if proved {
+            ("you are now an operator", "is now an operator")
+        } else {
+            ("operator secret refused", "sent a wrong operator secret")
+        };
+        println!("[op] {} (#{id}) {log}", h.name);
+        tell(h, id, reply, &mut sends);
+        queue(&state, sends)
+    };
+    drop(wake);
+}
+
 /// Channel traffic is loss-tolerant: `try_send` and DROP on a full/closed queue,
 /// never counted toward the slow-client kick ([`kick_slow`]/[`OUT_CAPACITY`]).
 /// Relayed only to the sender's visible interest set. The sender id is stamped
@@ -2576,15 +2744,27 @@ fn on_mod_data(
     seq: u32,
     bytes: protocol::ModBytes,
 ) {
-    let frame: Arc<[u8]> =
-        ServerMessage::PeerModData { channel, sender: id, seq, bytes }.encode().into();
-    let state = shared.lock_recover();
-    let Some(speaker) = state.players.get(&id) else { return };
-    for &pid in &speaker.visible {
-        if let Some(other) = state.players.get(&pid) && other.ready {
-            let _ = other.out.try_send(frame.clone());
+    relay(shared, id, ServerMessage::PeerModData { channel, sender: id, seq, bytes }.encode().into());
+}
+
+/// Loss-tolerant: `frame` reaches `from`'s visible, ready peers, and a full queue drops
+/// it without a kick. The writers wake after the lock is released.
+fn relay(shared: &Arc<Mutex<State>>, from: u32, frame: Arc<[u8]>) {
+    let wake = {
+        let state = shared.lock_recover();
+        let Some(speaker) = state.players.get(&from) else { return };
+        let mut wake = Vec::with_capacity(speaker.visible.len());
+        for &pid in &speaker.visible {
+            if let Some(other) = state.players.get(&pid)
+                && other.ready
+                && other.out.push(Arc::clone(&frame)).is_ok()
+            {
+                wake.push(other.out.writer.clone());
+            }
         }
-    }
+        Wake(wake)
+    };
+    drop(wake);
 }
 
 /// Anchors the shared clock so joiners inherit the CURRENT time. A non-finite
@@ -2599,7 +2779,7 @@ fn on_set_time(shared: &Arc<Mutex<State>>, ctx: &Ctx, id: u32, day: f32) {
     {
         let mut state = shared.lock_recover();
         let Some(h) = state.players.get(&id) else { return };
-        if !is_operator(ctx, &h.name) {
+        if !is_operator(ctx, h) {
             tell(h, id, "only an operator can set the time", &mut sends);
             let wake = queue(&state, sends);
             drop(state);
@@ -2683,56 +2863,54 @@ fn kick_slow(state: &State, ids: &[u32]) {
     }
 }
 
-/// Queue `frame` for a player who is not ready yet. False when an essential
-/// frame still does not fit after cosmetic frames have been dropped.
+/// Queue `frame` for a player who is not ready yet. False when an essential frame
+/// does not fit after cosmetic frames have been dropped, when an essential frame has
+/// waited past [`BACKLOG_AGE`], or when the player is already kicked.
 fn enqueue_backlog(h: &mut PlayerHandle, frame: Arc<[u8]>, now: Instant) -> bool {
-    trim_aged(h, now);
-    let swing = protocol::is_peer_swing(&frame);
+    if h.kicked.load(Ordering::Relaxed) || !trim_aged(h, now) {
+        return false;
+    }
+    let cosmetic = protocol::is_cosmetic(&frame);
     while h.backlog_bytes + frame.len() > BACKLOG_BYTES {
-        if !drop_oldest_swing(h) {
-            if swing {
-                return true;
-            }
-            return false;
+        if !drop_oldest_cosmetic(h) {
+            return cosmetic;
         }
     }
     h.backlog_bytes += frame.len();
-    h.backlog.push(Queued { at: now, frame });
+    h.backlog.push_back(Queued { at: now, frame });
     true
 }
 
-fn trim_aged(h: &mut PlayerHandle, now: Instant) {
-    let mut index = 0;
-    while index < h.backlog.len() {
-        if now.saturating_duration_since(h.backlog[index].at) >= BACKLOG_AGE {
-            h.backlog_bytes = h.backlog_bytes.saturating_sub(h.backlog[index].frame.len());
-            h.backlog.remove(index);
-        } else {
-            index += 1;
+/// Drop frames older than [`BACKLOG_AGE`]. The backlog is in time order, so only the front
+/// is read. False when an aged frame is essential: dropping it would desync the joiner.
+fn trim_aged(h: &mut PlayerHandle, now: Instant) -> bool {
+    while let Some(front) = h.backlog.front()
+        && now.saturating_duration_since(front.at) >= BACKLOG_AGE
+    {
+        if !protocol::is_cosmetic(&front.frame) {
+            return false;
         }
+        let len = front.frame.len();
+        h.backlog_bytes = h.backlog_bytes.saturating_sub(len);
+        h.backlog.pop_front();
     }
+    true
 }
 
-fn drop_oldest_swing(h: &mut PlayerHandle) -> bool {
-    let Some(index) = h.backlog.iter().position(|queued| protocol::is_peer_swing(&queued.frame)) else {
+fn drop_oldest_cosmetic(h: &mut PlayerHandle) -> bool {
+    let Some(index) = h.backlog.iter().position(|queued| protocol::is_cosmetic(&queued.frame)) else {
         return false;
     };
-    h.backlog_bytes = h.backlog_bytes.saturating_sub(h.backlog[index].frame.len());
-    h.backlog.remove(index);
+    if let Some(queued) = h.backlog.remove(index) {
+        h.backlog_bytes = h.backlog_bytes.saturating_sub(queued.frame.len());
+    }
     true
 }
 
 /// Swing relay: the swinger's visible set, same as voice. A full queue drops
 /// the frame; a swing is cosmetic and never a kick.
 fn relay_swing(shared: &Arc<Mutex<State>>, id: u32) {
-    let frame: Arc<[u8]> = ServerMessage::PeerSwing { id }.encode().into();
-    let state = shared.lock_recover();
-    let Some(swinger) = state.players.get(&id) else { return };
-    for &pid in &swinger.visible {
-        if let Some(other) = state.players.get(&pid) && other.ready {
-            let _ = other.out.try_send(Arc::clone(&frame));
-        }
-    }
+    relay(shared, id, ServerMessage::PeerSwing { id }.encode().into());
 }
 
 /// Welcome, the edit overlay, [`ServerMessage::SnapshotEnd`], the clock, and
@@ -2833,11 +3011,11 @@ fn reject(rt: &Runtime, send: &mut SendStream, conn: &quinn::Connection, reason:
         let _ = send.finish();
         let _ = tokio::time::timeout(REJECT_DRAIN, conn.closed()).await;
     });
-    println!("[x] rejected a connection: {reason}");
+    println!("[x] rejected a connection: {}", console_text(reason));
 }
 
 fn deny_mods(rt: &Runtime, send: &mut SendStream, conn: &quinn::Connection, ids: Vec<Arc<str>>) {
-    let listed = ids.iter().map(|id| id.as_ref()).collect::<Vec<_>>().join(", ");
+    let listed = ids.iter().map(|id| console_text(id)).collect::<Vec<_>>().join(", ");
     rt.block_on(async {
         let _ = protocol::write_frame_async(send, &ServerMessage::ModsDenied { ids }.encode()).await;
         let _ = send.finish();
@@ -2884,6 +3062,25 @@ fn clean_name(raw: &str) -> Arc<str> {
 
 fn clean_chat(raw: &str) -> Arc<str> {
     raw.chars().filter(|c| !c.is_control()).take(MAX_CHAT).collect::<String>().trim().into()
+}
+
+/// Peer text for the server console with control characters escaped, so a peer
+/// cannot drive the operator's terminal.
+fn console_text(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for c in raw.chars() {
+        if c.is_control() {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The server's own chat name: any name whose letters and digits alone spell "server".
+fn reserved_name(name: &str) -> bool {
+    name.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).eq("server".chars())
 }
 
 #[cfg(test)]
@@ -2946,13 +3143,15 @@ mod tests {
             up: Face::PosY,
             stance: Stance::Standing,
             last_move: Instant::now() - Duration::from_secs(10),
+            budget: MOVE_FLOOR,
+            op: false,
             visible: HashSet::default(),
             body: PoseBody::new(0.0, 0.0, DQuat::IDENTITY, Vec3::ZERO, Face::PosY, Stance::Standing),
             moved: 0,
             out: Outbox { tx: Some(tx), writer: Arc::default() },
             kick,
             ready: true,
-            backlog: Vec::new(),
+            backlog: VecDeque::new(),
             backlog_bytes: 0,
             kicked: Arc::new(AtomicBool::new(false)),
             occupied: Vec::new(),
@@ -2961,6 +3160,13 @@ mod tests {
             novel: 0,
             announced: HashSet::default(),
         }
+    }
+
+    /// A world with no charts, so an edit's reach is judged at the cell itself.
+    fn chartless() -> &'static crate::world::terrain::Generator {
+        use std::sync::OnceLock;
+        static FLAT: OnceLock<crate::world::terrain::Generator> = OnceLock::new();
+        FLAT.get_or_init(|| Arc::new(crate::world::generation::FlatTerrain::new(&mut BlockRegistry::with_builtins(), 1)))
     }
 
     /// Noclip is open, so movement-envelope tests do not build a collision world
@@ -3088,6 +3294,7 @@ mod tests {
             generator: test_generator(),
             hooks: None,
             ops: Vec::new(),
+            op_secrets: Vec::new(),
             mods_allow: Vec::new(),
             mods_deny: Vec::new(),
             store: None,
@@ -3130,7 +3337,7 @@ mod tests {
         let (a, e) = crate::sim::reactions::destructive_pair(&mut state.registry);
         let (sa, se) = (state.registry.spec(a), state.registry.spec(e));
         let spec = state.intern(&sa).unwrap();
-        state.edits.insert(cell, Cell { block: a, spec, rev: 1 });
+        state.edits.insert(cell, Cell { block: a, spec, rev: 1, natural: false });
         (sa, se)
     }
 
@@ -3192,8 +3399,8 @@ mod tests {
         let mut state = test_state(players);
         let rock = state.registry.lookup_spec(&rock_spec()).or_else(|| state.registry.parse_spec(&rock_spec())).unwrap();
         let spec = state.intern(&state.registry.spec(rock)).unwrap();
-        state.edits.insert((1, 2, 3), Cell { block: rock, spec: spec.clone(), rev: 2 });
-        state.edits.insert((4, 5, 6), Cell { block: rock, spec, rev: 1 });
+        state.edits.insert((1, 2, 3), Cell { block: rock, spec: spec.clone(), rev: 2, natural: false });
+        state.edits.insert((4, 5, 6), Cell { block: rock, spec, rev: 1, natural: false });
         let muts = [
             Mutation { pos: (1, 2, 3), from: AIR, to: rock },
             Mutation { pos: (4, 5, 6), from: AIR, to: rock },
@@ -3216,12 +3423,12 @@ mod tests {
         players.insert(1u32, test_player(DVec3::new(8.5, 20.0, 8.5), out, test_kick()));
         let shared = Arc::new(Mutex::new(test_state(players)));
         let rock = rock_spec();
-        on_edit(&shared, None, &[], 1, 1, 8, 20, 8, 0, &rock);
+        on_edit(&shared, None, chartless(), 1, 1, 8, 20, 8, 0, &rock);
         {
             let state = shared.lock_recover();
             assert_eq!(state.reactions.pending(), 6, "a placement wakes the cell's six contacts");
         }
-        on_edit(&shared, None, &[], 1, 2, 8, 20, 8, 1, "air");
+        on_edit(&shared, None, chartless(), 1, 2, 8, 20, 8, 1, "air");
         let state = shared.lock_recover();
         assert_eq!(state.reactions.pending(), 6, "a removal wakes the same six (deduplicated)");
     }
@@ -3273,8 +3480,8 @@ mod tests {
         players.insert(1u32, test_player(DVec3::new(8.5, 20.0, 8.5), out, test_kick()));
         let shared = Arc::new(Mutex::new(test_state(players)));
 
-        on_edit(&shared, None, &[], 1, 1, 500, 20, 500, 0, "air"); // far away: rejected
-        on_edit(&shared, None, &[], 1, 2, 8, 20, 8, 0, "air"); // in reach: recorded
+        on_edit(&shared, None, chartless(), 1, 1, 500, 20, 500, 0, "air"); // far away: rejected
+        on_edit(&shared, None, chartless(), 1, 2, 8, 20, 8, 0, "air"); // in reach: recorded
 
         let state = shared.lock_recover();
         assert!(state.edits.contains_key(&(8, 20, 8)), "in-reach edit recorded");
@@ -3330,7 +3537,7 @@ mod tests {
             other => panic!("expected a Position snap-back, got {other:?}"),
         }
         // ...so the follow-up edit at the forged position stays out of reach.
-        on_edit(&shared, None, &[], 1, 7, 4000, 20, 4000, 0, "air");
+        on_edit(&shared, None, chartless(), 1, 7, 4000, 20, 4000, 0, "air");
         assert!(!shared.lock_recover().edits.contains_key(&(4000, 20, 4000)));
 
         // Outside the world border: rejected no matter how slow.
@@ -3382,21 +3589,21 @@ mod tests {
         };
 
         // First break wins at revision 1.
-        on_edit(&shared, None, &[], 1, 10, 8, 20, 8, 0, "air");
+        on_edit(&shared, None, chartless(), 1, 10, 8, 20, 8, 0, "air");
         assert_eq!(ack(&rx), (10, true, 1));
 
         // The racing loser expected revision 0 and is rejected — exactly one
         // reward, and its ack is the rollback signal.
-        on_edit(&shared, None, &[], 1, 11, 8, 20, 8, 0, "air");
+        on_edit(&shared, None, chartless(), 1, 11, 8, 20, 8, 0, "air");
         assert_eq!(ack(&rx), (11, false, 1));
 
         // Building on the current revision succeeds.
         let rock = rock_spec();
-        on_edit(&shared, None, &[], 1, 12, 8, 20, 8, 1, &rock);
+        on_edit(&shared, None, chartless(), 1, 12, 8, 20, 8, 1, &rock);
         assert_eq!(ack(&rx), (12, true, 2));
 
         // Junk specs are rejected before touching the overlay or the pool.
-        on_edit(&shared, None, &[], 1, 13, 8, 20, 8, 2, "banana:zzz");
+        on_edit(&shared, None, chartless(), 1, 13, 8, 20, 8, 2, "banana:zzz");
         assert_eq!(ack(&rx), (13, false, 2));
         assert_eq!(shared.lock_recover().edits[&(8, 20, 8)].spec.as_ref(), rock.as_str());
     }
@@ -3412,8 +3619,8 @@ mod tests {
 
         // The same spec interned twice: one canonical entry.
         let rock = rock_spec();
-        on_edit(&shared, None, &[], 1, 1, 8, 20, 8, 0, &rock);
-        on_edit(&shared, None, &[], 1, 2, 8, 21, 8, 0, &rock);
+        on_edit(&shared, None, chartless(), 1, 1, 8, 20, 8, 0, &rock);
+        on_edit(&shared, None, chartless(), 1, 2, 8, 21, 8, 0, &rock);
         {
             let state = shared.lock_recover();
             assert_eq!(state.spec_pool.len(), 1, "equivalent spellings share one entry");
@@ -3424,8 +3631,8 @@ mod tests {
         }
 
         // Overwriting both cells strands the old spec: it must leave the pool.
-        on_edit(&shared, None, &[], 1, 3, 8, 20, 8, 1, "air");
-        on_edit(&shared, None, &[], 1, 4, 8, 21, 8, 1, "air");
+        on_edit(&shared, None, chartless(), 1, 3, 8, 20, 8, 1, "air");
+        on_edit(&shared, None, chartless(), 1, 4, 8, 21, 8, 1, "air");
         {
             let state = shared.lock_recover();
             assert_eq!(state.spec_pool.len(), 1, "only \"air\" remains interned");
@@ -4033,18 +4240,18 @@ mod tests {
         let mut players = HashMap::new();
         players.insert(1u32, test_player(at_reach, out, test_kick()));
         let shared = Arc::new(Mutex::new(test_state(players)));
-        on_edit(&shared, None, &[], 1, 1, 8, 20, 8, 0, "air");
+        on_edit(&shared, None, chartless(), 1, 1, 8, 20, 8, 0, "air");
         assert!(shared.lock_recover().edits.contains_key(&(8, 20, 8)), "exact REACH must land");
 
         let just_out = DVec3::new(center.x + EDIT_REACH * 1.001, center.y, center.z);
         shared.lock_recover().players.get_mut(&1).unwrap().pos = just_out;
-        on_edit(&shared, None, &[], 1, 2, 8, 21, 8, 0, "air");
+        on_edit(&shared, None, chartless(), 1, 2, 8, 21, 8, 0, "air");
         assert!(!shared.lock_recover().edits.contains_key(&(8, 21, 8)));
 
-        on_edit(&shared, None, &[], 1, 3, i32::MIN, i32::MIN, i32::MIN, 0, "air");
-        on_edit(&shared, None, &[], 1, 4, i32::MAX, i32::MAX, i32::MAX, 0, "air");
+        on_edit(&shared, None, chartless(), 1, 3, i32::MIN, i32::MIN, i32::MIN, 0, "air");
+        on_edit(&shared, None, chartless(), 1, 4, i32::MAX, i32::MAX, i32::MAX, 0, "air");
         let far = crate::math::WORLD_BORDER as i32 + 64;
-        on_edit(&shared, None, &[], 1, 5, far, 20, far, 0, "air");
+        on_edit(&shared, None, chartless(), 1, 5, far, 20, far, 0, "air");
         assert!(!shared.lock_recover().edits.contains_key(&(far, 20, far)));
         let _ = rx;
     }
@@ -4172,7 +4379,7 @@ mod tests {
         rec.deny_edit = true;
         let table = Mutex::new(hooks::Table::new(vec![Box::new(rec)]));
 
-        on_edit(&shared, Some(&table), &[], 1, 42, 8, 20, 8, 0, "air");
+        on_edit(&shared, Some(&table), chartless(), 1, 42, 8, 20, 8, 0, "air");
 
         let to_editor = drain_msgs(&rx1);
         assert_eq!(to_editor.len(), 1, "exactly one ack");
@@ -4199,7 +4406,7 @@ mod tests {
         rec.panic_edit = true;
         let table = Mutex::new(hooks::Table::new(vec![Box::new(rec)]));
 
-        on_edit(&shared, Some(&table), &[], 1, 1, 8, 20, 8, 0, "air");
+        on_edit(&shared, Some(&table), chartless(), 1, 1, 8, 20, 8, 0, "air");
 
         match &drain_msgs(&rx1)[..] {
             [ServerMessage::EditAck { req, accepted, rev }] => {
@@ -4319,6 +4526,7 @@ mod tests {
                         block,
                         spec: spec.clone(),
                         rev: (m.pos.0 as u32) + 1,
+                        natural: false,
                     },
                 );
             }
@@ -4491,7 +4699,7 @@ mod tests {
         let mut players = HashMap::new();
         players.insert(1u32, test_player(DVec3::new(8.5, 20.0, 8.5), out, test_kick()));
         let shared = Arc::new(Mutex::new(test_state(players)));
-        on_edit(&shared, None, &[], 1, 1, 8, 20, 8, 0, &spec);
+        on_edit(&shared, None, chartless(), 1, 1, 8, 20, 8, 0, &spec);
         match ServerMessage::decode(&rx.try_recv().unwrap()) {
             Some(ServerMessage::EditAck { accepted: true, .. }) => {}
             other => panic!("a full configuration must be accepted, got {other:?}"),
@@ -4542,16 +4750,16 @@ mod tests {
         players.insert(1u32, test_player(DVec3::new(8.5, 20.0, 8.5), out, test_kick()));
         let shared = Arc::new(Mutex::new(test_state(players)));
         let rock = rock_spec();
-        on_edit(&shared, None, &[], 1, 1, 8, 20, 8, 0, &rock);
-        on_edit(&shared, None, &[], 1, 2, 8, 21, 8, 0, &rock);
+        on_edit(&shared, None, chartless(), 1, 1, 8, 20, 8, 0, &rock);
+        on_edit(&shared, None, chartless(), 1, 2, 8, 21, 8, 0, &rock);
         let extra = {
             let state = shared.lock_recover();
             assert_eq!(state.spec_pool.get(rock.as_str()).copied(), Some(2));
             state.edits[&(8, 21, 8)].spec.clone()
         };
-        on_edit(&shared, None, &[], 1, 3, 8, 20, 8, 1, "air");
+        on_edit(&shared, None, chartless(), 1, 3, 8, 20, 8, 1, "air");
         assert_eq!(shared.lock_recover().spec_pool.get(rock.as_str()).copied(), Some(1));
-        on_edit(&shared, None, &[], 1, 4, 8, 21, 8, 1, "air");
+        on_edit(&shared, None, chartless(), 1, 4, 8, 21, 8, 1, "air");
         assert!(!shared.lock_recover().spec_pool.contains_key(rock.as_str()), "zero cells frees the entry");
         drop(extra);
     }
@@ -4573,9 +4781,9 @@ mod tests {
         players.insert(1u32, test_player(DVec3::new(8.5, 20.0, 8.5), out, test_kick()));
         let shared = Arc::new(Mutex::new(test_state(players)));
         let before = shared.lock_recover().registry.block_count();
-        on_edit(&shared, None, &[], 1, 1, 8, 20, 8, 0, &numbered_spec(1));
+        on_edit(&shared, None, chartless(), 1, 1, 8, 20, 8, 0, &numbered_spec(1));
         assert_eq!(shared.lock_recover().registry.block_count(), before + 1);
-        on_edit(&shared, None, &[], 1, 2, 8, 20, 8, 0, &numbered_spec(2));
+        on_edit(&shared, None, chartless(), 1, 2, 8, 20, 8, 0, &numbered_spec(2));
         assert_eq!(shared.lock_recover().registry.block_count(), before + 1, "stale expect must not intern");
         assert_eq!(shared.lock_recover().players[&1].novel, 1);
         let _ = rx;
@@ -4587,23 +4795,24 @@ mod tests {
         let before = shared.lock_recover().registry.block_count();
         let mut expect = 0u32;
         for i in 0..NOVEL_SPEC_QUOTA {
-            on_edit(&shared, None, &[], 1, i + 1, 8, 20, 8, expect, &numbered_spec(i as u8));
+            on_edit(&shared, None, chartless(), 1, i + 1, 8, 20, 8, expect, &numbered_spec(i as u8));
             expect += 1;
         }
         assert_eq!(shared.lock_recover().registry.block_count(), before + NOVEL_SPEC_QUOTA as usize);
         assert_eq!(shared.lock_recover().players[&1].novel, NOVEL_SPEC_QUOTA);
         let count = shared.lock_recover().registry.block_count();
-        on_edit(&shared, None, &[], 1, 1000, 8, 20, 8, expect, &numbered_spec(250));
+        on_edit(&shared, None, chartless(), 1, 1000, 8, 20, 8, expect, &numbered_spec(250));
         assert_eq!(shared.lock_recover().registry.block_count(), count, "past the quota: no intern");
-        on_edit(&shared, None, &[], 1, 1001, 8, 20, 8, expect, "air");
+        on_edit(&shared, None, chartless(), 1, 1001, 8, 20, 8, expect, "air");
         assert!(shared.lock_recover().edits[&(8, 20, 8)].spec.as_ref() == "air");
         assert_eq!(shared.lock_recover().players[&1].novel, NOVEL_SPEC_QUOTA, "air is not novel");
         let _ = rx;
     }
 
-    fn stamp_now(shared: &Arc<Mutex<State>>, id: u32) {
+    /// Anchor the envelope one realistic move gap ago: the next move's budget refills for that long.
+    fn stamp_gap(shared: &Arc<Mutex<State>>, id: u32) {
         if let Some(h) = shared.lock_recover().players.get_mut(&id) {
-            h.last_move = Instant::now();
+            h.last_move = Instant::now() - Duration::from_millis(100);
         }
     }
 
@@ -4614,8 +4823,7 @@ mod tests {
         let mut players = HashMap::new();
         players.insert(1u32, test_player(start, out, test_kick()));
         let shared = Arc::new(Mutex::new(test_state(players)));
-        stamp_now(&shared, 1);
-        shared.lock_recover().players.get_mut(&1).unwrap().last_move = Instant::now() - Duration::from_millis(100);
+        stamp_gap(&shared, 1);
 
         let fall = DVec3::new(start.x, start.y - 2_000.0, start.z);
         on_move(
@@ -4635,15 +4843,14 @@ mod tests {
 
         // The fall left a stored speed. Clear it so the next drop is judged on a zero report.
         shared.lock_recover().players.get_mut(&1).unwrap().velocity = Vec3::ZERO;
-        stamp_now(&shared, 1);
+        stamp_gap(&shared, 1);
         let forged = DVec3::new(fall.x, fall.y - 2_000.0, fall.z);
         on_move(&shared, lax_ctx(), 1, forged, 0.0, 0.0, DQuat::IDENTITY, Vec3::ZERO, Face::PosY, Stance::Standing);
         assert_eq!(shared.lock_recover().players[&1].pos, fall, "the same drop with no speed is a teleport");
 
-        stamp_now(&shared, 1);
+        stamp_gap(&shared, 1);
         let flown = DVec3::new(start.x + 1_000.0, start.y, start.z);
-        // Reset onto a fresh anchor at `fall` then fly. The previous reject did not move the anchor
-        // only if stamp_now ran; it did. Position is still `fall`.
+        // Fly from `fall`, where the refused drop left the player.
         let speed = crate::player::MAX_SPEED as f32;
         on_move(
             &shared,
@@ -4660,7 +4867,7 @@ mod tests {
         assert_eq!(shared.lock_recover().players[&1].pos.x, fall.x + 1_000.0, "fast flight is not snapped");
         let _ = flown;
 
-        stamp_now(&shared, 1);
+        stamp_gap(&shared, 1);
         let too_far = DVec3::new(fall.x + crate::player::MAX_SPEED * 2.0, fall.y, fall.z);
         on_move(
             &shared,
@@ -4680,7 +4887,7 @@ mod tests {
         );
 
         on_cruise(&shared, 1, crate::player::CRUISE_MAX);
-        stamp_now(&shared, 1);
+        stamp_gap(&shared, 1);
         let cruise_to = DVec3::new(fall.x + crate::player::MAX_SPEED * 2.0, fall.y, fall.z);
         on_move(
             &shared,
@@ -4915,7 +5122,8 @@ mod tests {
         }).unwrap();
         let mut conn = Connection::connect("127.0.0.1", handle.addr().port(), "ada", "").unwrap();
         let s = conn.spawn();
-        let (x, y, z) = (crate::math::block_coord(s.x), crate::math::block_coord(s.y), crate::math::block_coord(s.z));
+        // The grass under the spawn: breaking it changes the world, so the file keeps it.
+        let (x, y, z) = (crate::math::block_coord(s.x), crate::world::generation::FLAT_HEIGHT - 1, crate::math::block_coord(s.z));
         let req = conn.send_edit(x, y, z, "air".into()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(3);
         let mut accepted = false;
@@ -5238,7 +5446,7 @@ mod tests {
         let pong: Arc<[u8]> = ServerMessage::Pong { nonce: 1 }.encode().into();
         assert!(enqueue_backlog(&mut player, pong, now));
         assert_eq!(player.backlog.len(), 1, "a frame older than the age bound is dropped");
-        assert!(!protocol::is_peer_swing(&player.backlog[0].frame));
+        assert!(!protocol::is_cosmetic(&player.backlog[0].frame));
         assert!(!player.kicked.load(Ordering::Relaxed));
     }
 
@@ -5329,7 +5537,7 @@ mod tests {
         relay_swing(&shared, 1);
         assert!(rx_a.try_recv().is_err(), "the swinger does not hear their own swing");
         let frame = rx_b.try_recv().expect("a player who can see the swinger hears it");
-        assert!(protocol::is_peer_swing(&frame));
+        assert!(matches!(ServerMessage::decode(&frame), Some(ServerMessage::PeerSwing { id: 1 })));
         assert!(rx_c.try_recv().is_err(), "a peer who is not ready is not in the audience");
     }
 
@@ -5416,6 +5624,7 @@ mod tests {
             generator,
             hooks: None,
             ops: ops.iter().map(|name| (*name).to_ascii_lowercase()).collect(),
+            op_secrets: Vec::new(),
             mods_allow: Vec::new(),
             mods_deny: Vec::new(),
             store: None,
@@ -5489,7 +5698,7 @@ mod tests {
             assert!(state.registry.is_solid(id));
             let canonical = state.registry.spec(id);
             let shared_spec = state.intern(&canonical).unwrap();
-            state.edits.insert(fresh, Cell { block: id, spec: shared_spec, rev: 1 });
+            state.edits.insert(fresh, Cell { block: id, spec: shared_spec, rev: 1, natural: false });
         }
         step(&shared, &ctx, into);
         assert_eq!(shared.lock_recover().players[&1].pos, start, "a solid edit the body newly enters snaps back");
@@ -5545,12 +5754,12 @@ mod tests {
             // Feet on the inside column's top, the body reaching past the box edge.
             let pos = DVec3::new(f64::from(edge) + 0.9, f64::from(inside) + eye, f64::from(z) + 0.5);
             assert!(
-                !body_blocked(&state, &generator, &seams, pos, Stance::Standing, Face::PosY, &[]),
+                !body_blocked(&state, &generator, &seams, pos, pos, Stance::Standing, Face::PosY, &[]),
                 "standing across the edge at z {z} (inside top {inside}, glued top {outside}) was blocked"
             );
             let sunk = pos - DVec3::Y * 1.5;
             assert!(
-                body_blocked(&state, &generator, &seams, sunk, Stance::Standing, Face::PosY, &[]),
+                body_blocked(&state, &generator, &seams, sunk, sunk, Stance::Standing, Face::PosY, &[]),
                 "a body sunk into the edge at z {z} was clear"
             );
             checked += 1;
@@ -5582,7 +5791,7 @@ mod tests {
         };
         let mut pos = DVec3::new(8.5, 80.0, 8.5);
         for _ in 0..40 {
-            if !body_blocked(&state, &generator, &seams, pos, Stance::Standing, Face::PosY, &[]) {
+            if !body_blocked(&state, &generator, &seams, pos, pos, Stance::Standing, Face::PosY, &[]) {
                 break;
             }
             pos.y += 16.0;
@@ -5593,7 +5802,7 @@ mod tests {
         occupied.extend_from_slice(&cells[..n]);
         for _ in 0..8 {
             pos.x += 0.5;
-            let _ = body_blocked(&state, &generator, &seams, pos, Stance::Standing, Face::PosY, &occupied);
+            let _ = body_blocked(&state, &generator, &seams, pos, pos, Stance::Standing, Face::PosY, &occupied);
             let n = fill_body_cells(pos, Stance::Standing, Face::PosY, &mut cells).expect("body fits");
             occupied.clear();
             occupied.extend_from_slice(&cells[..n]);
@@ -5606,6 +5815,7 @@ mod tests {
                 &state,
                 &generator,
                 &seams,
+                pos,
                 next,
                 Stance::Standing,
                 Face::PosY,
@@ -5627,6 +5837,7 @@ mod tests {
                 &generator,
                 &seams,
                 pos,
+                pos,
                 Stance::Standing,
                 Face::PosY,
                 &occupied,
@@ -5636,6 +5847,29 @@ mod tests {
         let stand_us = stand.elapsed().as_secs_f64() * 1.0e6 / f64::from(steps);
         eprintln!("noclip standing: {stand_us:.2} µs/move");
         assert!(us < 1000.0, "newly entered cells took {us:.2} µs/move");
+        // Long sweeps, straight up from the spawn so the whole path is walked.
+        let spawn = generator.chart_spawn().expect("a charted start world");
+        let n = fill_body_cells(spawn, Stance::Standing, Face::PosY, &mut cells).expect("body fits");
+        let mut worst = 0.0f64;
+        for length in [8.0, 64.0, SWEEP_LIMIT] {
+            let to = spawn + DVec3::Y * length;
+            let started = Instant::now();
+            let blocked = std::hint::black_box(body_blocked(
+                &state,
+                &generator,
+                &seams,
+                spawn,
+                to,
+                Stance::Standing,
+                Face::PosY,
+                &cells[..n],
+            ));
+            let sweep_us = started.elapsed().as_secs_f64() * 1.0e6;
+            assert!(!blocked, "the sky above the spawn is clear");
+            eprintln!("noclip sweep of {length} blocks: {sweep_us:.1} µs ({:.2} µs/block)", sweep_us / length);
+            worst = worst.max(sweep_us);
+        }
+        assert!(worst < 200_000.0, "the longest sweep took {worst:.1} µs");
     }
 
     #[test]
@@ -5665,5 +5899,303 @@ mod tests {
         let mut bak = path.file_name().unwrap().to_os_string();
         bak.push(".bak");
         let _ = std::fs::remove_file(path.with_file_name(bak));
+    }
+
+    /// Cycling channel names cannot beat the connection's total, and new names stop at the cap.
+    #[test]
+    fn mod_channels_share_one_budget_and_a_name_cap() {
+        let now = Instant::now();
+        let channel = |i: usize| protocol::Channel::parse(&format!("c{i}")).unwrap();
+        let mut names = ChannelBudget::new();
+        for i in 0..MAX_CHANNELS {
+            assert!(names.allow(&channel(i), now));
+        }
+        assert!(!names.allow(&channel(MAX_CHANNELS), now), "a new name past the cap is dropped");
+        assert!(names.allow(&channel(0), now), "a known name keeps its window");
+        let mut flood = ChannelBudget::new();
+        let passed = (0..4 * MOD_DATA_RATE as usize).filter(|&i| flood.allow(&channel(i % MAX_CHANNELS), now)).count();
+        assert_eq!(passed, MOD_DATA_RATE as usize, "switching channels buys no extra rate");
+    }
+
+    /// Under a speed cap, a move split into many messages covers no more than one burst plus
+    /// the cap over the time taken. A fast stream that stalls and lands at once still passes.
+    #[test]
+    fn split_moves_gain_nothing_over_the_speed_cap() {
+        let cap = 30.0 * crate::math::PER_METER;
+        let (out, _rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
+        let start = DVec3::new(8.5, 40.0, 8.5);
+        let mut players = HashMap::new();
+        players.insert(1u32, test_player(start, out, test_kick()));
+        let shared = Arc::new(Mutex::new(test_state(players)));
+        shared.lock_recover().max_speed = cap;
+        let anchored = Instant::now();
+        shared.lock_recover().players.get_mut(&1).unwrap().last_move = anchored;
+        for _ in 0..40 {
+            let at = shared.lock_recover().players[&1].pos;
+            let to = DVec3::new(at.x + 5.0, at.y, at.z);
+            on_move(&shared, lax_ctx(), 1, to, 0.0, 0.0, DQuat::IDENTITY, Vec3::new(cap as f32, 0.0, 0.0), Face::PosY, Stance::Standing);
+        }
+        let covered = shared.lock_recover().players[&1].pos.x - start.x;
+        let bound = MOVE_FLOOR + cap * anchored.elapsed().as_secs_f64();
+        assert!(covered <= bound + 1e-9, "40 split moves covered {covered} blocks, the bound is {bound}");
+        assert!(covered >= MOVE_FLOOR - 5.0, "the burst is spendable, covered {covered}");
+
+        let fast = 1000.0 * crate::math::PER_METER;
+        let (out, rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
+        let mut players = HashMap::new();
+        players.insert(1u32, test_player(start, out, test_kick()));
+        let shared = Arc::new(Mutex::new(test_state(players)));
+        shared.lock_recover().players.get_mut(&1).unwrap().last_move = Instant::now() - Duration::from_millis(133);
+        let step = fast * 0.033;
+        for i in 1..=4 {
+            let to = DVec3::new(start.x + step * f64::from(i), start.y, start.z);
+            on_move(&shared, lax_ctx(), 1, to, 0.0, 0.0, DQuat::IDENTITY, Vec3::new(fast as f32, 0.0, 0.0), Face::PosY, Stance::Standing);
+            assert_eq!(shared.lock_recover().players[&1].pos, to, "stalled move {i} at 1 km/s");
+        }
+        assert!(rx.try_recv().is_err(), "no snap-back");
+    }
+
+    /// With noclip refused, a move whose destination is open but whose path crosses a wall
+    /// snaps back. A body teleported into ground can still walk out, a path longer than the
+    /// sweep fails closed, and a cruise is judged at its destination.
+    #[test]
+    fn a_move_cannot_pass_through_a_wall() {
+        let eye = crate::player::Stance::Standing.eye_offset();
+        let ground = crate::world::generation::FLAT_HEIGHT;
+        let surface = DVec3::new(0.5, f64::from(ground) + eye, 0.5);
+        let beyond = DVec3::new(6.5, surface.y, 0.5);
+        let step = |shared: &Arc<Mutex<State>>, ctx: &Ctx, pos: DVec3, speed: f32| {
+            on_move(shared, ctx, 1, pos, 0.0, 0.0, DQuat::IDENTITY, Vec3::new(speed, 0.0, 0.0), Face::PosY, Stance::Standing);
+        };
+
+        let (players, _rx) = pose(surface);
+        let (shared, ctx) = flat_shared(players, NoclipPolicy::Off, &[]);
+        step(&shared, &ctx, beyond, 0.0);
+        assert_eq!(shared.lock_recover().players[&1].pos, beyond, "an open path is clear");
+
+        let (players, _rx) = pose(surface);
+        let (shared, ctx) = flat_shared(players, NoclipPolicy::Off, &[]);
+        {
+            let mut state = shared.lock_recover();
+            let rock = state.registry.parse_spec(&rock_spec()).unwrap();
+            let canonical = state.registry.spec(rock);
+            for x in 2..=4 {
+                for y in ground..ground + 3 {
+                    for z in -1..=1 {
+                        let spec = state.intern(&canonical).unwrap();
+                        state.edits.insert((x, y, z), Cell { block: rock, spec, rev: 1, natural: false });
+                    }
+                }
+            }
+        }
+        step(&shared, &ctx, beyond, 0.0);
+        assert_eq!(shared.lock_recover().players[&1].pos, surface, "a three-block wall is not crossed");
+
+        let buried = DVec3::new(0.5, f64::from(ground), 0.5);
+        let (players, _rx) = pose(surface);
+        let (shared, ctx) = flat_shared(players, NoclipPolicy::Off, &[]);
+        on_teleport(&shared, &ctx, 1, buried);
+        step(&shared, &ctx, surface, 0.0);
+        assert_eq!(shared.lock_recover().players[&1].pos, surface, "a body teleported into ground walks out");
+
+        let sky = DVec3::new(surface.x, surface.y + SWEEP_LIMIT + 10.0, surface.z);
+        let fast = crate::player::MAX_SPEED as f32;
+        let (players, _rx) = pose(surface);
+        let (shared, ctx) = flat_shared(players, NoclipPolicy::Off, &[]);
+        step(&shared, &ctx, sky, fast);
+        assert_eq!(shared.lock_recover().players[&1].pos, surface, "a path past the sweep fails closed");
+        on_cruise(&shared, 1, crate::player::CRUISE_MAX);
+        step(&shared, &ctx, sky, fast);
+        assert_eq!(shared.lock_recover().players[&1].pos, sky, "a cruise is judged at its destination");
+    }
+
+    /// The final save waits until every connection has been told to go, so no edit can be
+    /// acknowledged after the save has read the ledger.
+    #[test]
+    fn stop_closes_connections_before_the_final_save() {
+        use crate::net::client::{Connection, Incoming};
+        let path = crate::save::store::test_temp_path("stop-order");
+        let handle = flat(Config { world: Some(path.clone()), ..Config::default() });
+        let mut conn = Connection::connect("127.0.0.1", handle.addr().port(), "ada", "").unwrap();
+        let gate = handle.save_gate.lock_recover();
+        thread::scope(|scope| {
+            let stopping = scope.spawn(|| handle.stop());
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut closed = false;
+            while !closed && Instant::now() < deadline {
+                closed = conn.poll().into_iter().any(|e| matches!(e, Incoming::Disconnected { .. }));
+                if !closed {
+                    thread::sleep(Duration::from_millis(20));
+                }
+            }
+            assert!(!path.exists(), "the save is still waiting");
+            drop(gate);
+            stopping.join().unwrap();
+            assert!(closed, "connections close before the final save");
+        });
+        assert!(path.exists(), "stop still saves");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Chat until a line containing `want` arrives, or three seconds pass.
+    fn chat_until(conn: &mut crate::net::client::Connection, want: &str) -> Vec<String> {
+        let mut texts = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline && !texts.iter().any(|t: &String| t.contains(want)) {
+            for event in conn.poll() {
+                if let crate::net::client::Incoming::Chat { text, .. } = event {
+                    texts.push(text.to_string());
+                }
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        texts
+    }
+
+    /// An `ops.txt` secret beats the bare name: the player is an operator only after `/op` with
+    /// that secret. The line is answered privately and reaches nobody else.
+    #[test]
+    fn an_operator_secret_is_proved_with_op_and_never_relayed() {
+        use crate::net::client::Connection;
+        let handle = flat(Config {
+            teleport: TeleportPolicy::Ops,
+            ops: vec!["ada".into()],
+            op_secrets: vec![("Ada".into(), "s3cret".into())],
+            ..Config::default()
+        });
+        let port = handle.addr().port();
+        let mut ada = Connection::connect("127.0.0.1", port, "ada", "").unwrap();
+        let mut bob = Connection::connect("127.0.0.1", port, "bob", "").unwrap();
+        let far = DVec3::new(300.5, 30.0, 300.5);
+        ada.send_teleport(far);
+        assert!(chat_until(&mut ada, "only an operator").iter().any(|t| t == "only an operator can teleport"));
+        ada.send_chat(chat::GLOBAL, "/op wrong");
+        assert!(chat_until(&mut ada, "refused").iter().any(|t| t == "operator secret refused"));
+        ada.send_chat(chat::GLOBAL, "/op s3cret");
+        assert!(chat_until(&mut ada, "operator").iter().any(|t| t == "you are now an operator"));
+        ada.send_teleport(far);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut moved = false;
+        while !moved && Instant::now() < deadline {
+            moved = handle.state.lock_recover().players.values().any(|h| &*h.name == "ada" && h.pos == far);
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(moved, "a proved operator may teleport");
+        ada.send_chat(chat::GLOBAL, "hello");
+        let heard = chat_until(&mut bob, "hello");
+        assert!(heard.iter().any(|t| t == "hello"), "ordinary chat still flows: {heard:?}");
+        assert!(!heard.iter().any(|t| t.contains("/op") || t.contains("s3cret") || t.contains("wrong")), "{heard:?}");
+        assert_eq!(op_secret("/op  s3cret "), Some(Arc::from("s3cret")));
+        assert_eq!(op_secret("/opera"), None);
+        handle.stop();
+    }
+
+    /// One full frame plus another fits the join backlog, and an essential frame that waits
+    /// past the age bound kicks the joiner instead of vanishing.
+    #[test]
+    fn backlog_holds_a_full_frame_and_kicks_on_an_aged_essential_one() {
+        let (out, _rx) = sync_channel::<Arc<[u8]>>(4);
+        let mut player = test_player(DVec3::ZERO, out, test_kick());
+        player.ready = false;
+        let now = Instant::now();
+        let air: Arc<str> = "air".into();
+        let full: Arc<[u8]> = {
+            let mut frames = Vec::new();
+            let mut writer = SnapshotWriter::new();
+            let mut emit = |frame| frames.push(frame);
+            for i in 0..20_000 {
+                writer.push((i * 1000, 0, 0), 1, 0, "air", &mut emit);
+            }
+            frames.swap_remove(0)
+        };
+        assert!(full.len() > MAX_FRAME - 64 && full.len() <= MAX_FRAME);
+        let edit: Arc<[u8]> = ServerMessage::Edit { x: 1, y: 2, z: 3, rev: 1, spec: air.clone() }.encode().into();
+        assert!(enqueue_backlog(&mut player, full, now));
+        assert!(enqueue_backlog(&mut player, edit.clone(), now), "a full frame and one more fit");
+        assert!(!enqueue_backlog(&mut player, edit, now + BACKLOG_AGE), "an aged edit kicks");
+        assert_eq!(player.backlog.len(), 2, "no essential frame was dropped");
+    }
+
+    #[test]
+    fn edits_past_the_spec_pool_stay_in_the_file() {
+        let mut state = test_state(HashMap::new());
+        for i in 0..MAX_SPEC_POOL {
+            state.intern(&format!("spec-{i}")).unwrap();
+        }
+        let rock = rock_spec();
+        let kept = install_edits(&mut state, &[(1, 2, 3, rock.clone()), (4, 5, 6, "air".into())]);
+        assert_eq!(kept, vec![(1, 2, 3, rock), (4, 5, 6, "air".to_string())]);
+        assert!(state.edits.is_empty());
+    }
+
+    /// An edit that puts back the generated block keeps its revision in memory but is not saved.
+    #[test]
+    fn a_no_op_edit_stays_out_of_the_world_file() {
+        let path = crate::save::store::test_temp_path("no-op");
+        let flags = persist::Flags { seed: 1, worldgen: WorldgenKind::Flat, terrain: TerrainCfg::default(), warn: false };
+        let ground = crate::world::generation::FLAT_HEIGHT;
+        let (players, _rx) = pose(DVec3::new(0.5, f64::from(ground) + 2.0, 0.5));
+        let (shared, mut ctx) = flat_shared(players, NoclipPolicy::All, &[]);
+        ctx.store = Some(Arc::new(persist::load(&path, &flags).unwrap().store.unwrap()));
+        on_edit(&shared, None, &ctx.generator, 1, 1, 0, ground + 1, 0, 0, "air");
+        on_edit(&shared, None, &ctx.generator, 1, 2, 1, ground - 1, 0, 0, "air");
+        assert_eq!(shared.lock_recover().edits.len(), 2, "both edits hold a revision");
+        save_world(&shared, &ctx, &Mutex::new(()));
+        let again = persist::load(&path, &flags).unwrap();
+        assert_eq!(again.edits, vec![(1, ground - 1, 0, "air".to_string())]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Initials from a source that never hears the server (a spoofed address) get a stateless
+    /// retry and take no handshake slot; a real client still joins through the retry.
+    #[test]
+    fn unvalidated_initials_take_no_handshake_slot() {
+        use crate::net::client::Connection;
+        let handle = flat(Config::default());
+        let server = SocketAddr::from((Ipv4Addr::LOCALHOST, handle.addr().port()));
+        let relay = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        relay.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+        let relay_addr = relay.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let relay_stop = stop.clone();
+        // Forward the client's packets to the server; drop every answer.
+        let forward = thread::spawn(move || {
+            let mut buf = [0u8; 2048];
+            while !relay_stop.load(Ordering::Relaxed) {
+                if let Ok((n, from)) = relay.recv_from(&mut buf)
+                    && from != server
+                {
+                    let _ = relay.send_to(&buf[..n], server);
+                }
+            }
+        });
+        let (rt, ep) = client_endpoint();
+        let attempts: Vec<_> = {
+            let _g = rt.enter();
+            (0..4).map(|_| ep.connect(relay_addr, "watt").unwrap()).collect()
+        };
+        rt.block_on(async { tokio::time::sleep(Duration::from_millis(400)).await });
+        assert_eq!(handle.handshake_slots(), 0, "a source that cannot answer holds no slot");
+        stop.store(true, Ordering::Relaxed);
+        forward.join().unwrap();
+        drop(attempts);
+        Connection::connect("127.0.0.1", server.port(), "real", "").expect("a real client passes the retry");
+        handle.stop();
+    }
+
+    #[test]
+    fn console_text_escapes_control_characters() {
+        assert_eq!(console_text("\u{1b}[2Jpwc.hotbar\u{7}"), "\\u{1b}[2Jpwc.hotbar\\u{7}");
+        assert_eq!(console_text("plain ünïcode"), "plain ünïcode");
+    }
+
+    #[test]
+    fn names_that_spell_server_are_reserved() {
+        for name in ["server", "Server", "S.E.R.V.E.R", "<server>", "server>", " _server_ "] {
+            assert!(reserved_name(name), "{name}");
+        }
+        for name in ["servers", "observer", "server2", "serve", "ada"] {
+            assert!(!reserved_name(name), "{name}");
+        }
     }
 }

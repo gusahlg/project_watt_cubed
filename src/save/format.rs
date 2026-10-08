@@ -106,7 +106,7 @@ const EDIT_BYTES: usize = 14;
 /// Sanity caps while reading, so a corrupt length prefix can't balloon memory.
 /// The spec-table count is a u16, so the table can hold every `u16` index.
 const MAX_SPECS: usize = 65_535;
-const MAX_EDITS: u32 = 50_000_000;
+pub(crate) const MAX_EDITS: u32 = 50_000_000;
 const MAX_MOD_STATE: u32 = 16 * 1024 * 1024;
 /// Bytes of one pending reaction contact.
 const CONTACT_BYTES: usize = 4 * 3 + 1 + 4;
