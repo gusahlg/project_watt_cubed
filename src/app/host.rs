@@ -146,8 +146,11 @@ mod tests {
         assert!(host.serves(&id));
 
         let mut friend = Connection::connect("127.0.0.1", port, "bob", "").unwrap();
+        // Break the flat world's top block under the spawn: a real edit (air where air already is
+        // would be a no-op the server leaves out of the file).
         let s = friend.spawn();
-        let req = friend.send_edit(block_coord(s.x), block_coord(s.y), block_coord(s.z), "air".into()).unwrap();
+        let ground = crate::world::generation::FLAT_HEIGHT - 1;
+        let req = friend.send_edit(block_coord(s.x), ground, block_coord(s.z), "air".into()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(3);
         let mut accepted = false;
         while !accepted && Instant::now() < deadline {

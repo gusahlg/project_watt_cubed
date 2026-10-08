@@ -15,6 +15,8 @@
 //! the [`hooks`] seam (`ServerMod`) without changing the wire.
 pub(crate) mod client;
 pub(crate) mod hooks;
+#[cfg(test)]
+mod mp;
 mod pair;
 pub(crate) mod persist;
 pub(crate) mod protocol;
