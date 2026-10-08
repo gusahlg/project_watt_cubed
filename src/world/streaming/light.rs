@@ -35,6 +35,13 @@ impl LightGate {
     fn mark_dirty(&mut self, coord: Coord) {
         self.dirty.entry(coord).or_insert_with(crate::sched::now);
     }
+
+    /// Drop an unloaded chunk from every set.
+    pub(super) fn forget(&mut self, coord: Coord) {
+        self.blocked_since.remove(&coord);
+        self.degraded.remove(&coord);
+        self.dirty.remove(&coord);
+    }
 }
 
 /// Cap on per-chunk remesh/job samples kept for the stress mean/p95 gauges.
@@ -556,8 +563,7 @@ impl World {
     }
 
     /// Advance the light-gate before the mesh lane runs: reap timers whose
-    /// chunk stopped waiting, drop degraded/dirty entries for unloaded chunks,
-    /// promote `light_dirty` (and relit-degraded) chunks whose 27-neighbourhood
+    /// chunk stopped waiting, promote `light_dirty` (and relit-degraded) chunks whose 27-neighbourhood
     /// has no pending light work or whose degrade timer expired, and re-seed
     /// exactly the chunks whose DEGRADE TIMER expired — expiry raises no event
     /// of its own, so this sweep (over ONLY the timed/dirty maps, never the
@@ -567,26 +573,18 @@ impl World {
     /// neighbour data via `store_chunk`).
     pub(in crate::world) fn tick_light_gate(&mut self) {
         // `LightGate` is `Default`, so move it out to break the self-borrow while
-        // the predicates below read the chunk map. Empty maps skip `retain`
-        // (it still walks capacity); a drained flood `shrink_to_fit`s once.
+        // the predicates below read the chunk map. Unload already dropped every
+        // gone chunk ([`forget_chunk`](Self::forget_chunk)). An empty map skips
+        // `retain` (it still walks capacity); a drained flood `shrink_to_fit`s once.
         let mut gate = std::mem::take(&mut self.light_gate);
-        if !gate.degraded.is_empty() {
-            gate.degraded.retain(|c| self.chunks.contains_key(c));
-            if gate.degraded.is_empty() {
-                gate.degraded.shrink_to_fit();
-            }
+        if gate.degraded.is_empty() && gate.degraded.capacity() > 0 {
+            gate.degraded.shrink_to_fit();
         }
-        if !gate.dirty.is_empty() {
-            gate.dirty.retain(|c, _| self.chunks.contains_key(c));
-            if gate.dirty.is_empty() {
-                gate.dirty.shrink_to_fit();
-            }
+        if gate.dirty.is_empty() && gate.dirty.capacity() > 0 {
+            gate.dirty.shrink_to_fit();
         }
-        if !self.light_terminal.is_empty() {
-            self.light_terminal.retain(|c| self.chunks.contains_key(c));
-            if self.light_terminal.is_empty() {
-                self.light_terminal.shrink_to_fit();
-            }
+        if self.light_terminal.is_empty() && self.light_terminal.capacity() > 0 {
+            self.light_terminal.shrink_to_fit();
         }
         if !gate.blocked_since.is_empty() {
             gate.blocked_since
@@ -674,8 +672,7 @@ impl World {
             // Every arm below acts, and only once the 27-neighbourhood has
             // no pending light work.
             _ if !self.light_nhood_quiet(coord) => true,
-            // Unloaded out from under the set between marking and here, or
-            // nothing to draw: drop the degraded flag.
+            // No chunk, or nothing to draw: drop the degraded flag.
             None | Some(MeshState::Air) => {
                 self.light_terminal.remove(&coord);
                 false

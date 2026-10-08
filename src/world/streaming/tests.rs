@@ -548,7 +548,7 @@ fn degraded_chunk_promotes_when_a_neighbour_is_missing() {
     .expect("one pass present");
     world.chunks.get_mut(&edge).unwrap().state = MeshState::Ready(meshes);
     world.mark_degraded(edge, true);
-    world.chunks.remove(&missing);
+    world.forget_chunk(missing);
     world.generating.clear();
     world.mesh_worklist.clear();
     world.light_worklist.clear();
@@ -1030,7 +1030,7 @@ fn settle_seeds_only_neighbours_that_have_data() {
     let c = Coord::new(0, 0, 0);
     let missing = c.step(Face::PosY);
     let present = c.step(Face::PosX);
-    world.chunks.remove(&missing);
+    world.forget_chunk(missing);
     world.chunks.get_mut(&c).unwrap().light = None;
     assert!(
         world.chunks.contains_key(&present),
