@@ -1,5 +1,6 @@
 //! Far worlds and moons as sky impostors, taken from the cosmos catalog.
-//! The list is rebuilt every frame into a reused buffer.
+//! What each body draws is built once per world; every frame only places it relative to the eye,
+//! into a reused buffer.
 
 use voxel_engine::{
     DVec3, FarBody, FarShape, LinearRgb, Quat, SunOverride, Vec3, MAX_FAR_BODIES,
@@ -33,10 +34,81 @@ struct HomeMap {
     hi: f64,
 }
 
+/// What one body draws, apart from where it sits relative to the eye. Built once per world.
+#[derive(Debug)]
+struct Static {
+    /// The draw, with a placeholder direction and distance.
+    far: FarBody,
+    /// The impostor's radius before rounding: the body is drawn only from farther out.
+    radius: f64,
+    /// [`stream_reach`] of a cube, whose own mesh is the body while it streams. `None` for a round
+    /// body, whose sphere is drawn unless the eye is inside it.
+    stream_reach: Option<f64>,
+    /// Home's daylight air, worn once its map is live. `None` for every other body.
+    day_air: Option<LinearRgb>,
+}
+
+impl Static {
+    fn new(cosmos: &Cosmos, body: &Body, twin_ordinal: u32, atlases: &[std::sync::Arc<crate::space::atlas::Atlas>]) -> Self {
+        let (shape, albedo, atmosphere) = paint(body, twin_ordinal);
+        let (shape, radius) = if body.kind == Kind::Home {
+            (shape, home_impostor(cosmos, body).1)
+        } else if let Some(warped) = warped_impostor(atlases, body) {
+            warped
+        } else {
+            (shape, shown_radius(atlases, body) - sink_in(cosmos, body).unwrap_or(0.0))
+        };
+        Self {
+            far: FarBody { radius: radius as f32, shape, albedo, atmosphere, seed: body.seed, ..FarBody::default() },
+            radius,
+            stream_reach: sink(body).is_none().then(|| stream_reach(cosmos, body)),
+            day_air: (body.kind == Kind::Home).then(daylight_air),
+        }
+    }
+
+    /// `body` as seen from `eye`, or nothing while voxels cover it. Home draws its map once the map
+    /// is live (`mapped`), with this frame's limb sine.
+    fn place(&self, cosmos: &Cosmos, body: &Body, eye: DVec3, mapped: bool, horizon: f32) -> Option<FarBody> {
+        let delta = body.centre_f() - eye;
+        let dist = delta.length();
+        let streamed = self.stream_reach.is_some_and(|reach| dist < reach && cosmos.altitude(body, eye) < STREAM_ALTITUDE);
+        if streamed || !(dist > self.radius) || !dist.is_finite() {
+            return None;
+        }
+        let n = delta / dist;
+        let dir = Vec3::new(n.x as f32, n.y as f32, n.z as f32);
+        let distance = dist as f32;
+        let radius = self.far.radius;
+        if !dir.is_finite()
+            || dir.length_squared() == 0.0
+            || !distance.is_finite()
+            || !radius.is_finite()
+            || !(distance > radius)
+        {
+            return None;
+        }
+        let mut far = FarBody { dir, distance, ..self.far };
+        // Air-shell thickness in blocks, the same unit as `radius` (engine `FarShape::Mapped`).
+        let air = AIR_TOP as f32;
+        if let Some(day) = self.day_air
+            && mapped
+            && horizon.is_finite()
+            && air.is_finite()
+            && air >= 0.0
+        {
+            far.shape = FarShape::Mapped { map: super::planet_map::HOME_MAP, horizon, air };
+            far.atmosphere = day;
+        }
+        Some(far)
+    }
+}
+
 /// Reused far-body list. Capacity stays at [`MAX_FAR_BODIES`] after the first frame.
 #[derive(Debug)]
 pub struct FarBodies {
     list: Vec<FarBody>,
+    /// One per catalog body, in catalog order. Built on the first frame with a cosmos.
+    statics: Vec<Static>,
     /// Core light while the eye is in a Hollow's cavity. `None` outside it.
     sun: Option<SunOverride>,
     /// Looked up once. `None` when the generator has no relaxed home datum.
@@ -51,6 +123,7 @@ impl Default for FarBodies {
     fn default() -> Self {
         Self {
             list: Vec::with_capacity(MAX_FAR_BODIES),
+            statics: Vec::new(),
             sun: None,
             map: None,
             looked: false,
@@ -92,27 +165,42 @@ impl FarBodies {
         let Some(cosmos) = generator.cosmos() else {
             return &self.list;
         };
+        self.prepare_statics(cosmos, generator.atlases());
         if let Some((hollow, ember)) = cosmos.hollow_cavity(eye) {
             self.fill_cavity(cosmos, hollow, ember, eye);
             return &self.list;
         }
-        let mut twin = 0u32;
-        for body in cosmos.bodies() {
-            let ordinal = if body.kind == Kind::Twin {
-                let i = twin;
-                twin += 1;
-                i
-            } else {
-                0
-            };
+        for (body, fixed) in cosmos.bodies().iter().zip(&self.statics) {
             if self.list.len() == MAX_FAR_BODIES {
                 break;
             }
-            if let Some(far) = impostor(cosmos, body, eye, ordinal, generator.atlases(), mapped, horizon) {
+            if let Some(far) = fixed.place(cosmos, body, eye, mapped, horizon) {
                 self.list.push(far);
             }
         }
         &self.list
+    }
+
+    /// One allocation of every body's [`Static`]. Later frames compare a length.
+    fn prepare_statics(&mut self, cosmos: &Cosmos, atlases: &[std::sync::Arc<crate::space::atlas::Atlas>]) {
+        if self.statics.len() == cosmos.bodies().len() {
+            return;
+        }
+        let mut twin = 0u32;
+        self.statics = cosmos
+            .bodies()
+            .iter()
+            .map(|body| {
+                let ordinal = if body.kind == Kind::Twin {
+                    let i = twin;
+                    twin += 1;
+                    i
+                } else {
+                    0
+                };
+                Static::new(cosmos, body, ordinal, atlases)
+            })
+            .collect();
     }
 
     /// One allocation of the rebased datum. Later frames do nothing.
@@ -179,7 +267,8 @@ impl FarBodies {
                 seed: hollow.seed,
             });
         }
-        if let Some(mut far) = impostor(cosmos, ember, eye, 0, &[], false, 1.0) {
+        // Catalog ids are catalog indices.
+        if let Some(mut far) = self.statics[usize::from(ember.id)].place(cosmos, ember, eye, false, 1.0) {
             far.atmosphere = LinearRgb([
                 far.atmosphere.0[0] * CORE_GLOW,
                 far.atmosphere.0[1] * CORE_GLOW,
@@ -373,12 +462,11 @@ fn rounded_exponent(k: f64) -> f32 {
     if p.is_finite() && p >= 2.0 { p as f32 } else { 2.0 }
 }
 
-/// Whether the eye at `dist` from `body` is low enough over it for its own mesh to stream. The exact
-/// altitude (a warp inversion for a sagging twin, every frame) only matters near the body: past its
+/// Distance from `body` inside which the eye may be low enough over it for its own mesh to stream.
+/// The exact altitude (a warp inversion for a sagging twin) only matters inside it: past the body's
 /// reach, its highest datum and the streaming altitude, it cannot stream.
-fn streams(cosmos: &Cosmos, body: &Body, eye: DVec3, dist: f64) -> bool {
-    let near = dist < 1.25 * body.reach() + cosmos.relief_range(body).1.max(0.0) + STREAM_ALTITUDE;
-    near && cosmos.altitude(body, eye) < STREAM_ALTITUDE
+fn stream_reach(cosmos: &Cosmos, body: &Body) -> f64 {
+    1.25 * body.reach() + cosmos.relief_range(body).1.max(0.0) + STREAM_ALTITUDE
 }
 
 /// The start world's impostor: a sphere at its lowest datum, sunk by [`sink`], so it stays under
@@ -412,64 +500,6 @@ fn warped_impostor(atlases: &[std::sync::Arc<crate::space::atlas::Atlas>], body:
     Some((FarShape::Rounded { exponent: rounded_exponent(corner / face) }, face))
 }
 
-/// One catalog body as seen from `eye`, or nothing while voxels cover it.
-fn impostor(
-    cosmos: &Cosmos,
-    body: &Body,
-    eye: DVec3,
-    twin_ordinal: u32,
-    atlases: &[std::sync::Arc<crate::space::atlas::Atlas>],
-    mapped: bool,
-    horizon: f32,
-) -> Option<FarBody> {
-    let delta = body.centre_f() - eye;
-    let dist = delta.length();
-    let (mut shape, albedo, mut atmosphere) = paint(body, twin_ordinal);
-    let radius = if body.kind == Kind::Home {
-        let (_, radius) = home_impostor(cosmos, body);
-        // Air-shell thickness in blocks, the same unit as `radius` (engine `FarShape::Mapped`).
-        let air = AIR_TOP as f32;
-        if mapped && horizon.is_finite() && air.is_finite() && air >= 0.0 {
-            shape = FarShape::Mapped { map: super::planet_map::HOME_MAP, horizon, air };
-            atmosphere = daylight_air();
-        }
-        radius
-    } else if let Some((rounded, radius)) = warped_impostor(atlases, body) {
-        shape = rounded;
-        radius
-    } else {
-        shown_radius(atlases, body) - sink_in(cosmos, body).unwrap_or(0.0)
-    };
-    // A cube's own mesh is the body while it streams; a round body's sphere is drawn unless the eye
-    // is inside it.
-    let streamed = sink(body).is_none() && streams(cosmos, body, eye, dist);
-    if streamed || !(dist > radius) || !dist.is_finite() {
-        return None;
-    }
-    let n = delta / dist;
-    let dir = Vec3::new(n.x as f32, n.y as f32, n.z as f32);
-    let distance = dist as f32;
-    let radius_f = radius as f32;
-    if !dir.is_finite()
-        || dir.length_squared() == 0.0
-        || !distance.is_finite()
-        || !radius_f.is_finite()
-        || !(distance > radius_f)
-    {
-        return None;
-    }
-    Some(FarBody {
-        dir,
-        distance,
-        radius: radius_f,
-        shape,
-        rotation: Quat::IDENTITY,
-        albedo,
-        atmosphere,
-        seed: body.seed,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -478,6 +508,101 @@ mod tests {
     use crate::world::generation::FlatTerrain;
     use crate::world::terrain::cosmos::Kind;
     use crate::world::terrain::Terrain;
+
+    /// The streaming test as `update` ran it before [`Static`].
+    fn streams(cosmos: &Cosmos, body: &Body, eye: DVec3, dist: f64) -> bool {
+        let near = dist < 1.25 * body.reach() + cosmos.relief_range(body).1.max(0.0) + STREAM_ALTITUDE;
+        near && cosmos.altitude(body, eye) < STREAM_ALTITUDE
+    }
+
+    /// One catalog body as seen from `eye` before [`Static`], everything re-derived.
+    fn impostor(
+        cosmos: &Cosmos,
+        body: &Body,
+        eye: DVec3,
+        twin_ordinal: u32,
+        atlases: &[std::sync::Arc<crate::space::atlas::Atlas>],
+        mapped: bool,
+        horizon: f32,
+    ) -> Option<FarBody> {
+        let delta = body.centre_f() - eye;
+        let dist = delta.length();
+        let (mut shape, albedo, mut atmosphere) = paint(body, twin_ordinal);
+        let radius = if body.kind == Kind::Home {
+            let (_, radius) = home_impostor(cosmos, body);
+            // Air-shell thickness in blocks, the same unit as `radius` (engine `FarShape::Mapped`).
+            let air = AIR_TOP as f32;
+            if mapped && horizon.is_finite() && air.is_finite() && air >= 0.0 {
+                shape = FarShape::Mapped { map: crate::sky::planet_map::HOME_MAP, horizon, air };
+                atmosphere = daylight_air();
+            }
+            radius
+        } else if let Some((rounded, radius)) = warped_impostor(atlases, body) {
+            shape = rounded;
+            radius
+        } else {
+            shown_radius(atlases, body) - sink_in(cosmos, body).unwrap_or(0.0)
+        };
+        // A cube's own mesh is the body while it streams; a round body's sphere is drawn unless the eye
+        // is inside it.
+        let streamed = sink(body).is_none() && streams(cosmos, body, eye, dist);
+        if streamed || !(dist > radius) || !dist.is_finite() {
+            return None;
+        }
+        let n = delta / dist;
+        let dir = Vec3::new(n.x as f32, n.y as f32, n.z as f32);
+        let distance = dist as f32;
+        let radius_f = radius as f32;
+        if !dir.is_finite()
+            || dir.length_squared() == 0.0
+            || !distance.is_finite()
+            || !radius_f.is_finite()
+            || !(distance > radius_f)
+        {
+            return None;
+        }
+        Some(FarBody {
+            dir,
+            distance,
+            radius: radius_f,
+            shape,
+            rotation: Quat::IDENTITY,
+            albedo,
+            atmosphere,
+            seed: body.seed,
+        })
+    }
+
+    /// The list `update` built before [`Static`], every body re-derived each frame. In a cavity:
+    /// the Ember alone, without the wall.
+    fn oracle(generator: &dyn TerrainGenerator, eye: DVec3, mapped: bool, horizon: f32) -> Vec<FarBody> {
+        let Some(cosmos) = generator.cosmos() else { return Vec::new() };
+        if let Some((_, ember)) = cosmos.hollow_cavity(eye) {
+            let glow = |mut far: FarBody| {
+                far.atmosphere = LinearRgb(far.atmosphere.0.map(|c| c * CORE_GLOW));
+                far
+            };
+            return impostor(cosmos, ember, eye, 0, &[], false, 1.0).map(glow).into_iter().collect();
+        }
+        let mut list = Vec::new();
+        let mut twin = 0u32;
+        for body in cosmos.bodies() {
+            let ordinal = if body.kind == Kind::Twin {
+                let i = twin;
+                twin += 1;
+                i
+            } else {
+                0
+            };
+            if list.len() == MAX_FAR_BODIES {
+                break;
+            }
+            if let Some(far) = impostor(cosmos, body, eye, ordinal, generator.atlases(), mapped, horizon) {
+                list.push(far);
+            }
+        }
+        list
+    }
 
     fn radius_f(cosmos: &Cosmos, atlases: &[std::sync::Arc<crate::space::atlas::Atlas>], body: &Body) -> f32 {
         let radius = if body.kind == Kind::Home {
@@ -651,7 +776,7 @@ mod tests {
         assert!(far.sun_override().is_none());
     }
 
-    /// The distance shortcut in `streams` never changes the answer: around every body, from inside its
+    /// The [`stream_reach`] shortcut never changes the answer: around every body, from inside its
     /// streaming band out past the shortcut, it agrees with the exact altitude test.
     #[test]
     fn the_streaming_shortcut_agrees_with_the_exact_altitude() {
@@ -660,17 +785,54 @@ mod tests {
         let cosmos = terrain.cosmos().expect("cosmos");
         for body in cosmos.bodies() {
             let c = body.centre_f();
+            let reach = stream_reach(cosmos, body);
             for dir in [DVec3::X, DVec3::Y, DVec3::NEG_Z, DVec3::ONE.normalize(), DVec3::new(1.0, -0.4, 0.2).normalize()] {
                 for k in [0.5, 0.9, 1.0, 1.05, 1.2, 1.5, 3.0] {
                     for extra in [0.0, 5_000.0, 19_000.0, 21_000.0, 1.0e6] {
                         let eye = c + dir * (body.reach() * k + extra);
                         let dist = (c - eye).length();
                         let exact = cosmos.altitude(body, eye) < STREAM_ALTITUDE;
-                        assert_eq!(streams(cosmos, body, eye, dist), exact, "{:?} at {eye}", body.kind);
+                        assert_eq!(dist < reach && exact, exact, "{:?} at {eye}", body.kind);
                     }
                 }
             }
         }
+    }
+
+    /// Along a flight from spawn past every body, into the streaming band over each and through the
+    /// Hollow's cavity, with home's map off and on, the list is the old per-frame derivation's.
+    #[test]
+    fn the_list_matches_the_per_frame_derivation_along_a_flight() {
+        let mut registry = BlockRegistry::with_builtins();
+        let terrain = Terrain::new(&mut registry, 42);
+        let cosmos = terrain.cosmos().expect("cosmos");
+        let mut eyes = vec![DVec3::new(0.5, 8.0, 0.5)];
+        for body in cosmos.bodies() {
+            let (c, from) = (body.centre_f(), *eyes.last().unwrap());
+            eyes.extend((1..25).map(|i| from.lerp(c, f64::from(i) / 25.0)));
+            for dir in [DVec3::Y, DVec3::new(0.3, 1.0, -0.2).normalize()] {
+                for up in [-100.0, 1_000.0, 15_000.0, 19_900.0, 20_100.0, 40_000.0] {
+                    eyes.push(c + dir * (radius_of(body) + up));
+                }
+                eyes.extend([0.5, 1.02, 1.5, 3.0].map(|k| c + dir * body.reach() * k));
+            }
+        }
+        eyes.push(DVec3::new(1.0e8, 0.0, 0.0));
+        let mut far = FarBodies::default();
+        let mut cavity = 0;
+        for (i, &eye) in eyes.iter().enumerate() {
+            far.set_live(i % 2 == 1);
+            let list = far.update(&terrain, eye).to_vec();
+            let got = if cosmos.hollow_cavity(eye).is_some() {
+                cavity += 1;
+                &list[1..]
+            } else {
+                &list[..]
+            };
+            let want = oracle(&terrain, eye, i % 2 == 1, far.horizon);
+            assert_eq!(format!("{got:?}"), format!("{want:?}"), "eye {eye}");
+        }
+        assert!(cavity > 10, "the flight crosses the cavity");
     }
 
     #[test]
