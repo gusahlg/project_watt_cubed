@@ -1,6 +1,6 @@
 //! Read-only block, surface, collision, and acoustic queries over loaded chunks.
 
-use std::ops::Range;
+use std::ops::{Range, RangeInclusive};
 use std::sync::Arc;
 
 use glam::UVec3;
@@ -169,41 +169,6 @@ impl World {
         None
     }
 
-    /// Calls paint for the top solid block of each column in the x/z rectangle.
-    pub fn for_surface_columns(
-        &self,
-        x0: i32,
-        z0: i32,
-        x1: i32,
-        z1: i32,
-        mut paint: impl FnMut(i32, i32, i32, Color),
-    ) {
-        let s = CHUNK_SIZE as i32;
-        let (cx0, cx1) = (x0.div_euclid(s), x1.div_euclid(s));
-        let (cz0, cz1) = (z0.div_euclid(s), z1.div_euclid(s));
-        for cx in cx0..=cx1 {
-            for cz in cz0..=cz1 {
-                let ys = self.column_chunks(cx, cz);
-                if ys.is_empty() {
-                    continue;
-                }
-                let xs = x0.max(cx * s)..=x1.min((cx + 1) * s - 1);
-                let zs = z0.max(cz * s)..=z1.min((cz + 1) * s - 1);
-                for x in xs {
-                    let lx = x.rem_euclid(s) as usize;
-                    for z in zs.clone() {
-                        let lz = z.rem_euclid(s) as usize;
-                        if let Some((top_y, color)) =
-                            self.top_solid_in_column(cx, cz, ys, lx, lz)
-                        {
-                            paint(x, z, top_y, color);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     /// The cell under a foot: 0.1 along `−up`, or along storage −Y when `feet`
     /// sits in a round body's chart (storage +Y is up there).
     pub fn ground_cell(&self, feet: voxel_engine::DVec3, up: Face) -> (i32, i32, i32) {
@@ -312,17 +277,10 @@ impl World {
     }
 
     /// Loaded altitude-chunk indices in the `(cu, cv)` column of `face`, highest first.
-    /// [`column_chunks`](Self::column_chunks) is this for [`Face::PosY`].
     pub fn column_alts(&self, face: Face, cu: i32, cv: i32) -> &[i32] {
         self.column_chunks
             .get(&ColumnKey { face, a: cu, b: cv })
             .map_or(&[], Vec::as_slice)
-    }
-
-    /// Loaded chunk-Y layers in the PosY `(cx, cz)` column, highest first. Empty
-    /// when that column has no loaded chunks.
-    pub fn column_chunks(&self, cx: i32, cz: i32) -> &[i32] {
-        self.column_alts(Face::PosY, cx, cz)
     }
 
     /// The loaded chunk at `(cx, cy, cz)`, if any.
@@ -332,52 +290,75 @@ impl World {
             .map(|loaded| loaded.chunk.as_ref())
     }
 
-    /// Highest solid in one face-local column of `face`. `alts` is that column's
-    /// altitude chunks, highest first. The returned altitude is face-local
-    /// (`chunk_alt0 + la`); on PosY that integer is the world Y.
-    pub(crate) fn top_solid_on_face(
+    /// Highest solid of each face-local column `(lu, lv)` in `us × vs` of the `(cu, cv)` chunk
+    /// column of `face`, as `out[lv][lu]`: the face-local altitude (`chunk_alt0 + la`; on PosY
+    /// the world Y) and colour, `None` where no loaded chunk holds a solid. The altitude chunks
+    /// are resolved once, highest first, and each settles every column it tops.
+    pub(crate) fn top_solids_on_face(
         &self,
         face: Face,
-        cu: i32,
-        cv: i32,
-        alts: &[i32],
-        lu: usize,
-        lv: usize,
-    ) -> Option<(i32, Color)> {
+        (cu, cv): (i32, i32),
+        us: Range<usize>,
+        vs: Range<usize>,
+        out: &mut [[Option<(i32, Color)>; CHUNK_SIZE]; CHUNK_SIZE],
+    ) {
+        for row in &mut out[vs.clone()] {
+            row[us.clone()].fill(None);
+        }
         let frame = crate::space::FaceFrame::new(face);
         let s = CHUNK_SIZE as i32;
-        for &ca in alts {
+        let mut open = us.len() * vs.len();
+        for &ca in self.column_alts(face, cu, cv) {
+            if open == 0 {
+                break;
+            }
             let coord = frame.chunk_to_world((cu, ca, cv));
             let Some(chunk) = self.chunk_at(coord.x, coord.y, coord.z) else {
                 continue;
             };
+            let uniform = chunk.uniform();
+            if uniform.is_some_and(|id| !self.registry.is_solid(id)) {
+                continue;
+            }
             let alt0 = frame.chunk_alt0(coord);
-            let top = match chunk.uniform() {
-                Some(id) if self.registry.is_solid(id) => Some((alt0 + s - 1, id)),
-                Some(_) => None,
-                None => (0..CHUNK_SIZE).rev().find_map(|la| {
-                    let (lx, ly, lz) = frame.index_to_world(lu, la, lv);
-                    let id = chunk.get_local(lx, ly, lz);
-                    self.registry.is_solid(id).then_some((alt0 + la as i32, id))
-                }),
-            };
-            if let Some((alt, id)) = top {
-                return Some((alt, self.registry.color(id)));
+            for lv in vs.clone() {
+                for lu in us.clone() {
+                    let slot = &mut out[lv][lu];
+                    if slot.is_some() {
+                        continue;
+                    }
+                    let top = match uniform {
+                        Some(id) => Some((alt0 + s - 1, id)),
+                        None => (0..CHUNK_SIZE).rev().find_map(|la| {
+                            let (lx, ly, lz) = frame.index_to_world(lu, la, lv);
+                            let id = chunk.get_local(lx, ly, lz);
+                            self.registry.is_solid(id).then_some((alt0 + la as i32, id))
+                        }),
+                    };
+                    if let Some((alt, id)) = top {
+                        *slot = Some((alt, self.registry.color(id)));
+                        open -= 1;
+                    }
+                }
             }
         }
-        None
     }
 
-    /// Top solid in one local column of a PosY chunk column, walking `ys` (highest first).
-    pub(crate) fn top_solid_in_column(
-        &self,
-        cx: i32,
-        cz: i32,
-        ys: &[i32],
-        lx: usize,
-        lz: usize,
-    ) -> Option<(i32, Color)> {
-        self.top_solid_on_face(Face::PosY, cx, cz, ys, lx, lz)
+    /// A fingerprint of every block edit and of the loaded altitude chunks in the chunk columns
+    /// `cus × cvs` of `face`: an unchanged stamp means an unchanged surface over that area.
+    pub(crate) fn surface_stamp(&self, face: Face, cus: RangeInclusive<i32>, cvs: RangeInclusive<i32>) -> u64 {
+        let mix = |h: u64, x: u64| crate::hash::splitmix_finish(h ^ x);
+        let mut h = mix(0, self.edit_generation);
+        for cu in cus {
+            for cv in cvs.clone() {
+                let alts = self.column_alts(face, cu, cv);
+                h = mix(h, alts.len() as u64);
+                for &ca in alts {
+                    h = mix(h, ca as u32 as u64);
+                }
+            }
+        }
+        h
     }
 
     /// Test fixture: store `chunk` and index it in `face`'s column, highest altitude first.
@@ -523,6 +504,29 @@ mod tests {
     use crate::world::{Loaded, MeshState};
     use std::collections::BTreeMap;
     use voxel_engine::DVec3;
+
+    impl World {
+        /// Calls paint for the top solid block of each column in the x/z rectangle.
+        fn for_surface_columns(&self, x0: i32, z0: i32, x1: i32, z1: i32, mut paint: impl FnMut(i32, i32, i32, Color)) {
+            let s = CHUNK_SIZE as i32;
+            let local = |r: &RangeInclusive<i32>| r.start().rem_euclid(s) as usize..r.end().rem_euclid(s) as usize + 1;
+            let mut tops = [[None; CHUNK_SIZE]; CHUNK_SIZE];
+            for cx in x0.div_euclid(s)..=x1.div_euclid(s) {
+                for cz in z0.div_euclid(s)..=z1.div_euclid(s) {
+                    let xs = x0.max(cx * s)..=x1.min((cx + 1) * s - 1);
+                    let zs = z0.max(cz * s)..=z1.min((cz + 1) * s - 1);
+                    self.top_solids_on_face(Face::PosY, (cx, cz), local(&xs), local(&zs), &mut tops);
+                    for x in xs {
+                        for z in zs.clone() {
+                            if let Some((y, color)) = tops[z.rem_euclid(s) as usize][x.rem_euclid(s) as usize] {
+                                paint(x, z, y, color);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     fn insert_chunk(world: &mut World, coord: Coord, chunk: Chunk) {
         world.chunks.insert(
