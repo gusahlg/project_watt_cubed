@@ -233,9 +233,16 @@ impl<'a> SpecTable<'a> {
     /// common case, and `entry` measured slower for them.
     #[inline]
     pub fn index(&mut self, spec: &'a str) -> Result<u16, SaveError> {
-        if let Some(&at) = self.index.get(spec) {
-            return Ok(at);
+        match self.index.get(spec) {
+            Some(&at) => Ok(at),
+            None => self.append(spec),
         }
+    }
+
+    /// First use of `spec`, out of line so the lookup nearly every edit takes stays small.
+    #[cold]
+    #[inline(never)]
+    fn append(&mut self, spec: &'a str) -> Result<u16, SaveError> {
         let at = u16::try_from(self.specs.len())
             .map_err(|_| SaveError::Corrupt("too many distinct block specs to save"))?;
         self.specs.push(spec.to_string());
