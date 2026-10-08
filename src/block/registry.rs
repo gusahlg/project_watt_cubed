@@ -281,16 +281,23 @@ impl BlockRegistry {
     }
 
     /// The id of sorted occurrences; on a miss, `make` builds the entry.
+    #[inline]
     fn intern_with(&mut self, sorted: &[Element], make: impl FnOnce() -> (Configuration, Block)) -> Option<BlockId> {
         let mut key = [0; MAX_ENCODING];
         let key = Encoding::write(sorted, &mut key);
         if let Some(&id) = self.intern.get(key) {
             return Some(id);
         }
+        let (c, block) = make();
+        self.insert(key, c, block)
+    }
+
+    /// A new entry under its canonical bytes `key`. Out of line, so a hit stays small.
+    #[cold]
+    fn insert(&mut self, key: &[u8], c: Configuration, block: Block) -> Option<BlockId> {
         if self.configs.len() >= MAX_BLOCK_TYPES {
             return None;
         }
-        let (c, block) = make();
         let id = BlockId(self.configs.len() as u16);
         let obs = observe(&self.law, &block);
         let vis = visual_with(&self.law, &block, &obs);

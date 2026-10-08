@@ -47,6 +47,7 @@ impl Encoding {
 
     /// The canonical bytes of sorted occurrences, written into `out` without allocating: the
     /// filled prefix.
+    #[inline]
     pub fn write<'a>(elements: &[Element], out: &'a mut [u8; MAX_ENCODING]) -> &'a [u8] {
         debug_assert!(elements.is_sorted(), "occurrences out of canonical order");
         out[0] = elements.len() as u8;
@@ -120,6 +121,7 @@ impl Configuration {
     }
 
     /// [`Configuration::decode`] into `out` without allocating: the occurrences, sorted.
+    #[inline]
     pub fn decode_into<'a>(bytes: &[u8], out: &'a mut [Element; CAPACITY]) -> Result<&'a [Element], DecodeError> {
         let (&len, rest) = bytes.split_first().ok_or(DecodeError::Empty)?;
         let len = len as usize;
