@@ -210,7 +210,7 @@ mod tests {
                 || gate.dirty.contains_key(c)
                 || world.light_terminal.contains(c)
         };
-        let stale: Vec<&Coord> = marked.iter().filter(|c| !world.chunks.contains_key(c) && held(c)).collect();
+        let stale: Vec<Coord> = marked.iter().copied().filter(|c| !world.chunks.contains_key(c) && held(c)).collect();
         assert!(stale.is_empty(), "unloaded chunks still marked: {stale:?}");
     }
 }
