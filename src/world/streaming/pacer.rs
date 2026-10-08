@@ -379,67 +379,45 @@ impl World {
         // lazily spawned pool before the pacer catches it on the next pass.
         self.apply_loading_radius();
         let pacer = self.stream_pacer;
-        let up = self.live_up();
-        let load_h = self.load_h;
-        let load_v = self.load_v;
-        let load_heading = self.load_heading;
-        let horizontal = self.view.horizontal;
-        let section_vel = self.section_vel;
-        let tight = !self.loading_full();
+        let (up, fold) = (self.live_up(), self.fold);
+        let view = if self.loading_full() {
+            let (radius, vel) = (self.view.horizontal, self.section_vel);
+            pipeline::ViewSnap::full(center_chunk, far_view, radius, far_m, vel, up, fold)
+        } else {
+            // A speed-reduced loading horizon: the draw radius stays on the world; this only
+            // decides which queued near jobs still run. The far predictor zeros velocity above
+            // its teleport cap. The near window still aims with the real travel, or nothing at
+            // several km/s would know which way is ahead.
+            pipeline::ViewSnap {
+                center: center_chunk,
+                far: far_view,
+                radius: self.load_h,
+                v_radius: self.load_v,
+                margin: super::DATA_MARGIN,
+                heading: self.load_heading,
+                up,
+                fold,
+                far_m,
+                vel: pacer.travel(),
+            }
+        };
         let slab = self.spawn_slab;
-        let fold = self.fold;
         let workers = self.worker_pool();
         if let Some(stager) = stager {
             workers.set_stager(stager);
         }
         workers.set_slab(slab);
-        if tight {
-            // The far predictor zeros velocity above its teleport cap. The near
-            // window still aims with the real travel, or nothing at several
-            // km/s would know which way is ahead.
-            let travel = pacer.travel();
-            workers.set_load_view(
-                center_chunk.x,
-                center_chunk.y,
-                center_chunk.z,
-                far_view,
-                load_h,
-                load_v,
-                super::DATA_MARGIN,
-                load_heading,
-                far_m,
-                travel.x,
-                travel.y,
-                travel.z,
-                up,
-                fold,
-            );
-        } else {
-            workers.set_view(
-                center_chunk.x,
-                center_chunk.y,
-                center_chunk.z,
-                far_view,
-                horizontal,
-                far_m,
-                section_vel.x,
-                section_vel.y,
-                section_vel.z,
-                up,
-                fold,
-            );
-        }
+        workers.publish(&view);
         workers.set_near_cap(pacer.near_queue_cap(workers.worker_capacity()));
     }
 
     /// The view a spawn request publishes: at rest around near centre `c` and far centre `f`, with
     /// the collision slab.
     pub(super) fn publish_spawn_view(&mut self, c: Coord, f: Coord, up: Option<Face>, slab: ChunkBox) {
-        let (far_m, far_view) = (self.far_horizon(), self.far_view(f));
-        let view_r = self.view.horizontal;
-        let fold = self.fold;
+        let (far, far_m, radius) = (self.far_view(f), self.far_horizon(), self.view.horizontal);
+        let view = pipeline::ViewSnap::full(c, far, radius, far_m, DVec3::ZERO, up, self.fold);
         let workers = self.worker_pool();
-        workers.set_view(c.x, c.y, c.z, far_view, view_r, far_m, 0.0, 0.0, 0.0, up, fold);
+        workers.publish(&view);
         workers.set_slab(Some(slab));
     }
 
@@ -454,8 +432,8 @@ impl World {
         up: Option<Face>,
         fold: seam::Unfold,
     ) {
-        let workers = self.worker_pool();
-        workers.set_view(c.x, c.y, c.z, far_view, radius, far_m, 0.0, 0.0, 0.0, up, fold);
+        let view = pipeline::ViewSnap::full(c, far_view, radius, far_m, DVec3::ZERO, up, fold);
+        self.worker_pool().publish(&view);
     }
 }
 

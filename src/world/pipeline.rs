@@ -26,7 +26,7 @@
 //!   Bounded even mid-burst (a worker finishes at most its current job), and
 //!   a stuck GPU can never block it — workers never issue GPU calls.
 use std::ops::RangeInclusive;
-use std::sync::atomic::{AtomicI32, AtomicI8, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread::{self, JoinHandle};
@@ -43,10 +43,11 @@ use super::terrain::Generator;
 use super::light::{self, CeilingWindow, FaceShell, LightGrid, PaddedLight};
 use super::mesh::{self, ChunkMeshData, Padded, new_chunk_mesh_data};
 use super::neighborhood::BoundedPool;
+use super::seam::Unfold;
 use super::section::{self, SectionMeshData, SectionPos};
 use crate::block::registry::{BlockId, HotTables};
-use crate::coord::ByPass;
-use voxel_engine::{Engine, MeshData, MeshStager, MeshStaging, Pass};
+use crate::coord::{ByPass, ChunkBox};
+use voxel_engine::{DVec3, Engine, MeshData, MeshStager, MeshStaging, Pass};
 
 /// Mesh job snapshot: pure mesher state (light pre-settled, no live chunk map sharing).
 pub struct ChunkSnapshot {
@@ -643,324 +644,100 @@ const CANCEL_MARGIN: i32 = 4;
 
 /// Where the far field stands, as the job gate measures far work: its centre chunk column and the
 /// chart net around it (the identity off charts).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(in crate::world) struct FarView {
     pub x: i32,
     pub z: i32,
-    pub fold: super::seam::Unfold,
+    pub fold: Unfold,
 }
 
 impl FarView {
     /// Standing on chunk column `(x, z)` off every chart.
     #[cfg(test)]
     pub(in crate::world) fn flat(x: i32, z: i32) -> Self {
-        Self { x, z, fold: super::seam::Unfold::IDENTITY }
+        Self { x, z, fold: Unfold::IDENTITY }
     }
 }
 
-/// The live view, shared with the worker pool. The world stores the streaming
-/// centre/radius (and the far-field horizon) here every stream pass; the
-/// queues then re-key their backlogs toward where the player is NOW and
-/// deschedule entries left behind — once per CHANGE ([`ViewGate::epoch`]),
-/// not per pop. Fast movement therefore reorders the backlog and sheds it
-/// instead of grinding through stale regions.
-///
-/// Centre/radius/velocity/horizon fields are written Relaxed, then published by
-/// a Release epoch bump; queue rebuilds Acquire that epoch before reading the
-/// snapshot. [`CANCEL_MARGIN`] remains the spatial hysteresis, not a substitute
-/// for cross-atomic publication.
-pub(in crate::world) struct ViewGate {
-    /// Streaming centre chunk. Three atomics so a negative coordinate is a
-    /// plain `i32`, not a packed bitcast.
-    cx: AtomicI32,
-    cy: AtomicI32,
-    cz: AtomicI32,
-    /// The far field's centre chunk `(x, z)`: far entries are measured from it. It is the
-    /// streaming centre except above a round world, where the far field keeps standing on the
-    /// chart after the near window has left it.
-    fx: AtomicI32,
-    fz: AtomicI32,
-    /// Horizontal view radius in chunks; `i32::MAX` (permissive) until set.
-    /// Near distance is 3-D chess against this one radius. While the loading
-    /// window is tight this is the loading radius, not the draw radius.
-    radius: AtomicI32,
-    /// Vertical loading radius. `i32::MAX` keeps the historical rule: distance
-    /// along the up axis never deschedules.
-    v_radius: AtomicI32,
-    /// Chunks past the horizontal radius a queued near job still survives.
-    /// [`CANCEL_MARGIN`] at rest; the data shell while the loading window is tight.
-    margin: AtomicI32,
-    /// Dominant-axis sign of travel (`0` at rest). A change bumps the epoch so
-    /// a reversal drops behind jobs without waiting for a chunk cross.
-    heading: AtomicI8,
-    /// Streaming up: a [`Face`] discriminant, or [`UP_NONE`] when isotropic.
-    /// Default is +Y so an unset gate matches the historical XZ metric
-    /// (`dy == 0`).
-    up: AtomicU8,
-    /// Monotone stamp of the centres, radii, margin, heading, up and chart nets:
-    /// bumped only when one actually changes, so the queues' O(n) re-key rebuild
-    /// runs once per boundary cross (or loading-radius step) instead of once per pop.
-    epoch: AtomicU64,
-    /// Far-field descheduling horizon in METRES (`f64` bits; +∞ until set):
-    /// the outer ladder radius plus the velocity lookahead, refreshed every
-    /// stream pass. Deliberately NOT folded into `epoch` — it wobbles with
-    /// velocity every pass, and the wanted checks read it LIVE rather than
-    /// baking it into keys.
-    far_m: AtomicU64,
-    /// Eye velocity, as `f64` bits. Queue priorities use this to favor the
-    /// leading edge during travel instead of spending the reduced budget
-    /// behind the player. +Y bias ignores `vel_y`.
-    vel_x: AtomicU64,
-    vel_y: AtomicU64,
-    vel_z: AtomicU64,
-    /// The chart net around a storage centre: job chunks are measured folded
-    /// into it (`folded` says whether it is anything but the identity, so the
-    /// physical path never takes the lock).
-    fold: std::sync::RwLock<super::seam::Unfold>,
-    folded: std::sync::atomic::AtomicBool,
-    /// The chart net around the far centre: far entries are measured folded into it, so a
-    /// neighbour chart's sections sit beside the home chart and not a face box away. The
-    /// identity off charts.
-    far_fold: std::sync::RwLock<super::seam::Unfold>,
-    far_folded: std::sync::atomic::AtomicBool,
-    /// The spawn or teleport slab physics is waiting on, in the centre's net:
-    /// its jobs always run. `slab_set` keeps the lock off the common path.
-    slab: std::sync::RwLock<Option<crate::coord::ChunkBox>>,
-    slab_set: std::sync::atomic::AtomicBool,
-    /// Near-queue lookahead, published by the main thread from the world's
-    /// streaming pacer.
-    near_queue_cap: AtomicUsize,
+/// The live view the worker pool keys its queues against, published whole by the world every
+/// stream pass ([`Workers::publish`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(in crate::world) struct ViewSnap {
+    /// Streaming centre chunk.
+    pub center: Coord,
+    /// Where the far field stands: far entries are measured from it. It is the streaming centre
+    /// except above a round world, where the far field keeps standing on the chart after the near
+    /// window has left it.
+    pub far: FarView,
+    /// Horizontal view radius in chunks; `i32::MAX` keeps every job. Near distance is chess
+    /// against this one radius. While the loading window is tight this is the loading radius,
+    /// not the draw radius.
+    pub radius: i32,
+    /// Vertical loading radius. `i32::MAX` keeps the historical rule: distance along the up axis
+    /// never deschedules.
+    pub v_radius: i32,
+    /// Chunks past the horizontal radius a queued near job still survives: [`CANCEL_MARGIN`] at
+    /// rest, the data shell while the loading window is tight.
+    pub margin: i32,
+    /// Dominant-axis sign of travel (`0` at rest). A change re-keys, so a reversal drops behind
+    /// jobs without waiting for a chunk cross.
+    pub heading: i8,
+    /// Streaming up; `None` when isotropic. +Y is the historical XZ metric.
+    pub up: Option<Face>,
+    /// The chart net around the storage centre: job chunks are measured folded into it.
+    pub fold: Unfold,
+    /// Far-field descheduling horizon in metres (+∞ keeps every far job): the outer ladder radius
+    /// plus the velocity lookahead.
+    pub far_m: f64,
+    /// Eye velocity. Priorities favour the leading edge during travel instead of spending the
+    /// reduced budget behind the player.
+    pub vel: DVec3,
 }
 
-/// [`ViewGate::up`] code for an isotropic volume (no face).
-const UP_NONE: u8 = 255;
+impl ViewSnap {
+    /// Before the first publish: every job is wanted and every near key is 0 (FIFO).
+    const PERMISSIVE: Self = Self {
+        center: Coord { x: 0, y: 0, z: 0 },
+        far: FarView { x: 0, z: 0, fold: Unfold::IDENTITY },
+        radius: i32::MAX,
+        v_radius: i32::MAX,
+        margin: CANCEL_MARGIN,
+        heading: 0,
+        up: Some(Face::PosY),
+        fold: Unfold::IDENTITY,
+        far_m: f64::INFINITY,
+        vel: DVec3::ZERO,
+    };
 
-impl ViewGate {
-    fn new() -> Self {
-        Self {
-            cx: AtomicI32::new(0),
-            cy: AtomicI32::new(0),
-            cz: AtomicI32::new(0),
-            fx: AtomicI32::new(0),
-            fz: AtomicI32::new(0),
-            radius: AtomicI32::new(i32::MAX),
-            v_radius: AtomicI32::new(i32::MAX),
-            margin: AtomicI32::new(CANCEL_MARGIN),
-            heading: AtomicI8::new(0),
-            up: AtomicU8::new(Face::PosY as u8),
-            epoch: AtomicU64::new(0),
-            far_m: AtomicU64::new(f64::INFINITY.to_bits()),
-            vel_x: AtomicU64::new(0.0f64.to_bits()),
-            vel_y: AtomicU64::new(0.0f64.to_bits()),
-            vel_z: AtomicU64::new(0.0f64.to_bits()),
-            fold: std::sync::RwLock::new(super::seam::Unfold::IDENTITY),
-            folded: std::sync::atomic::AtomicBool::new(false),
-            far_fold: std::sync::RwLock::new(super::seam::Unfold::IDENTITY),
-            far_folded: std::sync::atomic::AtomicBool::new(false),
-            slab: std::sync::RwLock::new(None),
-            slab_set: std::sync::atomic::AtomicBool::new(false),
-            // Permissive until a real Workers pool publishes its capacity;
-            // direct queue tests and non-streaming users retain legacy behavior.
-            near_queue_cap: AtomicUsize::new(usize::MAX),
-        }
-    }
-
-    #[cfg(test)]
-    fn set(&self, cx: i32, cy: i32, cz: i32, radius: i32) {
-        let prev = (
-            self.cx.swap(cx, Ordering::Relaxed),
-            self.cy.swap(cy, Ordering::Relaxed),
-            self.cz.swap(cz, Ordering::Relaxed),
-        );
-        self.fx.store(cx, Ordering::Relaxed);
-        self.fz.store(cz, Ordering::Relaxed);
-        let prev_radius = self.radius.swap(radius, Ordering::Relaxed);
-        if prev != (cx, cy, cz) || prev_radius != radius {
-            self.epoch.fetch_add(1, Ordering::Release);
-        }
-    }
-
-    /// Load-first publish: skip atomic stores when the snapshot is unchanged.
-    fn publish(
-        &self,
-        cx: i32,
-        cy: i32,
-        cz: i32,
+    /// A view of the whole radius: no vertical limit, the [`CANCEL_MARGIN`] and no heading.
+    pub(in crate::world) fn full(
+        center: Coord,
         far: FarView,
         radius: i32,
-        v_radius: i32,
-        margin: i32,
-        heading: i8,
         far_m: f64,
-        vel_x: f64,
-        vel_y: f64,
-        vel_z: f64,
+        vel: DVec3,
         up: Option<Face>,
-        fold: super::seam::Unfold,
-    ) {
-        // Stored ahead of the centres, so the one epoch bump below publishes each centre with its
-        // net. A re-key that measured the new net from the other chart's centre would deschedule
-        // every queued job: the charts' storage boxes do not overlap.
-        let near_net_moved = Self::store_fold(&self.fold, &self.folded, fold);
-        let far_net_moved = Self::store_fold(&self.far_fold, &self.far_folded, far.fold);
-        let far_bits = far_m.to_bits();
-        let vx = vel_x.to_bits();
-        let vy = vel_y.to_bits();
-        let vz = vel_z.to_bits();
-        let up_code = match up {
-            Some(face) => face as u8,
-            None => UP_NONE,
-        };
-        let same_center = !near_net_moved
-            && !far_net_moved
-            && self.cx.load(Ordering::Relaxed) == cx
-            && self.cy.load(Ordering::Relaxed) == cy
-            && self.cz.load(Ordering::Relaxed) == cz
-            && self.fx.load(Ordering::Relaxed) == far.x
-            && self.fz.load(Ordering::Relaxed) == far.z
-            && self.radius.load(Ordering::Relaxed) == radius
-            && self.v_radius.load(Ordering::Relaxed) == v_radius
-            && self.margin.load(Ordering::Relaxed) == margin
-            && self.heading.load(Ordering::Relaxed) == heading
-            && self.up.load(Ordering::Relaxed) == up_code;
-        let same_far = self.far_m.load(Ordering::Relaxed) == far_bits;
-        let same_vel = self.vel_x.load(Ordering::Relaxed) == vx
-            && self.vel_y.load(Ordering::Relaxed) == vy
-            && self.vel_z.load(Ordering::Relaxed) == vz;
-        if same_center && same_far && same_vel {
-            return;
-        }
-        if !same_vel {
-            self.vel_x.store(vx, Ordering::Relaxed);
-            self.vel_y.store(vy, Ordering::Relaxed);
-            self.vel_z.store(vz, Ordering::Relaxed);
-        }
-        if !same_far {
-            self.far_m.store(far_bits, Ordering::Relaxed);
-        }
-        if !same_center {
-            self.cx.store(cx, Ordering::Relaxed);
-            self.cy.store(cy, Ordering::Relaxed);
-            self.cz.store(cz, Ordering::Relaxed);
-            self.fx.store(far.x, Ordering::Relaxed);
-            self.fz.store(far.z, Ordering::Relaxed);
-            self.radius.store(radius, Ordering::Relaxed);
-            self.v_radius.store(v_radius, Ordering::Relaxed);
-            self.margin.store(margin, Ordering::Relaxed);
-            self.heading.store(heading, Ordering::Relaxed);
-            self.up.store(up_code, Ordering::Relaxed);
-            self.epoch.fetch_add(1, Ordering::Release);
-        }
+        fold: Unfold,
+    ) -> Self {
+        Self { center, far, radius, v_radius: i32::MAX, margin: CANCEL_MARGIN, heading: 0, up, fold, far_m, vel }
     }
 
-    /// Publish the far-field horizon (metres from the eye).
-    #[cfg(test)]
-    fn set_far(&self, metres: f64) {
-        self.far_m.store(metres.to_bits(), Ordering::Relaxed);
+    /// The part of the view that re-keys the queues: everything but the horizon and the velocity,
+    /// which wobble every pass and are read as they are when a re-key runs.
+    fn keyed(&self) -> Self {
+        Self { far_m: 0.0, vel: DVec3::ZERO, ..*self }
     }
 
-    #[cfg(test)]
-    fn set_velocity(&self, x: f64, z: f64) {
-        self.vel_x.store(x.to_bits(), Ordering::Relaxed);
-        self.vel_y.store(0.0f64.to_bits(), Ordering::Relaxed);
-        self.vel_z.store(z.to_bits(), Ordering::Relaxed);
-    }
-
-    fn set_near_cap(&self, near_cap: usize) {
-        self.near_queue_cap.store(near_cap.max(1), Ordering::Relaxed);
-    }
-
-    fn near_queue_cap(&self) -> usize {
-        self.near_queue_cap.load(Ordering::Relaxed).max(1)
-    }
-
-    fn epoch(&self) -> u64 {
-        self.epoch.load(Ordering::Acquire)
-    }
-
-    fn center(&self) -> (i32, i32, i32) {
-        (
-            self.cx.load(Ordering::Relaxed),
-            self.cy.load(Ordering::Relaxed),
-            self.cz.load(Ordering::Relaxed),
-        )
-    }
-
-    fn up_face(&self) -> Option<Face> {
-        Face::from_index(self.up.load(Ordering::Relaxed))
-    }
-
-    /// Publish the chart net alone, against the centre already published. A caller about to move
-    /// the centre passes the net to [`publish`](Self::publish) instead: publishing the net first
-    /// re-keys the new net from the old centre and deschedules every near job.
-    fn set_fold(&self, fold: super::seam::Unfold) {
-        if Self::store_fold(&self.fold, &self.folded, fold) {
-            self.epoch.fetch_add(1, Ordering::Release);
-        }
-    }
-
-    /// Publish the pending spawn slab. Offered every pass: no slab before and
-    /// after is one atomic load.
-    fn set_slab(&self, slab: Option<crate::coord::ChunkBox>) {
-        if slab.is_none() && !self.slab_set.load(Ordering::Relaxed) {
-            return;
-        }
-        let mut cur = self.slab.write().unwrap_or_else(std::sync::PoisonError::into_inner);
-        *cur = slab;
-        self.slab_set.store(slab.is_some(), Ordering::Relaxed);
-    }
-
-    /// Whether `c` (already in the centre's net) is in the pending spawn slab.
-    fn in_slab(&self, c: Coord) -> bool {
-        self.slab_set.load(Ordering::Relaxed)
-            && self
-                .slab
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_some_and(|b| b.contains(c))
-    }
-
-    /// Store `fold` in `slot`; returns whether it changed. The far net is offered every pass, so
-    /// an unchanged net takes only the read lock.
-    fn store_fold(
-        slot: &std::sync::RwLock<super::seam::Unfold>,
-        folded: &std::sync::atomic::AtomicBool,
-        fold: super::seam::Unfold,
-    ) -> bool {
-        if *slot.read().unwrap_or_else(std::sync::PoisonError::into_inner) == fold {
-            return false;
-        }
-        let mut cur = slot.write().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if *cur == fold {
-            return false;
-        }
-        *cur = fold;
-        folded.store(!fold.is_identity(), Ordering::Relaxed);
-        true
-    }
-
-    /// A job chunk's place in the chart net (itself off round worlds).
-    #[inline]
-    fn folded(&self, x: i32, y: i32, z: i32) -> (i32, i32, i32) {
-        if !self.folded.load(Ordering::Relaxed) {
-            return (x, y, z);
-        }
-        let c = self.fold.read().unwrap_or_else(std::sync::PoisonError::into_inner).fold(Coord::new(x, y, z));
-        (c.x, c.y, c.z)
-    }
-
-    /// Chess distance from the live centre across the up face (+Y: the XZ
-    /// chess this gate always used), 3-D chess when isotropic; `0` while
-    /// permissive. The chunk is already placed in the chart net
-    /// ([`folded`](Self::folded)), so a job in a neighbouring chart is
-    /// measured where the net puts it.
-    fn dist_in_net(&self, x: i32, y: i32, z: i32) -> i32 {
-        if self.radius.load(Ordering::Relaxed) == i32::MAX {
+    /// Chess distance from the centre across the up face (+Y: the XZ chess this gate always
+    /// used), 3-D chess when isotropic; `0` while permissive. `c` is already in the chart net, so
+    /// a job in a neighbouring chart is measured where the net puts it.
+    fn dist_in_net(&self, c: Coord) -> i32 {
+        if self.radius == i32::MAX {
             return 0;
         }
-        let (px, py, pz) = self.center();
-        let d = [(x - px).abs(), (y - py).abs(), (z - pz).abs()];
-        match self.up_face() {
+        let p = self.center;
+        let d = [(c.x - p.x).abs(), (c.y - p.y).abs(), (c.z - p.z).abs()];
+        match self.up {
             Some(face) => {
                 let a = face.axis();
                 (0..3).filter(|&i| i != a).map(|i| d[i]).max().unwrap_or(0)
@@ -969,120 +746,136 @@ impl ViewGate {
         }
     }
 
-    /// Motion-biased near priority. Chess distance stays the integer part;
-    /// the fractional key space lets leading/trailing alignment move a job
-    /// without collapsing adjacent rings onto one integer. Bias is in the
-    /// plane perpendicular to the up face, in chunk units. +Y uses XZ only.
-    fn near_key(&self, x: i32, y: i32, z: i32) -> u64 {
-        let (x, y, z) = self.folded(x, y, z);
-        let base = self.dist_in_net(x, y, z) as u64 * 1024;
+    /// Motion-biased near key of `c` in the net. Chess distance stays the integer part; the
+    /// fractional key space lets leading/trailing alignment move a job without collapsing
+    /// adjacent rings onto one integer. Bias is in the plane perpendicular to the up face, in
+    /// chunk units. +Y uses XZ only.
+    fn key_in_net(&self, c: Coord) -> u64 {
+        let base = self.dist_in_net(c) as u64 * 1024;
         if base == 0 {
             return 0;
         }
-        let (px, py, pz) = self.center();
+        let p = self.center;
         super::bias_order(
             base,
-            self.velocity(),
-            (x - px) as f64,
-            (y - py) as f64,
-            (z - pz) as f64,
-            self.up_face(),
+            self.vel,
+            (c.x - p.x) as f64,
+            (c.y - p.y) as f64,
+            (c.z - p.z) as f64,
+            self.up,
         )
     }
 
-    /// Whether a job at this chunk is still worth running. A permissive radius
-    /// keeps every job, and so does the pending spawn slab (physics waits on
-    /// it). Otherwise the chunk must sit inside the published radius plus
-    /// margin, inside the vertical loading radius when one is set, and, while a
-    /// heading is set, not strictly behind the player.
-    fn wanted(&self, x: i32, y: i32, z: i32) -> bool {
-        let radius = self.radius.load(Ordering::Relaxed);
-        if radius == i32::MAX {
+    /// Whether a job at `c` in the net is still worth running. A permissive radius keeps every
+    /// job, and so does the pending spawn `slab` (physics waits on it). Otherwise the chunk must
+    /// sit inside the radius plus margin, inside the vertical loading radius when one is set,
+    /// and, while a heading is set, not strictly behind the player.
+    fn wanted_in_net(&self, c: Coord, slab: Option<ChunkBox>) -> bool {
+        if self.radius == i32::MAX || slab.is_some_and(|b| b.contains(c)) {
             return true;
         }
-        let (x, y, z) = self.folded(x, y, z);
-        let coord = Coord::new(x, y, z);
-        if self.in_slab(coord) {
-            return true;
-        }
-        let (px, py, pz) = self.center();
-        let up = self.up_face();
-        let center = Coord::new(px, py, pz);
-        let margin = self.margin.load(Ordering::Relaxed);
-        if self.dist_in_net(x, y, z) > radius + margin {
+        if self.dist_in_net(c) > self.radius + self.margin {
             return false;
         }
-        let vr = self.v_radius.load(Ordering::Relaxed);
-        if vr != i32::MAX
-            && let Some(face) = up
-            && coord.along(center, face) > vr + margin
+        if self.v_radius != i32::MAX
+            && let Some(face) = self.up
+            && c.along(self.center, face) > self.v_radius + self.margin
         {
             return false;
         }
-        self.heading.load(Ordering::Relaxed) == 0
-            || !super::streaming::chunk_behind(center, coord, self.velocity(), up)
+        self.heading == 0 || !super::streaming::chunk_behind(self.center, c, self.vel, self.up)
+    }
+
+    /// The key of a new near job anchored at `anchor`.
+    fn near_key(&self, anchor: Coord) -> u64 {
+        self.key_in_net(self.fold.fold(anchor))
+    }
+
+    /// A queued near job's key against this view, or `None` once it is no longer wanted. The
+    /// anchor is computed and folded once.
+    fn rekey_near(&self, job: &Job, slab: Option<ChunkBox>) -> Option<u64> {
+        let c = self.fold.fold(near_anchor(job, self.center));
+        self.wanted_in_net(c, slab).then(|| self.key_in_net(c))
     }
 
     /// The far eye in metres — the far centre chunk's centre (the streaming centre's height),
     /// matching [`player_dist2`](super::player_dist2)'s convention.
     fn eye_m(&self) -> (f64, f64, f64) {
-        let (_, cy, _) = self.center();
-        let (cx, cz) = (self.fx.load(Ordering::Relaxed), self.fz.load(Ordering::Relaxed));
         let s = CHUNK_SIZE as f64;
         let half = s / 2.0;
-        (cx as f64 * s + half, cy as f64 * s + half, cz as f64 * s + half)
+        (self.far.x as f64 * s + half, self.center.y as f64 * s + half, self.far.z as f64 * s + half)
     }
 
-    /// Live squared distance (m²) from the eye to a world point.
-    fn far_dist2_m(&self, wx: i64, wy: i64, wz: i64) -> u64 {
+    /// A queued far entry's key against this view, or `None` once it left the horizon. The entry
+    /// at world centre `(wx, wz)` is measured where the far field's chart net puts it; storage
+    /// outside that net sorts last and drops once a horizon is set. Its own footprint `span` is
+    /// the hysteresis margin — sections are large, so the chunk-sized [`CANCEL_MARGIN`] would be
+    /// meaningless here. Permissive until both a view and a horizon have been published.
+    /// Sections are an XZ heightfield: the eye's altitude is the entry's, so `dy` is 0 and a +Y
+    /// gate matches the old 2-D metric. [`motion_biased_dist2`](super::motion_biased_dist2)
+    /// ignores `vel.y`.
+    fn rekey_far(&self, wx: i64, wz: i64, span: i64) -> Option<u64> {
+        let permissive = !self.far_m.is_finite() || self.radius == i32::MAX;
+        let Some((wx, wz)) = self.far.fold.fold_column(wx, wz) else {
+            return permissive.then_some(u64::MAX);
+        };
         let (ex, ey, ez) = self.eye_m();
-        let (dx, dy, dz) = (wx as f64 - ex, wy as f64 - ey, wz as f64 - ez);
-        (dx * dx + dy * dy + dz * dz) as u64
+        let (dx, dy, dz) = (wx as f64 - ex, (ey as i64) as f64 - ey, wz as f64 - ez);
+        let dist2 = (dx * dx + dy * dy + dz * dz) as u64;
+        let limit = self.far_m + span as f64;
+        (permissive || (dist2 as f64) <= limit * limit)
+            .then(|| super::motion_biased_dist2(dist2, self.vel, dx, dz))
     }
+}
 
-    fn velocity(&self) -> voxel_engine::DVec3 {
-        voxel_engine::DVec3::new(
-            f64::from_bits(self.vel_x.load(Ordering::Relaxed)),
-            f64::from_bits(self.vel_y.load(Ordering::Relaxed)),
-            f64::from_bits(self.vel_z.load(Ordering::Relaxed)),
-        )
+/// The live view as the queues hold it, behind the queue lock. The world publishes a [`ViewSnap`]
+/// every stream pass; the queues then re-key their backlogs toward where the player is NOW and
+/// deschedule entries left behind — once per CHANGE ([`epoch`](Self::epoch)), not per pop. Fast
+/// movement therefore reorders the backlog and sheds it instead of grinding through stale
+/// regions. [`CANCEL_MARGIN`] remains the spatial hysteresis.
+struct ViewGate {
+    view: ViewSnap,
+    /// Bumped only when the keyed part of the view changes, so the queues' O(n) re-key runs once
+    /// per boundary cross (or loading-radius step) instead of once per pop.
+    epoch: u64,
+    /// The spawn or teleport slab physics is waiting on, in the centre's net: its jobs always run.
+    slab: Option<ChunkBox>,
+    /// Near-queue lookahead, from the world's streaming pacer.
+    near_cap: usize,
+}
+
+impl Default for ViewGate {
+    /// Permissive until a real [`Workers`] pool publishes; direct queue tests and non-streaming
+    /// users keep the legacy behaviour.
+    fn default() -> Self {
+        Self { view: ViewSnap::PERMISSIVE, epoch: 0, slab: None, near_cap: usize::MAX }
     }
+}
 
-    /// A far entry's centre in the far field's chart net (itself off charts); `None` for storage
-    /// outside it.
-    #[inline]
-    fn far_place(&self, wx: i64, wz: i64) -> Option<(i64, i64)> {
-        if !self.far_folded.load(Ordering::Relaxed) {
-            return Some((wx, wz));
+impl ViewGate {
+    fn publish(&mut self, view: &ViewSnap) {
+        if view.keyed() != self.view.keyed() {
+            self.epoch += 1;
         }
-        self.far_fold.read().unwrap_or_else(std::sync::PoisonError::into_inner).fold_column(wx, wz)
+        self.view = *view;
     }
 
-    /// Section re-key. Sections are an XZ heightfield: `wy` is the live eye
-    /// altitude, so `dy` is 0 and a +Y gate matches the old 2-D metric.
-    /// [`motion_biased_dist2`](super::motion_biased_dist2) ignores `vel.y`.
-    fn far_key(&self, wx: i64, wz: i64) -> u64 {
-        let Some((wx, wz)) = self.far_place(wx, wz) else { return u64::MAX };
-        let (ex, ey, ez) = self.eye_m();
-        let (dx, dz) = (wx as f64 - ex, wz as f64 - ez);
-        super::motion_biased_dist2(self.far_dist2_m(wx, ey as i64, wz), self.velocity(), dx, dz)
-    }
-
-    /// Whether a far entry with world-centre `(wx, wz)` and footprint `span`
-    /// is still inside the live horizon. The entry's own span is the
-    /// hysteresis margin — sections are large, so the chunk-sized
-    /// [`CANCEL_MARGIN`] would be meaningless here. Permissive until both a
-    /// view and a horizon have been published. Vertical distance is dropped
-    /// (the section has no altitude).
-    fn far_wanted(&self, wx: i64, wz: i64, span: i64) -> bool {
-        let far = f64::from_bits(self.far_m.load(Ordering::Relaxed));
-        if !far.is_finite() || self.radius.load(Ordering::Relaxed) == i32::MAX {
-            return true;
+    /// Publish the chart net alone, against the centre already published. A caller about to move
+    /// the centre publishes the net with it instead: publishing the net first re-keys the new net
+    /// from the old centre and deschedules every near job.
+    fn set_fold(&mut self, fold: Unfold) {
+        if self.view.fold != fold {
+            self.view.fold = fold;
+            self.epoch += 1;
         }
-        let Some((wx, wz)) = self.far_place(wx, wz) else { return false };
-        let limit = far + span as f64;
-        let (_, ey, _) = self.eye_m();
-        (self.far_dist2_m(wx, ey as i64, wz) as f64) <= limit * limit
+    }
+
+    /// Centre `(cx, cy, cz)` with `radius`, the far field standing on the same column.
+    #[cfg(test)]
+    fn set(&mut self, cx: i32, cy: i32, cz: i32, radius: i32) {
+        let far = FarView { x: cx, z: cz, ..self.view.far };
+        let view = ViewSnap { center: Coord::new(cx, cy, cz), far, radius, ..self.view };
+        self.publish(&view);
     }
 }
 
@@ -1197,12 +990,12 @@ impl EpochHeap {
         }));
     }
 
-    /// Re-key every entry and deschedule the unwanted, once per epoch.
+    /// Re-key every entry and deschedule the unwanted (`rekey` returns `None`),
+    /// once per epoch. Rebuilt in the heap's own buffer: no allocation.
     fn sync(
         &mut self,
         epoch: u64,
-        key: impl Fn(&Keyed) -> u64,
-        wanted: impl Fn(&Keyed) -> bool,
+        rekey: impl Fn(&Keyed) -> Option<u64>,
         cancelled: &mut Vec<JobKey>,
     ) {
         if self.keyed_at == epoch {
@@ -1212,16 +1005,18 @@ impl EpochHeap {
         if self.heap.is_empty() {
             return;
         }
-        let mut kept = Vec::with_capacity(self.heap.len());
-        for std::cmp::Reverse(mut entry) in std::mem::take(&mut self.heap).into_vec() {
-            if wanted(&entry) {
-                entry.d = key(&entry);
-                kept.push(std::cmp::Reverse(entry));
-            } else {
-                cancelled.push(JobKey::of(&entry.job));
+        let mut entries = std::mem::take(&mut self.heap).into_vec();
+        entries.retain_mut(|std::cmp::Reverse(entry)| match rekey(entry) {
+            Some(d) => {
+                entry.d = d;
+                true
             }
-        }
-        self.heap = std::collections::BinaryHeap::from(kept); // O(n) heapify
+            None => {
+                cancelled.push(JobKey::of(&entry.job));
+                false
+            }
+        });
+        self.heap = std::collections::BinaryHeap::from(entries); // O(n) heapify
     }
 
     fn pop(&mut self) -> Option<Job> {
@@ -1243,15 +1038,11 @@ impl EpochHeap {
     }
 }
 
-/// Chunk a near job is measured from against the live gate. Panic jobs and
-/// anything without an anchor sit at the origin, matching the old `(0, 0)`
-/// column (the permissive gate forces distance 0 before that point matters).
-fn near_anchor(job: &Job, gate: &ViewGate) -> (i32, i32, i32) {
-    let (cx, cy, cz) = gate.center();
-    match job.anchor(Coord::new(cx, cy, cz)) {
-        Some(c) => (c.x, c.y, c.z),
-        None => (0, 0, 0),
-    }
+/// Chunk a near job is measured from against the view `center`. Panic jobs
+/// and anything without an anchor sit at the origin (the permissive gate
+/// forces distance 0 before that point matters).
+fn near_anchor(job: &Job, center: Coord) -> Coord {
+    job.anchor(center).unwrap_or(Coord { x: 0, y: 0, z: 0 })
 }
 
 /// A far job's world-space centre and footprint span (metres), for live
@@ -1277,12 +1068,13 @@ fn far_center_span(job: &Job) -> (i64, i64, i64) {
 /// every view change — sustained fast flight sheds far work it has left
 /// behind instead of grinding it (the old far class re-keyed NEVER: only the
 /// >512 m/s teleport purge touched it). `closed` is the shutdown flag a
-///
 /// blocked `pop` wakes on.
 #[derive(Default)]
 struct JobQueue {
     near: EpochHeap,
     far: EpochHeap,
+    /// The live view both classes are keyed against.
+    gate: ViewGate,
     closed: bool,
 }
 
@@ -1293,15 +1085,15 @@ impl JobQueue {
     /// Far work on this legacy path is uncapped (its only producers are tests);
     /// streaming far lanes use cap-checked [`Workers::submit_far`]. Near work
     /// obeys the pacer's bounded lookahead.
-    fn push(&mut self, job: Job, gate: &ViewGate) -> bool {
+    fn push(&mut self, job: Job) -> bool {
         match priority(&job) {
             Priority::Near => {
-                if self.near.len() >= gate.near_queue_cap() {
+                if self.near.len() >= self.gate.near_cap {
                     return false;
                 }
-                let (x, y, z) = near_anchor(&job, gate);
-                let d = gate.near_key(x, y, z);
-                self.near.push(d, x as i64, z as i64, 0, job);
+                let c = near_anchor(&job, self.gate.view.center);
+                let d = self.gate.view.near_key(c);
+                self.near.push(d, i64::from(c.x), i64::from(c.z), 0, job);
             }
             Priority::Far => {
                 let (wx, wz, span) = far_center_span(&job);
@@ -1339,29 +1131,13 @@ impl JobQueue {
     /// re-key and drain their left-behind entries into `cancelled` — the
     /// caller reports each as [`Done::Cancelled`] so its claim is released
     /// instead of stranded.
-    fn pop(&mut self, gate: &ViewGate, cancelled: &mut Vec<JobKey>) -> Option<Job> {
-        let epoch = gate.epoch();
-        self.near.sync(
-            epoch,
-            |e| {
-                let (x, y, z) = near_anchor(&e.job, gate);
-                gate.near_key(x, y, z)
-            },
-            |e| {
-                let (x, y, z) = near_anchor(&e.job, gate);
-                gate.wanted(x, y, z)
-            },
-            cancelled,
-        );
+    fn pop(&mut self, cancelled: &mut Vec<JobKey>) -> Option<Job> {
+        let ViewGate { view, epoch, slab, .. } = &self.gate;
+        self.near.sync(*epoch, |e| view.rekey_near(&e.job, *slab), cancelled);
         // Far syncs on the same trigger even while near work exists: a flood
         // keeps workers in the near class for a long time, and stale far
         // claims must release promptly, not once the near backlog drains.
-        self.far.sync(
-            epoch,
-            |e| gate.far_key(e.wx, e.wz),
-            |e| gate.far_wanted(e.wx, e.wz, e.span),
-            cancelled,
-        );
+        self.far.sync(*epoch, |e| view.rekey_far(e.wx, e.wz, e.span), cancelled);
         self.near.pop().or_else(|| self.far.pop())
     }
 }
@@ -1378,8 +1154,6 @@ fn lock_queue(lock: &Mutex<JobQueue>) -> MutexGuard<'_, JobQueue> {
 pub struct Workers {
     /// Shared queue plus the condition idle workers wait on for new work.
     gate: Arc<(Mutex<JobQueue>, Condvar)>,
-    /// The live view snapshot the queue re-prioritizes and descheduled against.
-    view: Arc<ViewGate>,
     results: Receiver<Done>,
     handles: Vec<JoinHandle<()>>,
     capacity: usize,
@@ -1417,24 +1191,22 @@ impl Workers {
         // generation, FAR_QUEUE_CAP for sections, one-per-coord for light).
         let (done, results) = mpsc::channel::<Done>();
         let capacity = threads.max(1);
-        let gate = Arc::new((Mutex::new(JobQueue::default()), Condvar::new()));
-        let view = Arc::new(ViewGate::new());
-        view.set_near_cap(near_lookahead(capacity));
+        let mut queue = JobQueue::default();
+        queue.gate.near_cap = near_lookahead(capacity);
+        let gate = Arc::new((Mutex::new(queue), Condvar::new()));
         let stager = Arc::new(OnceLock::new());
         let staging = Arc::new(StagingStats::new());
         let handles = (0..capacity)
             .map(|_| {
                 let gate = Arc::clone(&gate);
-                let view = Arc::clone(&view);
                 let done = done.clone();
                 let stager = Arc::clone(&stager);
                 let staging = Arc::clone(&staging);
-                thread::spawn(move || worker_loop(&gate, &view, &done, &stager, &staging))
+                thread::spawn(move || worker_loop(&gate, &done, &stager, &staging))
             })
             .collect();
         Self {
             gate,
-            view,
             results,
             handles,
             capacity,
@@ -1453,80 +1225,30 @@ impl Workers {
         self.staging.snapshot()
     }
 
-    /// Publish the live streaming centre, where the far field stands, horizontal radius
-    /// (chunks), and the far-field horizon (metres). The queues re-key their backlogs against it
-    /// and deschedule left-behind entries — once per change, at the pool.
-    pub(in crate::world) fn set_view(
-        &self,
-        cx: i32,
-        cy: i32,
-        cz: i32,
-        far: FarView,
-        radius: i32,
-        far_m: f64,
-        vel_x: f64,
-        vel_y: f64,
-        vel_z: f64,
-        up: Option<Face>,
-        fold: super::seam::Unfold,
-    ) {
-        self.view.publish(
-            cx,
-            cy,
-            cz,
-            far,
-            radius,
-            i32::MAX,
-            CANCEL_MARGIN,
-            0,
-            far_m,
-            vel_x,
-            vel_y,
-            vel_z,
-            up,
-            fold,
-        );
+    fn queue(&self) -> MutexGuard<'_, JobQueue> {
+        lock_queue(&self.gate.0)
     }
 
-    /// Publish a speed-reduced loading horizon: horizontal `radius`, vertical
-    /// `v_radius`, `margin` past each, and the travel `heading`. The draw radius
-    /// stays on the world; this only decides which queued near jobs still run.
-    pub(in crate::world) fn set_load_view(
-        &self,
-        cx: i32,
-        cy: i32,
-        cz: i32,
-        far: FarView,
-        radius: i32,
-        v_radius: i32,
-        margin: i32,
-        heading: i8,
-        far_m: f64,
-        vel_x: f64,
-        vel_y: f64,
-        vel_z: f64,
-        up: Option<Face>,
-        fold: super::seam::Unfold,
-    ) {
-        self.view.publish(
-            cx, cy, cz, far, radius, v_radius, margin, heading, far_m, vel_x, vel_y, vel_z, up, fold,
-        );
+    /// Publish the live view. The queues re-key their backlogs against it and
+    /// deschedule left-behind entries — once per change, at the pool.
+    pub(in crate::world) fn publish(&self, view: &ViewSnap) {
+        self.queue().gate.publish(view);
     }
 
     /// Publish the chart net alone, against the centre already published. Callers about to move
-    /// the centre pass the net to [`set_view`](Self::set_view) instead.
-    pub(in crate::world) fn set_fold(&self, fold: super::seam::Unfold) {
-        self.view.set_fold(fold);
+    /// the centre publish the net with it instead.
+    pub(in crate::world) fn set_fold(&self, fold: Unfold) {
+        self.queue().gate.set_fold(fold);
     }
 
     /// Publish the pending spawn slab: the gate never deschedules its jobs.
-    pub(in crate::world) fn set_slab(&self, slab: Option<crate::coord::ChunkBox>) {
-        self.view.set_slab(slab);
+    pub(in crate::world) fn set_slab(&self, slab: Option<ChunkBox>) {
+        self.queue().gate.slab = slab;
     }
 
     /// Publish the near-queue lookahead: submits past it are declined.
     pub(in crate::world) fn set_near_cap(&self, near_cap: usize) {
-        self.view.set_near_cap(near_cap);
+        self.queue().gate.near_cap = near_cap.max(1);
     }
 
     pub(in crate::world) fn worker_capacity(&self) -> usize {
@@ -1534,39 +1256,34 @@ impl Workers {
     }
 
     pub(in crate::world) fn queue_depths(&self) -> (usize, usize) {
-        let (lock, _) = &*self.gate;
-        let queue = lock_queue(lock);
+        let queue = self.queue();
         (queue.near.len(), queue.far.len())
     }
 
     /// Free near-queue slots against the pacer cap. One lock; `0` means a
     /// submit this pass will be declined.
     pub(in crate::world) fn near_slots_free(&self) -> usize {
-        let (lock, _) = &*self.gate;
-        let queue = lock_queue(lock);
-        self.view.near_queue_cap().saturating_sub(queue.near.len())
+        let queue = self.queue();
+        queue.gate.near_cap.saturating_sub(queue.near.len())
     }
 
     /// Free far-queue slots against [`FAR_QUEUE_CAP`]. One lock.
     pub(in crate::world) fn far_slots_free(&self) -> usize {
-        let (lock, _) = &*self.gate;
-        let queue = lock_queue(lock);
-        FAR_QUEUE_CAP.saturating_sub(queue.far.len())
+        FAR_QUEUE_CAP.saturating_sub(self.queue().far.len())
     }
 
     /// Queue a job at its scheduling class; returns whether it was accepted.
     /// `false` means shutdown or adaptive near-lookahead backpressure, so the
     /// caller must not claim it and the normal pending lane retries later.
     pub(in crate::world) fn submit(&self, job: Job) -> bool {
-        let (lock, work) = &*self.gate;
-        let mut queue = lock_queue(lock);
+        let mut queue = self.queue();
         if queue.closed {
             return false;
         }
-        let admitted = queue.push(job, &self.view);
+        let admitted = queue.push(job);
         drop(queue);
         if admitted {
-            work.notify_one();
+            self.gate.1.notify_one();
         }
         admitted
     }
@@ -1579,15 +1296,14 @@ impl Workers {
     /// claimed ⇒ owed exactly one `Done`), it just retries on a later frame.
     #[must_use]
     pub(in crate::world) fn submit_far(&self, job: Job, dist2: u64) -> bool {
-        let (lock, work) = &*self.gate;
-        let mut queue = lock_queue(lock);
+        let mut queue = self.queue();
         if queue.closed {
             return false;
         }
         let admitted = queue.push_far(job, dist2);
         drop(queue);
         if admitted {
-            work.notify_one();
+            self.gate.1.notify_one();
         }
         admitted
     }
@@ -1602,8 +1318,7 @@ impl Workers {
     /// whole section lane (configuration change). A worker already executing a
     /// job is unaffected and remains protected by epoch/token validation.
     pub(in crate::world) fn clear_far(&self) -> Vec<JobKey> {
-        let (lock, _) = &*self.gate;
-        lock_queue(lock).clear_far()
+        self.queue().clear_far()
     }
 }
 
@@ -1612,9 +1327,8 @@ impl Drop for Workers {
     /// either waiting on the condvar (returns at once) or finishing one job, so
     /// the join is bounded and GPU-independent.
     fn drop(&mut self) {
-        let (lock, work) = &*self.gate;
-        lock_queue(lock).closed = true;
-        work.notify_all();
+        self.queue().closed = true;
+        self.gate.1.notify_all();
         for handle in self.handles.drain(..) {
             let _ = handle.join();
         }
@@ -1695,7 +1409,6 @@ fn job_meter(job: &Job) -> voxel_engine::profile::Meter {
 
 fn worker_loop(
     gate: &(Mutex<JobQueue>, Condvar),
-    view: &ViewGate,
     done: &Sender<Done>,
     stager: &OnceLock<MeshStager>,
     stats: &StagingStats,
@@ -1714,7 +1427,7 @@ fn worker_loop(
                 if queue.closed {
                     return;
                 }
-                let job = queue.pop(view, &mut cancelled);
+                let job = queue.pop(&mut cancelled);
                 if job.is_some() || !cancelled.is_empty() {
                     break job;
                 }
@@ -2083,16 +1796,12 @@ mod tests {
         }
     }
 
-    /// A permissive gate (no view published yet): near keeps FIFO order.
-    fn open_gate() -> ViewGate {
-        ViewGate::new()
-    }
-
     /// `pop` with cancellation plumbing asserted empty — for tests where no
-    /// descheduling is expected.
-    fn pop_clean(q: &mut JobQueue, gate: &ViewGate) -> Option<Job> {
+    /// descheduling is expected. A fresh queue's gate is permissive (no view
+    /// published yet): near keeps FIFO order.
+    fn pop_clean(q: &mut JobQueue) -> Option<Job> {
         let mut cancelled = Vec::new();
-        let job = q.pop(gate, &mut cancelled);
+        let job = q.pop(&mut cancelled);
         assert!(
             cancelled.is_empty(),
             "unexpected descheduling: {cancelled:?}"
@@ -2113,24 +1822,23 @@ mod tests {
 
         // Interleave far/near so a FIFO alone would not reproduce the order.
         let mut q = JobQueue::default();
-        let gate = open_gate();
-        q.push(far(0), &gate);
-        q.push(near(0), &gate);
-        q.push(far(1), &gate);
-        q.push(near(1), &gate);
+        q.push(far(0));
+        q.push(near(0));
+        q.push(far(1));
+        q.push(near(1));
 
         // All near first (FIFO within class), then all far (FIFO within class).
         assert!(matches!(
-            pop_clean(&mut q, &gate),
+            pop_clean(&mut q),
             Some(Job::GenerateColumn { key: ColumnKey { a: 0, b: 0, .. }, .. })
         ));
         assert!(matches!(
-            pop_clean(&mut q, &gate),
+            pop_clean(&mut q),
             Some(Job::GenerateColumn { key: ColumnKey { a: 1, b: 1, .. }, .. })
         ));
-        assert_eq!(section_id(&pop_clean(&mut q, &gate).unwrap()), 0);
-        assert_eq!(section_id(&pop_clean(&mut q, &gate).unwrap()), 1);
-        assert!(pop_clean(&mut q, &gate).is_none());
+        assert_eq!(section_id(&pop_clean(&mut q).unwrap()), 0);
+        assert_eq!(section_id(&pop_clean(&mut q).unwrap()), 1);
+        assert!(pop_clean(&mut q).is_none());
     }
 
     /// The fast-movement fix: near pops re-key against the LIVE centre (the
@@ -2148,18 +1856,17 @@ mod tests {
         };
 
         let mut q = JobQueue::default();
-        let gate = open_gate();
-        q.push(near(26, 26), &gate); // enqueued first, but no longer the closest
-        q.push(near(0, 1), &gate); // right next to the ORIGINAL centre
-        q.push(near(6, 6), &gate); // a few chunks out from the original centre
-        q.push(near(28, 29), &gate); // right next to where the player ends up
+        q.push(near(26, 26)); // enqueued first, but no longer the closest
+        q.push(near(0, 1)); // right next to the ORIGINAL centre
+        q.push(near(6, 6)); // a few chunks out from the original centre
+        q.push(near(28, 29)); // right next to where the player ends up
 
         // The player sprints to (28, 28) with radius 3: priorities flip, and
         // everything left more than radius + CANCEL_MARGIN chunks behind is
         // descheduled with its claim reported.
-        gate.set(28, 0, 28, 3);
+        q.gate.set(28, 0, 28, 3);
         let mut cancelled = Vec::new();
-        let first = q.pop(&gate, &mut cancelled).expect("work remains");
+        let first = q.pop(&mut cancelled).expect("work remains");
         assert!(
             matches!(first, Job::GenerateColumn { key: ColumnKey { a: 28, b: 29, .. }, .. }),
             "the job nearest the LIVE centre must pop first, not the oldest"
@@ -2187,10 +1894,10 @@ mod tests {
 
         // The surviving (26, 26) — inside the ring at distance 2 — runs next.
         let mut cancelled = Vec::new();
-        let second = q.pop(&gate, &mut cancelled).expect("one survivor");
+        let second = q.pop(&mut cancelled).expect("one survivor");
         assert!(matches!(second, Job::GenerateColumn { key: ColumnKey { a: 26, b: 26, .. }, .. }));
         assert!(cancelled.is_empty());
-        assert!(q.pop(&gate, &mut cancelled).is_none(), "queue drained");
+        assert!(q.pop(&mut cancelled).is_none(), "queue drained");
     }
 
     #[test]
@@ -2203,26 +1910,25 @@ mod tests {
             edits: Vec::new(),
         };
         let mut q = JobQueue::default();
-        let gate = open_gate();
-        gate.set_velocity(100.0, 0.0);
-        gate.set(0, 0, 0, 20);
-        gate.set_near_cap(near_lookahead(2)); // max(2 * 4, 8)
+        q.gate.view.vel = DVec3::new(100.0, 0.0, 0.0);
+        q.gate.set(0, 0, 0, 20);
+        q.gate.near_cap = near_lookahead(2); // max(2 * 4, 8)
 
         // Equal distance, trailing inserted first: direction must win.
-        assert!(q.push(near(-5), &gate));
-        assert!(q.push(near(5), &gate));
+        assert!(q.push(near(-5)));
+        assert!(q.push(near(5)));
         assert!(matches!(
-            pop_clean(&mut q, &gate),
+            pop_clean(&mut q),
             Some(Job::GenerateColumn { key: ColumnKey { a: 5, b: 0, .. }, .. })
         ));
 
         // Refill to the adaptive lookahead ceiling. Rejection leaves ownership
         // with the caller, which therefore never claims doomed extra work.
-        while q.near.len() < gate.near_queue_cap() {
+        while q.near.len() < q.gate.near_cap {
             let id = q.near.len() as i32 + 1;
-            assert!(q.push(near(id), &gate));
+            assert!(q.push(near(id)));
         }
-        assert!(!q.push(near(19), &gate));
+        assert!(!q.push(near(19)));
         assert_eq!(q.near.len(), 8);
     }
 
@@ -2242,34 +1948,31 @@ mod tests {
             Job::GenerateColumn { key, range, .. } => (key.a, *range.start()),
             _ => panic!("a column job"),
         };
-        let publish = |gate: &ViewGate, v_radius: i32, heading: i8| {
-            gate.publish(
-                0,
-                0,
-                0,
-                FarView::flat(0, 0),
-                2,
+        let publish = |q: &mut JobQueue, v_radius: i32, heading: i8| {
+            q.gate.publish(&ViewSnap {
                 v_radius,
-                1,
+                margin: 1,
                 heading,
-                f64::INFINITY,
-                600.0,
-                0.0,
-                0.0,
-                Some(Face::PosY),
-                crate::world::seam::Unfold::IDENTITY,
-            )
+                ..ViewSnap::full(
+                    Coord::new(0, 0, 0),
+                    FarView::flat(0, 0),
+                    2,
+                    f64::INFINITY,
+                    DVec3::new(600.0, 0.0, 0.0),
+                    Some(Face::PosY),
+                    Unfold::IDENTITY,
+                )
+            })
         };
         let mut q = JobQueue::default();
-        let gate = ViewGate::new();
-        gate.set_slab(Some(crate::coord::ChunkBox::new(Coord::new(0, 0, 0), 1, 2)));
+        q.gate.slab = Some(ChunkBox::new(Coord::new(0, 0, 0), 1, 2));
         for (a, alt) in [(2, 0), (4, 0), (-2, 0), (0, 3), (-1, 0), (0, -2)] {
-            assert!(q.push(column(a, alt), &gate));
+            assert!(q.push(column(a, alt)));
         }
-        publish(&gate, 0, 1);
+        publish(&mut q, 0, 1);
         let mut cancelled = Vec::new();
         let mut kept = Vec::new();
-        while let Some(job) = q.pop(&gate, &mut cancelled) {
+        while let Some(job) = q.pop(&mut cancelled) {
             kept.push(a_of(&job));
         }
         kept.sort_unstable();
@@ -2277,24 +1980,24 @@ mod tests {
         assert_eq!(cancelled.len(), 3, "outside, behind, and too high drop: {cancelled:?}");
 
         // With the slab landed, the same trail and height drop too.
-        gate.set_slab(None);
+        q.gate.slab = None;
         for (a, alt) in [(-1, 0), (0, -2)] {
-            assert!(q.push(column(a, alt), &gate));
+            assert!(q.push(column(a, alt)));
         }
-        publish(&gate, 0, -1);
+        publish(&mut q, 0, -1);
         cancelled.clear();
-        assert!(q.pop(&gate, &mut cancelled).is_none(), "nothing outside the window runs");
+        assert!(q.pop(&mut cancelled).is_none(), "nothing outside the window runs");
         assert_eq!(cancelled.len(), 2, "{cancelled:?}");
 
         // Without a heading the trail is kept: a full-speed window that is not
         // reduced drops nothing it would load.
         for (a, alt) in [(-2, 0), (2, 0)] {
-            assert!(q.push(column(a, alt), &gate));
+            assert!(q.push(column(a, alt)));
         }
-        publish(&gate, i32::MAX, 0);
+        publish(&mut q, i32::MAX, 0);
         cancelled.clear();
         let mut kept = Vec::new();
-        while let Some(job) = q.pop(&gate, &mut cancelled) {
+        while let Some(job) = q.pop(&mut cancelled) {
             kept.push(a_of(&job));
         }
         assert!(cancelled.is_empty(), "no heading drops nothing behind: {cancelled:?}");
@@ -2311,32 +2014,31 @@ mod tests {
         // push dist2 {9, 1, 4, 1}: pops must see 1(first-pushed), 1, 4, 9.
         // A permissive gate never bumps its epoch, so the admission keys hold.
         let mut q = JobQueue::default();
-        let gate = open_gate();
         assert!(q.push_far(job(0), 9)); // seq 0
         assert!(q.push_far(job(1), 1)); // seq 1 — first-pushed of the two dist2 = 1
         assert!(q.push_far(job(2), 4)); // seq 2
         assert!(q.push_far(job(3), 1)); // seq 3
         assert_eq!(
-            id_of(&pop_clean(&mut q, &gate).unwrap()),
+            id_of(&pop_clean(&mut q).unwrap()),
             1,
             "nearest, first-pushed tie"
         );
         assert_eq!(
-            id_of(&pop_clean(&mut q, &gate).unwrap()),
+            id_of(&pop_clean(&mut q).unwrap()),
             3,
             "nearest, second tie (FIFO)"
         );
         assert_eq!(
-            id_of(&pop_clean(&mut q, &gate).unwrap()),
+            id_of(&pop_clean(&mut q).unwrap()),
             2,
             "dist2 = 4 next"
         );
         assert_eq!(
-            id_of(&pop_clean(&mut q, &gate).unwrap()),
+            id_of(&pop_clean(&mut q).unwrap()),
             0,
             "dist2 = 9 last"
         );
-        assert!(pop_clean(&mut q, &gate).is_none(), "drained");
+        assert!(pop_clean(&mut q).is_none(), "drained");
 
         // At the cap, admission REJECTS (never evicts an accepted job: accepted
         // ⇒ claimed ⇒ owed a Done); everything already admitted survives.
@@ -2355,7 +2057,7 @@ mod tests {
         );
         // Popping frees a slot, so the next submit admits again (lane retry).
         assert_eq!(
-            id_of(&pop_clean(&mut q, &open_gate()).unwrap()),
+            id_of(&pop_clean(&mut q).unwrap()),
             0,
             "nearest still pops first"
         );
@@ -2375,23 +2077,22 @@ mod tests {
         let (wx50, wz50, _) = far_center_span(&job(50));
 
         let mut q = JobQueue::default();
-        let gate = ViewGate::new();
         // Admission claims job 50 is NEAREST (dist2 = 1 vs 100) — stale lies.
         assert!(q.push_far(job(0), 100));
         assert!(q.push_far(job(50), 1));
 
         // The player appears at the origin; the horizon covers section 0 but
         // falls short of section 50 (midpoint of their true eye distances).
-        gate.set(0, 0, 0, 8);
+        q.gate.set(0, 0, 0, 8);
         let eye = |wx: i64, wz: i64| {
             let (ex, ez) = (8.0f64, 8.0f64);
             ((wx as f64 - ex).powi(2) + (wz as f64 - ez).powi(2)).sqrt()
         };
-        gate.set_far((eye(wx0, wz0) + eye(wx50, wz50)) / 2.0 - span0 as f64);
+        q.gate.view.far_m = (eye(wx0, wz0) + eye(wx50, wz50)) / 2.0 - span0 as f64;
 
         let mut cancelled = Vec::new();
         let popped = q
-            .pop(&gate, &mut cancelled)
+            .pop(&mut cancelled)
             .expect("the in-horizon section survives");
         assert_eq!(
             section_id(&popped),
@@ -2407,7 +2108,7 @@ mod tests {
             matches!(&cancelled[0], JobKey::Section { pos, .. } if pos.x == 50),
             "with its exact claim reported: {cancelled:?}"
         );
-        assert!(q.pop(&gate, &mut cancelled).is_none(), "drained");
+        assert!(q.pop(&mut cancelled).is_none(), "drained");
     }
 
     /// Far entries are measured from the far centre, not the streaming centre: above a round world
@@ -2420,28 +2121,20 @@ mod tests {
         let mut q = JobQueue::default();
         assert!(q.push_far(job(0), 0));
         assert!(q.push_far(job(50), 0));
-        let gate = ViewGate::new();
         // The streaming centre is far from both sections; the far centre is section 0's chunk, and
         // the horizon reaches it but not section 50.
         let far = FarView::flat(wx0.div_euclid(16) as i32, wz0.div_euclid(16) as i32);
-        gate.publish(
-            1_000_000,
-            0,
-            1_000_000,
+        q.gate.publish(&ViewSnap::full(
+            Coord::new(1_000_000, 0, 1_000_000),
             far,
             8,
-            i32::MAX,
-            CANCEL_MARGIN,
-            0,
             3_000.0 - span0 as f64,
-            0.0,
-            0.0,
-            0.0,
+            DVec3::ZERO,
             Some(Face::PosY),
-            crate::world::seam::Unfold::IDENTITY,
-        );
+            Unfold::IDENTITY,
+        ));
         let mut cancelled = Vec::new();
-        let popped = q.pop(&gate, &mut cancelled).expect("the section under the far centre survives");
+        let popped = q.pop(&mut cancelled).expect("the section under the far centre survives");
         assert_eq!(section_id(&popped), 0);
         assert!(
             matches!(&cancelled[..], [JobKey::Section { pos, .. }] if pos.x == 50),
@@ -2450,7 +2143,7 @@ mod tests {
     }
 
     /// The +Y chart's +Z edge and the chunk across that seam, with the net each chart publishes.
-    fn seam_edge(generator: &Generator) -> (Coord, Coord, crate::world::seam::Unfold, crate::world::seam::Unfold) {
+    fn seam_edge(generator: &Generator) -> (Coord, Coord, Unfold, Unfold) {
         use crate::space::atlas::Patch;
         let home = generator.cosmos().expect("cosmos").home();
         let atlas = generator
@@ -2492,45 +2185,29 @@ mod tests {
             generator: terrain.clone(),
             edits: Vec::new(),
         };
-        let publish = |gate: &ViewGate, c: Coord, fold: crate::world::seam::Unfold| {
-            gate.publish(
-                c.x,
-                c.y,
-                c.z,
-                FarView::flat(c.x, c.z),
-                6,
-                i32::MAX,
-                CANCEL_MARGIN,
-                0,
-                f64::INFINITY,
-                0.0,
-                0.0,
-                0.0,
-                up,
-                fold,
-            );
+        let publish = |q: &mut JobQueue, c: Coord, fold: Unfold| {
+            let far = FarView::flat(c.x, c.z);
+            q.gate.publish(&ViewSnap::full(c, far, 6, f64::INFINITY, DVec3::ZERO, up, fold));
         };
 
         let mut together = JobQueue::default();
-        let gate = ViewGate::new();
-        publish(&gate, y_c, y_fold);
-        assert!(together.push(column(y_c), &gate) && together.push(column(z_c), &gate));
-        publish(&gate, z_c, z_fold);
+        publish(&mut together, y_c, y_fold);
+        assert!(together.push(column(y_c)) && together.push(column(z_c)));
+        publish(&mut together, z_c, z_fold);
         let mut cancelled = Vec::new();
         let mut kept = 0;
-        while together.pop(&gate, &mut cancelled).is_some() {
+        while together.pop(&mut cancelled).is_some() {
             kept += 1;
         }
         assert_eq!(kept, 2, "one publish keeps both sides of the seam: {cancelled:?}");
         assert!(cancelled.is_empty());
 
         let mut split = JobQueue::default();
-        let gate = ViewGate::new();
-        publish(&gate, y_c, y_fold);
-        assert!(split.push(column(y_c), &gate) && split.push(column(z_c), &gate));
-        gate.set_fold(z_fold);
+        publish(&mut split, y_c, y_fold);
+        assert!(split.push(column(y_c)) && split.push(column(z_c)));
+        split.gate.set_fold(z_fold);
         cancelled.clear();
-        assert!(split.pop(&gate, &mut cancelled).is_none(), "the split publish runs nothing");
+        assert!(split.pop(&mut cancelled).is_none(), "the split publish runs nothing");
         assert_eq!(cancelled.len(), 2, "both claims are descheduled: {cancelled:?}");
     }
 
@@ -2950,14 +2627,15 @@ mod tests {
     fn view_gate_wanted_roundtrips_negative_and_border_centres() {
         let s = CHUNK_SIZE as i32;
         let border = (crate::math::WORLD_BORDER as i32).div_euclid(s);
-        let gate = ViewGate::new();
+        let mut gate = ViewGate::default();
         for cx in [0, 1, -1, 7, -7, border, -border] {
             gate.set(cx, 0, -cx, 4);
-            assert_eq!(gate.center(), (cx, 0, -cx), "centre round-trips");
-            assert!(gate.wanted(cx, 0, -cx));
-            assert!(gate.wanted(cx + 4 + CANCEL_MARGIN, 0, -cx));
-            assert!(!gate.wanted(cx + 4 + CANCEL_MARGIN + 1, 0, -cx));
-            assert_eq!(gate.dist_in_net(cx, 0, -cx), 0);
+            let view = gate.view;
+            assert_eq!(view.center, Coord::new(cx, 0, -cx), "centre round-trips");
+            assert!(view.wanted_in_net(Coord::new(cx, 0, -cx), None));
+            assert!(view.wanted_in_net(Coord::new(cx + 4 + CANCEL_MARGIN, 0, -cx), None));
+            assert!(!view.wanted_in_net(Coord::new(cx + 4 + CANCEL_MARGIN + 1, 0, -cx), None));
+            assert_eq!(view.dist_in_net(Coord::new(cx, 0, -cx)), 0);
         }
     }
 
@@ -2973,7 +2651,6 @@ mod tests {
         assert_eq!(alt, 20, "world x is the +X altitude, not the tangent");
 
         let mut q = JobQueue::default();
-        let gate = open_gate();
         let column = |key: ColumnKey, range: std::ops::RangeInclusive<i32>| Job::GenerateColumn {
             key,
             range,
@@ -2981,20 +2658,560 @@ mod tests {
             edits: Vec::new(),
         };
         // PosY at y = 20: straight up the +Y axis, distance 0 across it (kept, as always).
-        q.push(column(ColumnKey { face: Face::PosY, a: 0, b: 0 }, 20..=20), &gate);
+        q.push(column(ColumnKey { face: Face::PosY, a: 0, b: 0 }, 20..=20));
         // PosX at world (20, 0, 0): 20 chunks across +Y. Reading (a, b) as (x, z) would see 1.
-        q.push(column(pos_x, 20..=20), &gate);
+        q.push(column(pos_x, 20..=20));
         // Inside the cancel ring.
-        q.push(column(ColumnKey { face: Face::PosY, a: 1, b: 0 }, 0..=0), &gate);
+        q.push(column(ColumnKey { face: Face::PosY, a: 1, b: 0 }, 0..=0));
 
-        gate.set(0, 0, 0, 3);
+        q.gate.set(0, 0, 0, 3);
         let mut cancelled = Vec::new();
-        let first = q.pop(&gate, &mut cancelled).expect("near jobs survive");
+        let first = q.pop(&mut cancelled).expect("near jobs survive");
         assert!(
             matches!(first, Job::GenerateColumn { key: ColumnKey { face: Face::PosY, a: 0, b: 0, .. }, .. }),
             "the column straight up is nearest across +Y"
         );
         assert_eq!(cancelled.len(), 1, "only the job far across +Y drops: {cancelled:?}");
         assert!(matches!(&cancelled[0], JobKey::Column { key, .. } if *key == pos_x));
+    }
+
+    /// The per-entry atomic gate and queue sync the view snapshot replaced, kept as the reference
+    /// for [`snapshot_pop_matches_the_per_entry_gate`].
+    mod per_entry {
+        use std::sync::RwLock;
+        use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI8, AtomicU8, AtomicU64, Ordering};
+
+        use crate::coord::{ChunkBox, Face};
+        use crate::world::chunk::CHUNK_SIZE;
+        use crate::world::pipeline::{
+            CANCEL_MARGIN, EpochHeap, FarView, Job, JobKey, Keyed, Priority, far_center_span, priority,
+        };
+        use crate::world::seam::Unfold;
+        use crate::world::{Coord, bias_order, motion_biased_dist2, streaming::chunk_behind};
+
+        const UP_NONE: u8 = 255;
+
+        pub(super) struct Gate {
+            cx: AtomicI32,
+            cy: AtomicI32,
+            cz: AtomicI32,
+            fx: AtomicI32,
+            fz: AtomicI32,
+            radius: AtomicI32,
+            v_radius: AtomicI32,
+            margin: AtomicI32,
+            heading: AtomicI8,
+            up: AtomicU8,
+            epoch: AtomicU64,
+            far_m: AtomicU64,
+            vel_x: AtomicU64,
+            vel_y: AtomicU64,
+            vel_z: AtomicU64,
+            fold: RwLock<Unfold>,
+            folded: AtomicBool,
+            far_fold: RwLock<Unfold>,
+            far_folded: AtomicBool,
+            slab: RwLock<Option<ChunkBox>>,
+            slab_set: AtomicBool,
+        }
+
+        impl Gate {
+            pub(super) fn new() -> Self {
+                Self {
+                    cx: AtomicI32::new(0),
+                    cy: AtomicI32::new(0),
+                    cz: AtomicI32::new(0),
+                    fx: AtomicI32::new(0),
+                    fz: AtomicI32::new(0),
+                    radius: AtomicI32::new(i32::MAX),
+                    v_radius: AtomicI32::new(i32::MAX),
+                    margin: AtomicI32::new(CANCEL_MARGIN),
+                    heading: AtomicI8::new(0),
+                    up: AtomicU8::new(Face::PosY as u8),
+                    epoch: AtomicU64::new(0),
+                    far_m: AtomicU64::new(f64::INFINITY.to_bits()),
+                    vel_x: AtomicU64::new(0.0f64.to_bits()),
+                    vel_y: AtomicU64::new(0.0f64.to_bits()),
+                    vel_z: AtomicU64::new(0.0f64.to_bits()),
+                    fold: RwLock::new(Unfold::IDENTITY),
+                    folded: AtomicBool::new(false),
+                    far_fold: RwLock::new(Unfold::IDENTITY),
+                    far_folded: AtomicBool::new(false),
+                    slab: RwLock::new(None),
+                    slab_set: AtomicBool::new(false),
+                }
+            }
+
+            pub(super) fn publish(
+                &self,
+                cx: i32,
+                cy: i32,
+                cz: i32,
+                far: FarView,
+                radius: i32,
+                v_radius: i32,
+                margin: i32,
+                heading: i8,
+                far_m: f64,
+                vel_x: f64,
+                vel_y: f64,
+                vel_z: f64,
+                up: Option<Face>,
+                fold: Unfold,
+            ) {
+                let near_net_moved = Self::store_fold(&self.fold, &self.folded, fold);
+                let far_net_moved = Self::store_fold(&self.far_fold, &self.far_folded, far.fold);
+                let far_bits = far_m.to_bits();
+                let vx = vel_x.to_bits();
+                let vy = vel_y.to_bits();
+                let vz = vel_z.to_bits();
+                let up_code = match up {
+                    Some(face) => face as u8,
+                    None => UP_NONE,
+                };
+                let same_center = !near_net_moved
+                    && !far_net_moved
+                    && self.cx.load(Ordering::Relaxed) == cx
+                    && self.cy.load(Ordering::Relaxed) == cy
+                    && self.cz.load(Ordering::Relaxed) == cz
+                    && self.fx.load(Ordering::Relaxed) == far.x
+                    && self.fz.load(Ordering::Relaxed) == far.z
+                    && self.radius.load(Ordering::Relaxed) == radius
+                    && self.v_radius.load(Ordering::Relaxed) == v_radius
+                    && self.margin.load(Ordering::Relaxed) == margin
+                    && self.heading.load(Ordering::Relaxed) == heading
+                    && self.up.load(Ordering::Relaxed) == up_code;
+                let same_far = self.far_m.load(Ordering::Relaxed) == far_bits;
+                let same_vel = self.vel_x.load(Ordering::Relaxed) == vx
+                    && self.vel_y.load(Ordering::Relaxed) == vy
+                    && self.vel_z.load(Ordering::Relaxed) == vz;
+                if same_center && same_far && same_vel {
+                    return;
+                }
+                if !same_vel {
+                    self.vel_x.store(vx, Ordering::Relaxed);
+                    self.vel_y.store(vy, Ordering::Relaxed);
+                    self.vel_z.store(vz, Ordering::Relaxed);
+                }
+                if !same_far {
+                    self.far_m.store(far_bits, Ordering::Relaxed);
+                }
+                if !same_center {
+                    self.cx.store(cx, Ordering::Relaxed);
+                    self.cy.store(cy, Ordering::Relaxed);
+                    self.cz.store(cz, Ordering::Relaxed);
+                    self.fx.store(far.x, Ordering::Relaxed);
+                    self.fz.store(far.z, Ordering::Relaxed);
+                    self.radius.store(radius, Ordering::Relaxed);
+                    self.v_radius.store(v_radius, Ordering::Relaxed);
+                    self.margin.store(margin, Ordering::Relaxed);
+                    self.heading.store(heading, Ordering::Relaxed);
+                    self.up.store(up_code, Ordering::Relaxed);
+                    self.epoch.fetch_add(1, Ordering::Release);
+                }
+            }
+
+            fn epoch(&self) -> u64 {
+                self.epoch.load(Ordering::Acquire)
+            }
+
+            fn center(&self) -> (i32, i32, i32) {
+                (
+                    self.cx.load(Ordering::Relaxed),
+                    self.cy.load(Ordering::Relaxed),
+                    self.cz.load(Ordering::Relaxed),
+                )
+            }
+
+            fn up_face(&self) -> Option<Face> {
+                Face::from_index(self.up.load(Ordering::Relaxed))
+            }
+
+            pub(super) fn set_fold(&self, fold: Unfold) {
+                if Self::store_fold(&self.fold, &self.folded, fold) {
+                    self.epoch.fetch_add(1, Ordering::Release);
+                }
+            }
+
+            pub(super) fn set_slab(&self, slab: Option<ChunkBox>) {
+                if slab.is_none() && !self.slab_set.load(Ordering::Relaxed) {
+                    return;
+                }
+                *self.slab.write().unwrap() = slab;
+                self.slab_set.store(slab.is_some(), Ordering::Relaxed);
+            }
+
+            fn in_slab(&self, c: Coord) -> bool {
+                self.slab_set.load(Ordering::Relaxed) && self.slab.read().unwrap().is_some_and(|b| b.contains(c))
+            }
+
+            fn store_fold(slot: &RwLock<Unfold>, folded: &AtomicBool, fold: Unfold) -> bool {
+                if *slot.read().unwrap() == fold {
+                    return false;
+                }
+                let mut cur = slot.write().unwrap();
+                if *cur == fold {
+                    return false;
+                }
+                *cur = fold;
+                folded.store(!fold.is_identity(), Ordering::Relaxed);
+                true
+            }
+
+            fn folded(&self, x: i32, y: i32, z: i32) -> (i32, i32, i32) {
+                if !self.folded.load(Ordering::Relaxed) {
+                    return (x, y, z);
+                }
+                let c = self.fold.read().unwrap().fold(Coord::new(x, y, z));
+                (c.x, c.y, c.z)
+            }
+
+            fn dist_in_net(&self, x: i32, y: i32, z: i32) -> i32 {
+                if self.radius.load(Ordering::Relaxed) == i32::MAX {
+                    return 0;
+                }
+                let (px, py, pz) = self.center();
+                let d = [(x - px).abs(), (y - py).abs(), (z - pz).abs()];
+                match self.up_face() {
+                    Some(face) => {
+                        let a = face.axis();
+                        (0..3).filter(|&i| i != a).map(|i| d[i]).max().unwrap_or(0)
+                    }
+                    None => d[0].max(d[1]).max(d[2]),
+                }
+            }
+
+            fn near_key(&self, x: i32, y: i32, z: i32) -> u64 {
+                let (x, y, z) = self.folded(x, y, z);
+                let base = self.dist_in_net(x, y, z) as u64 * 1024;
+                if base == 0 {
+                    return 0;
+                }
+                let (px, py, pz) = self.center();
+                bias_order(base, self.velocity(), (x - px) as f64, (y - py) as f64, (z - pz) as f64, self.up_face())
+            }
+
+            fn wanted(&self, x: i32, y: i32, z: i32) -> bool {
+                let radius = self.radius.load(Ordering::Relaxed);
+                if radius == i32::MAX {
+                    return true;
+                }
+                let (x, y, z) = self.folded(x, y, z);
+                let coord = Coord::new(x, y, z);
+                if self.in_slab(coord) {
+                    return true;
+                }
+                let (px, py, pz) = self.center();
+                let up = self.up_face();
+                let center = Coord::new(px, py, pz);
+                let margin = self.margin.load(Ordering::Relaxed);
+                if self.dist_in_net(x, y, z) > radius + margin {
+                    return false;
+                }
+                let vr = self.v_radius.load(Ordering::Relaxed);
+                if vr != i32::MAX
+                    && let Some(face) = up
+                    && coord.along(center, face) > vr + margin
+                {
+                    return false;
+                }
+                self.heading.load(Ordering::Relaxed) == 0 || !chunk_behind(center, coord, self.velocity(), up)
+            }
+
+            fn eye_m(&self) -> (f64, f64, f64) {
+                let (_, cy, _) = self.center();
+                let (cx, cz) = (self.fx.load(Ordering::Relaxed), self.fz.load(Ordering::Relaxed));
+                let s = CHUNK_SIZE as f64;
+                let half = s / 2.0;
+                (cx as f64 * s + half, cy as f64 * s + half, cz as f64 * s + half)
+            }
+
+            fn far_dist2_m(&self, wx: i64, wy: i64, wz: i64) -> u64 {
+                let (ex, ey, ez) = self.eye_m();
+                let (dx, dy, dz) = (wx as f64 - ex, wy as f64 - ey, wz as f64 - ez);
+                (dx * dx + dy * dy + dz * dz) as u64
+            }
+
+            fn velocity(&self) -> voxel_engine::DVec3 {
+                voxel_engine::DVec3::new(
+                    f64::from_bits(self.vel_x.load(Ordering::Relaxed)),
+                    f64::from_bits(self.vel_y.load(Ordering::Relaxed)),
+                    f64::from_bits(self.vel_z.load(Ordering::Relaxed)),
+                )
+            }
+
+            fn far_place(&self, wx: i64, wz: i64) -> Option<(i64, i64)> {
+                if !self.far_folded.load(Ordering::Relaxed) {
+                    return Some((wx, wz));
+                }
+                self.far_fold.read().unwrap().fold_column(wx, wz)
+            }
+
+            fn far_key(&self, wx: i64, wz: i64) -> u64 {
+                let Some((wx, wz)) = self.far_place(wx, wz) else { return u64::MAX };
+                let (ex, ey, ez) = self.eye_m();
+                let (dx, dz) = (wx as f64 - ex, wz as f64 - ez);
+                motion_biased_dist2(self.far_dist2_m(wx, ey as i64, wz), self.velocity(), dx, dz)
+            }
+
+            fn far_wanted(&self, wx: i64, wz: i64, span: i64) -> bool {
+                let far = f64::from_bits(self.far_m.load(Ordering::Relaxed));
+                if !far.is_finite() || self.radius.load(Ordering::Relaxed) == i32::MAX {
+                    return true;
+                }
+                let Some((wx, wz)) = self.far_place(wx, wz) else { return false };
+                let limit = far + span as f64;
+                let (_, ey, _) = self.eye_m();
+                (self.far_dist2_m(wx, ey as i64, wz) as f64) <= limit * limit
+            }
+        }
+
+        fn near_anchor(job: &Job, gate: &Gate) -> (i32, i32, i32) {
+            let (cx, cy, cz) = gate.center();
+            match job.anchor(Coord::new(cx, cy, cz)) {
+                Some(c) => (c.x, c.y, c.z),
+                None => (0, 0, 0),
+            }
+        }
+
+        /// The old re-key: wanted and key from two closures (each recomputing the anchor), the
+        /// survivors collected into a new vector.
+        fn sync(
+            heap: &mut EpochHeap,
+            epoch: u64,
+            key: impl Fn(&Keyed) -> u64,
+            wanted: impl Fn(&Keyed) -> bool,
+            cancelled: &mut Vec<JobKey>,
+        ) {
+            if heap.keyed_at == epoch {
+                return;
+            }
+            heap.keyed_at = epoch;
+            if heap.heap.is_empty() {
+                return;
+            }
+            let mut kept = Vec::with_capacity(heap.heap.len());
+            for std::cmp::Reverse(mut entry) in std::mem::take(&mut heap.heap).into_vec() {
+                if wanted(&entry) {
+                    entry.d = key(&entry);
+                    kept.push(std::cmp::Reverse(entry));
+                } else {
+                    cancelled.push(JobKey::of(&entry.job));
+                }
+            }
+            heap.heap = std::collections::BinaryHeap::from(kept);
+        }
+
+        #[derive(Default)]
+        pub(super) struct Queue {
+            near: EpochHeap,
+            far: EpochHeap,
+        }
+
+        impl Queue {
+            pub(super) fn push(&mut self, job: Job, gate: &Gate, near_cap: usize) -> bool {
+                match priority(&job) {
+                    Priority::Near => {
+                        if self.near.len() >= near_cap {
+                            return false;
+                        }
+                        let (x, y, z) = near_anchor(&job, gate);
+                        let d = gate.near_key(x, y, z);
+                        self.near.push(d, x as i64, z as i64, 0, job);
+                    }
+                    Priority::Far => {
+                        let (wx, wz, span) = far_center_span(&job);
+                        self.far.push(0, wx, wz, span, job);
+                    }
+                }
+                true
+            }
+
+            pub(super) fn push_far(&mut self, job: Job, dist2: u64) {
+                let (wx, wz, span) = far_center_span(&job);
+                self.far.push(dist2, wx, wz, span, job);
+            }
+
+            pub(super) fn pop(&mut self, gate: &Gate, cancelled: &mut Vec<JobKey>) -> Option<Job> {
+                let epoch = gate.epoch();
+                sync(
+                    &mut self.near,
+                    epoch,
+                    |e| {
+                        let (x, y, z) = near_anchor(&e.job, gate);
+                        gate.near_key(x, y, z)
+                    },
+                    |e| {
+                        let (x, y, z) = near_anchor(&e.job, gate);
+                        gate.wanted(x, y, z)
+                    },
+                    cancelled,
+                );
+                sync(
+                    &mut self.far,
+                    epoch,
+                    |e| gate.far_key(e.wx, e.wz),
+                    |e| gate.far_wanted(e.wx, e.wz, e.span),
+                    cancelled,
+                );
+                self.near.pop().or_else(|| self.far.pop())
+            }
+        }
+    }
+
+    /// The snapshot re-key pops and deschedules exactly what the per-entry atomic gate did, on
+    /// random queues and views across a chart seam: near and far jobs, folded nets, spawn slabs,
+    /// loading horizons, headings, horizons and velocities that change without a re-key.
+    #[test]
+    fn snapshot_pop_matches_the_per_entry_gate() {
+        let terrain = generator(42);
+        let (y_c, z_c, y_fold, z_fold) = seam_edge(&terrain);
+        let folds = [Unfold::IDENTITY, y_fold, z_fold];
+        let tables = Arc::new(BlockRegistry::with_builtins().hot_tables());
+        let detail = crate::ident::Detail(2);
+        let span = SectionPos { body: 0, face: Face::PosY, detail, x: 0, z: 0 }.span() as i32;
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n) as i32
+        };
+        // A chunk a few chunks from one of the two seam centres.
+        let near_seam = |next: &mut dyn FnMut(u64) -> i32| {
+            let c = if next(2) == 0 { y_c } else { z_c };
+            Coord::new(c.x + next(17) - 8, c.y + next(9) - 4, c.z + next(17) - 8)
+        };
+        let faces = [Face::PosX, Face::NegX, Face::PosY, Face::NegY, Face::PosZ, Face::NegZ];
+        let (mut pops, mut drops) = (0usize, 0usize);
+        for _ in 0..48 {
+            let mut new = JobQueue::default();
+            let mut old = per_entry::Queue::default();
+            let gate = per_entry::Gate::new();
+            let near_cap = 4 + next(40) as usize;
+            new.gate.near_cap = near_cap;
+            for _ in 0..300 {
+                let (a, b): (Job, Job) = match next(10) {
+                    0..=2 => {
+                        let c = near_seam(&mut next);
+                        let face = faces[next(6) as usize];
+                        let (key, alt) = ColumnKey::of(face, c);
+                        let range = alt - next(3)..=alt + next(3);
+                        let job = || Job::GenerateColumn {
+                            key,
+                            range: range.clone(),
+                            generator: terrain.clone(),
+                            edits: Vec::new(),
+                        };
+                        (job(), job())
+                    }
+                    3 => {
+                        let coord = near_seam(&mut next);
+                        let job = || Job::GenerateOpen { coord, generator: terrain.clone(), edits: Vec::new() };
+                        (job(), job())
+                    }
+                    4..=5 => {
+                        let c = near_seam(&mut next);
+                        let pos = SectionPos {
+                            body: 0,
+                            face: Face::PosY,
+                            detail,
+                            x: (c.x * CHUNK_SIZE as i32).div_euclid(span) + next(5) - 2,
+                            z: (c.z * CHUNK_SIZE as i32).div_euclid(span) + next(5) - 2,
+                        };
+                        let token = ClaimToken(next(1 << 20) as u64);
+                        let job = || Job::Section {
+                            pos,
+                            epoch: 0,
+                            token,
+                            generator: terrain.clone(),
+                            edits: Vec::new(),
+                            tables: Arc::clone(&tables),
+                        };
+                        if next(4) == 0 {
+                            assert!(new.push(job()));
+                            assert!(old.push(job(), &gate, near_cap));
+                        } else {
+                            let dist2 = next(1 << 24) as u64;
+                            assert!(new.push_far(job(), dist2));
+                            old.push_far(job(), dist2);
+                        }
+                        continue;
+                    }
+                    6 => {
+                        let center = near_seam(&mut next);
+                        let far_c = if next(3) == 0 { near_seam(&mut next) } else { center };
+                        let far = FarView { x: far_c.x, z: far_c.z, fold: folds[next(3) as usize] };
+                        let pick = |next: &mut dyn FnMut(u64) -> i32, all: &[i32]| all[next(all.len() as u64) as usize];
+                        let speeds = [0, 0, 10, -30, 200, -200, 600];
+                        let view = ViewSnap {
+                            center,
+                            far,
+                            radius: pick(&mut next, &[i32::MAX, 2, 4, 6, 9]),
+                            v_radius: pick(&mut next, &[i32::MAX, 0, 1, 3]),
+                            margin: pick(&mut next, &[CANCEL_MARGIN, 1]),
+                            heading: (next(7) - 3) as i8,
+                            up: [None, Some(faces[next(6) as usize])][next(2) as usize],
+                            fold: folds[next(3) as usize],
+                            far_m: [f64::INFINITY, 200.0 + next(3000) as f64][next(2) as usize],
+                            vel: DVec3::new(
+                                f64::from(pick(&mut next, &speeds)),
+                                f64::from(pick(&mut next, &speeds)),
+                                f64::from(pick(&mut next, &speeds)),
+                            ),
+                        };
+                        // Half the time only the horizon and velocity move: no re-key until the next change.
+                        let view = if next(2) == 0 {
+                            ViewSnap { far_m: view.far_m, vel: view.vel, ..new.gate.view }
+                        } else {
+                            view
+                        };
+                        new.gate.publish(&view);
+                        let (c, v) = (view.center, view.vel);
+                        gate.publish(
+                            c.x, c.y, c.z, view.far, view.radius, view.v_radius, view.margin, view.heading,
+                            view.far_m, v.x, v.y, v.z, view.up, view.fold,
+                        );
+                        continue;
+                    }
+                    7 => {
+                        let slab = (next(2) == 0).then(|| ChunkBox::new(near_seam(&mut next), 1, 2));
+                        new.gate.slab = slab;
+                        gate.set_slab(slab);
+                        continue;
+                    }
+                    8 => {
+                        let fold = folds[next(3) as usize];
+                        new.gate.set_fold(fold);
+                        gate.set_fold(fold);
+                        continue;
+                    }
+                    _ => {
+                        let (mut new_cancelled, mut old_cancelled) = (Vec::new(), Vec::new());
+                        let got = new.pop(&mut new_cancelled).map(|j| JobKey::of(&j));
+                        let want = old.pop(&gate, &mut old_cancelled).map(|j| JobKey::of(&j));
+                        assert_eq!(got, want, "pop order");
+                        assert_eq!(new_cancelled, old_cancelled, "cancellations");
+                        pops += usize::from(got.is_some());
+                        drops += new_cancelled.len();
+                        continue;
+                    }
+                };
+                assert_eq!(new.push(a), old.push(b, &gate, near_cap), "near admission");
+            }
+            loop {
+                let (mut new_cancelled, mut old_cancelled) = (Vec::new(), Vec::new());
+                let got = new.pop(&mut new_cancelled).map(|j| JobKey::of(&j));
+                let want = old.pop(&gate, &mut old_cancelled).map(|j| JobKey::of(&j));
+                assert_eq!(got, want, "drain order");
+                assert_eq!(new_cancelled, old_cancelled, "drain cancellations");
+                pops += usize::from(got.is_some());
+                drops += new_cancelled.len();
+                if got.is_none() {
+                    break;
+                }
+            }
+        }
+        assert!(pops > 500 && drops > 50, "the random walk exercised both paths: {pops} pops, {drops} drops");
     }
 }

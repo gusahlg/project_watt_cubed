@@ -3776,10 +3776,8 @@ fn open_gen_cursor_drains_across_frames() {
         let pool = world.worker_pool();
         let cap = pool.worker_capacity();
         pool.set_near_cap(pipeline::near_lookahead(cap));
-        pool.set_view(
-            center.x, center.y, center.z, pipeline::FarView::flat(center.x, center.z), 1, 0.0, 0.0, 0.0, 0.0, None,
-            super::seam::Unfold::IDENTITY,
-        );
+        let far = pipeline::FarView::flat(center.x, center.z);
+        pool.publish(&pipeline::ViewSnap::full(center, far, 1, 0.0, DVec3::ZERO, None, seam::Unfold::IDENTITY));
     }
     let budget = voxel_engine::producer::Budget::Millis(0.0);
     world.request_region_data(center, budget);
@@ -3873,10 +3871,8 @@ fn buried_solid_mesh_is_air_and_an_edit_remeshes_it() {
         let pool = world.worker_pool();
         let cap = pool.worker_capacity();
         pool.set_near_cap(pipeline::near_lookahead(cap));
-        pool.set_view(
-            center.x, center.y, center.z, pipeline::FarView::flat(center.x, center.z), 2, 0.0, 0.0, 0.0, 0.0, up,
-            super::seam::Unfold::IDENTITY,
-        );
+        let far = pipeline::FarView::flat(center.x, center.z);
+        pool.publish(&pipeline::ViewSnap::full(center, far, 2, 0.0, DVec3::ZERO, up, seam::Unfold::IDENTITY));
     }
     admit::<MeshLane>(
         &mut world,
@@ -3982,10 +3978,8 @@ fn asteroid_entry_breakdown() {
         let cap = pool.worker_capacity();
         // Heavy entry frames stay unboosted: lookahead is `active * 4`.
         pool.set_near_cap(pipeline::near_lookahead(cap));
-        pool.set_view(
-            center.x, center.y, center.z, pipeline::FarView::flat(center.x, center.z), VIEW_H, 0.0, 0.0, 0.0, 0.0, up,
-            super::seam::Unfold::IDENTITY,
-        );
+        let far = pipeline::FarView::flat(center.x, center.z);
+        pool.publish(&pipeline::ViewSnap::full(center, far, VIEW_H, 0.0, DVec3::ZERO, up, seam::Unfold::IDENTITY));
         cap
     };
     // `None` up: every axis uses the horizontal radius. Data box adds one shell.
