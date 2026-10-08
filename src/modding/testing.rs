@@ -19,11 +19,12 @@ pub(crate) struct Stub {
     id: &'static str,
     actions: &'static [Action],
     commands: &'static [Command],
+    visual: Option<VisualGroup>,
 }
 
 impl Stub {
     pub(crate) const fn new(id: &'static str) -> Self {
-        Self { id, actions: &[], commands: &[] }
+        Self { id, actions: &[], commands: &[], visual: None }
     }
 
     pub(crate) const fn actions(self, actions: &'static [Action]) -> Self {
@@ -32,6 +33,10 @@ impl Stub {
 
     pub(crate) const fn commands(self, commands: &'static [Command]) -> Self {
         Self { commands, ..self }
+    }
+
+    pub(crate) const fn visual(self, group: VisualGroup) -> Self {
+        Self { visual: Some(group), ..self }
     }
 }
 
@@ -47,6 +52,9 @@ impl Mod for Stub {
     }
     fn commands(&self) -> &[Command] {
         self.commands
+    }
+    fn visual_group(&self) -> Option<VisualGroup> {
+        self.visual
     }
     fn run_command(&mut self, ctx: &mut CommandContext<'_>, cmd: &str, _args: &[&str]) -> Option<Vec<Line>> {
         self.commands.iter().any(|c| c.name == cmd).then(|| {

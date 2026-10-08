@@ -76,24 +76,48 @@ pub struct VisualMask {
 
 impl Default for VisualMask {
     fn default() -> Self {
-        Self {
-            atmosphere: true,
-            post: true,
-            lighting: true,
-        }
+        Self::of(VisualGroup::ALL)
     }
 }
 
 impl VisualMask {
+    pub const NONE: Self = Self {
+        atmosphere: false,
+        post: false,
+        lighting: false,
+    };
+
+    /// The mask with exactly `groups` on: a group is on when any enabled mod owns it. The mods
+    /// screen and the renderer both build their mask here.
+    pub fn of(groups: impl IntoIterator<Item = VisualGroup>) -> Self {
+        let mut mask = Self::NONE;
+        for group in groups {
+            mask.set(group, true);
+        }
+        mask
+    }
+
+    pub fn get(self, group: VisualGroup) -> bool {
+        match group {
+            VisualGroup::Atmosphere => self.atmosphere,
+            VisualGroup::Post => self.post,
+            VisualGroup::Lighting => self.lighting,
+        }
+    }
+
+    pub fn set(&mut self, group: VisualGroup, on: bool) {
+        *match group {
+            VisualGroup::Atmosphere => &mut self.atmosphere,
+            VisualGroup::Post => &mut self.post,
+            VisualGroup::Lighting => &mut self.lighting,
+        } = on;
+    }
+
     pub fn apply(self, mut cfg: RenderConfig) -> RenderConfig {
-        if !self.atmosphere {
-            cfg.strip_group(VisualGroup::Atmosphere);
-        }
-        if !self.post {
-            cfg.strip_group(VisualGroup::Post);
-        }
-        if !self.lighting {
-            cfg.strip_group(VisualGroup::Lighting);
+        for group in VisualGroup::ALL {
+            if !self.get(group) {
+                cfg.strip_group(group);
+            }
         }
         cfg
     }
@@ -106,12 +130,7 @@ impl VisualMask {
     /// Name of the visual mod forcing `key` off, if any.
     pub fn forced_off(self, key: &str) -> Option<&'static str> {
         let group = crate::render_config::lane_group(key)?;
-        let on = match group {
-            VisualGroup::Atmosphere => self.atmosphere,
-            VisualGroup::Post => self.post,
-            VisualGroup::Lighting => self.lighting,
-        };
-        if on { None } else { Some(group.mod_name()) }
+        (!self.get(group)).then(|| group.mod_name())
     }
 }
 
@@ -524,7 +543,8 @@ pub trait Mod {
         0
     }
 
-    /// Which fancy render group this mod owns, if any.
+    /// Which fancy render group this mod owns, if any. The host reads it when the mod is
+    /// installed or switched on or off.
     fn visual_group(&self) -> Option<VisualGroup> {
         None
     }
@@ -583,6 +603,8 @@ pub struct Mods {
     /// Bumped when a mod is installed or enabled or disabled, so the input
     /// table can rebuild once instead of every frame.
     action_gen: u64,
+    /// The enabled mods' visual groups, rebuilt with `action_gen`.
+    visuals: VisualMask,
     /// Package ids the current server refused. Not written to `mods.cfg`.
     server_packages: Vec<String>,
     /// Module ids that were on when the server refused their package. Restored
@@ -609,6 +631,7 @@ impl Mods {
             entries: Vec::new(),
             declared_groups: Vec::new(),
             action_gen: 0,
+            visuals: VisualMask::NONE,
             server_packages: Vec::new(),
             server_held: Vec::new(),
         }
@@ -625,11 +648,14 @@ impl Mods {
             entry.module.on_enable();
         }
         self.entries.push(entry);
-        self.bump_actions();
+        self.enabled_changed();
     }
 
-    fn bump_actions(&mut self) {
+    /// The enabled set changed: a new action generation and visual mask.
+    fn enabled_changed(&mut self) {
         self.action_gen = self.action_gen.wrapping_add(1);
+        let enabled = self.entries.iter().filter(|e| e.enabled);
+        self.visuals = VisualMask::of(enabled.filter_map(|e| e.module.visual_group()));
     }
 
     /// Generation of the enabled action lists. Changes when a mod is installed
@@ -870,7 +896,7 @@ impl Mods {
         } else {
             entry.module.on_disable();
         }
-        self.bump_actions();
+        self.enabled_changed();
         true
     }
 
@@ -913,21 +939,9 @@ impl Mods {
             .unwrap_or(&FLAT)
     }
 
+    /// The visual groups the enabled mods own (see [`VisualMask::of`]).
     pub fn visual_mask(&self) -> VisualMask {
-        let mut mask = VisualMask {
-            atmosphere: false,
-            post: false,
-            lighting: false,
-        };
-        for entry in self.entries.iter().filter(|e| e.enabled) {
-            match entry.module.visual_group() {
-                Some(VisualGroup::Atmosphere) => mask.atmosphere = true,
-                Some(VisualGroup::Post) => mask.post = true,
-                Some(VisualGroup::Lighting) => mask.lighting = true,
-                None => {}
-            }
-        }
-        mask
+        self.visuals
     }
 
     /// Enable or disable a mod by [`Mod::id`] (case-insensitive). No-op if
