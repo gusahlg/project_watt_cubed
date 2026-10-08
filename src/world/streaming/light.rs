@@ -201,16 +201,18 @@ impl World {
         ceiling
     }
 
+    /// Raise `ceiling` over every opaque edit in column `key`, read through the roof index.
     fn raise_edited_roofs(&self, key: ColumnKey, ceiling: &mut light::CeilingWindow) {
+        let Some(alts) = self.edit_column_chunks.get(&key) else {
+            return;
+        };
         let frame = FaceFrame::new(key.face);
         let s = CHUNK_SIZE as i32;
-        for (&c, cells) in &self.edits {
-            if !matches!(self.generator.sky(c), Sky::Axis(face) if face == key.face) {
+        for &layer in alts {
+            let c = key.chunk(layer);
+            let Some(cells) = self.edits.get(&c) else {
                 continue;
-            }
-            if ColumnKey::of(key.face, c).0 != key {
-                continue;
-            }
+            };
             for (&index, &id) in cells {
                 if !self.registry.is_opaque(id) {
                     continue;
@@ -710,5 +712,146 @@ impl World {
                 true
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::render_config::RenderConfig;
+    use crate::world::generation::WorldgenKind;
+    use crate::world::terrain::cosmos::{Kind, Shape};
+
+    /// The roof raise before the index: every edited chunk of the world, filtered by sky and column.
+    fn raise_by_scan(world: &World, key: ColumnKey, ceiling: &mut light::CeilingWindow) {
+        let frame = FaceFrame::new(key.face);
+        let s = CHUNK_SIZE as i32;
+        for (&c, cells) in &world.edits {
+            if !matches!(world.generator.sky(c), Sky::Axis(face) if face == key.face) {
+                continue;
+            }
+            if ColumnKey::of(key.face, c).0 != key {
+                continue;
+            }
+            for (&index, &id) in cells {
+                if !world.registry.is_opaque(id) {
+                    continue;
+                }
+                let (lx, ly, lz) = Chunk::local_of(index);
+                let (lu, _, lv) = frame.index_to_local(lx, ly, lz);
+                let cell = (c.x * s + lx as i32, c.y * s + ly as i32, c.z * s + lz as i32);
+                ceiling.raise(lu, lv, frame.cell_to_local(cell).1 + 1);
+            }
+        }
+    }
+
+    fn surfaces(ceiling: &light::CeilingWindow) -> Vec<i32> {
+        let mut out: Vec<i32> = (0..CHUNK_SIZE * CHUNK_SIZE).map(|i| ceiling.surface_at(i % CHUNK_SIZE, i / CHUNK_SIZE)).collect();
+        out.push(ceiling.min_surface());
+        out
+    }
+
+    /// Random roofs, holes and compacted edits on every face of a twin cube: each column's ceiling
+    /// built through the index equals the one built by scanning the whole overlay.
+    #[test]
+    fn indexed_roofs_match_the_overlay_scan() {
+        let mut world = World::with_kind(7, RenderConfig::default(), WorldgenKind::Diffusion, false);
+        let cosmos = world.generator.cosmos().expect("cosmos");
+        let twin = *cosmos
+            .bodies()
+            .iter()
+            .find(|b| b.kind == Kind::Twin && matches!(b.shape, Shape::Cube { .. }))
+            .expect("a twin cube");
+        let rock = world.registry.id_by_label("rock").expect("rock");
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut rand = |n: i32| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % n as u64) as i32
+        };
+        let centre = (twin.centre[0] as i32, twin.centre[1] as i32, twin.centre[2] as i32);
+        let mut cells = Vec::new();
+        let mut faces = Vec::new();
+        for face in Face::ALL {
+            let frame = FaceFrame::new(face);
+            let (cu, _, cv) = frame.cell_to_local(centre);
+            for _ in 0..80 {
+                let (u, v) = (cu + rand(96) - 48, cv + rand(96) - 48);
+                let ground = world.generator.surface(face, u, v);
+                assert_ne!(ground, i32::MIN, "{face:?} has ground at its centre");
+                let (x, y, z) = frame.cell_to_world((u, ground + rand(48) - 6, v));
+                world.set_block(x, y, z, if rand(4) == 0 { AIR } else { rock });
+                cells.push((x, y, z));
+                if let Sky::Axis(f) = world.generator.sky(World::chunk_of(x, y, z))
+                    && !faces.contains(&f)
+                {
+                    faces.push(f);
+                }
+            }
+        }
+        // A lone roof put back compacts its chunk out of the overlay; the index keeps the layer.
+        let frame = FaceFrame::new(Face::PosY);
+        let (cu, _, cv) = frame.cell_to_local(centre);
+        let (u, v) = (cu + 70, cv - 70);
+        cells.push(frame.cell_to_world((u, world.generator.surface(Face::PosY, u, v) + 40, v)));
+        let lone = *cells.last().unwrap();
+        world.set_block(lone.0, lone.1, lone.2, rock);
+        for &(x, y, z) in cells.iter().rev().step_by(3) {
+            let generated = world.generator.voxel_at(x, y, z);
+            world.set_block(x, y, z, generated);
+        }
+        assert!(faces.len() >= 3, "edits under several skies: {faces:?}");
+        let gone = World::chunk_of(lone.0, lone.1, lone.2);
+        assert!(!world.edits.contains_key(&gone), "the lone roof compacted away");
+        let mut keys: Vec<ColumnKey> = world.edit_column_chunks.keys().copied().collect();
+        for &c in world.edits.keys() {
+            if let Sky::Axis(face) = world.generator.sky(c) {
+                keys.push(ColumnKey::of(face, c).0);
+            }
+        }
+        for key in keys {
+            let heights = world.generator.generate_column(key, 1..=0).1;
+            let mut scanned = light::CeilingWindow::from_heights(key.face, |lu, lv| heights[lu + lv * CHUNK_SIZE]);
+            raise_by_scan(&world, key, &mut scanned);
+            assert_eq!(surfaces(&world.ceiling_from_heights(key, &heights)), surfaces(&scanned), "{key:?}");
+        }
+    }
+
+    /// Ceiling install cost while unrelated edits grow from 1k to 100k chunks: flat with the index,
+    /// linear for the overlay scan it replaced.
+    /// `cargo test --release --lib ceiling_install_cost -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn ceiling_install_cost() {
+        let mut world = World::generate();
+        let rock = world.registry.id_by_label("rock").expect("rock");
+        let key = ColumnKey { face: Face::PosY, a: 0, b: 0 };
+        for i in 0..8 {
+            world.set_block(i, 40 + i, 2 * i, rock);
+        }
+        let heights = world.generator.generate_column(key, 1..=0).1;
+        let mut edited = 0;
+        let mut costs = Vec::new();
+        for n in [1_000, 10_000, 100_000] {
+            while edited < n {
+                world.set_block(16 * (2 + edited % 1_000), 30, 16 * (2 + edited / 1_000), rock);
+                edited += 1;
+            }
+            let reps = 2_000;
+            let start = Instant::now();
+            for _ in 0..reps {
+                world.ceilings.remove(&key);
+                world.install_ceiling(key, &heights);
+            }
+            let indexed = start.elapsed().as_secs_f64() * 1e6 / f64::from(reps);
+            let start = Instant::now();
+            let mut ceiling = light::CeilingWindow::from_heights(key.face, |lu, lv| heights[lu + lv * CHUNK_SIZE]);
+            raise_by_scan(&world, key, &mut ceiling);
+            let scan = start.elapsed().as_secs_f64() * 1e6;
+            println!("ceiling install with {n} edited chunks: indexed {indexed:.2} us, overlay scan {scan:.0} us");
+            costs.push(indexed);
+        }
+        assert!(costs[2] < costs[0] * 4.0, "install cost grew with unrelated edits: {costs:?}");
     }
 }

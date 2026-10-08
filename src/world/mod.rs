@@ -391,6 +391,10 @@ pub struct World {
     /// Chunk-y extent of the edits in each chunk column `(x, z)`, never shrunk. The generator's
     /// surface bounds miss a pit dug below them or a tower built above.
     edit_columns: FastMap<(i32, i32), [i32; 2]>,
+    /// Edited altitude chunks of each [`ColumnKey`], entered on a chunk's first edit and never
+    /// removed, so a ceiling reads its column's roofs without scanning every edit. A chunk whose
+    /// edits compacted away is skipped at the lookup. `Open` chunks are not entered.
+    edit_column_chunks: FastMap<ColumnKey, Vec<i32>>,
     /// The far field's chunk centre: the chart column under the eye, which outlasts the near
     /// window's chart reach; the streaming centre elsewhere. Set by [`stream`](Self::stream).
     far_center: Option<Coord>,
@@ -832,6 +836,7 @@ impl World {
             window_ground: streaming::NearBounds::default(),
             retired: None,
             edit_columns: FastMap::default(),
+            edit_column_chunks: FastMap::default(),
             far_center: None,
             far_fold: seam::Unfold::IDENTITY,
             far_atlas: None,
