@@ -768,6 +768,53 @@ fn assert_lod_bands(world: &mut World, label: &str) {
     println!("{label}: empty {empty} of {shown}, {drawn} sections, {} frontier edges", frontier.len());
 }
 
+/// Probe: how many quads the morph's dy splits add, per detail, over the drawn cut at the owner site.
+#[test]
+#[ignore]
+fn morph_quad_overhead_probe() {
+    use crate::render_config::{RenderConfig, lod_for};
+    use super::generation::WorldgenKind;
+
+    let (lod_levels, lod_detail) = lod_for(16);
+    let render = RenderConfig { lod2: true, occlusion: true, lod_levels, lod_detail, ..RenderConfig::default() };
+    let mut world = World::with_kind(42, render, WorldgenKind::Diffusion, false);
+    world.set_view_distances(16, 5);
+    world.section_pyramid.unit = world.view.lod_unit();
+    arm_drawn(&mut world, DVec3::new(-19.1, 390.8, -0.6));
+    world.recompute_lod_morph();
+    let tables = world.tables.get();
+    let quads = |m: &super::section::SectionMeshData| -> u64 {
+        m.slabs.iter().map(|slab| slab.data.iter().map(|(_, d)| d.quad_counts().iter().map(|&q| u64::from(q)).sum::<u64>()).sum::<u64>()).sum()
+    };
+    let mut per = [(0u64, 0u64, 0usize); 16];
+    for &(s, mask) in &world.section_visible {
+        if mask.is_empty() {
+            continue;
+        }
+        let on = super::section::mesh::extract_section_mesh_dy(s, world.generator.as_ref(), &[], &tables, true);
+        let off = super::section::mesh::extract_section_mesh_dy(s, world.generator.as_ref(), &[], &tables, false);
+        let e = &mut per[s.detail.0 as usize];
+        e.0 += quads(&off);
+        e.1 += quads(&on);
+        e.2 += 1;
+    }
+    let (mut t0, mut t1) = (0u64, 0u64);
+    for (d, (off, on, n)) in per.iter().enumerate() {
+        if *n == 0 {
+            continue;
+        }
+        let band = world.lod_morph[d + MESH_SHIFT];
+        t0 += off;
+        t1 += on;
+        println!(
+            "detail {d}: {n} sections, quads {off} -> {on} (+{:.1}%), band morphs {}",
+            (*on as f64 / (*off).max(1) as f64 - 1.0) * 100.0,
+            band.end > band.start
+        );
+    }
+    println!("total quads {t0} -> {t1} (+{:.1}%)", (t1 as f64 / t0.max(1) as f64 - 1.0) * 100.0);
+}
+
 /// Chart, RD16/V5, the drawn far field after the near window has taken its columns.
 #[test]
 fn lod_morph_bands_hold_on_charted_worlds() {

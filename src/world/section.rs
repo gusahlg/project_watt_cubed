@@ -31,7 +31,7 @@ use super::generation::TerrainGenerator;
 use super::lod;
 
 /// Submodule keeps mesh representation and consumer together.
-mod mesh;
+pub(in crate::world) mod mesh;
 pub(in crate::world) use mesh::face_edits;
 pub(in crate::world) use mesh::{SectionMeshData, chart_slab_corners, extract_section_mesh, warp_slab_corners};
 

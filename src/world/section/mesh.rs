@@ -609,7 +609,7 @@ pub(in crate::world) fn extract_section_mesh<G: TerrainGenerator + ?Sized>(
     extract_section_mesh_dy(pos, r#gen, edits, tables, pos.face == Face::PosY)
 }
 
-fn extract_section_mesh_dy<G: TerrainGenerator + ?Sized>(
+pub(in crate::world) fn extract_section_mesh_dy<G: TerrainGenerator + ?Sized>(
     pos: SectionPos,
     r#gen: &G,
     edits: &[(ChunkCoord, Vec<(usize, BlockId)>)],
