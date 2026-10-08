@@ -699,20 +699,7 @@ impl Game {
             return Signal::Continue;
         }
 
-        // Advance the day/night clock (singleplayer drives it locally; a server
-        // sync overrides `day` on arrival), throttled by `sky_hz`. With the
-        // lane off, compose samples fixed noon without mutating authoritative
-        // clock state; re-enabling resumes the stored time instead of freezing
-        // a stripped profile at night.
-        if self.render.day_night {
-            let steps = self.sky_gate.steps(dt);
-            if steps != 0 {
-                self.sky
-                    .tick(steps as f64 * self.sky_gate.step_dt(dt) as f64);
-            }
-        } else {
-            self.sky_gate.reset();
-        }
+        self.tick_sky(dt);
 
         // This frame's audio facts, accumulated across the phases. Footsteps are
         // added at the audio commit; mods choose the cues and the voice sessions.
@@ -1246,34 +1233,10 @@ impl Game {
         let mut sched_ctx = SchedCtx::new(&mut self.world, Some(&mut *eng));
         self.sched.tick(&mut sched_ctx, &clocks);
 
-        // The topology pass (selection/admission/unload) rides `stream_hz`;
-        // forced refreshes (teleports, freecam/HUD changes, settings) run out
-        // of band so correctness never waits on a 15 Hz clock. `stream` owns
-        // the result pump on those frames, so skip the extra pump here.
-        let stream_due = if std::mem::take(&mut self.force_stream) {
-            self.stream_gate.reset();
-            true
-        } else {
-            self.stream_gate.steps(dt) != 0
-        };
-        // A cruise holds the world still: in-flight work lands, nothing new streams around the
-        // player. Ending it streams the destination like a teleport.
-        if !stream_due || self.player.cruising() {
-            self.world
-                .pump(Some(&mut *eng), &mut self.sched, mods.appearance());
+        let due = self.take_stream_due(dt);
+        if !self.stream_or_pump(Some(&mut *eng), due, mods) {
             return;
         }
-
-        let stream_center = match &self.camera.mode {
-            CameraMode::Free { rig, .. } => rig.pos,
-            CameraMode::Person(_) => self.player.position,
-        };
-        self.world.stream(
-            stream_center,
-            Some(&mut *eng),
-            &mut self.sched,
-            mods.appearance(),
-        );
 
         // A hidden/minimal HUD does no minimap clock read or terrain raster
         // work; refreshes share streaming's cadence instead of waking alone.
@@ -1292,9 +1255,68 @@ impl Game {
         }
     }
 
+    /// Advance the day/night clock (singleplayer drives it locally; a server
+    /// sync overrides `day` on arrival), throttled by `sky_hz`. With the
+    /// lane off, compose samples fixed noon without mutating authoritative
+    /// clock state; re-enabling resumes the stored time instead of freezing
+    /// a stripped profile at night.
+    fn tick_sky(&mut self, dt: f32) {
+        if self.render.day_night {
+            let steps = self.sky_gate.steps(dt);
+            if steps != 0 {
+                self.sky
+                    .tick(steps as f64 * self.sky_gate.step_dt(dt) as f64);
+            }
+        } else {
+            self.sky_gate.reset();
+        }
+    }
+
+    /// Whether the topology pass (selection/admission/unload) runs this frame. It
+    /// rides `stream_hz`; forced refreshes (teleports, freecam/HUD changes,
+    /// settings) run out of band so correctness never waits on a 15 Hz clock.
+    fn take_stream_due(&mut self, dt: f32) -> bool {
+        if std::mem::take(&mut self.force_stream) {
+            self.stream_gate.reset();
+            true
+        } else {
+            self.stream_gate.steps(dt) != 0
+        }
+    }
+
+    /// Where the world streams around: the camera, which is the player unless
+    /// the freecam rig has flown elsewhere.
+    fn stream_center(&self) -> DVec3 {
+        match &self.camera.mode {
+            CameraMode::Free { rig, .. } => rig.pos,
+            CameraMode::Person(_) => self.player.position,
+        }
+    }
+
+    /// Stream around the camera when a pass is `due` (`stream` owns the result
+    /// pump on those frames), else only pump finished work. A cruise holds the
+    /// world still: in-flight work lands, nothing new streams around the
+    /// player; ending it streams the destination like a teleport. Returns
+    /// whether it streamed.
+    fn stream_or_pump(&mut self, eng: Option<&mut Engine>, due: bool, mods: &Mods) -> bool {
+        if !due || self.player.cruising() {
+            self.world
+                .pump(eng, &mut self.sched, mods.appearance());
+            return false;
+        }
+        let center = self.stream_center();
+        self.world.stream(
+            center,
+            eng,
+            &mut self.sched,
+            mods.appearance(),
+        );
+        true
+    }
+
     /// Headless quiet frame: input drain, motion (inert), scheduler, stream/pump,
     /// silent audio, HUD/lighting caches — the pieces `update` + `draw` run, in
-    /// order, without an Engine.
+    /// order, through the same helpers, without an Engine.
     #[cfg(test)]
     fn tick_quiet(
         &mut self,
@@ -1306,15 +1328,7 @@ impl Game {
         settings: &Settings,
         mods: &mut Mods,
     ) {
-        if self.render.day_night {
-            let steps = self.sky_gate.steps(dt);
-            if steps != 0 {
-                self.sky
-                    .tick(steps as f64 * self.sky_gate.step_dt(dt) as f64);
-            }
-        } else {
-            self.sky_gate.reset();
-        }
+        self.tick_sky(dt);
         let events = std::mem::take(&mut self.events_scratch);
         if self.input_locked {
             router.drain_frame();
@@ -1326,23 +1340,8 @@ impl Game {
         let clocks = self.sched.clocks(dt);
         let mut sched_ctx = SchedCtx::new(&mut self.world, None);
         self.sched.tick(&mut sched_ctx, &clocks);
-        let stream_due = if std::mem::take(&mut self.force_stream) {
-            self.stream_gate.reset();
-            true
-        } else {
-            self.stream_gate.steps(dt) != 0
-        };
-        let stream_center = match &self.camera.mode {
-            CameraMode::Free { rig, .. } => rig.pos,
-            CameraMode::Person(_) => self.player.position,
-        };
-        if stream_due && !self.player.cruising() {
-            self.world
-                .stream(stream_center, None, &mut self.sched, mods.appearance());
-        } else {
-            self.world
-                .pump(None, &mut self.sched, mods.appearance());
-        }
+        let due = self.take_stream_due(dt);
+        self.stream_or_pump(None, due, mods);
         self.sample_peers();
         let ids = router.action_ids();
         self.commit_audio(AudioPhase {
@@ -2346,14 +2345,9 @@ mod tests {
         assert!(!game.world().anything_in_flight());
     }
 
-    #[test]
-    fn quiet_minimum_frame_allocates_nothing_and_reads_the_clock_once() {
-        use crate::alloc_count;
-        use crate::audio::{AudioService, SoundSystem};
-        use crate::input::router::Router;
-        use crate::settings::Settings;
-        use crate::ui::HudMode;
-
+    /// A settled scripted game at the Minimum preset with input locked, its settings adopted as
+    /// world entry adopts them.
+    fn quiet_minimum_game() -> (Game, Settings) {
         let mut settings = Settings::default();
         assert!(settings.select_preset("minimum"));
         let render = settings.render_config();
@@ -2374,6 +2368,17 @@ mod tests {
             "settled: {}",
             game.world().entry_debug()
         );
+        (game, settings)
+    }
+
+    #[test]
+    fn quiet_minimum_frame_allocates_nothing_and_reads_the_clock_once() {
+        use crate::alloc_count;
+        use crate::audio::{AudioService, SoundSystem};
+        use crate::input::router::Router;
+        use crate::ui::HudMode;
+
+        let (mut game, settings) = quiet_minimum_game();
 
         let (mut sound, symbols) = SoundSystem::mute();
         let mut audio = AudioService::new();
@@ -2434,29 +2439,9 @@ mod tests {
         use crate::alloc_count;
         use crate::audio::{AudioService, SoundSystem};
         use crate::input::router::Router;
-        use crate::settings::Settings;
 
-        let mut settings = Settings::default();
-        assert!(settings.select_preset("minimum"));
-        let render = settings.render_config();
-        let mut game = Game::scripted(1, render);
-        game.scripted = false;
-        game.set_input_locked(true);
-        game.world_mut()
-            .set_view_distances(settings.render_distance, settings.vertical_distance);
-        game.world_mut().transition_lighting(settings.lighting);
-        game.world_mut().set_ao_flag(settings.ao);
-        game.world_mut()
-            .set_render_lanes(settings.occlusion, settings.lod2);
-        game.adopt_gameplay_settings(&settings, render);
+        let (mut game, settings) = quiet_minimum_game();
         let pos = game.player().position;
-        game.world_mut().settle_around(pos);
-        assert!(
-            game.world().entry_complete(),
-            "settled: {}",
-            game.world().entry_debug()
-        );
-
         let (x, y, z) = (
             pos.x.floor() as i32,
             pos.y.floor() as i32,

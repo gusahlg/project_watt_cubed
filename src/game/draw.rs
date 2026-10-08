@@ -55,16 +55,22 @@ impl DrawState {
 struct Scene {
     pose: ViewPose,
     camera: Camera3D,
+    lighting: Lighting,
+    peers: Vec<PeerDraw>,
+    screen: (i32, i32),
+    dt: f32,
+}
+
+/// The frame's composed lighting truth: the source of the engine's per-frame
+/// UBO for sky/fog and avatar key lighting, and the clear.
+struct Lighting {
     /// The one clock sample every sun consumer shares this frame.
     sky_frame: SkyFrame,
     /// Body up and altitude above the local surface datum.
     sky_ctx: crate::frame_snapshot::SkyContext,
-    peers: Vec<PeerDraw>,
-    frame_uniforms: voxel_engine::skeleton::FrameUniformsGpu,
+    uniforms: voxel_engine::skeleton::FrameUniformsGpu,
     clear: voxel_engine::LinearRgb,
     debug_flat: Option<Color>,
-    screen: (i32, i32),
-    dt: f32,
 }
 
 /// Lighting/clear state for a profile whose sky and animation inputs are
@@ -124,7 +130,7 @@ impl Game {
             self.sky.sync_far_map(eng, self.world.terrain());
         }
         let mut scene = self.compose_phase(eng, fov, shake);
-        let mut f = eng.begin_frame(scene.clear);
+        let mut f = eng.begin_frame(scene.lighting.clear);
         self.scene_phase(&mut f, &scene);
         self.hud_phase(&mut f, mods, &scene);
         // Reclaim peer capacity after both consumers finish with the immutable
@@ -164,10 +170,6 @@ impl Game {
         let want_tags = self.name_tags && self.theme.hud.shows_world_ui();
         let peers = self.peer_draws(screen, &camera, &pose, dt, self.player_models, want_tags);
 
-        // Compose the single per-frame lighting truth: the source for the
-        // engine's per-frame UBO for sky/fog and avatar key lighting. The UBO is
-        // the only path; legacy push lanes have been retired.
-        //
         // Exposure is the render thread's latest metered+smoothed value,
         // sourced through `Engine::exposure_for_compose`; temporal smoothing
         // already happened render-side, so frame delta is passed only for
@@ -182,7 +184,22 @@ impl Game {
         } else {
             voxel_engine::skeleton::Exposure::DEFAULT
         };
+        let lighting = self.compose_lighting(&pose, exposure);
 
+        Scene {
+            pose,
+            camera,
+            lighting,
+            peers,
+            screen,
+            dt,
+        }
+    }
+
+    /// Compose the single per-frame lighting truth for `pose`: the source for
+    /// the engine's per-frame UBO for sky/fog and avatar key lighting. The UBO
+    /// is the only path; legacy push lanes have been retired.
+    fn compose_lighting(&mut self, pose: &ViewPose, exposure: voxel_engine::skeleton::Exposure) -> Lighting {
         // ONE clock sample for lighting, clear colour, and sky geometry,
         // cached by the quantised day and body up. Day/night off renders fixed
         // noon (cheap, readable stripped-profile lighting) while the
@@ -219,7 +236,7 @@ impl Game {
         // patch only the camera-anchored UV lanes.
         // Minimum/Fast ride this path.
         let cacheable_frame = !self.render.weather && !self.render.clouds && !self.render.exposure;
-        let (mut frame_uniforms, cached_clear) = if cacheable_frame {
+        let (mut uniforms, cached_clear) = if cacheable_frame {
             let render = &self.render;
             // (day, content_rev, altitude's space fade, body up): any render/palette
             // change bumps the stamp, so the freeze predicate's own inputs invalidate
@@ -254,11 +271,11 @@ impl Game {
             // The camera-anchored UV lanes are the only inputs that can differ
             // while lighting is frozen; exposure and jitter are fixed by the
             // cache predicate.
-            frame_uniforms.anim[1] = anim_uv[0];
-            frame_uniforms.anim[2] = anim_uv[1];
+            uniforms.anim[1] = anim_uv[0];
+            uniforms.anim[2] = anim_uv[1];
         }
-        if self.drawing.last_uniforms != Some(frame_uniforms) {
-            self.drawing.last_uniforms = Some(frame_uniforms);
+        if self.drawing.last_uniforms != Some(uniforms) {
+            self.drawing.last_uniforms = Some(uniforms);
             #[cfg(test)]
             crate::alloc_count::note_engine(crate::alloc_count::EngineCall::FrameUniforms);
         }
@@ -277,18 +294,12 @@ impl Game {
                 Some(TERRAIN_KEY),
             ),
         };
-
-        Scene {
-            pose,
-            camera,
+        Lighting {
             sky_frame,
             sky_ctx,
-            peers,
-            frame_uniforms,
+            uniforms,
             clear,
             debug_flat,
-            screen,
-            dt,
         }
     }
 
@@ -351,20 +362,21 @@ impl Game {
             // Lighting is decided when the 3D scope opens (no post-hoc setter):
             // the composed per-frame UBO carries the lighting truth in every mode
             // (the renderer overlays the debug-flat reserved key for TerrainKey).
+            let lit = &scene.lighting;
             let mut f3 = f.begin_3d(
                 camera,
                 pose.eye,
-                voxel_engine::Lighting::Composed(scene.frame_uniforms),
+                voxel_engine::Lighting::Composed(lit.uniforms),
             );
-            f3.set_debug_flat(scene.debug_flat);
+            f3.set_debug_flat(lit.debug_flat);
             // Fog and water read the same basis as the sky, including debug-flat frames.
-            f3.set_local_frame(scene.sky_ctx.up.as_vec3(), scene.sky_ctx.altitude as f32);
+            f3.set_local_frame(lit.sky_ctx.up.as_vec3(), lit.sky_ctx.altitude as f32);
             if matches!(self.debug_view, DebugView::Normal) {
                 let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::ListSky);
                 let view_blocks = crate::sky::chunk_view_blocks(self.world.view_radius());
                 self.sky.draw(
                     &mut f3,
-                    scene.sky_frame,
+                    lit.sky_frame,
                     pose.eye,
                     self.world.terrain(),
                     view_blocks,
@@ -531,60 +543,7 @@ impl Game {
         const DT: f32 = 1.0 / 60.0;
         self.refresh_hud_text(0, DT);
         let pose = self.camera.pose(&self.player, &self.world, 90.0, 0.0);
-        let sky_day = if self.render.day_night {
-            (self.sky.clock.day() * 4096.0).round() / 4096.0
-        } else {
-            0.5
-        };
-        let sky_ctx = crate::frame_snapshot::SkyContext {
-            up: pose.up(),
-            altitude: self.sky_altitude(pose.eye),
-            fade: self.space_fade(),
-        };
-        let (up_q, plane) = sky_keys(pose.eye, sky_ctx.up);
-        let up = sky_ctx.up.as_vec3();
-        let sky_frame = {
-            let sky = &self.sky;
-            *self
-                .drawing
-                .sky_frame_cache
-                .get_or((sky_day.to_bits(), up_q), || sky.frame_at_day(sky_day, up))
-        };
-        let uv_key = [plane[0].to_bits(), plane[1].to_bits()];
-        let anim_uv = *self.drawing.anim_uv_cache.get_or(uv_key, || {
-            crate::frame_snapshot::wrap_plane(plane[0], plane[1])
-        });
-        let cacheable = !self.render.weather && !self.render.clouds && !self.render.exposure;
-        if cacheable {
-            let space = crate::frame_snapshot::space_factor(sky_ctx.altitude, sky_ctx.fade).to_bits();
-            let key = (sky_day.to_bits(), self.content_rev.0, space, up_q);
-            let uniforms = {
-                let sky = &self.sky;
-                let render = &self.render;
-                let cached = self.drawing.static_frame_cache.get_or(key, || {
-                    let snapshot = crate::frame_snapshot::compose_at(
-                        sky,
-                        sky_frame,
-                        sky_ctx,
-                        anim_uv,
-                        voxel_engine::skeleton::Exposure::DEFAULT,
-                        render,
-                    );
-                    StaticFrame {
-                        uniforms: voxel_engine::skeleton::FrameUniformsGpu::from(&snapshot),
-                        clear: sky.clear_at(sky_frame, up),
-                    }
-                });
-                let mut uniforms = cached.uniforms;
-                uniforms.anim[1] = anim_uv[0];
-                uniforms.anim[2] = anim_uv[1];
-                uniforms
-            };
-            if self.drawing.last_uniforms != Some(uniforms) {
-                self.drawing.last_uniforms = Some(uniforms);
-                crate::alloc_count::note_engine(crate::alloc_count::EngineCall::FrameUniforms);
-            }
-        }
+        self.compose_lighting(&pose, voxel_engine::skeleton::Exposure::DEFAULT);
         if self.mod_hud && self.theme.hud.shows_mod_hud() {
             self.hud_scratch.clear();
             mods.hud(
