@@ -611,7 +611,7 @@ mod tests {
         assert_eq!(map.rebuild(&world, Face::PosY, IVec2::new(1, 0), true), Some(true), "a step repaints");
     }
 
-    /// Cost probe: one full rebuild against the idle interval check that replaces it.
+    /// Cost probe: a full rebuild, the idle interval check that replaces it, and a 16-texel shift.
     #[test]
     #[ignore]
     fn minimap_rebuild_cost() {
@@ -620,18 +620,25 @@ mod tests {
         let origin = IVec2::new(0, 0);
         let mut map = Minimap::new(MinimapConfig::DEFAULT);
         const N: u32 = 50;
+        let us = |t: Instant| t.elapsed().as_secs_f64() * 1e6 / f64::from(N);
         let t = Instant::now();
         for _ in 0..N {
             map.center = None;
             assert_eq!(map.rebuild(&world, Face::PosY, origin, true), Some(true));
         }
-        let full = t.elapsed().as_secs_f64() * 1e6 / f64::from(N);
+        let full = us(t);
         let t = Instant::now();
         for _ in 0..N {
             assert_eq!(map.rebuild(&world, Face::PosY, origin, true), Some(false), "the idle rebuild is skipped");
         }
-        let idle = t.elapsed().as_secs_f64() * 1e6 / f64::from(N);
-        println!("minimap_rebuild_cost ({N} iters): full rebuild {full:.1} us, idle check {idle:.1} us");
+        let idle = us(t);
+        let t = Instant::now();
+        for i in 0..N {
+            let col = if i % 2 == 0 { IVec2::new(16, 8) } else { origin };
+            assert_eq!(map.rebuild(&world, Face::PosY, col, false), Some(true));
+        }
+        let shift = us(t);
+        println!("minimap_rebuild_cost ({N} iters): full {full:.1} us, idle {idle:.1} us, shift {shift:.1} us");
     }
 
     /// A player standing on the +X face rasters that face's (u, v), and the height
