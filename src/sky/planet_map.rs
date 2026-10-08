@@ -4,12 +4,11 @@
 //! so a baked face is the cube the sky samples. The draw keeps the 256² previews until all six
 //! 1024² faces are ready, then installs that cube once.
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::{Duration, SystemTime};
 
 use glam::DVec3;
 use voxel_engine::Color;
@@ -25,22 +24,16 @@ use crate::world::generation::TerrainGenerator;
 use crate::world::terrain::cosmos::{Body, Cosmos, Kind};
 use crate::world::terrain::Generator;
 
+mod cache;
+
+use cache::{cache_load, cache_save, key_hash, prune_cache, Key};
+
 /// Bump when the bake bytes change. Files from any other version are deleted.
 pub(crate) const BAKE_VERSION: u32 = 3;
 /// First pass, every face, so a far body has a colour before the full map lands.
 pub(crate) const PREVIEW: u32 = 256;
 /// Full face. Six of these are the cached map.
 pub(crate) const FULL: u32 = 1024;
-/// How many distinct bake keys the disk cache keeps.
-const KEPT_KEYS: usize = 8;
-/// An orphan `.tmp` older than this is deleted.
-const TMP_MAX_AGE: Duration = Duration::from_secs(60);
-
-const MAGIC: &[u8; 4] = b"PWCM";
-/// magic, version, seed, body, face, size, key hash, payload checksum.
-const HEADER: usize = 40;
-
-static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Body-space direction of a cube texel centre. The engine owns the cube table;
 /// this promotes it to f64 for the chart lookup.
@@ -174,188 +167,6 @@ pub(crate) fn horizon_sine(dist: f64, hi: f64, air: f64) -> f32 {
     }
     let h = -inside.sqrt();
     if h.is_finite() { h as f32 } else { 1.0 }
-}
-
-/// The cache key's hash: FNV-1a 64 over every channel of the colour snapshot, then the worldgen
-/// fingerprint, chart `n`, and the FNV-1a 64 of the datum offsets' little-endian bits.
-fn key_hash(colors: &[Color], fingerprint: u64, n: i64, datum: &[f32]) -> u64 {
-    let mut offsets = Fnv64::new();
-    for o in datum {
-        offsets.bytes(&o.to_le_bytes());
-    }
-    let mut h = Fnv64::new();
-    for c in colors {
-        h.bytes(&[c.r, c.g, c.b, c.a]);
-    }
-    h.bytes(&fingerprint.to_le_bytes()).bytes(&n.to_le_bytes()).bytes(&offsets.finish().to_le_bytes()).finish()
-}
-
-#[derive(Clone, Copy)]
-struct Key {
-    seed: i64,
-    body: u16,
-    hash: u64,
-    version: u32,
-}
-
-fn cache_path(dir: &Path, key: &Key, size: u32, face: usize) -> PathBuf {
-    dir.join(format!(
-        "pm-{}-{}-{:016x}-v{}-s{size}-f{face}.bin",
-        key.seed, key.body, key.hash, key.version
-    ))
-}
-
-fn push_u32(buf: &mut Vec<u8>, v: u32) {
-    buf.extend_from_slice(&v.to_le_bytes());
-}
-
-fn read_exact(bytes: &[u8], at: usize, n: usize) -> Option<&[u8]> {
-    bytes.get(at..at + n)
-}
-
-fn u32_at(bytes: &[u8], at: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(read_exact(bytes, at, 4)?.try_into().ok()?))
-}
-
-fn u64_at(bytes: &[u8], at: usize) -> Option<u64> {
-    Some(u64::from_le_bytes(read_exact(bytes, at, 8)?.try_into().ok()?))
-}
-
-fn i64_at(bytes: &[u8], at: usize) -> Option<i64> {
-    Some(i64::from_le_bytes(read_exact(bytes, at, 8)?.try_into().ok()?))
-}
-
-fn u16_at(bytes: &[u8], at: usize) -> Option<u16> {
-    Some(u16::from_le_bytes(read_exact(bytes, at, 2)?.try_into().ok()?))
-}
-
-fn tmp_path(path: &Path) -> PathBuf {
-    let n = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let mut name = path.file_name().map(|s| s.to_os_string()).unwrap_or_default();
-    name.push(format!(".{}.{n}.tmp", std::process::id()));
-    path.with_file_name(name)
-}
-
-fn touch(path: &Path) {
-    let Ok(file) = std::fs::File::options().write(true).open(path) else { return };
-    let _ = file.set_modified(SystemTime::now());
-}
-
-/// `pm-{seed}-{body}-{hash}-v{version}-s{size}-f{face}.bin` → (group, version).
-fn cache_name_parts(name: &str) -> Option<(&str, u32)> {
-    let stem = name.strip_suffix(".bin")?;
-    let (head, face) = stem.rsplit_once("-f")?;
-    face.parse::<u16>().ok()?;
-    let (head, size) = head.rsplit_once("-s")?;
-    size.parse::<u32>().ok()?;
-    let (group, ver) = head.rsplit_once("-v")?;
-    Some((group, ver.parse().ok()?))
-}
-
-/// Keep the [`KEPT_KEYS`] newest keys of this [`BAKE_VERSION`]. Other versions go, and so does
-/// an orphan `.tmp` older than a minute.
-fn prune_cache(dir: &Path) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
-    let now = SystemTime::now();
-    struct Item {
-        path: PathBuf,
-        group: String,
-        mtime: SystemTime,
-    }
-    let mut items = Vec::new();
-    for ent in rd.flatten() {
-        let path = ent.path();
-        let name = ent.file_name();
-        let name = name.to_string_lossy();
-        let mtime = ent.metadata().ok().and_then(|m| m.modified().ok()).unwrap_or(SystemTime::UNIX_EPOCH);
-        let tmp = path.extension().is_some_and(|e| e == "tmp");
-        if tmp {
-            if now.duration_since(mtime).unwrap_or_default() > TMP_MAX_AGE {
-                let _ = std::fs::remove_file(&path);
-            }
-            continue;
-        }
-        let Some((group, version)) = cache_name_parts(&name) else { continue };
-        if version != BAKE_VERSION {
-            let _ = std::fs::remove_file(&path);
-            continue;
-        }
-        items.push(Item { path, group: group.to_string(), mtime });
-    }
-    let mut groups: Vec<(String, SystemTime)> = Vec::new();
-    for item in &items {
-        if let Some(found) = groups.iter_mut().find(|g| g.0 == item.group) {
-            if item.mtime > found.1 {
-                found.1 = item.mtime;
-            }
-        } else {
-            groups.push((item.group.clone(), item.mtime));
-        }
-    }
-    if groups.len() <= KEPT_KEYS {
-        return;
-    }
-    groups.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    for item in &items {
-        if groups[KEPT_KEYS..].iter().any(|g| g.0 == item.group) {
-            let _ = std::fs::remove_file(&item.path);
-        }
-    }
-}
-
-/// Write one face. A short or mismatched buffer is not written. The payload's FNV checksum
-/// sits in the header; a later load rejects a body that does not match it.
-fn cache_save(dir: &Path, key: &Key, size: u32, face: usize, rgba: &[u8]) {
-    let expect = (size as usize).saturating_mul(size as usize).saturating_mul(4);
-    if rgba.len() != expect || face > u16::MAX as usize {
-        return;
-    }
-    if std::fs::create_dir_all(dir).is_err() {
-        return;
-    }
-    let path = cache_path(dir, key, size, face);
-    let tmp = tmp_path(&path);
-    let sum = Fnv64::new().bytes(rgba).finish();
-    let mut bytes = Vec::with_capacity(HEADER + rgba.len());
-    bytes.extend_from_slice(MAGIC);
-    push_u32(&mut bytes, key.version);
-    bytes.extend_from_slice(&key.seed.to_le_bytes());
-    bytes.extend_from_slice(&key.body.to_le_bytes());
-    bytes.extend_from_slice(&(face as u16).to_le_bytes());
-    push_u32(&mut bytes, size);
-    bytes.extend_from_slice(&key.hash.to_le_bytes());
-    bytes.extend_from_slice(&sum.to_le_bytes());
-    bytes.extend_from_slice(rgba);
-    if std::fs::write(&tmp, &bytes).is_err() {
-        let _ = std::fs::remove_file(&tmp);
-        return;
-    }
-    if std::fs::rename(&tmp, &path).is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-}
-
-/// The face bytes, or `None` when the file is missing, short, keyed differently, or its
-/// payload checksum does not match. A hit touches the file so the cache keeps recent keys.
-fn cache_load(dir: &Path, key: &Key, size: u32, face: usize) -> Option<Vec<u8>> {
-    let path = cache_path(dir, key, size, face);
-    let bytes = std::fs::read(&path).ok()?;
-    let expect = (size as usize).saturating_mul(size as usize).saturating_mul(4);
-    if bytes.len() != HEADER + expect || bytes.get(..4) != Some(MAGIC) {
-        return None;
-    }
-    if u32_at(&bytes, 4)? != key.version
-        || i64_at(&bytes, 8)? != key.seed
-        || u16_at(&bytes, 16)? != key.body
-        || u16_at(&bytes, 18)? != face as u16
-        || u32_at(&bytes, 20)? != size
-        || u64_at(&bytes, 24)? != key.hash
-        || u64_at(&bytes, 32)? != Fnv64::new().bytes(&bytes[HEADER..]).finish()
-    {
-        return None;
-    }
-    touch(&path);
-    Some(bytes[HEADER..].to_vec())
 }
 
 struct Job {
@@ -686,7 +497,7 @@ impl PlanetBake {
             self.poll();
             if self.worker.is_some() {
                 assert!(start.elapsed().as_secs() < 30, "planet-map bake did not finish");
-                std::thread::sleep(Duration::from_millis(1));
+                std::thread::sleep(std::time::Duration::from_millis(1));
             }
         }
         self.poll();
@@ -805,10 +616,9 @@ impl MapFeed {
 #[cfg(test)]
 mod tests {
     use super::{
-        bake_face, bake_enabled, cache_load, cache_name_parts, cache_path, cache_save, clamp_column,
-        column_direction, column_linear, column_of, cube_texel_dir, home_chart_n, horizon_sine, impostor_datum,
-        map_key, prune_cache, round_i32, tmp_path, world_fingerprint, FarSink, Key, MapFeed, PlanetBake, BAKE_VERSION,
-        FULL, HEADER, HOME_MAP, KEPT_KEYS, PREVIEW,
+        bake_face, bake_enabled, clamp_column, column_direction, column_linear, column_of, cube_texel_dir, home_chart_n,
+        horizon_sine, impostor_datum, map_key, round_i32, world_fingerprint, FarSink, Key, MapFeed, PlanetBake,
+        BAKE_VERSION, FULL, HOME_MAP, PREVIEW,
     };
     use crate::alloc_count;
     use crate::block::registry::{AIR, BlockId, BlockRegistry};
@@ -820,7 +630,7 @@ mod tests {
     use crate::world::terrain::cosmos::{Kind, AIR_TOP, HOME_RADIUS};
     use crate::world::terrain::TerrainCfg;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::time::{Duration, SystemTime};
+    use std::time::Duration;
     use crate::sky::palette::{Anchor, Role, Rgb, NEW_SHOKA};
     use crate::world::terrain::Terrain;
     use glam::DVec3;
@@ -1138,98 +948,10 @@ mod tests {
         }
     }
 
-    fn scratch(name: &str) -> PathBuf {
+    pub(super) fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("pwc-planet-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
-    }
-
-    #[test]
-    fn cache_round_trips_and_rejects_a_stale_key() {
-        let dir = scratch("cache");
-        let key = Key { seed: 42, body: 3, hash: 0xabc, version: BAKE_VERSION };
-        let rgba = vec![9u8, 8, 7, 255, 1, 2, 3, 255, 4, 5, 6, 255, 7, 8, 9, 255];
-        cache_save(&dir, &key, 2, 4, &rgba);
-        assert_eq!(cache_load(&dir, &key, 2, 4).as_deref(), Some(rgba.as_slice()));
-        let stale = Key { hash: 0xabd, ..key };
-        assert!(cache_load(&dir, &stale, 2, 4).is_none());
-        let old = Key { version: BAKE_VERSION + 1, ..key };
-        assert!(cache_load(&dir, &old, 2, 4).is_none());
-        let path = cache_path(&dir, &key, 2, 4);
-        let mut bytes = std::fs::read(&path).unwrap();
-        bytes[HEADER] ^= 0xff;
-        std::fs::write(&path, &bytes).unwrap();
-        assert!(cache_load(&dir, &key, 2, 4).is_none(), "a bad payload checksum is rejected");
-        bytes[HEADER] ^= 0xff;
-        std::fs::write(&path, &bytes).unwrap();
-        assert_eq!(cache_load(&dir, &key, 2, 4).as_deref(), Some(rgba.as_slice()));
-        bytes[0] = b'X';
-        std::fs::write(&path, &bytes).unwrap();
-        assert!(cache_load(&dir, &key, 2, 4).is_none());
-        std::fs::write(&path, &bytes[..10]).unwrap();
-        assert!(cache_load(&dir, &key, 2, 4).is_none());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_tmp_name_is_unique_to_the_process_and_the_write() {
-        let path = PathBuf::from("pm-1-1-0000000000000001-v3-s4-f0.bin");
-        let a = tmp_path(&path);
-        let b = tmp_path(&path);
-        assert_ne!(a, b);
-        let pid = std::process::id().to_string();
-        for name in [a, b].map(|p| p.file_name().unwrap().to_string_lossy().into_owned()) {
-            assert!(name.contains(&pid), "{name}");
-            assert!(name.ends_with(".tmp"), "{name}");
-        }
-        let (group, ver) = cache_name_parts("pm--7-2-0000000000000001-v3-s1024-f0.bin").unwrap();
-        assert_eq!(group, "pm--7-2-0000000000000001");
-        assert_eq!(ver, BAKE_VERSION);
-    }
-
-    #[test]
-    fn the_cache_keeps_the_eight_newest_keys_and_drops_stale_files() {
-        let dir = scratch("prune");
-        std::fs::create_dir_all(&dir).unwrap();
-        let rgba = vec![1u8, 2, 3, 255];
-        let now = SystemTime::now();
-        for i in 0..KEPT_KEYS + 1 {
-            let key = Key { seed: i as i64, body: 1, hash: i as u64, version: BAKE_VERSION };
-            cache_save(&dir, &key, 1, 0, &rgba);
-            let path = cache_path(&dir, &key, 1, 0);
-            let age = Duration::from_secs(10 * (KEPT_KEYS as u64 + 1 - i as u64));
-            let file = std::fs::File::options().write(true).open(&path).unwrap();
-            file.set_modified(now.checked_sub(age).unwrap()).unwrap();
-        }
-        let old = Key { seed: 99, body: 1, hash: 99, version: BAKE_VERSION + 1 };
-        cache_save(&dir, &old, 1, 0, &rgba);
-        let old_tmp = dir.join(format!("orphan.{}.tmp", std::process::id()));
-        std::fs::write(&old_tmp, b"x").unwrap();
-        let file = std::fs::File::options().write(true).open(&old_tmp).unwrap();
-        file.set_modified(now.checked_sub(Duration::from_secs(120)).unwrap()).unwrap();
-        drop(file);
-        let fresh_tmp = dir.join("fresh.tmp");
-        std::fs::write(&fresh_tmp, b"y").unwrap();
-
-        prune_cache(&dir);
-
-        assert!(!old_tmp.exists(), "a tmp older than a minute is deleted");
-        assert!(fresh_tmp.exists(), "a fresh tmp stays");
-        assert!(!cache_path(&dir, &old, 1, 0).exists(), "another bake version is deleted");
-        for i in 0..KEPT_KEYS + 1 {
-            let key = Key { seed: i as i64, body: 1, hash: i as u64, version: BAKE_VERSION };
-            let exists = cache_path(&dir, &key, 1, 0).exists();
-            assert_eq!(exists, i != 0, "key {i} kept={exists}");
-        }
-
-        let key = Key { seed: 1, body: 1, hash: 1, version: BAKE_VERSION };
-        let path = cache_path(&dir, &key, 1, 0);
-        let old_m = now.checked_sub(Duration::from_secs(10_000)).unwrap();
-        std::fs::File::options().write(true).open(&path).unwrap().set_modified(old_m).unwrap();
-        assert_eq!(cache_load(&dir, &key, 1, 0).as_deref(), Some(rgba.as_slice()));
-        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
-        assert!(mtime > old_m + Duration::from_secs(1_000), "a hit touches the file");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1265,26 +987,6 @@ mod tests {
         let terrain = Terrain::new(&mut registry, 42);
         let key = map_key(&terrain, &registry, WorldgenKind::Diffusion, knobs).unwrap();
         assert_eq!((key.seed, key.body, key.hash), (42, 0, 0xc0d8_998d_8559_c507));
-    }
-
-    /// A face cached by an older build still loads, and a save writes the same bytes.
-    #[test]
-    fn a_cached_face_keeps_its_bytes() {
-        let dir = scratch("golden");
-        let key = Key { seed: -7, body: 3, hash: 0x0123_4567_89ab_cdef, version: BAKE_VERSION };
-        let rgba: Vec<u8> = (0..16u8).map(|i| i.wrapping_mul(37)).collect();
-        cache_save(&dir, &key, 2, 4, &rgba);
-        let path = cache_path(&dir, &key, 2, 4);
-        let bytes = std::fs::read(&path).unwrap();
-        const GOLDEN: [u8; HEADER + 16] = [
-            80, 87, 67, 77, 3, 0, 0, 0, 249, 255, 255, 255, 255, 255, 255, 255, 3, 0, 4, 0, 2, 0, 0, 0, 239, 205, 171,
-            137, 103, 69, 35, 1, 53, 71, 62, 183, 21, 152, 109, 55, 0, 37, 74, 111, 148, 185, 222, 3, 40, 77, 114, 151,
-            188, 225, 6, 43,
-        ];
-        assert_eq!(bytes, GOLDEN);
-        std::fs::write(&path, GOLDEN).unwrap();
-        assert_eq!(cache_load(&dir, &key, 2, 4), Some(rgba));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
