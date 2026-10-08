@@ -2,6 +2,21 @@
 
 use super::*;
 
+/// The coarsest section detail: a Ready ancestor walk stops here.
+const COARSEST: crate::ident::Detail = crate::ident::Detail(crate::render_config::LOD_COARSEST_DETAIL as i8);
+
+/// `s` lies strictly under one of `holes`.
+fn under_hole(s: SectionPos, holes: &FastSet<SectionPos>) -> bool {
+    let mut p = s;
+    while p.detail < COARSEST {
+        p = p.parent();
+        if holes.contains(&p) {
+            return true;
+        }
+    }
+    false
+}
+
 impl World {
     /// Spawn background max-mip bake around the eye's face. Re-bakes when the eye
     /// leaves the inner half of the baked square, or the body/face changes.
@@ -138,71 +153,57 @@ impl World {
         if self.section_budget_used() < self.sections_allowed() {
             return 0;
         }
-        let desired: FastSet<SectionPos> = self.section_desired.iter().copied().collect();
-        self.sections
-            .iter()
-            .filter(|&(&s, st)| st.is_ready() && self.stands_under_hole(s, &desired))
-            .count()
+        let holes = self.section_holes(&self.section_desired);
+        if holes.is_empty() {
+            return 0;
+        }
+        self.sections.iter().filter(|&(&s, st)| st.is_ready() && under_hole(s, &holes)).count()
     }
 
-    /// `s` is a Ready tile strictly under a desired cell that nothing Ready draws yet.
+    /// The cells of `cells` that nothing Ready draws yet: no Ready self or ancestor.
+    fn section_holes(&self, cells: &[SectionPos]) -> FastSet<SectionPos> {
+        cells.iter().copied().filter(|&c| !self.section_covered(c)).collect()
+    }
+
+    /// `s` is a Ready tile strictly under one of `holes` (see [`section_holes`](Self::section_holes)).
     /// Unload and reclaim would otherwise drop it in the frame before the visible set
     /// can stand it back in.
-    pub(super) fn stands_under_hole(&self, s: SectionPos, desired: &FastSet<SectionPos>) -> bool {
-        if !self.sections.get(&s).is_some_and(|st| st.is_ready()) {
-            return false;
-        }
-        let max = crate::ident::Detail(crate::render_config::LOD_COARSEST_DETAIL as i8);
-        let mut p = s;
-        while p.detail < max {
-            p = p.parent();
-            if desired.contains(&p) && !self.section_covered(p) {
-                return true;
-            }
-        }
-        false
+    pub(super) fn stands_under_hole(&self, s: SectionPos, holes: &FastSet<SectionPos>) -> bool {
+        self.section_ready(s) && under_hole(s, holes)
     }
 
     /// Ready sections strictly under a drawn cell that has no Ready self or ancestor.
     /// [`resolve_covering`](quadtree::resolve_covering) only walks up, so a tile that just
     /// left the cut would pop off before its replacement can draw.
-    fn ready_tiles_under(
-        sections: &FastMap<SectionPos, SectionState>,
-        drawn: &[SectionPos],
-        max: crate::ident::Detail,
-    ) -> Vec<SectionPos> {
-        let ready = |p: SectionPos| sections.get(&p).is_some_and(|s| s.is_ready());
-        let mut holes = FastSet::default();
-        for &c in drawn {
-            if quadtree::drawable_cover(c, max, &ready).is_none() {
-                holes.insert(c);
-            }
-        }
+    fn ready_tiles_under(&self, drawn: &[SectionPos]) -> Vec<SectionPos> {
+        let holes = self.section_holes(drawn);
         if holes.is_empty() {
             return Vec::new();
         }
-        let mut extra = Vec::new();
-        for (&s, state) in sections {
-            if !state.is_ready() {
-                continue;
-            }
-            let mut p = s;
-            while p.detail < max {
-                p = p.parent();
-                if holes.contains(&p) {
-                    extra.push(s);
-                    break;
-                }
-            }
-        }
-        extra
+        self.sections
+            .iter()
+            .filter(|&(&s, st)| st.is_ready() && under_hole(s, &holes))
+            .map(|(&s, _)| s)
+            .collect()
+    }
+
+    /// Section `p` is loaded and Ready.
+    fn section_ready(&self, p: SectionPos) -> bool {
+        self.sections.get(&p).is_some_and(|s| s.is_ready())
     }
 
     /// True if the cell or a Ready ancestor covers it.
     pub(in crate::world) fn section_covered(&self, cell: SectionPos) -> bool {
-        let max = crate::ident::Detail(crate::render_config::LOD_COARSEST_DETAIL as i8);
-        let ready = |p: SectionPos| self.sections.get(&p).is_some_and(|s| s.is_ready());
-        quadtree::drawable_cover(cell, max, &ready).is_some()
+        quadtree::drawable_cover(cell, COARSEST, &|p| self.section_ready(p)).is_some()
+    }
+
+    /// Remove section `pos`, keeping the meshing count and the cover flag in step. The caller
+    /// frees what it returns.
+    pub(in crate::world) fn drop_section(&mut self, pos: SectionPos) -> Option<SectionState> {
+        let state = self.sections.remove(&pos)?;
+        super::adjust_count(&mut self.meshing_sections, matches!(state, SectionState::Meshing { .. }), false);
+        self.section_cover_dirty.set();
+        Some(state)
     }
 
     /// Edits affecting this section: chunks within its footprint and height domain.
@@ -235,18 +236,17 @@ impl World {
             return;
         };
         let desired = std::mem::take(&mut self.section_desired);
-        let max = crate::ident::Detail(crate::render_config::LOD_COARSEST_DETAIL as i8);
-        let ready = |p: SectionPos| self.sections.get(&p).is_some_and(|s| s.is_ready());
+        let ready = |p: SectionPos| self.section_ready(p);
         // A cell the settled full-res chunks already draw hands over at once, ahead of the clip.
         let mut drawn: Vec<SectionPos> = desired.iter().copied().filter(|&c| !self.full_res_covers(center, c)).collect();
         // A finer Ready tile keeps drawing while the cut that replaces it is still meshing.
         // Dropping it first opens a hole; the coarser tile takes over the frame it lands.
-        let standins = Self::ready_tiles_under(&self.sections, &drawn, max);
+        let standins = self.ready_tiles_under(&drawn);
         drawn.extend(standins);
-        let cut = quadtree::resolve_covering(&drawn, max, &ready);
+        let cut = quadtree::resolve_covering(&drawn, COARSEST, &ready);
         let backlog = desired.iter().any(|&c| {
             !self.sections.contains_key(&c)
-                && quadtree::drawable_cover(c, max, &ready).is_none()
+                && quadtree::drawable_cover(c, COARSEST, &ready).is_none()
                 && !self.coverage_skips(center, c)
         });
         self.section_desired = desired;
@@ -297,14 +297,15 @@ impl World {
             return;
         }
         let need = holes + (used - allowed);
-        let max = crate::ident::Detail(crate::render_config::LOD_COARSEST_DETAIL as i8);
-        let ready = |p: SectionPos| self.sections.get(&p).is_some_and(|s| s.is_ready());
-        let desired: FastSet<SectionPos> = self.section_desired.iter().copied().collect();
+        // What each desired cell is drawn by, or that nothing draws it yet. A Ready desired cell
+        // draws itself, so the covers hold every one.
         let mut covers: FastSet<SectionPos> = FastSet::default();
+        let mut uncovered: FastSet<SectionPos> = FastSet::default();
         for &c in &self.section_desired {
-            if let Some(p) = quadtree::drawable_cover(c, max, &ready) {
-                covers.insert(p);
-            }
+            match quadtree::drawable_cover(c, COARSEST, &|p| self.section_ready(p)) {
+                Some(p) => covers.insert(p),
+                None => uncovered.insert(c),
+            };
         }
         let spare: Vec<SectionPos> = self
             .sections
@@ -313,7 +314,7 @@ impl World {
                 if !matches!(state, SectionState::Ready { .. }) {
                     return None;
                 }
-                (!desired.contains(&s) && !covers.contains(&s) && !self.stands_under_hole(s, &desired)).then_some(s)
+                (!covers.contains(&s) && !under_hole(s, &uncovered)).then_some(s)
             })
             .collect();
         let mut victims: Vec<(u64, SectionPos)> = spare
@@ -339,7 +340,7 @@ impl World {
             if gpu && eng.is_none() {
                 continue;
             }
-            if let Some(state) = self.sections.remove(&s) {
+            if let Some(state) = self.drop_section(s) {
                 if let Some(eng) = eng.as_deref_mut() {
                     state.free(eng);
                 }
@@ -348,7 +349,6 @@ impl World {
         }
         if freed > 0 {
             self.pending_sections.set();
-            self.section_cover_dirty.set();
         }
     }
 
@@ -363,6 +363,7 @@ impl World {
         // KEEP reads the frame's cached frontier (already velocity-unioned),
         // so sections stay kept even as a fast-moving eye passes.
         let desired: FastSet<SectionPos> = self.section_desired.iter().copied().collect();
+        let holes = self.section_holes(&self.section_desired);
         let visible: FastSet<SectionPos> = self.section_visible.iter().map(|(p, _)| *p).collect();
         // Fading sections still draw this frame. Keep meshes until fade completes
         // or outgoing section vanishes mid-fade.
@@ -399,7 +400,7 @@ impl World {
                     return self.full_res_covers(center, *s);
                 }
                 // A finer tile still drawing a hole. The visible rebuild stands it in after this.
-                if self.stands_under_hole(*s, &desired) {
+                if self.stands_under_hole(*s, &holes) {
                     return false;
                 }
                 let span = s.span() as i64;
@@ -416,18 +417,12 @@ impl World {
                 !pyramid::acceptable(dist, s.detail, cfg)
             })
             .collect();
-        for s in &stale {
-            if let Some(state) = self.sections.remove(s) {
-                super::adjust_count(
-                    &mut self.meshing_sections,
-                    matches!(state, SectionState::Meshing { .. }),
-                    false,
-                );
+        // Removals move the covering (a freed cell may re-expose an ancestor).
+        for &s in &stale {
+            if let Some(state) = self.drop_section(s) {
                 free(state);
             }
         }
-        // Removals move the covering (a freed cell may re-expose an ancestor).
-        self.section_cover_dirty.raise(!stale.is_empty());
     }
 
     /// Free GPU meshes so edited sections re-extract from the updated overlay.
@@ -444,7 +439,7 @@ impl World {
             }
             match self.sections.get(&s) {
                 Some(SectionState::Ready { .. }) => {
-                    if let Some(state) = self.sections.remove(&s) {
+                    if let Some(state) = self.drop_section(s) {
                         state.free(eng);
                     }
                     self.dirty_sections.remove(&s);
@@ -458,7 +453,136 @@ impl World {
         }
         if freed {
             self.pending_sections.set();
-            self.section_cover_dirty.set();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ident::Detail;
+
+    /// The old per-section walk: each ancestor checked against the desired set, then for cover.
+    fn old_stands_under_hole(world: &World, s: SectionPos, desired: &FastSet<SectionPos>) -> bool {
+        if !world.sections.get(&s).is_some_and(|st| st.is_ready()) {
+            return false;
+        }
+        let mut p = s;
+        while p.detail < COARSEST {
+            p = p.parent();
+            if desired.contains(&p) && !world.section_covered(p) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn old_count_section_standins(world: &World) -> usize {
+        if world.section_budget_used() < world.sections_allowed() {
+            return 0;
+        }
+        let desired: FastSet<SectionPos> = world.section_desired.iter().copied().collect();
+        world.sections.iter().filter(|&(&s, st)| st.is_ready() && old_stands_under_hole(world, s, &desired)).count()
+    }
+
+    fn old_ready_tiles_under(world: &World, drawn: &[SectionPos]) -> Vec<SectionPos> {
+        let ready = |p: SectionPos| world.sections.get(&p).is_some_and(|s| s.is_ready());
+        let holes: FastSet<SectionPos> =
+            drawn.iter().copied().filter(|&c| quadtree::drawable_cover(c, COARSEST, &ready).is_none()).collect();
+        if holes.is_empty() {
+            return Vec::new();
+        }
+        let mut extra = Vec::new();
+        for (&s, state) in &world.sections {
+            if !state.is_ready() {
+                continue;
+            }
+            let mut p = s;
+            while p.detail < COARSEST {
+                p = p.parent();
+                if holes.contains(&p) {
+                    extra.push(s);
+                    break;
+                }
+            }
+        }
+        extra
+    }
+
+    /// Nested sections and desired cells over a few coarsest squares: chains of Ready and meshing
+    /// tiles above and below the desired cells, plus fillers past the section floor.
+    fn scramble(world: &mut World, mut state: u64) {
+        let mut rand = |n: i32| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % n as u64) as i32
+        };
+        let fine = super::super::section::FINEST_DETAIL.0;
+        world.sections.clear();
+        world.section_desired.clear();
+        let mut token = 0;
+        let mut put = |world: &mut World, s: SectionPos, ready: bool| {
+            token += 1;
+            let state = if ready {
+                SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None }
+            } else {
+                SectionState::Meshing { token: pipeline::ClaimToken(token) }
+            };
+            world.sections.insert(s, state);
+        };
+        for _ in 0..300 {
+            let d = fine + rand(i32::from(COARSEST.0 - fine) + 1) as i8;
+            let n = 2 << (COARSEST.0 - d);
+            let mut c = SectionPos { body: 0, face: Face::PosY, detail: Detail(d), x: rand(n), z: rand(n) };
+            if rand(2) == 0 {
+                world.section_desired.push(c);
+            }
+            if rand(3) == 0 {
+                put(world, c, rand(4) != 0);
+            }
+            if rand(3) == 0 && c.detail < COARSEST {
+                put(world, c.parent(), rand(4) != 0);
+            }
+            while c.detail.0 > fine && rand(3) != 0 {
+                c = c.child(super::super::section::Quadrant::ALL[rand(4) as usize]);
+                if rand(2) == 0 {
+                    put(world, c, rand(4) != 0);
+                }
+            }
+        }
+        for i in 0..SECTION_SLOT_FLOOR as i32 {
+            put(world, SectionPos { body: 0, face: Face::PosY, detail: Detail(fine), x: 10_000 + i, z: -3 }, true);
+        }
+    }
+
+    /// The hole set gives the old per-section walks' answers: stand-in counts, stand-in tiles, and
+    /// which tiles stand under a hole. A Ready desired cell is always among the covers, so reclaim
+    /// needs no desired set.
+    #[test]
+    fn section_holes_match_the_old_walks() {
+        let mut world = World::generate();
+        world.slot_ceiling = 0;
+        for seed in 1..=40u64 {
+            scramble(&mut world, seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+            assert!(world.section_budget_used() >= world.sections_allowed());
+            let desired: FastSet<SectionPos> = world.section_desired.iter().copied().collect();
+            let holes = world.section_holes(&world.section_desired);
+            assert_eq!(world.count_section_standins(), old_count_section_standins(&world), "seed {seed}");
+            let mut new = world.ready_tiles_under(&world.section_desired);
+            let mut old = old_ready_tiles_under(&world, &world.section_desired);
+            new.sort_unstable_by_key(section_key);
+            old.sort_unstable_by_key(section_key);
+            assert_eq!(new, old, "seed {seed}");
+            let ready = |p: SectionPos| world.section_ready(p);
+            let covers: FastSet<SectionPos> =
+                world.section_desired.iter().filter_map(|&c| quadtree::drawable_cover(c, COARSEST, &ready)).collect();
+            for &s in world.sections.keys() {
+                assert_eq!(world.stands_under_hole(s, &holes), old_stands_under_hole(&world, s, &desired), "{s:?}");
+                if world.section_ready(s) && desired.contains(&s) {
+                    assert!(covers.contains(&s), "{s:?}");
+                }
+            }
         }
     }
 }

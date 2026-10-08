@@ -97,9 +97,8 @@ impl World {
                     && matches!(self.sections.get(&pos),
                         Some(SectionState::Meshing { token: t }) if *t == token);
                 if held {
-                    self.sections.remove(&pos);
-                    super::adjust_count(&mut self.meshing_sections, true, false);
-                    self.section_cover_dirty.set();
+                    // A meshing claim holds nothing on the GPU.
+                    self.drop_section(pos);
                 }
                 if rearm {
                     self.pending_sections.set();
