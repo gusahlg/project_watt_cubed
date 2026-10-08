@@ -231,6 +231,7 @@ pub(crate) struct SpecTable<'a> {
 
 impl<'a> SpecTable<'a> {
     /// The table index of `spec`, appended on first use.
+    #[inline]
     pub fn index(&mut self, spec: &'a str) -> Result<u16, SaveError> {
         match self.index.entry(spec) {
             Entry::Occupied(at) => Ok(*at.get()),
