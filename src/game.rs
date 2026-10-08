@@ -199,16 +199,16 @@ impl PendingModInput {
 struct PendingEdit {
     cell: (i32, i32, i32),
     /// What the cell held before the optimistic apply.
-    prev: crate::block::BlockId,
+    prev: BlockId,
     kind: PendingKind,
 }
 
 /// The economy side of a pending edit — what to give back on rejection.
 enum PendingKind {
-    /// Breaking awarded this configuration; a rejection revokes it.
-    Break(crate::block::BlockId),
+    /// Breaking yielded this configuration; a rejection revokes it only if it fit (`gained`).
+    Break { id: BlockId, gained: bool },
     /// Placing spent one crafted block of this id; a rejection refunds it.
-    Place(crate::block::BlockId),
+    Place(BlockId),
 }
 
 /// The live world the player is in.
@@ -1451,17 +1451,15 @@ impl Game {
                     // Resolve the portable spec against our own palette, then
                     // apply. The connection already dropped stale revisions,
                     // and our own edits come back as acks, not broadcasts.
-                    // Snapshot the cell first so a remote break names the block that
-                    // WAS there (its sound class), not a generic default.
-                    let prev = self.world.block_at(x, y, z);
+                    // A remote break names the block that WAS there (its sound
+                    // class), not a generic default.
                     let id = save::parse_block(self.world.registry_mut(), &spec);
-                    self.world.set_block(x, y, z, id);
-                    self.world.note_cell_changed(x, y, z);
-                    let at = sound_at(&self.world, x, y, z);
-                    events.push(if id == AIR {
-                        GameEvent::BlockBroken { at, block: prev, local: false }
-                    } else {
-                        GameEvent::BlockPlaced { at, block: id, local: false }
+                    self.write_cell((x, y, z), id, |at, prev| {
+                        events.push(if id == AIR {
+                            GameEvent::BlockBroken { at, block: prev, local: false }
+                        } else {
+                            GameEvent::BlockPlaced { at, block: id, local: false }
+                        });
                     });
                 }
                 Incoming::Mutation { x, y, z, spec } => {
@@ -1476,22 +1474,8 @@ impl Game {
                     self.pending_edits.remove(&req);
                 }
                 Incoming::EditRejected { req, restore } => {
-                    let Some(pending) = self.pending_edits.remove(&req) else {
-                        continue;
-                    };
-                    if restore {
-                        let (x, y, z) = pending.cell;
-                        self.world.set_block(x, y, z, pending.prev);
-                    }
-                    match pending.kind {
-                        PendingKind::Break(id) => {
-                            self.player.inventory.revoke(id, 1);
-                            mods.on_break_rejected(id);
-                        }
-                        PendingKind::Place(id) => {
-                            self.player.inventory.add(id, 1);
-                            mods.on_place_rejected(id, &self.world);
-                        }
+                    if let Some(pending) = self.pending_edits.remove(&req) {
+                        self.rollback(pending, restore, mods);
                     }
                 }
                 Incoming::Position { pos, frame, up } => {
@@ -1547,13 +1531,12 @@ impl Game {
                         mods.on_tool_used(ToolUse::NoReaction);
                         continue;
                     }
-                    let (x, y, z) = cell;
-                    let target = self.world.block_at(x, y, z);
                     let new_cell = save::parse_block(self.world.registry_mut(), &cell_spec);
                     let new_tool = save::parse_block(self.world.registry_mut(), &tool_spec);
-                    self.world.set_block(x, y, z, new_cell);
+                    let target = self.write_cell(cell, new_cell, |at, block| {
+                        events.push(GameEvent::ToolReacted { at, block });
+                    });
                     self.finish_tool_change(tool, new_tool, target, new_cell, mods);
-                    events.push(GameEvent::ToolReacted { at: sound_at(&self.world, x, y, z), block: target });
                 }
                 Incoming::PeerSwing { id } => {
                     // The swing edge → a whoosh at the peer's current position. The
@@ -1697,10 +1680,8 @@ impl Game {
         }
         match self.world.registry_mut().react(target, tool) {
             Some((_, new_cell, new_tool)) => {
-                self.world.set_block(x, y, z, new_cell);
-                self.world.note_cell_changed(x, y, z);
+                self.write_cell(cell, new_cell, |at, block| events.push(GameEvent::ToolReacted { at, block }));
                 self.finish_tool_change(tool, new_tool, target, new_cell, mods);
-                events.push(GameEvent::ToolReacted { at, block: target });
                 self.camera.fx.add_trauma(0.08);
             }
             None => mods.on_tool_used(ToolUse::NoReaction),
@@ -1733,37 +1714,64 @@ impl Game {
 
     /// No tool: break the block at `cell` into the inventory.
     fn break_block(&mut self, cell: (i32, i32, i32), mods: &mut Mods, events: &mut Vec<GameEvent>) {
-        let (x, y, z) = cell;
-        let id = self.world.block_at(x, y, z);
-        let at = sound_at(&self.world, x, y, z);
-        events.push(GameEvent::Swing { at });
-        events.push(GameEvent::BlockBroken { at, block: id, local: true });
-        self.world.set_block(x, y, z, AIR);
-        self.world.note_cell_changed(x, y, z);
-        let overflow = !self.player.inventory.add(id, 1);
-        mods.on_block_break(id, &self.world, overflow);
+        let id = self.write_cell(cell, AIR, |at, block| {
+            events.push(GameEvent::Swing { at });
+            events.push(GameEvent::BlockBroken { at, block, local: true });
+        });
+        let gained = self.player.inventory.add(id, 1);
+        mods.on_block_break(id, &self.world, !gained);
         self.camera.fx.add_trauma(0.15);
         self.local_anim.on_action(WireAction::Swing);
-        // Tell the server (it validates and relays to everyone else). The
-        // apply above is a PREDICTION for responsiveness: the ack rolls it
-        // back — cell and loot both — if we lose the race for this cell.
-        if let Some(net) = &mut self.net {
-            if let Some(req) = net.send_edit(x, y, z, "air".into()) {
-                self.pending_edits.insert(
-                    req,
-                    PendingEdit {
-                        cell: (x, y, z),
-                        prev: id,
-                        kind: PendingKind::Break(id),
-                    },
-                );
+        self.predict(PendingEdit { cell, prev: id, kind: PendingKind::Break { id, gained } }, mods);
+    }
+
+    /// Write `id` into `cell`, wake its contacts, and report the write: `report` gets where the
+    /// cell sounds and what it held, which is also returned.
+    fn write_cell(&mut self, (x, y, z): (i32, i32, i32), id: BlockId, report: impl FnOnce(DVec3, BlockId)) -> BlockId {
+        let prev = self.world.block_at(x, y, z);
+        self.world.set_block(x, y, z, id);
+        self.world.note_cell_changed(x, y, z);
+        report(sound_at(&self.world, x, y, z), prev);
+        prev
+    }
+
+    /// Tell the server about a local edit (it validates and relays to everyone else). The local
+    /// apply is a PREDICTION for responsiveness: the verdict rolls it back, cell and economy
+    /// both, if we lose the race for the cell. An edit that cannot be sent rolls back at once.
+    fn predict(&mut self, edit: PendingEdit, mods: &mut Mods) {
+        let Some(net) = &mut self.net else { return };
+        let spec: std::sync::Arc<str> = match edit.kind {
+            PendingKind::Break { .. } => "air".into(),
+            PendingKind::Place(id) => save::block_spec(self.world.registry(), id).into(),
+        };
+        let (x, y, z) = edit.cell;
+        match net.send_edit(x, y, z, spec) {
+            Some(req) => {
+                self.pending_edits.insert(req, edit);
                 net.send_swing();
-            } else {
-                self.world.set_block(x, y, z, id);
-                if !overflow {
+            }
+            None => self.rollback(edit, true, mods),
+        }
+    }
+
+    /// Undo a refused or unsent edit: give the cell back when `restore` (nothing newer landed on
+    /// it), revoke loot only if it fit, and refund a spent block.
+    fn rollback(&mut self, edit: PendingEdit, restore: bool, mods: &mut Mods) {
+        if restore {
+            let (x, y, z) = edit.cell;
+            self.world.set_block(x, y, z, edit.prev);
+            self.world.note_cell_changed(x, y, z);
+        }
+        match edit.kind {
+            PendingKind::Break { id, gained } => {
+                if gained {
                     self.player.inventory.revoke(id, 1);
                 }
                 mods.on_break_rejected(id);
+            }
+            PendingKind::Place(id) => {
+                self.player.inventory.add(id, 1);
+                mods.on_place_rejected(id, &self.world);
             }
         }
     }
@@ -1794,34 +1802,13 @@ impl Game {
                 self.player.inventory.add(id, 1);
                 continue;
             }
-            let prev = self.world.block_at(x, y, z);
-            let at = sound_at(&self.world, x, y, z);
-            events.push(GameEvent::Swing { at });
-            events.push(GameEvent::BlockPlaced { at, block: id, local: true });
-            self.world.set_block(x, y, z, id);
-            self.world.note_cell_changed(x, y, z);
+            let prev = self.write_cell((x, y, z), id, |at, _| {
+                events.push(GameEvent::Swing { at });
+                events.push(GameEvent::BlockPlaced { at, block: id, local: true });
+            });
             self.local_anim.on_action(WireAction::Swing);
-            // Tell the server in the same portable spec form saves use; it
-            // validates and relays, exactly like breaking does with "air".
-            // The spent unit is refunded if the server says no.
-            if let Some(net) = &mut self.net {
-                let spec = save::block_spec(self.world.registry(), id);
-                if let Some(req) = net.send_edit(x, y, z, spec.into()) {
-                    self.pending_edits.insert(
-                        req,
-                        PendingEdit {
-                            cell: (x, y, z),
-                            prev,
-                            kind: PendingKind::Place(id),
-                        },
-                    );
-                    net.send_swing();
-                } else {
-                    self.world.set_block(x, y, z, prev);
-                    self.player.inventory.add(id, 1);
-                    mods.on_place_rejected(id, &self.world);
-                }
-            }
+            // The server gets the same portable spec form saves use.
+            self.predict(PendingEdit { cell: (x, y, z), prev, kind: PendingKind::Place(id) }, mods);
         }
     }
 
@@ -1899,11 +1886,12 @@ fn align_body(player: &mut Player, dt: f32) {
 
 #[cfg(test)]
 mod tests {
-    use super::{FrameInput, Game, PendingModInput};
+    use super::{FrameInput, Game, PendingEdit, PendingKind, PendingModInput};
     use std::cell::Cell;
     use std::rc::Rc;
 
     use crate::audio::GameEvent;
+    use crate::block::{AIR, BlockId};
     use crate::input::intent::Chord;
     use crate::input::router::{Press, Router};
     use crate::modding::{Action, Command, CommandContext, Mod, ModContext, Mods};
@@ -2120,6 +2108,73 @@ mod tests {
         game.mod_tick((800, 600), &mut mods, &mut events, router.action_ids());
         assert_eq!(seen.get(), 1);
         assert!(game.pending_mod_input.is_empty());
+    }
+
+    /// A break whose loot did not fit (full inventory) and that the server refuses gives the cell
+    /// back and takes no unit the player already held.
+    #[test]
+    fn a_refused_break_with_a_full_inventory_keeps_the_held_unit() {
+        use crate::net::client::Connection;
+        use crate::net::server::{self, Config};
+        use std::time::{Duration, Instant};
+
+        let server = server::spawn(0, Config { seed: 1, ..Config::default() }).expect("loopback server");
+        let conn = Connection::connect("127.0.0.1", server.addr().port(), "ada", "").expect("connect");
+        let mut game = game().with_net(conn);
+        let rock = game.world.registry().id_by_label("rock").unwrap();
+        // A rock chunk far past the server's edit reach, so the break is refused.
+        let coord = crate::coord::ChunkCoord::new(40, 2, 40);
+        let chunk = crate::world::chunk::Chunk::from_uniform(40, 2, 40, rock);
+        game.world.store_column_chunk(crate::coord::Face::PosY, coord, chunk);
+        let (x, y, z) = (645, 40, 645);
+        let held = game.player.inventory.capacity() as u32;
+        assert!(game.player.inventory.add(rock, held));
+
+        let (mut mods, mut events) = (Mods::empty(), Vec::new());
+        game.break_block((x, y, z), &mut mods, &mut events);
+        assert_eq!(game.world.block_at(x, y, z), AIR, "the break is predicted");
+        assert_eq!(game.player.inventory.count(rock), held, "the loot did not fit");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !game.pending_edits.is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+            assert!(game.apply_net_events(&mut mods, &mut events).is_none(), "still connected");
+        }
+        assert!(game.pending_edits.is_empty(), "the server answered");
+        assert_eq!(game.world.block_at(x, y, z), rock, "the refused break gives the cell back");
+        assert_eq!(game.player.inventory.count(rock), held, "the refused break takes no held unit");
+        server.stop();
+    }
+
+    /// A game with a loaded air chunk around the returned cell, and the rock id.
+    fn edit_game() -> (Game, BlockId, (i32, i32, i32)) {
+        let mut game = game();
+        let rock = game.world.registry().id_by_label("rock").unwrap();
+        let chunk = crate::world::chunk::Chunk::from_uniform(0, 2, 0, AIR);
+        game.world.store_column_chunk(crate::coord::Face::PosY, crate::coord::ChunkCoord::new(0, 2, 0), chunk);
+        (game, rock, (3, 40, 3))
+    }
+
+    #[test]
+    fn a_refused_place_refunds_the_block_and_re_marks_the_restored_cell() {
+        let (mut game, rock, (x, y, z)) = edit_game();
+        game.world.set_block(x, y, z, rock);
+        let woken = game.world.reactions().pending();
+        let edit = PendingEdit { cell: (x, y, z), prev: AIR, kind: PendingKind::Place(rock) };
+        game.rollback(edit, true, &mut Mods::empty());
+        assert_eq!(game.world.block_at(x, y, z), AIR, "the cell is given back");
+        assert_eq!(game.player.inventory.count(rock), 1, "the spent block is refunded");
+        assert!(game.world.reactions().pending() > woken, "the restored cell wakes its contacts");
+    }
+
+    #[test]
+    fn a_refused_edit_without_restore_keeps_the_cell_and_revokes_loot_that_fit() {
+        let (mut game, rock, (x, y, z)) = edit_game();
+        assert!(game.player.inventory.add(rock, 1));
+        let edit = PendingEdit { cell: (x, y, z), prev: rock, kind: PendingKind::Break { id: rock, gained: true } };
+        game.rollback(edit, false, &mut Mods::empty());
+        assert_eq!(game.world.block_at(x, y, z), AIR, "a newer edit owns the cell");
+        assert_eq!(game.player.inventory.count(rock), 0, "loot that fit is revoked");
+        assert_eq!(game.world.reactions().pending(), 0, "an untouched cell wakes nothing");
     }
 
     #[test]
