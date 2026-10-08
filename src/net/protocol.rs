@@ -263,6 +263,21 @@ impl Wire for ModOffer {
     }
 }
 
+/// The enabled packages a `Hello` carries: at most [`MAX_MOD_OFFERS`], each id and version
+/// 1..=[`MAX_MOD_ID`] bytes, so the encoder never writes a list its decoder refuses. Also how
+/// many packages were left out.
+pub(crate) fn hello_offers(mods: &[(String, String)]) -> (Vec<ModOffer>, usize) {
+    let fits = |text: &str| (1..=MAX_MOD_ID).contains(&text.len());
+    let offers: Vec<ModOffer> = mods
+        .iter()
+        .filter(|(id, version)| fits(id) && fits(version))
+        .take(MAX_MOD_OFFERS)
+        .map(|(id, version)| ModOffer { id: id.as_str().into(), version: version.as_str().into() })
+        .collect();
+    let dropped = mods.len() - offers.len();
+    (offers, dropped)
+}
+
 fn bounded_mod_str(r: &mut codec::Reader) -> Option<Arc<str>> {
     let s = r.str16_lossy().ok()?;
     if s.is_empty() || s.len() > MAX_MOD_ID {
@@ -1338,5 +1353,31 @@ mod tests {
         read_frame(&mut std::io::Cursor::new(&zero), &mut got).unwrap();
         assert!(got.is_empty());
         zero.extend_from_slice(&[9]); // trailing unread bytes are the caller's problem
+    }
+
+    /// The packages a client reports always decode on the server: over-long ones and those past
+    /// the count are left out and counted, and ones at the limits stay.
+    #[test]
+    fn hello_offers_stay_within_the_decoder_limits() {
+        let mut mods: Vec<(String, String)> = (0..=MAX_MOD_OFFERS).map(|i| (format!("pkg.{i}"), "1.0.0".into())).collect();
+        mods.insert(0, ("pkg.long".into(), "1".repeat(MAX_MOD_ID + 1)));
+        mods.insert(1, ("x".repeat(MAX_MOD_ID), "v".repeat(MAX_MOD_ID)));
+        let hello = |mods: Vec<ModOffer>| ClientMessage::Hello {
+            protocol: 1,
+            worldgen: 0,
+            gravity: 0,
+            law: 0,
+            palette: 0,
+            name: "ada".into(),
+            password: "".into(),
+            mods,
+        };
+        let raw = mods.iter().map(|(id, version)| ModOffer { id: id.as_str().into(), version: version.as_str().into() }).collect();
+        assert_eq!(ClientMessage::decode(&hello(raw).encode()), None, "the unfitted list is refused");
+        let (offers, dropped) = hello_offers(&mods);
+        assert_eq!((offers.len(), dropped), (MAX_MOD_OFFERS, mods.len() - MAX_MOD_OFFERS));
+        assert_eq!(offers[0].id.len(), MAX_MOD_ID, "an id and version at the limit are kept");
+        let sent = hello(offers);
+        assert_eq!(ClientMessage::decode(&sent.encode()), Some(sent));
     }
 }
