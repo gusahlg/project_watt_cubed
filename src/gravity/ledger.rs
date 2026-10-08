@@ -41,7 +41,7 @@ struct RegionMass {
 }
 
 /// Exact mass corrections from edits.
-#[derive(Default, Debug)]
+#[derive(Default, Debug, PartialEq)]
 pub struct Ledger {
     chunks: HashMap<Key, ChunkMass>,
     /// Sorted, so every query sums in the same order whatever order edits arrived in.

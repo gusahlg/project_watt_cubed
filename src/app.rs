@@ -1518,7 +1518,9 @@ mod tests {
     }
 
     /// Probe for the world-entry stall: each entry path (new, small and ~100k-edit saves, a local
-    /// server) through the job, cold (first world in the process) and warm.
+    /// server, empty and serving the 100k-edit world) through the job, cold (first world in the
+    /// process) and warm. The 100k join also shows its overlay's worst frame, against applying
+    /// each cell as it arrives.
     #[test]
     #[ignore]
     fn entry_cost_probe() {
@@ -1563,11 +1565,67 @@ mod tests {
             let _ = black_box(save::store::read(&id).unwrap());
             println!("{label}: read and decode alone {:.1}ms", ms(t, Instant::now()));
             probe_entry(label, &mut mods, || Loading::load(id.clone(), render));
-            let _ = std::fs::remove_file(save::file_path(&id));
+            if edits == 100_000 {
+                probe_join_overlay(&save::file_path(&id), render, &mut mods);
+            }
+            for path in [save::file_path(&id), save::file_path(&id).with_extension("save.bak")] {
+                let _ = std::fs::remove_file(path);
+            }
         }
         let handle = server::spawn(0, Config { seed: 1234, worldgen: WorldgenKind::Diffusion, ..Config::default() }).unwrap();
         let conn = join_server("127.0.0.1", handle.addr().port(), "probe", "").expect("join");
         probe_entry("join", &mut mods, || Loading::join(conn, render, None, false));
+        handle.stop();
+    }
+
+    /// Join a server serving the world file at `path` twice: applying each overlay cell as it
+    /// arrives (the old path), then through the game's budgeted bulk install. Polls ~8 ms apart.
+    fn probe_join_overlay(path: &std::path::Path, render: RenderConfig, mods: &mut Mods) {
+        use crate::net::client::Incoming;
+        let ms = |t: Instant| t.elapsed().as_secs_f64() * 1000.0;
+        let world = Some(path.to_path_buf());
+        let config = Config { world, autosave_every: Duration::from_secs(3600), ..Config::default() };
+        let handle = server::spawn(0, config).unwrap();
+        let port = handle.addr().port();
+
+        let mut conn = join_server("127.0.0.1", port, "each", "").expect("join");
+        let mut world = World::with_kind_cfg(conn.seed(), render, conn.worldgen(), conn.terrain(), false);
+        let (start, mut frames, mut worst, mut cells) = (Instant::now(), 0, 0.0f64, 0);
+        while !conn.snapshot_ready() {
+            let t = Instant::now();
+            for event in conn.poll() {
+                if let Incoming::Mutation { x, y, z, spec } = event {
+                    let id = save::parse_block(world.registry_mut(), &spec);
+                    world.set_block(x, y, z, id);
+                    cells += 1;
+                }
+            }
+            worst = worst.max(ms(t));
+            frames += 1;
+            std::thread::sleep(Duration::from_millis(8));
+        }
+        let done = ms(start);
+        println!("join 100k overlay, each cell: {cells} cells, {frames} frames, worst frame {worst:.1}ms, done after {done:.0}ms");
+
+        let conn = join_server("127.0.0.1", port, "bulk", "").expect("join");
+        let Loading::Join { job, conn, .. } = Loading::join(conn, render, None, false) else { unreachable!() };
+        let (world, player) = job.wait();
+        mods.reset_state();
+        let mut game = Game::new(world, player, "multiplayer".into()).with_net(conn);
+        let (start, mut frames, mut worst) = (Instant::now(), 0, 0.0f64);
+        loop {
+            let t = Instant::now();
+            let settled = game.pump_net(mods);
+            worst = worst.max(ms(t));
+            frames += 1;
+            if settled {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(8));
+        }
+        let cells = game.world().edits().count();
+        let done = ms(start);
+        println!("join 100k overlay, bulk: {cells} cells, {frames} frames, worst frame {worst:.1}ms, done after {done:.0}ms");
         handle.stop();
     }
 

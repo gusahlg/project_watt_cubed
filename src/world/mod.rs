@@ -28,6 +28,8 @@
 //!   surface height, coordinate mapping, registry/seed accessors.
 //! * `edits.rs` — player edits: block placement, the edit overlay, dirty
 //!   marking, mesh freeing, and the render-distance setting.
+//! * `ledger.rs` — whole edit ledgers (a save's, a join snapshot's) installed
+//!   in bulk.
 pub mod brick;
 pub mod chunk;
 pub mod connectivity;
@@ -48,6 +50,7 @@ mod coverage;
 mod edits;
 mod heightmip;
 pub(crate) mod lanes;
+mod ledger;
 mod metric;
 mod quadtree;
 mod query;
@@ -255,6 +258,7 @@ impl LightSeedSplit {
 }
 
 pub use census::MemoryCensus;
+pub use ledger::Ledger;
 use connectivity::{Connectivity, Occlusion};
 
 /// The streamed chunk volume around the player: a horizontal ring radius and a
