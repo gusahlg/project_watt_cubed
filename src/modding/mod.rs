@@ -1197,6 +1197,7 @@ pub(crate) fn split_mod_version(data: &str) -> (u16, &str) {
 mod tests {
     use super::*;
     use super::split_mod_version;
+    use super::testing::Stub;
     use crate::menu::Menu;
     use crate::world::terrain::TerrainCfg;
     use crate::world::World;
@@ -1529,8 +1530,7 @@ mod tests {
     #[test]
     fn server_hold_turns_the_package_off_without_changing_saved_choices() {
         let mut mods = Mods::empty();
-        const NONE: &[Command] = &[];
-        mods.install_from(Some("pwc.dev-toolkit"), Box::new(Lister("tools", NONE)), true);
+        mods.install_from(Some("pwc.dev-toolkit"), Box::new(Stub::new("tools")), true);
         let before = mods.choices_text();
         assert!(before.contains("tools=on"));
         mods.hold_packages(&["pwc.dev-toolkit".to_string()]);
@@ -1587,27 +1587,6 @@ mod tests {
         assert_ne!(cursor.index, 0, "cursor must skip the group header");
     }
 
-    /// Answers the commands it lists, raising the player one block per command it runs.
-    struct Lister(&'static str, &'static [Command]);
-
-    impl Mod for Lister {
-        fn name(&self) -> &str {
-            self.0
-        }
-        fn id(&self) -> &'static str {
-            self.0
-        }
-        fn commands(&self) -> &[Command] {
-            self.1
-        }
-        fn run_command(&mut self, ctx: &mut CommandContext<'_>, cmd: &str, _args: &[&str]) -> Option<Vec<Line>> {
-            self.1.iter().any(|c| c.name == cmd).then(|| {
-                ctx.player.position.y += 1.0;
-                vec![Line::of(crate::ui::Role::Dim, self.0)]
-            })
-        }
-    }
-
     /// A mod written against the context-free hook only.
     struct Legacy;
 
@@ -1632,10 +1611,10 @@ mod tests {
     #[test]
     fn the_first_enabled_mod_that_knows_a_command_runs_it() {
         let mut mods = Mods::empty();
-        mods.install(Box::new(Lister("a", A)), true);
-        mods.install(Box::new(Lister("b", B)), true);
+        mods.install(Box::new(Stub::new("a").commands(A)), true);
+        mods.install(Box::new(Stub::new("b").commands(B)), true);
         mods.install(Box::new(Legacy), true);
-        mods.install(Box::new(Lister("off", &[Command { name: "hidden", args: "", help: "" }])), false);
+        mods.install(Box::new(Stub::new("off").commands(&[Command { name: "hidden", args: "", help: "" }])), false);
         let names: Vec<&str> = mods.commands().map(|c| c.name).collect();
         assert_eq!(names, ["tp", "time"], "enabled mods only, in install order, a shadowed name once");
 
