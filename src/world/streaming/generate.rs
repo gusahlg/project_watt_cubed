@@ -42,7 +42,7 @@ pub(in crate::world) enum GenRun {
 
 impl GenRun {
     /// The run that generates chunk `coord` alone, under its sky `sky`.
-    pub(in crate::world) fn of_chunk(coord: Coord, sky: Sky) -> GenRun {
+    fn of_chunk(coord: Coord, sky: Sky) -> GenRun {
         match sky {
             Sky::Axis(face) => {
                 let (key, alt) = ColumnKey::of(face, coord);
@@ -53,7 +53,7 @@ impl GenRun {
     }
 
     /// The strike/quarantine identity of this run's job.
-    pub(in crate::world) fn fail_key(self) -> FailKey {
+    fn fail_key(self) -> FailKey {
         match self {
             GenRun::Column { key, .. } => FailKey::Column { key },
             GenRun::Open { coord } => FailKey::Open { coord },
@@ -396,6 +396,11 @@ impl World {
     /// Chunk `coord` is loaded, or a generate job claims it.
     fn claimed(&self, coord: Coord) -> bool {
         self.chunks.contains_key(&coord) || self.generating.contains(&coord)
+    }
+
+    /// The generate job that would fill chunk `coord` is quarantined.
+    pub(in crate::world) fn generate_quarantined(&self, coord: Coord) -> bool {
+        self.quarantined.contains(&GenRun::of_chunk(coord, self.generator.sky(coord)).fail_key())
     }
 
     /// Land a generated column: install the skylight ceiling from the worker's

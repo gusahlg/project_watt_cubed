@@ -1,6 +1,7 @@
 //! Payload-less claim resolution: cancelled and panicked worker jobs, strikes and quarantine.
 
 use super::*;
+use super::generate::GenRun;
 
 /// Panics tolerated per claim before it is quarantined. A panic is a real bug
 /// in job code, usually deterministic for one input — retrying a couple of
