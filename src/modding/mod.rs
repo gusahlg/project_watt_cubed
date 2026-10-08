@@ -76,24 +76,48 @@ pub struct VisualMask {
 
 impl Default for VisualMask {
     fn default() -> Self {
-        Self {
-            atmosphere: true,
-            post: true,
-            lighting: true,
-        }
+        Self::of(VisualGroup::ALL)
     }
 }
 
 impl VisualMask {
+    pub const NONE: Self = Self {
+        atmosphere: false,
+        post: false,
+        lighting: false,
+    };
+
+    /// The mask with exactly `groups` on: a group is on when any enabled mod owns it. The mods
+    /// screen and the renderer both build their mask here.
+    pub fn of(groups: impl IntoIterator<Item = VisualGroup>) -> Self {
+        let mut mask = Self::NONE;
+        for group in groups {
+            mask.set(group, true);
+        }
+        mask
+    }
+
+    pub fn get(self, group: VisualGroup) -> bool {
+        match group {
+            VisualGroup::Atmosphere => self.atmosphere,
+            VisualGroup::Post => self.post,
+            VisualGroup::Lighting => self.lighting,
+        }
+    }
+
+    pub fn set(&mut self, group: VisualGroup, on: bool) {
+        *match group {
+            VisualGroup::Atmosphere => &mut self.atmosphere,
+            VisualGroup::Post => &mut self.post,
+            VisualGroup::Lighting => &mut self.lighting,
+        } = on;
+    }
+
     pub fn apply(self, mut cfg: RenderConfig) -> RenderConfig {
-        if !self.atmosphere {
-            cfg.strip_group(VisualGroup::Atmosphere);
-        }
-        if !self.post {
-            cfg.strip_group(VisualGroup::Post);
-        }
-        if !self.lighting {
-            cfg.strip_group(VisualGroup::Lighting);
+        for group in VisualGroup::ALL {
+            if !self.get(group) {
+                cfg.strip_group(group);
+            }
         }
         cfg
     }
@@ -106,12 +130,7 @@ impl VisualMask {
     /// Name of the visual mod forcing `key` off, if any.
     pub fn forced_off(self, key: &str) -> Option<&'static str> {
         let group = crate::render_config::lane_group(key)?;
-        let on = match group {
-            VisualGroup::Atmosphere => self.atmosphere,
-            VisualGroup::Post => self.post,
-            VisualGroup::Lighting => self.lighting,
-        };
-        if on { None } else { Some(group.mod_name()) }
+        (!self.get(group)).then(|| group.mod_name())
     }
 }
 
@@ -524,7 +543,8 @@ pub trait Mod {
         0
     }
 
-    /// Which fancy render group this mod owns, if any.
+    /// Which fancy render group this mod owns, if any. The host reads it when the mod is
+    /// installed or switched on or off.
     fn visual_group(&self) -> Option<VisualGroup> {
         None
     }
@@ -583,6 +603,10 @@ pub struct Mods {
     /// Bumped when a mod is installed or enabled or disabled, so the input
     /// table can rebuild once instead of every frame.
     action_gen: u64,
+    /// The enabled mods' visual groups, rebuilt with `action_gen`.
+    visuals: VisualMask,
+    /// Bumped whenever what the mods screen lists may have changed.
+    revision: u64,
     /// Package ids the current server refused. Not written to `mods.cfg`.
     server_packages: Vec<String>,
     /// Module ids that were on when the server refused their package. Restored
@@ -609,6 +633,8 @@ impl Mods {
             entries: Vec::new(),
             declared_groups: Vec::new(),
             action_gen: 0,
+            visuals: VisualMask::NONE,
+            revision: 0,
             server_packages: Vec::new(),
             server_held: Vec::new(),
         }
@@ -625,17 +651,31 @@ impl Mods {
             entry.module.on_enable();
         }
         self.entries.push(entry);
-        self.bump_actions();
+        self.enabled_changed();
     }
 
-    fn bump_actions(&mut self) {
+    /// The enabled set changed: a new action generation and visual mask.
+    fn enabled_changed(&mut self) {
         self.action_gen = self.action_gen.wrapping_add(1);
+        let enabled = self.entries.iter().filter(|e| e.enabled);
+        self.visuals = VisualMask::of(enabled.filter_map(|e| e.module.visual_group()));
+        self.revise();
+    }
+
+    fn revise(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
     }
 
     /// Generation of the enabled action lists. Changes when a mod is installed
     /// or switched on or off.
     pub fn action_generation(&self) -> u64 {
         self.action_gen
+    }
+
+    /// Changes whenever what the mods screen lists may have changed: a mod installed or switched,
+    /// a knob stepped or loaded, a group declared, or a server hold set or released.
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     /// Actions of every enabled mod, in install order.
@@ -652,6 +692,7 @@ impl Mods {
     fn declare_group(&mut self, group: Group) {
         if group.id != ESSENTIALS && !self.declared_groups.iter().any(|g| g.id == group.id) {
             self.declared_groups.push(group);
+            self.revise();
         }
     }
 
@@ -870,7 +911,7 @@ impl Mods {
         } else {
             entry.module.on_disable();
         }
-        self.bump_actions();
+        self.enabled_changed();
         true
     }
 
@@ -880,6 +921,7 @@ impl Mods {
 
     pub fn step_knob(&mut self, index: usize, knob: usize, delta: i32) {
         self.entries[index].module.step_knob(knob, delta);
+        self.revise();
     }
 
     /// Worldgen used for the next world: InfiniteDiffusion if that mod is on, else the flat
@@ -913,21 +955,9 @@ impl Mods {
             .unwrap_or(&FLAT)
     }
 
+    /// The visual groups the enabled mods own (see [`VisualMask::of`]).
     pub fn visual_mask(&self) -> VisualMask {
-        let mut mask = VisualMask {
-            atmosphere: false,
-            post: false,
-            lighting: false,
-        };
-        for entry in self.entries.iter().filter(|e| e.enabled) {
-            match entry.module.visual_group() {
-                Some(VisualGroup::Atmosphere) => mask.atmosphere = true,
-                Some(VisualGroup::Post) => mask.post = true,
-                Some(VisualGroup::Lighting) => mask.lighting = true,
-                None => {}
-            }
-        }
-        mask
+        self.visuals
     }
 
     /// Enable or disable a mod by [`Mod::id`] (case-insensitive). No-op if
@@ -978,6 +1008,7 @@ impl Mods {
             self.set_enabled(id, false);
         }
         self.server_held = turn_off;
+        self.revise();
     }
 
     /// True when the mod at `index` belongs to a package the server refused.
@@ -991,6 +1022,7 @@ impl Mods {
     pub fn release_server(&mut self) {
         let held = std::mem::take(&mut self.server_held);
         self.server_packages.clear();
+        self.revise();
         for id in held {
             self.set_enabled(&id, true);
         }
@@ -1104,13 +1136,11 @@ impl Mods {
     }
 
     fn apply_choice_state(&mut self, id: &str, data: &str) {
-        if let Some(entry) = self
-            .entries
-            .iter_mut()
-            .find(|e| e.module.id().eq_ignore_ascii_case(id))
-        {
-            entry.module.load_choice_state(data);
-        }
+        let Some(entry) = self.entries.iter_mut().find(|e| e.module.id().eq_ignore_ascii_case(id)) else {
+            return;
+        };
+        entry.module.load_choice_state(data);
+        self.revise();
     }
 
     /// Restore enable/disable choices and knob payloads from `mods.cfg`.
@@ -1139,12 +1169,16 @@ impl Mods {
 /// `mods.cfg` format: 2 since the diffusion mod became the default world generator.
 const CHOICES_VERSION: u32 = 2;
 
-/// Debounces `mods.cfg` writes so a held Left/Right does not rewrite at key-repeat rate.
-pub struct ChoicesFlush {
+/// Debounces file writes so a held Left/Right does not rewrite at key-repeat rate: a write is
+/// due once [`IDLE_MS`](Self::IDLE_MS) pass with no further mark.
+pub struct Debounce {
     last_ms: Option<u64>,
 }
 
-impl ChoicesFlush {
+/// The `mods.cfg` debounce, by its mod API name.
+pub type ChoicesFlush = Debounce;
+
+impl Debounce {
     pub const IDLE_MS: u64 = 250;
 
     pub fn new() -> Self {
@@ -1172,7 +1206,7 @@ impl ChoicesFlush {
     }
 }
 
-impl Default for ChoicesFlush {
+impl Default for Debounce {
     fn default() -> Self {
         Self::new()
     }
@@ -1197,6 +1231,7 @@ pub(crate) fn split_mod_version(data: &str) -> (u16, &str) {
 mod tests {
     use super::*;
     use super::split_mod_version;
+    use super::testing::Stub;
     use crate::menu::Menu;
     use crate::world::terrain::TerrainCfg;
     use crate::world::World;
@@ -1529,8 +1564,7 @@ mod tests {
     #[test]
     fn server_hold_turns_the_package_off_without_changing_saved_choices() {
         let mut mods = Mods::empty();
-        const NONE: &[Command] = &[];
-        mods.install_from(Some("pwc.dev-toolkit"), Box::new(Lister("tools", NONE)), true);
+        mods.install_from(Some("pwc.dev-toolkit"), Box::new(Stub::new("tools")), true);
         let before = mods.choices_text();
         assert!(before.contains("tools=on"));
         mods.hold_packages(&["pwc.dev-toolkit".to_string()]);
@@ -1587,27 +1621,6 @@ mod tests {
         assert_ne!(cursor.index, 0, "cursor must skip the group header");
     }
 
-    /// Answers the commands it lists, raising the player one block per command it runs.
-    struct Lister(&'static str, &'static [Command]);
-
-    impl Mod for Lister {
-        fn name(&self) -> &str {
-            self.0
-        }
-        fn id(&self) -> &'static str {
-            self.0
-        }
-        fn commands(&self) -> &[Command] {
-            self.1
-        }
-        fn run_command(&mut self, ctx: &mut CommandContext<'_>, cmd: &str, _args: &[&str]) -> Option<Vec<Line>> {
-            self.1.iter().any(|c| c.name == cmd).then(|| {
-                ctx.player.position.y += 1.0;
-                vec![Line::of(crate::ui::Role::Dim, self.0)]
-            })
-        }
-    }
-
     /// A mod written against the context-free hook only.
     struct Legacy;
 
@@ -1632,10 +1645,10 @@ mod tests {
     #[test]
     fn the_first_enabled_mod_that_knows_a_command_runs_it() {
         let mut mods = Mods::empty();
-        mods.install(Box::new(Lister("a", A)), true);
-        mods.install(Box::new(Lister("b", B)), true);
+        mods.install(Box::new(Stub::new("a").commands(A)), true);
+        mods.install(Box::new(Stub::new("b").commands(B)), true);
         mods.install(Box::new(Legacy), true);
-        mods.install(Box::new(Lister("off", &[Command { name: "hidden", args: "", help: "" }])), false);
+        mods.install(Box::new(Stub::new("off").commands(&[Command { name: "hidden", args: "", help: "" }])), false);
         let names: Vec<&str> = mods.commands().map(|c| c.name).collect();
         assert_eq!(names, ["tp", "time"], "enabled mods only, in install order, a shadowed name once");
 
@@ -1652,8 +1665,8 @@ mod tests {
     }
 
     #[test]
-    fn choices_flush_waits_250ms_then_resets_on_mark() {
-        let mut flush = ChoicesFlush::new();
+    fn debounce_waits_250ms_then_resets_on_mark() {
+        let mut flush = Debounce::new();
         assert!(!flush.poll(0));
         flush.mark(0);
         assert!(!flush.poll(249));
@@ -1668,7 +1681,32 @@ mod tests {
         flush.mark(10);
         assert!(flush.take());
         assert!(!flush.take());
-        assert!(!flush.poll(10 + ChoicesFlush::IDLE_MS));
+        assert!(!flush.poll(10 + Debounce::IDLE_MS));
+    }
+
+    /// Every host change the mods screen can show moves the revision; reading does not.
+    #[test]
+    fn revision_moves_with_what_the_mods_screen_lists() {
+        let mut mods = crate::modding::testing::standard();
+        let mut last = mods.revision();
+        let _ = (mods.visual_mask(), mods.choices_text(), mods.knobs(index_of(&mods, "diffusion")));
+        assert_eq!(mods.revision(), last, "reads");
+        let mut moved = |mods: &Mods, what: &str| {
+            assert_ne!(mods.revision(), last, "{what}");
+            last = mods.revision();
+        };
+        mods.set_enabled("post", false);
+        moved(&mods, "a switch");
+        mods.step_knob(index_of(&mods, "diffusion"), 0, 1);
+        moved(&mods, "a knob step");
+        mods.apply_choices_text("version=2\ndiffusion.state=relief=150\n");
+        moved(&mods, "a loaded knob payload");
+        mods.hold_packages(&["pwc.visuals".to_string()]);
+        moved(&mods, "a server hold");
+        mods.release_server();
+        moved(&mods, "a release");
+        mods.install(Box::new(Stub::new("extra")), false);
+        moved(&mods, "an install");
     }
 
     fn enabled(mods: &Mods, name: &str) -> bool {

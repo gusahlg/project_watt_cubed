@@ -218,10 +218,6 @@ impl Router {
         }
     }
 
-    pub fn context(&self) -> Context {
-        self.context
-    }
-
     /// Switch context, resetting stale repeat timers so a key held across the
     /// switch doesn't carry its autofire into the new context.
     pub fn set_context(&mut self, c: Context) {
@@ -581,77 +577,19 @@ impl Global<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::modding::{Action, Mod, Mods as Host};
+    use crate::modding::testing::{action, Stub};
+    use crate::modding::{Action, Mods as Host};
 
-    struct Slot3;
+    const SLOT3: &[Action] = &[action("bar.slot3", &[Chord::key(Key::Num3)])];
+    /// F is the core flight key.
+    const CLASH: &[Action] = &[action("clash.fire", &[Chord::key(Key::F), Chord::key(Key::Num3)])];
+    const WHEEL: &[Action] = &[action("wheel.down", &[Chord::bare(Source::WheelDown)])];
+    const HOLD: &[Action] = &[Action { held: true, ..action("voice.talk", &[Chord::key(Key::V)]) }];
 
-    impl Mod for Slot3 {
-        fn name(&self) -> &str {
-            "Slot3"
-        }
-        fn id(&self) -> &'static str {
-            "slot3"
-        }
-        fn actions(&self) -> &[Action] {
-            const CHORDS: &[Chord] = &[Chord::key(Key::Num3)];
-            const ACTIONS: &[Action] = &[Action {
-                id: "bar.slot3",
-                label: "Slot 3",
-                default: CHORDS,
-                repeat: false,
-                held: false,
-            }];
-            ACTIONS
-        }
-    }
-
-    struct Clash;
-
-    impl Mod for Clash {
-        fn name(&self) -> &str {
-            "Clash"
-        }
-        fn id(&self) -> &'static str {
-            "clash"
-        }
-        fn actions(&self) -> &[Action] {
-            const BOTH: &[Chord] = &[Chord::key(Key::F), Chord::key(Key::Num3)];
-            const ACTIONS: &[Action] = &[Action {
-                id: "clash.fire",
-                label: "Fire",
-                default: BOTH,
-                repeat: false,
-                held: false,
-            }];
-            ACTIONS
-        }
-    }
-
-    struct Wheel;
-
-    impl Mod for Wheel {
-        fn name(&self) -> &str {
-            "Wheel"
-        }
-        fn id(&self) -> &'static str {
-            "wheel"
-        }
-        fn actions(&self) -> &[Action] {
-            const DOWN: &[Chord] = &[Chord::bare(Source::WheelDown)];
-            const ACTIONS: &[Action] = &[Action {
-                id: "wheel.down",
-                label: "Down",
-                default: DOWN,
-                repeat: false,
-                held: false,
-            }];
-            ACTIONS
-        }
-    }
-
-    fn host(module: Box<dyn Mod>) -> Host {
+    /// One enabled mod declaring `actions`.
+    fn host(actions: &'static [Action]) -> Host {
         let mut mods = Host::empty();
-        mods.install(module, true);
+        mods.install(Box::new(Stub::new("stub").actions(actions)), true);
         mods
     }
 
@@ -674,7 +612,7 @@ mod tests {
     #[test]
     fn a_mod_action_fires_on_its_default_chord() {
         let mut router = Router::new();
-        let mods = host(Box::new(Slot3));
+        let mods = host(SLOT3);
         router.sync_actions(&mods);
         let sample = router.sample(&Press::key(Key::Num3), 1.0 / 60.0, true, true);
         assert!(fired(&router, "bar.slot3", sample.actions));
@@ -684,7 +622,7 @@ mod tests {
     #[test]
     fn a_core_binding_wins_a_clash() {
         let mut router = Router::new();
-        let mods = host(Box::new(Clash));
+        let mods = host(CLASH);
         router.sync_actions(&mods);
         let fly = router.sample(&Press::key(Key::F), 1.0 / 60.0, true, true);
         assert!(fly.gameplay[GameplayEvent::ToggleFly as usize], "F stays the flight key");
@@ -697,40 +635,18 @@ mod tests {
     #[test]
     fn a_menu_wheel_chord_does_not_block_a_mod_action() {
         let mut router = Router::new();
-        let mods = host(Box::new(Wheel));
+        let mods = host(WHEEL);
         router.sync_actions(&mods);
         let sample = router.sample(&Press::wheel(-1.0), 1.0 / 60.0, true, true);
         assert!(fired(&router, "wheel.down", sample.actions));
         assert_eq!(sample.wheel, -1);
     }
 
-    struct Hold;
-
-    impl Mod for Hold {
-        fn name(&self) -> &str {
-            "Hold"
-        }
-        fn id(&self) -> &'static str {
-            "hold"
-        }
-        fn actions(&self) -> &[Action] {
-            const CHORDS: &[Chord] = &[Chord::key(Key::V)];
-            const ACTIONS: &[Action] = &[Action {
-                id: "voice.talk",
-                label: "Push to talk",
-                default: CHORDS,
-                repeat: false,
-                held: true,
-            }];
-            ACTIONS
-        }
-    }
-
     /// A held action stays on while the key is down, including a frame with no press edge.
     #[test]
     fn a_held_action_stays_on_while_the_chord_is_down() {
         let mut router = Router::new();
-        let mods = host(Box::new(Hold));
+        let mods = host(HOLD);
         router.sync_actions(&mods);
         let down = Press {
             pressed_keys: 0,
