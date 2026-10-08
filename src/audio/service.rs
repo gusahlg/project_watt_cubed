@@ -20,7 +20,7 @@ use crate::world::World;
 use super::acoustics::{AcousticWindow, Listener, Response, WindowFrame};
 use super::backend::recording::{Intent, Recorder, RecordingBackend};
 use super::capture::{Capture, CaptureConfig};
-use super::content::{Catalog, CueId, CueSymbols, Loop, OneShot};
+use super::content::{Catalog, CueId, CueMode, CueSymbols, Loop, OneShot};
 use super::frame::{AudioFrame, Emitter, EmitterId, Occurrence, OccurrenceId, MAX_OCCURRENCES};
 use super::runtime::{MixChange, SoundSystem};
 use super::voice::{Epoch, Seq, SessionKey, VoicePacket, MAX_VOICE_PAYLOAD};
@@ -372,17 +372,15 @@ impl AudioService {
         dt: f32,
         console: &mut Console,
     ) {
-        let journal = std::mem::take(&mut self.journal);
-        let mut emitters = Vec::new();
-        if let Some(bed) = &self.ambient {
-            emitters.push(Emitter { id: EmitterId(1), cue: bed.cue, at: listener.pos, gain: bed.gain });
-        }
-        let needed = sound.has_live_sources() || !journal.is_empty() || !emitters.is_empty();
+        let bed = self.ambient.as_ref().map(|bed| Emitter { id: EmitterId(1), cue: bed.cue, at: listener.pos, gain: bed.gain });
+        let emitters = bed.as_slice();
+        let needed = sound.has_live_sources() || !self.journal.is_empty() || !emitters.is_empty();
         let window = self.window.refresh(world, listener.pos, dt, needed);
         let frame_dt = dt.clamp(1e-4, 0.5);
-        if let Ok(frame) = AudioFrame::new(frame_dt, listener, journal, emitters, window) {
+        if let Ok(frame) = AudioFrame::new(frame_dt, listener, &self.journal, emitters, window) {
             sound.submit(frame);
         }
+        self.journal.clear();
         let mut seen: Option<std::collections::HashSet<std::mem::Discriminant<super::Fault>>> = None;
         for fault in sound.drain_faults() {
             let set = seen.get_or_insert_with(std::collections::HashSet::new);
@@ -463,7 +461,7 @@ impl AudioApi<'_> {
         if !at.is_finite() || self.service.journal.len() >= MAX_OCCURRENCES {
             return false;
         }
-        let Some(id) = self.cue_one_shot(cue, Response::World) else { return false };
+        let Some(id) = self.cue::<OneShot>(cue, Response::World) else { return false };
         let occ = self.service.mint();
         self.service.journal.push(Occurrence { id: occ, cue: id, at: Some(at), gain });
         self.note(cue, Some(at), gain);
@@ -473,7 +471,7 @@ impl AudioApi<'_> {
     /// Play a UI one-shot now. Menus have no frame journal.
     pub fn play_ui(&mut self, cue: &str, gain: f32) -> bool {
         let Some(gain) = finite_gain(gain) else { return false };
-        let Some(id) = self.cue_one_shot(cue, Response::Ui) else { return false };
+        let Some(id) = self.cue::<OneShot>(cue, Response::Ui) else { return false };
         self.sound.play_ui(id, gain);
         self.note(cue, None, gain);
         true
@@ -482,7 +480,7 @@ impl AudioApi<'_> {
     /// Remember one ambient bed and resubmit it each frame until replaced or stopped.
     pub fn play_ambient(&mut self, cue: &str, gain: f32) -> bool {
         let Some(gain) = finite_gain(gain) else { return false };
-        let Some(id) = self.cue_loop(cue, Response::Ambient) else { return false };
+        let Some(id) = self.cue::<Loop>(cue, Response::Ambient) else { return false };
         self.service.ambient = Some(AmbientBed { cue: id, gain });
         self.note(cue, None, gain);
         true
@@ -595,16 +593,11 @@ impl AudioApi<'_> {
         }
     }
 
-    fn cue_one_shot(&self, name: &str, response: Response) -> Option<CueId<OneShot>> {
-        let cue = self.sound.catalog().typed::<OneShot>(self.symbols, name)?;
-        let raw = self.symbols.raw(name)?;
-        (self.sound.catalog().response_of(raw) == response).then_some(cue)
-    }
-
-    fn cue_loop(&self, name: &str, response: Response) -> Option<CueId<Loop>> {
-        let cue = self.sound.catalog().typed::<Loop>(self.symbols, name)?;
-        let raw = self.symbols.raw(name)?;
-        (self.sound.catalog().response_of(raw) == response).then_some(cue)
+    /// The cue named `name`, when it has mode `M` and plays in `response`.
+    fn cue<M: CueMode>(&self, name: &str, response: Response) -> Option<CueId<M>> {
+        let catalog = self.sound.catalog();
+        let cue = catalog.typed::<M>(self.symbols, name)?;
+        (catalog.cue(cue).response == response).then_some(cue)
     }
 }
 
