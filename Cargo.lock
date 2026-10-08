@@ -757,6 +757,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "field"
+version = "0.1.0"
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1785,6 +1789,7 @@ dependencies = [
  "ash",
  "bytemuck",
  "cpal",
+ "field",
  "glam 0.32.1",
  "kira",
  "libc",
