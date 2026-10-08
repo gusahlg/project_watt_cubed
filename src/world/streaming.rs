@@ -441,12 +441,7 @@ impl World {
     /// and a mined block still vanishes the same frame it was clicked.
     /// Steady-state cost is a channel poll and two sticky-flag checks.
     /// `eng` is `None` only in headless tests; GPU work panics without it.
-    pub fn pump(
-        &mut self,
-        mut eng: Option<&mut Engine>,
-        sched: &mut crate::sched::Scheduler,
-        appearance: &dyn BlockAppearance,
-    ) {
+    pub fn pump(&mut self, mut eng: Option<&mut Engine>, appearance: &dyn BlockAppearance) {
         self.remesh_stats.drop_stale_this_frame = 0;
         // Palette growth appends new block texture layers before any upload
         // this frame references a new layer.
@@ -457,13 +452,11 @@ impl World {
         // deadline Instant. Dirty-remesh and lod-clip stay (flag checks).
         if self.anything_in_flight() {
             let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::StreamDrain);
-            let drain_lane = self.lanes().drain;
-            sched.run_manual(drain_lane, self, eng.as_deref_mut());
+            lanes::DrainLane::run(self, eng.as_deref_mut());
         }
         // The synchronous edit remesh: self-gates on `pending_dirty`, so an
         // editless frame pays one flag check and does not need the engine.
-        let dirty_lane = self.lanes().dirty_remesh;
-        sched.run_manual(dirty_lane, self, eng.as_deref_mut());
+        lanes::DirtyRemeshLane::run(self, eng);
         // Fold any settle events into the LOD clip the moment they land.
         self.refresh_lod_clip();
     }
@@ -473,13 +466,7 @@ impl World {
     /// refreshes). [`pump`](Self::pump) covers the every-frame latency half;
     /// the drain/dirty lanes here are second-run no-ops on a pumped frame.
     /// Steady-state zero cost: one channel poll, lazy unload/generate on boundary cross.
-    pub fn stream(
-        &mut self,
-        center: DVec3,
-        mut eng: Option<&mut Engine>,
-        sched: &mut crate::sched::Scheduler,
-        appearance: &dyn BlockAppearance,
-    ) {
+    pub fn stream(&mut self, center: DVec3, mut eng: Option<&mut Engine>, appearance: &dyn BlockAppearance) {
         if let Some(eng) = eng.as_deref() {
             let stats = eng.mesh_stats();
             self.gpu_live_slots = stats.live_slots;
@@ -495,7 +482,7 @@ impl World {
         // boundary-cross frame's results drain against the live centre, not
         // the one they'd be discarded by. `stream_phase` pumps only on frames
         // the topology pass does not run; this is the pump on stream-due frames.
-        self.pump(eng.as_deref_mut(), sched, appearance);
+        self.pump(eng.as_deref_mut(), appearance);
         if full_pass {
             self.unload_far(
                 center_chunk,
@@ -508,10 +495,7 @@ impl World {
         // Runs every frame to drain a boundary-cross flood across frames;
         // self-gates on `pending_gen` so a settled world pays one flag check.
         // Placed after unload so freed slots can regenerate.
-        {
-            let gen_lane = self.lanes().generate;
-            sched.run_manual(gen_lane, self, None);
-        }
+        lanes::GenerateLane::run(self, None);
         if self.radius_shrunk.take() {
             // Meshes are about to be freed: the settled scan must restart.
             self.lod_clip_shrunk.set();
@@ -562,8 +546,7 @@ impl World {
         {
             let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::StreamLight);
             if self.lighting {
-                let light_lane = self.lanes().light_admit;
-                sched.run_manual(light_lane, self, None);
+                LightLane::run(self, None);
                 // No level-triggered mesh-lane forcing here: every event that
                 // can flip a chunk's mesh-readiness arms `pending_fresh` WITH
                 // a seed (`settle_light` seeds self + moved-border neighbours,
@@ -582,8 +565,7 @@ impl World {
         // (worklist seeded on load/light-move, O(shell) not a whole-map rescan).
         {
             let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::StreamMesh);
-            let dirty_lane = self.lanes().dirty_remesh;
-            sched.run_manual(dirty_lane, self, eng.as_deref_mut());
+            lanes::DirtyRemeshLane::run(self, eng.as_deref_mut());
             // Advance the light-gate degrade timers and keep still-waiting chunks on
             // the worklist (their degrade fires on the clock, which raises no re-seed
             // event) BEFORE the mesh lane reads them.
@@ -594,8 +576,7 @@ impl World {
             // evict the whole worklist with no re-seed event): `pending_fresh`
             // stays raised and admission self-resumes as uploads drain.
             if !self.upload_backlogged() {
-                let mesh_lane = self.lanes().mesh_admit;
-                sched.run_manual(mesh_lane, self, None);
+                MeshLane::run(self, None);
             }
             // Level-triggered backstop to the edge-triggered degraded clear: once
             // ALL light work is quiescent, any chunk still degraded is owed a
@@ -612,13 +593,11 @@ impl World {
             self.update_lod_face(far_chunk);
             // Until the bake lands, selection uses the worst-case ladder;
             // mip only coarsens, no upward pops during bake.
-            let mip_lane = self.lanes().mip;
-            sched.run_manual(mip_lane, self, None);
+            lanes::MipLane::run(self, None);
             // Section overlay lane: refresh the edit overlay BEFORE
             // selection/occlusion/material read it (the frontier's error
             // coarsening below already consults it).
-            let overlay_lane = self.lanes().section_overlay;
-            sched.run_manual(overlay_lane, self, None);
+            lanes::SectionOverlayLane::run(self, None);
             self.refresh_frontier(far_chunk);
             if full_pass || far_moved {
                 self.unload_sections(
@@ -630,22 +609,19 @@ impl World {
             }
             // Section dirty-remesh lane: free GPU meshes of edited sections so
             // they re-extract from the updated generator overlay.
-            let section_remesh_lane = self.lanes().section_remesh;
-            sched.run_manual(section_remesh_lane, self, eng.as_deref_mut());
+            lanes::SectionRemeshLane::run(self, eng.as_deref_mut());
             // The floor may be full of sections this frontier no longer draws.
             // Unload runs only on a boundary cross, so a still camera never
             // drops them and admission stays refused.
             self.reclaim_blocked_sections(far_chunk, eng.as_deref_mut());
-            let section_lane = self.lanes().section_admit;
-            sched.run_manual(section_lane, self, None);
+            SectionLane::run(self, None);
             // Section visible-set lane: re-resolve the covering only when an
             // event moved it (upload/unload/free/claim release/frontier or
             // ladder change) or while admission is still pending — the
             // level-triggered backstop that keeps holes re-arming the lane.
             // A converged, still far field pays a flag check, no covering walk.
             if self.section_cover_dirty.take() || self.pending_sections.get() {
-                let visible_lane = self.lanes().section_visible;
-                sched.run_manual(visible_lane, self, eng.as_deref_mut());
+                lanes::SectionVisibleLane::run(self, eng.as_deref_mut());
             }
         }
         // Occlusion is derived state, rebuilt here at the `&mut` sync point (never
@@ -655,8 +631,7 @@ impl World {
         // off lets render draw everything). A CPU-bound world pays nothing.
         {
             let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::StreamOcclusion);
-            let occ_lane = self.lanes().occlusion;
-            sched.run_manual(occ_lane, self, eng.as_deref_mut());
+            lanes::OcclusionLane::run(self, eng);
         }
         // Unloads/boundary crossings above may have shrunk the settled rings;
         // fold them in before this frame renders.

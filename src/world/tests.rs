@@ -369,49 +369,40 @@ fn moving_far_lane_admits_a_hole_past_the_resident_nearest() {
     );
 }
 
-/// A LOD aux lane driven end-to-end through the scheduler's `run_manual`
-/// (the call-point path `World::stream` uses) has the same effect as the
-/// direct method — here the visible-set lane arming the section lane
-/// while the covering has open holes.
+/// A LOD aux lane run at its call point (the way `World::stream` drives it) has
+/// the same effect as the direct method — here the visible-set lane arming the
+/// section lane while the covering has open holes.
 #[test]
-fn section_visible_lane_drives_through_run_manual() {
+fn section_visible_lane_run_arms_open_holes() {
     let mut world = lod2_world();
     let center = stand_on_twin(&mut world);
     world.pending_sections.take();
     world.section_desired = world.desired_sections(center);
 
-    let mut sched = crate::sched::Scheduler::new();
-    let handle = sched.register_manual(
-        lanes::SectionVisibleLane::manifest(),
-        Box::new(lanes::SectionVisibleLane),
-    );
-    sched.run_manual(handle, &mut world, None);
+    lanes::SectionVisibleLane::run(&mut world, None);
 
     assert!(
         world.pending_sections.get(),
-        "the visible lane, driven via run_manual, arms the section lane on open holes"
+        "the visible lane arms the section lane on open holes"
     );
 }
 
-/// The mesh admit lane IS the `MeshLane` producer now (no shim): driven
-/// end-to-end through the scheduler's `run_manual` it has the same effect as
-/// calling `admit` directly — here clearing `pending_fresh` once its
+/// The mesh admit lane IS the `MeshLane` marker: its `run` has the same effect
+/// as calling `admit` directly — here clearing `pending_fresh` once its
 /// worklist is empty (drained).
 #[test]
-fn mesh_admit_lane_drives_through_run_manual() {
+fn mesh_admit_lane_run_drains_an_empty_worklist() {
     let mut world = lod2_world();
     let center = ChunkCoord::new(0, 0, 0);
     world.center = Some(center);
     world.mesh_worklist.clear();
     world.pending_fresh.set();
 
-    let mut sched = crate::sched::Scheduler::new();
-    let handle = sched.register_manual(MeshLane::manifest(), Box::new(MeshLane));
-    sched.run_manual(handle, &mut world, None);
+    MeshLane::run(&mut world, None);
 
     assert!(
         !world.pending_fresh.get(),
-        "the mesh-admit lane, driven via run_manual, drains an empty worklist"
+        "the mesh-admit lane drains an empty worklist"
     );
 }
 

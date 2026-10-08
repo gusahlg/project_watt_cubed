@@ -56,7 +56,7 @@ mod clip;
 mod coverage;
 mod edits;
 mod heightmip;
-pub(crate) mod lanes;
+mod lanes;
 mod metric;
 mod occlusion;
 mod quadtree;
@@ -563,10 +563,6 @@ pub struct World {
     occlusion_active: bool,
     /// Manual occlusion override (from [`RenderConfig::occlusion`]), on by default when GPU-bound signal unavailable.
     occlusion_forced: bool,
-    /// Scheduler handles for the `stream` call-point CPU lanes, set by
-    /// `Game::new` after it registers them. `None` only before
-    /// that wiring (a bare `World` with no scheduler never calls `stream`).
-    stream_lanes: Option<lanes::StreamLanes>,
     /// Cross-chunk lighting enable flag. Driven by the `lighting` graphics
     /// setting via [`set_lighting`](World::set_lighting); the initial value only
     /// governs pre-`enter_game` generation and is overridden on world entry.
@@ -894,7 +890,6 @@ impl World {
             column_chunks: FastMap::default(),
             occlusion_active: false,
             occlusion_forced: render.occlusion,
-            stream_lanes: None,
             lighting: true,
             light_epoch: 0,
             light_claim_seq: 0,
@@ -1010,12 +1005,6 @@ impl World {
         }
     }
 
-    /// Wire the scheduler handles for the `stream` CPU lanes.
-    /// Called once by `Game::new` after registering the producers.
-    pub fn set_stream_lanes(&mut self, lanes: lanes::StreamLanes) {
-        self.stream_lanes = Some(lanes);
-    }
-
     /// Any generate/mesh/light/section claim or upload still outstanding.
     /// Counter reads only — idle `pump` uses this to skip the drain lane.
     pub fn anything_in_flight(&self) -> bool {
@@ -1026,13 +1015,6 @@ impl World {
             || !self.upload_queue.is_empty()
             || !self.light_apply_queue.is_empty()
             || !self.section_upload_queue.is_empty()
-    }
-
-    /// The registered stream-lane handles (panics if `stream` runs before
-    /// `Game::new` wired them — see [`World::stream_lanes`]).
-    fn lanes(&self) -> lanes::StreamLanes {
-        self.stream_lanes
-            .expect("stream lanes registered by Game::new")
     }
 }
 
