@@ -1,6 +1,7 @@
 //! Multiplayer integration tests: an in-process server and several clients over loopback.
 //! Each area has its own file; this module holds the shared harness.
 
+mod chaos;
 mod presence;
 mod session;
 mod world;
