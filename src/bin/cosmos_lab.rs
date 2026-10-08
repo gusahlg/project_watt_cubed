@@ -194,6 +194,8 @@ struct Stats {
     own_cohesion: Series,
     own_amount_spread: Series,
     own_colour_spread: Series,
+    own_restless: Series,
+    own_restless_of: usize,
     suite_spread_ok: usize,
     seeds_all_own: usize,
     start_own: usize,
@@ -276,6 +278,14 @@ impl Stats {
                 let amounts = s.own.iter().map(|m| m.amount);
                 self.own_amount_spread.push((amounts.clone().max().unwrap_or(0) - amounts.min().unwrap_or(0)) as f64);
                 self.own_colour_spread.push(colour_spread(&s.own));
+                if self.seeds <= 100 {
+                    let law = project_watt_cubed::material::Law::current();
+                    for m in &s.own {
+                        let (n, of) = project_watt_cubed::world::terrain::emergent::minerals::restless_against(&law, m);
+                        self.own_restless.push(n as f64);
+                        self.own_restless_of = of;
+                    }
+                }
                 let names = ["few distinct", "colour", "restless"];
                 let why: Vec<&str> = (0..3).filter(|k| s.causes >> k & 1 == 1).map(|k| names[k]).collect();
                 self.causes.add(if why.is_empty() { "own".to_string() } else { why.join("+") });
@@ -509,6 +519,7 @@ fn sweep(a: &Args, cfg: &TerrainCfg, name: &str, values: &[String]) {
         println!("law colour spread {}", st.own_colour_spread.summary());
         println!("law distinct {}", st.suite_distinct.summary());
         print!("{}", st.causes.line("verdict"));
+        println!("law minerals' reacting universals (of {}) {}", st.own_restless_of, st.own_restless.summary());
         println!("start density {}", st.start_density.summary());
         print!("{}", st.gates());
     }
@@ -636,6 +647,13 @@ fn main() {
     print!("{}", st.own_amount_spread.histogram("amount spread per suite", &lin(0.0, 2.0, 16)));
     print!("{}", st.own_colour_spread.histogram("colour spread per suite (0..765)", &lin(0.0, 40.0, 16)));
     print!("{}", st.causes.line("verdict (fallback causes)"));
+    print!(
+        "{}",
+        st.own_restless.histogram(
+            &format!("universal materials (of {}) each mineral reacts with, first 100 seeds", st.own_restless_of),
+            &[0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 24.0, 32.0]
+        )
+    );
     println!("### Suites kept (not fallback)");
     print!("{}", st.suite_amount.histogram("mineral amount", &lin(1.0, 3.0, 11)));
     print!("{}", st.suite_amount_spread.histogram("amount spread per suite", &lin(0.0, 2.0, 16)));

@@ -121,6 +121,14 @@ fn role_block(p: &[palette::Entry], label: &str) -> Block {
     Block::of(&p.iter().find(|e| e.label == label).expect("a palette role").config)
 }
 
+/// How many universal materials a mineral would react with, out of how many (a lab diagnostic of
+/// the rest check).
+pub fn restless_against(law: &Law, m: &Mineral) -> (usize, usize) {
+    let r = reference(law);
+    let b = Block::of(&m.config);
+    (r.universal.iter().filter(|u| !dormant(&b, u)).count(), r.universal.len())
+}
+
 /// Yield stress of matter of cohesion `cohesion` (Q8): the prototype response's four decades,
 /// as integer powers of [`YIELD_STEP`] (no libm).
 pub fn yield_of(cohesion: i32) -> f64 {
