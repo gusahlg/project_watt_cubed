@@ -211,6 +211,13 @@ enum PendingKind {
     Place(BlockId),
 }
 
+/// One peer as sampled once this frame: audio and drawing read the same pose.
+struct PeerFrame {
+    id: u32,
+    rendered: crate::net::client::Rendered,
+    visible: bool,
+}
+
 /// The live world the player is in.
 pub struct Game {
     world: World,
@@ -322,6 +329,8 @@ pub struct Game {
     // Retained-capacity scratch (cleared, never shrunk): stable frames do no
     // allocator work for these.
     placement_scratch: Vec<(i32, i32, i32, crate::block::registry::BlockId)>,
+    /// This frame's peers, in [`Connection::peers`] order.
+    peer_frames: Vec<PeerFrame>,
     peer_pose_scratch: Vec<PeerAudio>,
     /// Up-axes parallel to [`peer_pose_scratch`]. Kept off the public peer record.
     peer_up_scratch: Vec<crate::coord::Face>,
@@ -411,6 +420,7 @@ impl Game {
             content_rev: Revision::default(),
             drawing: draw::DrawState::new(),
             placement_scratch: Vec::new(),
+            peer_frames: Vec::new(),
             peer_pose_scratch: Vec::new(),
             peer_up_scratch: Vec::new(),
             phases: FramePhases::default(),
@@ -732,6 +742,7 @@ impl Game {
         }
         let active = !consumed;
         let t = Instant::now();
+        self.sample_peers();
         let ids = router.action_ids();
         self.commit_audio(AudioPhase {
             dt,
@@ -1310,6 +1321,7 @@ impl Game {
             self.world
                 .pump(None, &mut self.sched, mods.appearance());
         }
+        self.sample_peers();
         let ids = router.action_ids();
         self.commit_audio(AudioPhase {
             dt,
@@ -1324,6 +1336,18 @@ impl Game {
             ids,
         });
         self.compose_quiet(mods);
+    }
+
+    /// Sample every peer's pose once, at one instant, for this frame's audio and drawing.
+    fn sample_peers(&mut self) {
+        self.peer_frames.clear();
+        let Some(net) = &self.net else { return };
+        let now = crate::sched::now();
+        self.peer_frames.extend(net.peers().map(|peer| PeerFrame {
+            id: peer.id(),
+            rendered: peer.sample(now),
+            visible: peer.visible(),
+        }));
     }
 
     /// Hand this frame to the mods. A still singleplayer frame still runs the hook,
@@ -1353,24 +1377,21 @@ impl Game {
             return;
         }
 
-        let now = crate::sched::now();
         let mut peers = std::mem::take(&mut self.peer_pose_scratch);
         let mut ups = std::mem::take(&mut self.peer_up_scratch);
         peers.clear();
         ups.clear();
-        if let Some(net) = &self.net {
-            for peer in net.peers() {
-                let rendered = peer.sample(now);
-                peers.push(PeerAudio {
-                    id: peer.id(),
-                    at: rendered.pos.0,
-                    feet: rendered.pos.feet(rendered.stance, rendered.up).0,
-                    visible: peer.visible(),
-                    gait: rendered.phase,
-                    speed: rendered.speed,
-                });
-                ups.push(rendered.up);
-            }
+        for frame in &self.peer_frames {
+            let r = &frame.rendered;
+            peers.push(PeerAudio {
+                id: frame.id,
+                at: r.pos.0,
+                feet: r.pos.feet(r.stance, r.up).0,
+                visible: frame.visible,
+                gait: r.phase,
+                speed: r.speed,
+            });
+            ups.push(r.up);
         }
         // A console-owned frame does not step the player, so a stale walk speed
         // must not fire a footstep.

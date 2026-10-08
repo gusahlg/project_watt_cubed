@@ -162,7 +162,7 @@ impl Game {
 
         // `dt` steps each peer's animator (body-yaw follow, stance blend, swing).
         let want_tags = self.name_tags && self.theme.hud.shows_world_ui();
-        let peers = self.peer_draws(eng, &camera, &pose, dt, self.player_models, want_tags);
+        let peers = self.peer_draws(screen, &camera, &pose, dt, self.player_models, want_tags);
 
         // Compose the single per-frame lighting truth: the source for the
         // engine's per-frame UBO for sky/fog and avatar key lighting. The UBO is
@@ -607,7 +607,7 @@ impl Game {
     /// raycasts, and name cloning — each stops at its owning boundary.
     fn peer_draws(
         &mut self,
-        eng: &Engine,
+        screen: (i32, i32),
         camera: &Camera3D,
         pose: &ViewPose,
         dt: f32,
@@ -625,13 +625,16 @@ impl Game {
         let world = &self.world;
         let eye = pose.eye;
         let forward = pose.forward();
-        let now = crate::sched::now();
-        let screen_w = eng.screen_width() as f32;
-        let screen_h = eng.screen_height() as f32;
-        // Outside interest range there is no live pose: drawing the last
-        // heard one would freeze a ghost in place.
-        for peer in net.peers_mut().filter(|peer| peer.visible()) {
-            let r = peer.sample(now);
+        let (screen_w, screen_h) = (screen.0 as f32, screen.1 as f32);
+        // The frame's poses were sampled in this same order. Outside interest
+        // range there is no live pose: drawing the last heard one would freeze
+        // a ghost in place.
+        for (peer, frame) in net.peers_mut().zip(&self.peer_frames) {
+            debug_assert_eq!(peer.id(), frame.id);
+            if !frame.visible {
+                continue;
+            }
+            let r = &frame.rendered;
             let feet = r.pos.feet(r.stance, r.up);
             let color = peer_color(&peer.name);
             let model = want_models.then(|| {
