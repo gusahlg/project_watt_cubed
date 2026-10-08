@@ -484,17 +484,18 @@ pub(in crate::world) struct StagingSnapshot {
     pub section_ring_full: u64,
 }
 
-/// Copy one [`MeshData`] into a staging region via [`MeshStaging::vertex_writer`]
-/// (AABB tracked as vertices land). `None` if the ring is full or the write
-/// would not fit — caller falls back to the `Vec` payload.
+/// Write one [`MeshData`] into a staging region with [`MeshStaging::write_mesh`]:
+/// the vertices straight from the mesh's direction buckets in upload order, and
+/// the AABB the mesh tracked while it was built (no intermediate `Vec`, no
+/// rescan). `None` if the ring is full or the write would not fit — caller
+/// falls back to the `Vec` payload.
 fn stage_pass(stager: &MeshStager, data: &MeshData) -> Option<StagedPass> {
     let bytes = data.vertex_bytes();
     if bytes == 0 {
         return None;
     }
     let mut staging = stager.acquire(bytes)?;
-    let verts = data.vertices();
-    if !staging.vertex_writer().write(&verts) {
+    if !staging.write_mesh(data) {
         return None;
     }
     Some(StagedPass {
