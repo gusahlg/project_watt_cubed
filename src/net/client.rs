@@ -42,6 +42,9 @@ const PING_INTERVAL: Duration = Duration::from_secs(2);
 /// Mod-channel traffic is loss-tolerant, so an overrun drops the OLDEST frame
 /// on that channel rather than blocking or growing.
 const MOD_RING_CAP: usize = 64;
+/// Snapshot cells one [`Connection::poll`] hands the game, so a big join overlay
+/// is applied over several frames instead of in one long one.
+pub(crate) const APPLY_BUDGET: usize = 2048;
 
 struct InboundMod {
     sender: u32,
@@ -70,7 +73,7 @@ pub struct RemotePlayer {
     pub name: Arc<str>,
     pub anim: presence::Animator,
     /// Joins start hidden (the roster carries names, not positions); the
-    /// first `PeerMove` reveals them and `PeerExited` hides them again — so a
+    /// first pose reveals them and `PeerExited` hides them again — so a
     /// peer who wandered off isn't drawn frozen at their last heard pose.
     visible: bool,
     prev: Snapshot,
@@ -309,6 +312,9 @@ pub struct Connection {
     warned: bool,
     /// The join overlay has arrived ([`ServerMessage::SnapshotEnd`]). Stays set.
     snapshot_ready: bool,
+    /// Snapshot cells not handed to the game yet. While any wait, later messages
+    /// stay in the inbox, so they still apply after these.
+    held: VecDeque<(i32, i32, i32, u32, Arc<str>)>,
 }
 
 impl Connection {
@@ -450,7 +456,13 @@ fn connect_cancellable(
     if addrs.is_empty() {
         return Err(ConnectError::plain("address resolved to nothing"));
     }
-    let rt = Arc::new(Runtime::new().map_err(|e| ConnectError::plain(format!("runtime: {e}")))?);
+    // One worker drives quinn; the reader, writer and connect threads block on it.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .map_err(|e| ConnectError::plain(format!("runtime: {e}")))?;
+    let rt = Arc::new(rt);
     quic::install_crypto();
     let mut last = ConnectError::plain("could not connect");
     for addr in addrs {
@@ -605,6 +617,7 @@ fn connect_one(
             last_pong: Instant::now(),
             warned: false,
             snapshot_ready: false,
+            held: VecDeque::new(),
         })
 }
 
@@ -680,8 +693,14 @@ impl Connection {
         }
 
         let mut out = Vec::new();
-        loop {
+        let mut budget = APPLY_BUDGET;
+        release_held(&mut self.held, &mut self.cell_revs, &mut budget, &mut out);
+        while self.held.is_empty() {
             match self.inbox.try_recv() {
+                Ok(ServerMessage::Snapshot { edits }) => {
+                    self.held.extend(edits);
+                    release_held(&mut self.held, &mut self.cell_revs, &mut budget, &mut out);
+                }
                 Ok(msg) => self.apply(msg, &mut out),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
@@ -719,6 +738,31 @@ impl Connection {
             out,
         );
     }
+}
+
+/// Hand the game up to `budget` held snapshot cells.
+fn release_held(
+    held: &mut VecDeque<(i32, i32, i32, u32, Arc<str>)>,
+    cell_revs: &mut HashMap<(i32, i32, i32), u32>,
+    budget: &mut usize,
+    out: &mut Vec<Incoming>,
+) {
+    while *budget > 0 {
+        let Some(cell) = held.pop_front() else { return };
+        snapshot_cell(cell, cell_revs, out);
+        *budget -= 1;
+    }
+}
+
+/// Authoritative world state (bootstrap ledger, reaction commits): not a
+/// player's act, so it carries no place/break semantics or cue.
+fn snapshot_cell(
+    (x, y, z, rev, spec): (i32, i32, i32, u32, Arc<str>),
+    cell_revs: &mut HashMap<(i32, i32, i32), u32>,
+    out: &mut Vec<Incoming>,
+) {
+    cell_revs.insert((x, y, z), rev);
+    out.push(Incoming::Mutation { x, y, z, spec });
 }
 
 fn welcome_from(
@@ -856,11 +900,8 @@ fn apply_server_message(
 ) {
     match msg {
             ServerMessage::Snapshot { edits } => {
-                // Authoritative world state (bootstrap ledger, reaction commits): not a
-                // player's act, so it carries no place/break semantics or cue.
-                for (x, y, z, rev, spec) in edits {
-                    cell_revs.insert((x, y, z), rev);
-                    out.push(Incoming::Mutation { x, y, z, spec });
+                for cell in edits {
+                    snapshot_cell(cell, cell_revs, out);
                 }
             }
             ServerMessage::Edit { x, y, z, rev, spec } => {
@@ -907,7 +948,7 @@ fn apply_server_message(
                 };
                 // prev == target on join: speed 0 and a stationary phase, no
                 // Option<history> and no special-casing downstream. Hidden
-                // until their first PeerMove carries a real pose.
+                // until their first pose arrives.
                 let at = Snapshot {
                     pos: spawn,
                     yaw: 0.0,
@@ -936,23 +977,10 @@ fn apply_server_message(
                     out.push(Incoming::Left { name: p.name });
                 }
             }
-            ServerMessage::PeerMove { id, pos, yaw, pitch, frame, up, stance, velocity: _ } => {
-                if let Some(p) = peers.get_mut(&id) {
-                    let snapshot = Snapshot { pos, yaw, pitch, frame, up, stance };
-                    if p.visible {
-                        p.interval = p.recv_at.elapsed();
-                        p.prev = p.target;
-                        p.target = snapshot;
-                        p.distance += across_up(p.prev.pos, p.target.pos, snapshot.up);
-                    } else {
-                        // Re-entering interest range: snap, never lerp the
-                        // avatar across the distance covered while hidden.
-                        p.visible = true;
-                        p.interval = Duration::from_millis(0);
-                        p.prev = snapshot;
-                        p.target = snapshot;
-                    }
-                    p.recv_at = Instant::now();
+            ServerMessage::PeerPoses { poses } => {
+                let now = Instant::now();
+                for pose in poses.list {
+                    apply_pose(peers, pose, now);
                 }
             }
             ServerMessage::PeerExited { id } => {
@@ -1002,6 +1030,27 @@ fn apply_server_message(
                 out.push(Incoming::ToolResult { req, reacted, cell, cell_spec, tool_spec });
             }
         }
+}
+
+/// A pose for an unknown id is ignored.
+fn apply_pose(peers: &mut HashMap<u32, RemotePlayer>, pose: protocol::PeerPose, now: Instant) {
+    let Some(p) = peers.get_mut(&pose.id) else { return };
+    let snapshot =
+        Snapshot { pos: pose.pos, yaw: pose.yaw, pitch: pose.pitch, frame: pose.frame, up: pose.up, stance: pose.stance };
+    if p.visible {
+        p.interval = now.saturating_duration_since(p.recv_at);
+        p.prev = p.target;
+        p.target = snapshot;
+        p.distance += across_up(p.prev.pos, p.target.pos, snapshot.up);
+    } else {
+        // Re-entering interest range: snap, never lerp the
+        // avatar across the distance covered while hidden.
+        p.visible = true;
+        p.interval = Duration::from_millis(0);
+        p.prev = snapshot;
+        p.target = snapshot;
+    }
+    p.recv_at = now;
 }
 
 /// True while an in-flight `/tp` still has a heartbeat left to hear a
@@ -1373,20 +1422,25 @@ mod tests {
     }
 
     #[test]
-    fn out_of_order_duplicate_peermove_and_unknown_exit_never_panic() {
+    fn out_of_order_duplicate_poses_and_unknown_exit_never_panic() {
         let mut v = View::new();
-        let pose = |id, x| ServerMessage::PeerMove {
-            id,
-            pos: DVec3::new(x, 40.0, 0.0),
-            yaw: 0.0,
-            pitch: 0.0,
-            frame: DQuat::IDENTITY,
-            velocity: Vec3::ZERO,
-            up: Face::PosY,
-            stance: Stance::Standing,
+        let pose = |id, x| ServerMessage::PeerPoses {
+            poses: protocol::Poses {
+                origin: DVec3::new(0.0, 40.0, 0.0),
+                list: vec![protocol::PeerPose {
+                    id,
+                    pos: DVec3::new(x, 40.0, 0.0),
+                    yaw: 0.0,
+                    pitch: 0.0,
+                    frame: DQuat::IDENTITY,
+                    velocity: Vec3::ZERO,
+                    up: Face::PosY,
+                    stance: Stance::Standing,
+                }],
+            },
         };
         v.apply(pose(7, 3.0));
-        assert!(v.peers.is_empty(), "PeerMove for an unknown id is ignored");
+        assert!(v.peers.is_empty(), "a pose for an unknown id is ignored");
         v.apply(ServerMessage::PeerExited { id: 7 });
         v.apply(ServerMessage::PeerJoined { id: 7, name: "x".into() });
         v.apply(pose(7, 4.0));

@@ -156,7 +156,7 @@ pub(crate) mod quic {
 
 /// Wire revision. Client and server must match exactly at join. Bump on any
 /// incompatible frame change; history is `documentation/notes/protocol-history.md`.
-pub(crate) const PROTOCOL_VERSION: u32 = 16;
+pub(crate) const PROTOCOL_VERSION: u32 = 17;
 
 pub const DEFAULT_PORT: u16 = 5555;
 
