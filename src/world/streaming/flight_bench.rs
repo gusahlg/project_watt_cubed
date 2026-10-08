@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use super::headless::{Headless, Laps, PHASE_NAMES};
 use super::*;
 use crate::render_config::RenderConfig;
-use crate::world::generation::WorldgenKind;
+use crate::world::fixtures::{env_or, pace, spawned_round_world};
 
 /// The timing of a [`Headless::timed`] pass.
 fn laps(steps: &mut Headless) -> &mut Laps {
@@ -27,10 +27,6 @@ fn laps(steps: &mut Headless) -> &mut Laps {
 fn last_ms(steps: &mut Headless) -> (f32, bool) {
     let (took, full) = laps(steps).last;
     (took.as_secs_f32() * 1e3, full)
-}
-
-fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
-    std::env::var(name).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
 }
 
 /// One per-second look at the near field: the loading window's Ready share and the full draw
@@ -80,23 +76,14 @@ fn frame_stats(v: &mut [f32]) -> (f32, f32, f32, f32) {
 fn fly(speed: f64, secs: f64, settle: f64, view: (i32, i32), lod2: bool, hz: f64) {
     let mut render = RenderConfig::default();
     render.lod2 = lod2;
-    let mut w = World::with_kind(42, render, WorldgenKind::Diffusion, false);
-    w.set_view_distances(view.0, view.1);
-    let spawn = w.chart_spawn().expect("the start world is charted");
-    w.prepare_around(spawn);
-    w.drive_spawn_ready();
+    let (mut w, spawn) = spawned_round_world(render, view.0, view.1);
     let period = Duration::from_secs_f64(1.0 / hz);
     let mut steps = Headless::timed();
-    let pace = |start: Instant| {
-        if let Some(rest) = period.checked_sub(start.elapsed()) {
-            std::thread::sleep(rest);
-        }
-    };
     let t0 = Instant::now();
     while t0.elapsed().as_secs_f64() < settle && !w.entry_complete() {
         let start = Instant::now();
         w.stream_steps(spawn, &mut steps);
-        pace(start);
+        pace(start, period);
     }
     println!(
         "flight {speed} m/s: settled={} after {:.1}s view={view:?} lod2={lod2} hz={hz} chunks={} sections={}",
@@ -164,7 +151,7 @@ fn fly(speed: f64, secs: f64, settle: f64, view: (i32, i32), lod2: bool, hz: f64
             );
             next_sample += 1.0;
         }
-        pace(start);
+        pace(start, period);
     }
     // Counters and the end window are the flight, not the standstill afterwards.
     let flown = t0.elapsed().as_secs_f64();
@@ -184,7 +171,7 @@ fn fly(speed: f64, secs: f64, settle: f64, view: (i32, i32), lod2: bool, hz: f64
     let behind = w.counters.gen_landed_behind - behind0;
     let discarded = w.counters.gen_discarded - discarded0;
     let rebuilds = w.counters.gen_cursor_rebuilds - rebuilds0;
-    let mut stop = hold_still(&mut w, last_eye, &pace);
+    let mut stop = hold_still(&mut w, last_eye, period);
     let frames = ms.len();
     let total: f32 = ms.iter().sum();
     let (mean, p50, p95, max) = frame_stats(&mut ms);
@@ -264,7 +251,7 @@ struct Stop {
 
 /// Hold `eye` still for `FLIGHT_STOP` seconds so the loading window can grow back to the
 /// full view.
-fn hold_still(w: &mut World, eye: DVec3, pace: &impl Fn(Instant)) -> Stop {
+fn hold_still(w: &mut World, eye: DVec3, period: Duration) -> Stop {
     let secs = env_or("FLIGHT_STOP", 0.0);
     let mut stop = Stop { samples: Vec::new(), ms: Vec::new(), regrow_frames: 0, regrow_rebuilds: 0 };
     if secs <= 0.0 {
@@ -292,7 +279,7 @@ fn hold_still(w: &mut World, eye: DVec3, pace: &impl Fn(Instant)) -> Stop {
             stop.samples.push(Sample::take(w, held));
             next += 1.0;
         }
-        pace(start);
+        pace(start, period);
     }
     if regrowing {
         stop.regrow_frames = stop.ms.len();
@@ -359,9 +346,7 @@ fn full_window_ready(w: &World) -> (usize, usize) {
 }
 
 fn drawn(w: &World, coord: Coord) -> bool {
-    w.chunks
-        .get(&coord)
-        .is_some_and(|loaded| matches!(loaded.state, MeshState::Air | MeshState::Ready(_)))
+    w.chunks.get(&coord).is_some_and(|loaded| loaded.state.is_final())
 }
 
 /// Unready chunks inside the loading window: not stored, claimed by generation,

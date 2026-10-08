@@ -604,6 +604,7 @@ mod tests {
     }
 
     use super::super::headless::{step, step_finished};
+    use crate::world::fixtures::{air_loaded, ready_section, round_world};
     use crate::render_config::{RenderConfig, lod_for};
     use crate::world::generation::WorldgenKind;
     use std::time::{Duration, Instant};
@@ -618,7 +619,7 @@ mod tests {
     fn seeded(seed: i64, h: i32, v: i32) -> World {
         let (lod_levels, lod_detail) = lod_for(h);
         let render = RenderConfig { lod2: true, occlusion: true, lod_levels, lod_detail, ..RenderConfig::default() };
-        let mut world = World::with_kind(seed, render, WorldgenKind::Diffusion, false);
+        let mut world = round_world(seed, render);
         world.set_view_distances(h, v);
         world.section_pyramid.unit = world.view.lod_unit();
         world
@@ -1271,7 +1272,7 @@ mod tests {
         }
         let ancestor_order = <SectionLane as StreamLane>::order(&world, far, ancestor);
         assert!(ancestor_order < 32, "ancestor {ancestor:?} folds to order {ancestor_order}");
-        let ready = || SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None };
+        let ready = ready_section;
         world.sections.insert(ancestor, ready());
         world.section_desired.retain(|s| *s != ancestor);
         world.section_visible.retain(|(s, _)| *s != ancestor);
@@ -1470,21 +1471,6 @@ mod tests {
         )
     }
 
-    fn air(cx: i32, cy: i32, cz: i32) -> Loaded {
-        Loaded {
-            chunk: std::sync::Arc::new(Chunk::from_uniform(cx, cy, cz, AIR)),
-            state: MeshState::Air,
-            rev: 0,
-            connectivity: None,
-            visible: true,
-            light: None,
-            has_blocklight: false,
-            light_reseed: false,
-            light_gen: 0,
-            mesh_hash: None,
-        }
-    }
-
     /// Reference-frame chunks under `key`, or the storage chunks that hold them when `storage` is set.
     fn footprint_chunks(world: &World, key: SectionPos, storage: Option<Coord>) -> Vec<Coord> {
         let frame = FaceFrame::new(key.face);
@@ -1657,7 +1643,7 @@ mod tests {
             assert!(world.section_relief_band(cell).is_some(), "{face:?} stand section is not baked");
             assert!(!world.full_res_covers(storage, cell), "{face:?} unbacked section was skipped");
             for c in footprint_chunks(&world, cell, None) {
-                world.chunks.insert(c, air(c.x, c.y, c.z));
+                world.chunks.insert(c, air_loaded(c.x, c.y, c.z));
             }
             assert!(!world.full_res_covers(storage, cell), "{face:?} reference chunks covered a storage section");
             world.chunks.clear();
@@ -1669,12 +1655,12 @@ mod tests {
             };
             assert!(stored.contains(&stand), "{face:?} stand chunk {stand:?} is outside the footprint");
             for c in &stored {
-                world.chunks.insert(*c, air(c.x, c.y, c.z));
+                world.chunks.insert(*c, air_loaded(c.x, c.y, c.z));
             }
             assert!(world.full_res_covers(storage, cell), "{face:?} storage-backed section was kept");
             world.chunks.insert(stand, Loaded {
                 state: MeshState::NeedsMesh { building: true, prev: None },
-                ..air(stand.x, stand.y, stand.z)
+                ..air_loaded(stand.x, stand.y, stand.z)
             });
             assert!(!world.full_res_covers(storage, cell), "{face:?} an in-flight chunk still skipped");
         }

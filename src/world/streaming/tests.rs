@@ -3,7 +3,7 @@
 use super::super::StreamLane;
 use super::*;
 use crate::coord::ChunkCoord;
-use crate::world::fixtures::ready_section;
+use crate::world::fixtures::{ready_section, round_world, spawned_round_world};
 use crate::world::{light, mesh};
 use super::far::{inside_xz, storage_eye_block};
 use super::headless::{Headless, finish_jobs, step, step_finished};
@@ -167,23 +167,13 @@ fn near_diagonal_flight_keeps_its_heading() {
 
 /// Whether `coord` is drawn: a final mesh or nothing to draw.
 fn drawn(world: &World, coord: Coord) -> bool {
-    world
-        .chunks
-        .get(&coord)
-        .is_some_and(|l| matches!(l.state, MeshState::Air | MeshState::Ready(_)))
+    world.chunks.get(&coord).is_some_and(|l| l.state.is_final())
 }
 
 /// The round start world at view `(h, v)`, far field off, spawn slab landed.
-fn spawned_round_world(h: i32, v: i32) -> (World, DVec3) {
+fn near_only_world(h: i32, v: i32) -> (World, DVec3) {
     use crate::render_config::RenderConfig;
-    use crate::world::generation::WorldgenKind;
-    let render = RenderConfig { lod2: false, ..RenderConfig::default() };
-    let mut world = World::with_kind(42, render, WorldgenKind::Diffusion, false);
-    world.set_view_distances(h, v);
-    let spawn = world.chart_spawn().expect("the start world is charted");
-    world.prepare_around(spawn);
-    world.drive_spawn_ready();
-    (world, spawn)
+    spawned_round_world(RenderConfig { lod2: false, ..RenderConfig::default() }, h, v)
 }
 
 /// Every loaded chunk of the data box has a settled grid.
@@ -201,7 +191,7 @@ fn assert_data_box_lit(world: &World) {
 /// promoted on dark planes for a neighbour that never lights.
 #[test]
 fn rest_lights_the_data_box_and_promotes_nothing_on_dark_planes() {
-    let (mut world, spawn) = spawned_round_world(4, 2);
+    let (mut world, spawn) = near_only_world(4, 2);
     for pass in 0.. {
         if world.entry_complete() {
             break;
@@ -220,7 +210,7 @@ fn rest_lights_the_data_box_and_promotes_nothing_on_dark_planes() {
 /// trail the flight skipped, and no light settle stays owed.
 #[test]
 fn flight_then_stop_fills_the_whole_view() {
-    let (mut world, spawn) = spawned_round_world(6, 3);
+    let (mut world, spawn) = near_only_world(6, 3);
     let mut eye = spawn;
     let fly = |world: &mut World, eye: &mut DVec3, speed: f64, secs: f64| {
         let start = Instant::now();
@@ -1201,12 +1191,11 @@ fn chunks_wait_for_a_turn_back_only_near_a_seam() {
     use super::super::quadtree::QuadrantMask;
     use crate::ident::Detail;
     use crate::render_config::{RenderConfig, lod_for};
-    use crate::world::generation::WorldgenKind;
 
     let (lod_levels, lod_detail) = lod_for(6);
     let render = RenderConfig { lod2: true, occlusion: true, lod_levels, lod_detail, ..RenderConfig::default() };
     let world_at = |dir: DVec3| {
-        let mut world = World::with_kind(42, render, WorldgenKind::Diffusion, false);
+        let mut world = round_world(42, render);
         world.set_view_distances(6, 3);
         let eye = world.home_eye(dir, 100.0);
         let (home, _, _, _) = world.begin_stream(eye, None);
@@ -1258,7 +1247,7 @@ fn chunks_wait_for_a_turn_back_only_near_a_seam() {
     let span = 32;
     let (bx, bz) = (home.x * 16 + 8, home.z * 16 + 8);
     let pos = SectionPos { detail: Detail(0), body: 0, face: Face::PosY, x: bx.div_euclid(span), z: bz.div_euclid(span) };
-    world.sections.insert(pos, SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None });
+    world.sections.insert(pos, ready_section());
     world.section_visible.push((pos, QuadrantMask::ALL));
     world.unload_far_with(inland, |state, _| drop(state));
     assert!(world.chunks.contains_key(&home), "a section on screen does not drop a waiting chunk");
@@ -1276,11 +1265,10 @@ fn chunks_wait_for_a_turn_back_only_near_a_seam() {
 #[test]
 fn waiting_chunks_respect_the_layers_and_the_far_field_switch() {
     use crate::render_config::{RenderConfig, lod_for};
-    use crate::world::generation::WorldgenKind;
 
     let (lod_levels, lod_detail) = lod_for(6);
     let render = RenderConfig { lod2: true, occlusion: true, lod_levels, lod_detail, ..RenderConfig::default() };
-    let mut world = World::with_kind(42, render, WorldgenKind::Diffusion, false);
+    let mut world = round_world(42, render);
     world.set_view_distances(6, 3);
     let eye = world.home_eye(DVec3::new(0.0, 1.0, 1.0 - 6.5e-6), 100.0);
     let (home, _, _, _) = world.begin_stream(eye, None);
@@ -1430,9 +1418,8 @@ fn skipped_remesh_pushes_visibility_when_the_chunk_was_hidden() {
 #[test]
 fn far_chart_strip_hole_is_closed() {
     use crate::render_config::RenderConfig;
-    use crate::world::generation::WorldgenKind;
 
-    let mut world = World::with_kind(42, RenderConfig::default(), WorldgenKind::Diffusion, false);
+    let mut world = round_world(42, RenderConfig::default());
     let eye = world.chart_eye(DVec3::new(0.0, -8_640_801.0, 22_107_307.0)).expect("symptom chart eye");
     let ground = world.terrain().surface(Face::PosY, eye.x as i32, eye.z as i32);
     assert_ne!(ground, i32::MIN, "symptom column has no surface");
@@ -1512,11 +1499,10 @@ fn far_chart_seam_has_no_hole() {
     use crate::render_config::RenderConfig;
     use crate::space::atlas::Patch;
     use crate::space::chart::{self, Map};
-    use crate::world::generation::WorldgenKind;
     use crate::ident::Detail;
     use crate::world::section::{section_span, FINEST_DETAIL};
 
-    let mut world = World::with_kind(42, RenderConfig::default(), WorldgenKind::Diffusion, false);
+    let mut world = round_world(42, RenderConfig::default());
     let centre = world.generator.cosmos().expect("cosmos").home().centre_f();
     let atlas = world
         .generator
@@ -1747,7 +1733,7 @@ fn full_section_floor_keeps_the_lane_armed_and_frees_a_slot() {
         z: -3,
     };
     world.section_desired = vec![hole];
-    let empty = || SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None };
+    let empty = ready_section;
     for i in 0..super::super::SECTION_SLOT_FLOOR {
         world.sections.insert(filler(i), empty());
     }
@@ -1798,7 +1784,7 @@ fn standin_under_a_full_floor_still_admits_its_parent() {
         z: -3,
     };
     world.section_desired = vec![parent];
-    let empty = || SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None };
+    let empty = ready_section;
     for i in 0..super::super::SECTION_SLOT_FLOOR - 1 {
         world.sections.insert(filler(i), empty());
     }
@@ -1877,9 +1863,8 @@ fn mesh_seeds_only_admissible_chunks() {
 #[test]
 fn chart_frontier_holds_within_a_block() {
     use crate::render_config::RenderConfig;
-    use crate::world::generation::WorldgenKind;
 
-    let mut world = World::with_kind(42, RenderConfig::default(), WorldgenKind::Diffusion, false);
+    let mut world = round_world(42, RenderConfig::default());
     let spawn = world.chart_spawn().expect("the start world is charted");
     let eye = world.chart_eye(spawn).expect("spawn stands on a chart");
     let center = Coord::new(
@@ -1920,9 +1905,8 @@ fn chart_frontier_holds_within_a_block() {
 #[test]
 fn fast_frontier_holds_on_a_fixed_grid() {
     use crate::render_config::RenderConfig;
-    use crate::world::generation::WorldgenKind;
 
-    let mut world = World::with_kind(42, RenderConfig::default(), WorldgenKind::Diffusion, false);
+    let mut world = round_world(42, RenderConfig::default());
     let spawn = world.chart_spawn().expect("the start world is charted");
     let eye = world.chart_eye(spawn).expect("spawn stands on a chart");
     let center = Coord::new(
@@ -2041,9 +2025,8 @@ fn far_chart_seam_readiness_converges() {
     use crate::render_config::RenderConfig;
     use crate::space::atlas::Patch;
     use crate::space::chart::{self, Map};
-    use crate::world::generation::WorldgenKind;
 
-    let mut world = World::with_kind(42, RenderConfig::default(), WorldgenKind::Diffusion, false);
+    let mut world = round_world(42, RenderConfig::default());
     let centre = world.generator.cosmos().expect("cosmos").home().centre_f();
     let atlas = world
         .generator
@@ -2148,9 +2131,8 @@ fn far_chart_seam_readiness_converges() {
 #[test]
 fn far_eye_thresholds_hold() {
     use crate::render_config::RenderConfig;
-    use crate::world::generation::WorldgenKind;
 
-    let mut world = World::with_kind(42, RenderConfig::default(), WorldgenKind::Diffusion, false);
+    let mut world = round_world(42, RenderConfig::default());
     let up = DVec3::new(0.0, 1.0, 0.0);
     let climb = |world: &mut World, above: f64| {
         world.place_eyes(world.home_eye(up, above));
@@ -2234,9 +2216,8 @@ fn publish_far(world: &mut World) {
 #[test]
 fn far_chart_altitude_readiness_converges() {
     use crate::render_config::RenderConfig;
-    use crate::world::generation::WorldgenKind;
 
-    let mut world = World::with_kind(42, RenderConfig::default(), WorldgenKind::Diffusion, false);
+    let mut world = round_world(42, RenderConfig::default());
     for (site, dir, heights) in World::FAR_SITES {
         for &above in heights {
             let name = &format!("{site} +{above}");
@@ -2263,11 +2244,10 @@ fn far_chart_altitude_readiness_converges() {
 #[test]
 fn far_chart_altitude_readiness_converges_while_moving() {
     use crate::render_config::RenderConfig;
-    use crate::world::generation::WorldgenKind;
 
     const MOVES: usize = 48;
     const PASSES_PER_MOVE: usize = 12;
-    let mut world = World::with_kind(42, RenderConfig::default(), WorldgenKind::Diffusion, false);
+    let mut world = round_world(42, RenderConfig::default());
     let above = 50_000.0;
     for (site, dir, _) in World::FAR_SITES {
         let name = &format!("{site} +{above} moving");

@@ -2,6 +2,7 @@
 //! module tree (`world::tests`), same `super::*` access to private state.
 
 use super::*;
+use super::fixtures::{air_loaded, ready_section, round_world};
 use crate::block::registry::AIR;
 use crate::coord::Face;
 use crate::math::Aabb;
@@ -168,7 +169,7 @@ fn far_lane_admits_when_near_slots_exceed_the_cpu_cull_ceiling() {
     let held = |i: usize| SectionPos { body: 0, face: Face::PosY, detail: section::FINEST_DETAIL, x: 1 + i as i32, z: 0 };
     for i in 0..SECTION_SLOT_FLOOR - 1 {
         let state = if i % 2 == 0 {
-            SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None }
+            ready_section()
         } else {
             SectionState::Meshing { token: pipeline::ClaimToken(i as u64) }
         };
@@ -255,7 +256,7 @@ fn section_covering_gates_on_a_ready_ancestor_or_self() {
     let center = stand_on_twin(&mut world);
     let cell = world.desired_sections(center)[0];
     assert!(!world.section_covered(cell), "nothing loaded means uncovered");
-    let empty_ready = || SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None };
+    let empty_ready = ready_section;
     world.sections.insert(cell, empty_ready());
     assert!(world.section_covered(cell), "a Ready self covers");
     world.sections.remove(&cell);
@@ -277,7 +278,7 @@ fn ready_finer_section_draws_while_its_cut_is_meshing() {
         z: -8_000,
     };
     let child = parent.child(section::Quadrant::ALL[0]);
-    let empty = || SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None };
+    let empty = ready_section;
     world.section_desired = vec![parent];
     world.sections.insert(child, empty());
     world.sections.insert(parent, SectionState::Meshing { token: pipeline::ClaimToken(1) });
@@ -329,7 +330,7 @@ fn section_lane_stays_armed_while_desired_cells_are_uncovered() {
     // Everything Ready: converged — still no re-arm.
     world.pending_sections.take();
     for &cell in &world.section_desired.clone() {
-        world.sections.insert(cell, SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None });
+        world.sections.insert(cell, ready_section());
     }
     world.section_desired = world.desired_sections(center);
     world.rebuild_section_visible(None);
@@ -352,7 +353,7 @@ fn moving_far_lane_admits_a_hole_past_the_resident_nearest() {
     let at = |x: i32| SectionPos { body: 0, face: Face::PosY, detail: section::FINEST_DETAIL, x, z: 0 };
     world.section_desired = (0..40).map(at).collect();
     for x in 0..32 {
-        world.sections.insert(at(x), SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None });
+        world.sections.insert(at(x), ready_section());
     }
     let mut rank = Vec::new();
     let mut visited = Vec::new();
@@ -433,22 +434,6 @@ fn desired_frontier_responds_to_altitude() {
     );
 }
 
-/// A settled born-air chunk for testing coverage skip logic.
-fn air_chunk(cx: i32, cy: i32, cz: i32) -> Loaded {
-    Loaded {
-        chunk: std::sync::Arc::new(Chunk::from_uniform(cx, cy, cz, AIR)),
-        state: MeshState::Air,
-        rev: 0,
-        connectivity: None,
-        visible: true,
-        light: None,
-        has_blocklight: false,
-        light_reseed: false,
-        light_gen: 0,
-        mesh_hash: None,
-    }
-}
-
 /// Verify coverage_skips skips only provably-covered sections inside the slab,
 /// and only when backed by settled chunks.
 #[test]
@@ -506,7 +491,7 @@ fn coverage_skip_is_sound_and_backed() {
         for dz in 0..nchunks {
             for dx in 0..nchunks {
                 let (cx, cz) = (cx0 + dx, cz0 + dz);
-                world.chunks.insert(ChunkCoord::new(cx, cy, cz), air_chunk(cx, cy, cz));
+                world.chunks.insert(ChunkCoord::new(cx, cy, cz), air_loaded(cx, cy, cz));
             }
         }
     }
@@ -515,7 +500,7 @@ fn coverage_skip_is_sound_and_backed() {
     // If any chunk is in-flight, don't skip (fast-descent guard).
     world.chunks.insert(ChunkCoord::new(cx0, cy_lo, cz0), Loaded {
         state: MeshState::NeedsMesh { building: true, prev: None },
-        ..air_chunk(cx0, cy_lo, cz0)
+        ..air_loaded(cx0, cy_lo, cz0)
     });
     assert!(!world.coverage_skips(center, cell), "an in-flight covering chunk blocks the skip");
 }
@@ -684,9 +669,8 @@ fn edits_persist_across_unload() {
 #[test]
 fn distinct_seeds_differ() {
     use crate::render_config::RenderConfig;
-    use crate::world::generation::WorldgenKind;
-    let a = World::with_kind(1, RenderConfig::default(), WorldgenKind::Diffusion, false);
-    let b = World::with_kind(9_999, RenderConfig::default(), WorldgenKind::Diffusion, false);
+    let a = round_world(1, RenderConfig::default());
+    let b = round_world(9_999, RenderConfig::default());
     let strip = |w: &World| {
         let (_, x, z, ground) = home_storage_column(w, Face::PosY);
         assert_ne!(ground, i32::MIN, "the start chart has no surface");
@@ -1742,7 +1726,7 @@ fn lod2_far_field_drives_to_covering_complete() {
             if let Some(s @ SectionState::Meshing { .. }) = world.sections.get_mut(&pos)
                 && matches!(s, SectionState::Meshing { token: t } if *t == token)
             {
-                *s = SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None };
+                *s = ready_section();
             }
         }
     }
@@ -1822,23 +1806,11 @@ fn admit_selects_the_nearest_ready_mesh_keys() {
                 let fill = if y == 0 { stone } else { AIR };
                 world.chunks.insert(
                     coord,
-                    Loaded {
-                        chunk: std::sync::Arc::new(Chunk::from_data(
-                            x,
-                            y,
-                            z,
-                            ChunkData::Uniform(fill),
-                        )),
-                        state: MeshState::needs_mesh(),
-                        rev: 0,
-                        connectivity: None,
-                        visible: true,
-                        light: None,
-                        has_blocklight: false,
-                        light_reseed: false,
-                        light_gen: 0,
-                        mesh_hash: None,
-                    },
+                    Loaded::new(
+                        std::sync::Arc::new(Chunk::from_data(x, y, z, ChunkData::Uniform(fill))),
+                        MeshState::needs_mesh(),
+                        0,
+                    ),
                 );
             }
         }
@@ -1904,23 +1876,11 @@ fn admit_does_not_visit_far_blocked_seeds_once_want_is_filled() {
                 let fill = if y == 0 { stone } else { AIR };
                 world.chunks.insert(
                     coord,
-                    Loaded {
-                        chunk: std::sync::Arc::new(Chunk::from_data(
-                            x,
-                            y,
-                            z,
-                            ChunkData::Uniform(fill),
-                        )),
-                        state: MeshState::needs_mesh(),
-                        rev: 0,
-                        connectivity: None,
-                        visible: true,
-                        light: None,
-                        has_blocklight: false,
-                        light_reseed: false,
-                        light_gen: 0,
-                        mesh_hash: None,
-                    },
+                    Loaded::new(
+                        std::sync::Arc::new(Chunk::from_data(x, y, z, ChunkData::Uniform(fill))),
+                        MeshState::needs_mesh(),
+                        0,
+                    ),
                 );
             }
         }
@@ -2371,7 +2331,7 @@ fn mesh_free_hook_records_each_handle_once() {
     assert_eq!(mesh_free_log::take(), vec![h]);
 
     let h2 = MeshHandle::from_raw_parts(52, 1);
-    let mut loaded = air_chunk(0, 0, 0);
+    let mut loaded = air_loaded(0, 0, 0);
     loaded.state = ready(h2);
     loaded.retire_logged(MeshState::Air);
     assert_eq!(mesh_free_log::take(), vec![h2]);
@@ -3636,12 +3596,11 @@ fn great_rock_eye(world: &World) -> [i64; 3] {
 #[test]
 fn open_gen_cursor_drains_across_frames() {
     use crate::world::chunk::CHUNK_SIZE;
-    use crate::world::generation::WorldgenKind;
 
     let mut render = RenderConfig::default();
     render.lod2 = false;
     render.occlusion = false;
-    let mut world = World::with_kind(42, render, WorldgenKind::Diffusion, false);
+    let mut world = round_world(42, render);
     let eye = great_rock_eye(&world);
     world.set_view_distances(1, 1);
     let center = ChunkCoord::new(
@@ -3798,23 +3757,8 @@ fn buried_solid_mesh_is_air_and_an_edit_remeshes_it() {
 
 fn stone_loaded(coord: ChunkCoord, stone: crate::block::BlockId) -> Loaded {
     use crate::world::chunk::{Chunk, ChunkData};
-    Loaded {
-        chunk: std::sync::Arc::new(Chunk::from_data(
-            coord.x,
-            coord.y,
-            coord.z,
-            ChunkData::Uniform(stone),
-        )),
-        state: MeshState::needs_mesh(),
-        rev: 0,
-        connectivity: None,
-        visible: true,
-        light: Some(light::LightGrid::dark()),
-        has_blocklight: false,
-        light_reseed: false,
-        light_gen: 0,
-        mesh_hash: None,
-    }
+    let chunk = std::sync::Arc::new(Chunk::from_data(coord.x, coord.y, coord.z, ChunkData::Uniform(stone)));
+    Loaded { light: Some(light::LightGrid::dark()), ..Loaded::new(chunk, MeshState::needs_mesh(), 0) }
 }
 
 /// Headless stream to `entry_complete` inside the seed-42 catalog's greatest asteroid
@@ -3830,14 +3774,13 @@ fn asteroid_entry_breakdown() {
     use super::streaming::headless::{Headless, PHASE_NAMES};
     use crate::world::brick::ChunkPayload;
     use crate::world::chunk::{CHUNK_SIZE, CHUNK_VOLUME};
-    use crate::world::generation::WorldgenKind;
 
     const VIEW_H: i32 = 12;
     let mut render = RenderConfig::default();
     // Shipped settings leave distant LOD off. Occlusion rebuild needs the engine.
     render.lod2 = false;
     render.occlusion = false;
-    let mut world = World::with_kind(42, render, WorldgenKind::Diffusion, false);
+    let mut world = round_world(42, render);
     let [x, y, z] = great_rock_eye(&world);
     let eye = DVec3::new(x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5);
     world.set_view_distances(VIEW_H, 3);
