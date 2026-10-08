@@ -29,3 +29,37 @@ pub fn splitmix_next(state: &mut u64) -> u64 {
     splitmix_finish(*state)
 }
 
+/// Deterministic randomness for tests: a splitmix64 stream from a seed.
+#[cfg(test)]
+pub(crate) struct TestRng(u64);
+
+#[cfg(test)]
+impl TestRng {
+    pub(crate) fn new(seed: u64) -> Self {
+        Self(seed)
+    }
+
+    /// The next 64 bits of the stream.
+    pub(crate) fn next_u64(&mut self) -> u64 {
+        splitmix_next(&mut self.0)
+    }
+
+    /// A value in `0..n` (modulo bias is fine for tests).
+    pub(crate) fn below(&mut self, n: u64) -> u64 {
+        self.next_u64() % n
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The stream is splitmix64's reference sequence, so a test that pins values off it stays put.
+    #[test]
+    fn test_rng_is_splitmix64() {
+        let mut rng = TestRng::new(0);
+        let first = [rng.next_u64(), rng.next_u64(), rng.next_u64()];
+        assert_eq!(first, [0xe220_a839_7b1d_cdaf, 0x6e78_9e6a_a1b9_65f4, 0x06c4_5d18_8009_454f]);
+        assert!((0..1000).all(|_| rng.below(7) < 7));
+    }
+}
