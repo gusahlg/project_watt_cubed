@@ -391,13 +391,6 @@ impl ChunkBox {
         lo[0] <= c.x && c.x <= hi[0] && lo[1] <= c.y && c.y <= hi[1] && lo[2] <= c.z && c.z <= hi[2]
     }
 
-    /// Whether `c` lies within the box's inclusive extent along `axis`, wherever it is on the others.
-    #[inline]
-    pub fn spans(self, c: ChunkCoord, axis: usize) -> bool {
-        let k = [c.x, c.y, c.z][axis];
-        self.lo[axis] <= k && k <= self.hi[axis]
-    }
-
     /// Whether the boxes share a chunk.
     #[inline]
     pub fn meets(self, other: ChunkBox) -> bool {
