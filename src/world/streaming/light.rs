@@ -731,7 +731,7 @@ mod tests {
     use super::*;
     use crate::render_config::RenderConfig;
     use crate::world::generation::WorldgenKind;
-    use crate::world::terrain::cosmos::{Kind, Shape};
+    use crate::world::terrain::cosmos::Shape;
 
     /// The roof raise before the index: every edited chunk of the world, filtered by sky and column.
     fn raise_by_scan(world: &World, key: ColumnKey, ceiling: &mut light::CeilingWindow) {
@@ -762,18 +762,13 @@ mod tests {
         out
     }
 
-    /// Random roofs, holes and compacted edits on every face of a twin cube: each column's ceiling
-    /// built through the index equals the one built by scanning the whole overlay.
+    /// Random roofs, holes and compacted edits on every face of the stored cubes: each column's
+    /// ceiling built through the index equals the one built by scanning the whole overlay.
     #[test]
     fn indexed_roofs_match_the_overlay_scan() {
         let mut world = World::with_kind(7, RenderConfig::default(), WorldgenKind::Diffusion, false);
-        let cosmos = world.generator.cosmos().expect("cosmos");
-        let twin = *cosmos
-            .bodies()
-            .iter()
-            .find(|b| b.kind == Kind::Twin && matches!(b.shape, Shape::Cube { .. }))
-            .expect("a twin cube");
         let rock = world.registry.id_by_label("rock").expect("rock");
+        let cosmos = world.generator.cosmos().expect("cosmos");
         let mut state = 0x2545_f491_4f6c_dd1du64;
         let mut rand = |n: i32| {
             state ^= state << 13;
@@ -781,17 +776,30 @@ mod tests {
             state ^= state << 17;
             (state % n as u64) as i32
         };
-        let centre = (twin.centre[0] as i32, twin.centre[1] as i32, twin.centre[2] as i32);
+        // A storage cell just above each face centre of every stored cube: storage is the
+        // reference cube moved by `origin - ref_min`, and each face keeps its own sky.
+        let mut sites = Vec::new();
+        for atlas in world.generator.atlases() {
+            let Some(g) = atlas.grid else { continue };
+            let Some(Shape::Cube { half }) = cosmos.bodies().iter().find(|b| b.id == g.body).map(|b| b.shape) else {
+                continue;
+            };
+            let centre = (atlas.centre.x as i32, atlas.centre.y as i32, atlas.centre.z as i32);
+            for face in Face::ALL {
+                let frame = FaceFrame::new(face);
+                let (cu, ca, cv) = frame.cell_to_local(centre);
+                let r = frame.cell_to_world((cu, ca + half as i32 + 20, cv));
+                let at = |a: usize, c: i32| (i64::from(c) - g.ref_min[a] + g.origin[a]) as i32;
+                sites.push((face, (at(0, r.0), at(1, r.1), at(2, r.2))));
+            }
+        }
         let mut cells = Vec::new();
         let mut faces = Vec::new();
-        for face in Face::ALL {
+        for &(face, site) in &sites {
             let frame = FaceFrame::new(face);
-            let (cu, _, cv) = frame.cell_to_local(centre);
-            for _ in 0..80 {
-                let (u, v) = (cu + rand(96) - 48, cv + rand(96) - 48);
-                let ground = world.generator.surface(face, u, v);
-                assert_ne!(ground, i32::MIN, "{face:?} has ground at its centre");
-                let (x, y, z) = frame.cell_to_world((u, ground + rand(48) - 6, v));
+            let (su, sa, sv) = frame.cell_to_local(site);
+            for _ in 0..40 {
+                let (x, y, z) = frame.cell_to_world((su + rand(80) - 40, sa + rand(48) - 24, sv + rand(80) - 40));
                 world.set_block(x, y, z, if rand(4) == 0 { AIR } else { rock });
                 cells.push((x, y, z));
                 if let Sky::Axis(f) = world.generator.sky(World::chunk_of(x, y, z))
@@ -802,12 +810,13 @@ mod tests {
             }
         }
         // A lone roof put back compacts its chunk out of the overlay; the index keeps the layer.
-        let frame = FaceFrame::new(Face::PosY);
-        let (cu, _, cv) = frame.cell_to_local(centre);
-        let (u, v) = (cu + 70, cv - 70);
-        cells.push(frame.cell_to_world((u, world.generator.surface(Face::PosY, u, v) + 40, v)));
-        let lone = *cells.last().unwrap();
-        world.set_block(lone.0, lone.1, lone.2, rock);
+        let (face, site) = sites[0];
+        let frame = FaceFrame::new(face);
+        let (su, sa, sv) = frame.cell_to_local(site);
+        let lone = frame.cell_to_world((su + 300, sa + 10, sv));
+        let generated = world.generator.voxel_at(lone.0, lone.1, lone.2);
+        world.set_block(lone.0, lone.1, lone.2, if generated == rock { AIR } else { rock });
+        cells.push(lone);
         for &(x, y, z) in cells.iter().rev().step_by(3) {
             let generated = world.generator.voxel_at(x, y, z);
             world.set_block(x, y, z, generated);
