@@ -239,30 +239,33 @@ impl World {
 
     /// Build chunk GPU mesh (sync dirty-remesh). Frees old handle exactly once.
     fn mesh_chunk(&mut self, coord: Coord, eng: &mut Engine) {
-        self.refresh_tables();
-        // Move the scratch out so the build can borrow `self.chunks` shared
-        // (for cross-chunk neighbour culling) while filling it. `MeshData` has no
-        // `Default` (it carries a `Pass`), so swap in a fresh opaque scratch
-        // rather than `mem::take`; `build_chunk_mesh` clears it first anyway.
+        // Move the scratch out so the build can borrow `self` while filling it.
+        // `MeshData` has no `Default` (it carries a `Pass`), so swap in a fresh
+        // opaque scratch rather than `mem::take`; the build clears it first anyway.
         let mut scratch = std::mem::replace(&mut self.scratch, mesh::new_chunk_mesh_data());
-        let tables = self.tables.get();
-        let uniform = self.chunks[&coord].chunk.uniform();
-        let padded = self.capture_padded(coord);
-        // Use currently-published light (may be stale after edits). Geometry updates
-        // this frame for responsiveness; relit result lands later when light reconverges.
-        let degraded = !self.light_ready(coord);
-        self.mark_degraded(coord, degraded);
-        let light = self.capture_padded_light(coord, degraded);
-        mesh::build_chunk_mesh(&padded, uniform, &tables, &light, &mut scratch);
-        debug_assert!(
-            self.chunks.get(&coord).is_some_and(|l| l.state.is_dirty()),
-            "sync remesh of non-Dirty {coord:?}"
-        );
+        self.build_dirty_mesh(coord, &mut scratch);
         // `upload_chunk`'s retire frees the edited-Ready chunk's old mesh
         // (`Dirty.prev`) exactly once and installs the fresh `Ready`/`Air`.
         let hash = mesh::content_hash(&scratch);
         self.upload_chunk(coord, &scratch, Some(hash), eng);
         self.scratch = scratch;
+    }
+
+    /// The edit remesh's mesh of `coord`, built into `out`. Uses the published light, which may be
+    /// stale after an edit: geometry updates this frame, the relit mesh lands once light reconverges.
+    pub(in crate::world) fn build_dirty_mesh(&mut self, coord: Coord, out: &mut mesh::ChunkMeshData) {
+        self.refresh_tables();
+        let tables = self.tables.get();
+        let uniform = self.chunks[&coord].chunk.uniform();
+        let padded = self.capture_padded(coord);
+        let degraded = !self.light_ready(coord);
+        self.mark_degraded(coord, degraded);
+        let light = self.capture_padded_light(coord, degraded);
+        mesh::build_chunk_mesh(&padded, uniform, &tables, &light, out);
+        debug_assert!(
+            self.chunks.get(&coord).is_some_and(|l| l.state.is_dirty()),
+            "sync remesh of non-Dirty {coord:?}"
+        );
     }
 
     /// Re-snapshot hot solidity array if palette grew (append-only, new Arc, old jobs unaffected)
