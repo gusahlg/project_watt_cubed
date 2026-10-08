@@ -430,24 +430,8 @@ pub struct World {
     admit_coords: AdmitScratch<Coord>,
     /// Reused by the section admission lane.
     admit_sections: AdmitScratch<SectionPos>,
-    /// Generate runs for the current data box, nearest-first, not yet submitted.
-    /// Kept across frames: rebuilding it walks every coord, and a 2 ms budget
-    /// that pays that walk each pass admits only the floor.
-    gen_columns: Vec<(u64, streaming::GenRun)>,
-    /// Box `gen_columns` was gathered for. A mismatch, or `gen_cursor_dirty`,
-    /// rebuilds the queue instead of scanning the data box again.
-    gen_cursor_center: Option<Coord>,
-    gen_cursor_box: Option<ChunkBox>,
-    gen_cursor_slab: Option<ChunkBox>,
-    gen_cursor_dirty: bool,
-    /// Velocity the queued runs were last ordered with. A change re-sorts;
-    /// a standing eye does not.
-    gen_cursor_vel: DVec3,
-    gen_cursor_ranked: bool,
-    /// Loading radii and travel heading `gen_columns` was gathered for.
-    gen_cursor_lh: i32,
-    gen_cursor_lv: i32,
-    gen_cursor_heading: i8,
+    /// Generate runs for the current data box, and what they were gathered for.
+    gen_cursor: streaming::GenCursor,
     /// Radii new generation, light and mesh may cover. `-1` until the first
     /// stream, which means the full view. Already-loaded chunks outside this
     /// stay until the unload box frees them.
@@ -462,18 +446,8 @@ pub struct World {
     light_owed: FastSet<Coord>,
     /// Coords with generate jobs in flight. Blocks re-enqueue; cleared on drain.
     generating: FastSet<Coord>,
-    /// Worker results integrated, and claim keys released by deschedule.
-    /// The flight bench reads these; a quiet frame does not touch them.
-    jobs_completed: u64,
-    jobs_cancelled: u64,
-    /// Chunks stored from a generate result, how many of those were already
-    /// behind the player, and results dropped because the loading window had
-    /// left them (the flight bench's wasted-work counts).
-    gen_landed: u64,
-    gen_landed_behind: u64,
-    gen_discarded: u64,
-    /// Generation run-list rebuilds (the flight bench's regrow cost).
-    gen_cursor_rebuilds: u64,
+    /// The flight bench's and the stress gauges' counters.
+    counters: streaming::StreamCounters,
     /// `NeedsMesh { building: true }` claims. Counter so idle `pump` never scans chunks.
     building_meshes: usize,
     /// `SectionState::Meshing` claims. Counter so idle `pump` never scans sections.
@@ -499,13 +473,6 @@ pub struct World {
     light_pending: Sticky,
     /// Chunks needing light settling (budgeted, seeded on load/edit/border moves).
     light_worklist: worklist::RingWorklist,
-    /// Cumulative light-worklist insert attempts (stress: seeds per chunk).
-    light_seed_inserts: u64,
-    light_seed_split: LightSeedSplit,
-    /// Cumulative light jobs accepted by the worker pool.
-    light_admitted: u64,
-    /// Jobs accepted by the most recent [`admit`]`<LightLane>` pass.
-    light_admitted_last: usize,
     /// Chunks with a light-settle job in flight on the worker pool. A settle is
     /// claimed out of `light_worklist` at submit and released here when its grid
     /// lands, so at most one flood per chunk is in flight and the mesh gate
@@ -545,25 +512,8 @@ pub struct World {
     /// bounded hole in the world, not an infinite resubmit-panic loop. Every
     /// scan that would re-request the work consults this set.
     quarantined: FastSet<streaming::FailKey>,
-    /// Descriptor count last processed by [`Self::refresh_textures`].
-    textures_built: usize,
-    /// Built texture layers by id, kept so palette growth (crafting registers
-    /// one block at a time) appends new layers instead of regenerating all.
-    /// Cleared when the appearance `revision` (or GPU-descriptor flag) changes.
-    texture_cache: Vec<Vec<u8>>,
-    /// Layers last sent to the GPU (`set` on first upload, `append` after).
-    /// Existing layers never change: a layer is a pure function of the visual
-    /// at one revision, and ids are append-only, so growth never re-sends the
-    /// prefix unless the appearance revision moved.
-    uploaded_len: usize,
-    /// Appearance revision last used to fill [`Self::texture_cache`].
-    appearance_revision: u32,
-    /// Device texture-array layer ceiling, stamped into `HotTables::layer_cap`
-    /// so the meshers saturate vertex layers at it. Construction uses `u16::MAX`
-    /// (identity); the first engine contact overwrites it once.
-    texture_layer_cap: u16,
-    /// True after [`World::pump`] has read `Engine::max_texture_array_layers`.
-    texture_cap_from_device: bool,
+    /// The block texture array as last built and sent to the GPU.
+    textures: textures::BlockTextures,
     /// Baked corner AO in the mesher — stamped into `HotTables::ao`. A meshing
     /// input like `lighting`: toggling remeshes the world.
     ao: bool,
@@ -681,10 +631,6 @@ pub struct World {
     /// Cost knob for the engine's GPU cull dispatch; the far lane's section
     /// budget is [`sections_allowed`](Self::sections_allowed), not this raw value.
     slot_ceiling: u32,
-    /// Vertex bytes uploaded for sections in the current drain (harness peak).
-    section_upload_bytes: usize,
-    /// Chunk + section vertex bytes uploaded in the current drain (harness peak).
-    drain_upload_bytes: usize,
     /// Whether desired sections still need enqueueing (budget spreads a flood).
     pending_sections: Sticky,
     /// Sections invalidated by edits, freed and re-admitted from the generator.
@@ -902,16 +848,7 @@ impl World {
             workers: None,
             admit_coords: AdmitScratch::default(),
             admit_sections: AdmitScratch::default(),
-            gen_columns: Vec::new(),
-            gen_cursor_center: None,
-            gen_cursor_box: None,
-            gen_cursor_slab: None,
-            gen_cursor_dirty: false,
-            gen_cursor_vel: DVec3::ZERO,
-            gen_cursor_ranked: false,
-            gen_cursor_lh: i32::MIN,
-            gen_cursor_lv: i32::MIN,
-            gen_cursor_heading: 0,
+            gen_cursor: streaming::GenCursor::default(),
             load_h: -1,
             load_v: -1,
             load_moved: false,
@@ -919,12 +856,7 @@ impl World {
             load_heading: 0,
             light_owed: FastSet::default(),
             generating: FastSet::default(),
-            jobs_completed: 0,
-            jobs_cancelled: 0,
-            gen_landed: 0,
-            gen_landed_behind: 0,
-            gen_discarded: 0,
-            gen_cursor_rebuilds: 0,
+            counters: streaming::StreamCounters::default(),
             building_meshes: 0,
             meshing_sections: 0,
             pending_gen: Sticky::default(),
@@ -939,10 +871,6 @@ impl World {
                 Coord::new(0, 0, 0),
                 ViewVolume::view(DEFAULT_VIEW_RADIUS).worklist_rings(Some(Face::PosY), 0),
             ),
-            light_seed_inserts: 0,
-            light_seed_split: LightSeedSplit::default(),
-            light_admitted: 0,
-            light_admitted_last: 0,
             light_inflight: FastSet::default(),
             light_apply_queue: VecDeque::new(),
             light_gate: streaming::LightGate::default(),
@@ -951,12 +879,7 @@ impl World {
             mesh_pending_degraded: None,
             job_strikes: FastMap::default(),
             quarantined: FastSet::default(),
-            textures_built: 0,
-            texture_cache: Vec::new(),
-            uploaded_len: 0,
-            appearance_revision: 0,
-            texture_layer_cap: u16::MAX,
-            texture_cap_from_device: false,
+            textures: textures::BlockTextures::new(),
             ao: true,
             tables_epoch: 0,
             occlusion: Occlusion::default(),
@@ -993,8 +916,6 @@ impl World {
             section_upload_queue: VecDeque::new(),
             gpu_live_slots: 0,
             slot_ceiling: CPU_CULL_MAX,
-            section_upload_bytes: 0,
-            drain_upload_bytes: 0,
             pending_sections: Sticky::default(),
             dirty_sections: FastSet::default(),
             section_edit_rev: FastMap::default(),

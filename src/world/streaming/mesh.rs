@@ -273,7 +273,7 @@ impl World {
         // while `&mut self.tables` is held, so bind `registry` separately.
         let count = self.registry.block_count();
         let registry = &self.registry;
-        let layer_cap = self.texture_layer_cap;
+        let layer_cap = self.textures.layer_cap;
         let ao = self.ao;
         let rev = Revision::from_count(count | (self.tables_epoch as usize) << 32);
         self.tables.sync(rev, || {

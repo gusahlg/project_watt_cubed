@@ -346,8 +346,8 @@ impl World {
 
     /// Count a light-worklist insert (the stress harness's seeds-per-chunk signal).
     pub(in crate::world) fn seed_light(&mut self, coord: Coord, source: super::LightSeed) {
-        self.light_seed_inserts += 1;
-        self.light_seed_split.add(source);
+        self.counters.light_seed_inserts += 1;
+        self.counters.light_seed_split.add(source);
         if let Some(loaded) = self.chunks.get_mut(&coord) {
             loaded.light_reseed = false;
         }

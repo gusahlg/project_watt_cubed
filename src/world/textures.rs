@@ -6,6 +6,36 @@ use crate::block::appearance::{fill_layer, BlockAppearance, LAYER_BYTES, TEXTURE
 
 use super::World;
 
+/// The block texture array as last built and sent to the GPU.
+pub(super) struct BlockTextures {
+    /// Descriptor count last processed by [`World::refresh_textures`].
+    built: usize,
+    /// Built texture layers by id, kept so palette growth (crafting registers
+    /// one block at a time) appends new layers instead of regenerating all.
+    /// Cleared when the appearance `revision` (or GPU-descriptor flag) changes.
+    cache: Vec<Vec<u8>>,
+    /// Layers last sent to the GPU (`set` on first upload, `append` after).
+    /// Existing layers never change: a layer is a pure function of the visual
+    /// at one revision, and ids are append-only, so growth never re-sends the
+    /// prefix unless the appearance revision moved.
+    uploaded_len: usize,
+    /// Appearance revision last used to fill [`Self::cache`].
+    revision: u32,
+    /// Device texture-array layer ceiling, stamped into `HotTables::layer_cap`
+    /// so the meshers saturate vertex layers at it. Construction uses `u16::MAX`
+    /// (identity); the first engine contact overwrites it once.
+    pub(super) layer_cap: u16,
+    /// True after [`World::pump`] has read `Engine::max_texture_array_layers`.
+    cap_from_device: bool,
+}
+
+impl BlockTextures {
+    /// Nothing built or sent yet.
+    pub(super) fn new() -> Self {
+        Self { built: 0, cache: Vec::new(), uploaded_len: 0, revision: 0, layer_cap: u16::MAX, cap_from_device: false }
+    }
+}
+
 impl World {
     /// Rebuild/upload the block texture array when configurations gain layers (world entry, a newly
     /// interned configuration) or the appearance `revision` changes. Existing layers never change at
@@ -14,38 +44,38 @@ impl World {
     pub(super) fn refresh_textures(&mut self, eng: &mut Engine, appearance: &dyn BlockAppearance) {
         // Never zero and never past the vertex field's 14 bits. Construction caches `u16::MAX`; the
         // device cap is read once.
-        if !self.texture_cap_from_device {
+        if !self.textures.cap_from_device {
             let device = eng.max_texture_array_layers().clamp(1, u16::MAX as u32) as u16;
-            self.texture_layer_cap = device.min(crate::block::MAX_DESCRIPTORS as u16);
-            self.texture_cap_from_device = true;
-            self.registry.set_descriptor_cap(self.texture_layer_cap);
+            self.textures.layer_cap = device.min(crate::block::MAX_DESCRIPTORS as u16);
+            self.textures.cap_from_device = true;
+            self.registry.set_descriptor_cap(self.textures.layer_cap);
             #[cfg(test)]
             crate::alloc_count::note_engine(crate::alloc_count::EngineCall::TexLayers);
         }
         let count = self.registry.descriptor_count();
         let rev = appearance.revision();
-        if self.appearance_revision != rev {
-            self.texture_cache.clear();
-            self.uploaded_len = 0;
-            self.textures_built = 0;
-            self.appearance_revision = rev;
+        if self.textures.revision != rev {
+            self.textures.cache.clear();
+            self.textures.uploaded_len = 0;
+            self.textures.built = 0;
+            self.textures.revision = rev;
         }
-        if self.textures_built == count {
+        if self.textures.built == count {
             return;
         }
-        for i in self.texture_cache.len()..count {
+        for i in self.textures.cache.len()..count {
             let mut buf = [0u8; LAYER_BYTES];
             fill_layer(appearance, &self.registry, i as u16, &mut buf);
-            self.texture_cache.push(buf.to_vec());
+            self.textures.cache.push(buf.to_vec());
         }
-        let visible = count.min(self.texture_layer_cap as usize);
-        match plan_texture_upload(&self.texture_cache, self.uploaded_len, visible) {
+        let visible = count.min(self.textures.layer_cap as usize);
+        match plan_texture_upload(&self.textures.cache, self.textures.uploaded_len, visible) {
             Some(TextureUpload::Set(layers)) => eng.set_block_textures(TEXTURE_SIZE, layers),
             Some(TextureUpload::Append(layers)) => eng.append_block_textures(layers),
             None => {}
         }
-        self.uploaded_len = visible;
-        self.textures_built = count;
+        self.textures.uploaded_len = visible;
+        self.textures.built = count;
     }
 }
 

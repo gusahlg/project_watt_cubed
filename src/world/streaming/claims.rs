@@ -74,7 +74,7 @@ impl World {
                 if rearm || in_slab {
                     self.pending_gen.set();
                     // The run already left the queue when it was submitted.
-                    self.gen_cursor_dirty = true;
+                    self.gen_cursor.dirty = true;
                 }
             }
             pipeline::JobKey::Open { coord } => {
@@ -82,7 +82,7 @@ impl World {
                 self.generating.remove(&coord);
                 if rearm || in_slab {
                     self.pending_gen.set();
-                    self.gen_cursor_dirty = true;
+                    self.gen_cursor.dirty = true;
                 }
             }
             pipeline::JobKey::Mesh { coord } => {

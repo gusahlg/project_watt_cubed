@@ -49,10 +49,13 @@ mod window;
 
 pub use gauges::StreamGauges;
 pub(in crate::world) use far::{NearBounds, span_reach};
-pub(in crate::world) use generate::{FailKey, GenRun};
+pub(in crate::world) use gauges::StreamCounters;
+pub(in crate::world) use generate::{FailKey, GenCursor};
 pub(in crate::world) use light::{LightGate, RemeshStats};
 pub(in crate::world) use pacer::{StreamPacer, chunk_behind};
 pub(in crate::world) use window::Window;
+#[cfg(test)]
+pub(in crate::world) use generate::GenRun;
 use far::{eye_chunk, section_key};
 use pacer::{LoadWindow, travel_heading};
 #[cfg(test)]
@@ -685,7 +688,7 @@ impl World {
         // near window streams in, so its trail filter points the right way.
         let (travel, travel_dt) = eye_sample(self.near_eye_prev, center, now);
         self.near_eye_prev = center.is_finite().then_some((center, now));
-        self.light_admitted_last = 0;
+        self.counters.light_admitted_last = 0;
         let center_chunk = eye_chunk(center);
         let far_chunk = eye_chunk(far);
         let far_moved = self.set_far_center(far_chunk);

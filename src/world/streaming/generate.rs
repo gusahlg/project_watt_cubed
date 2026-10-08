@@ -51,6 +51,33 @@ impl GenRun {
     }
 }
 
+/// The generate run list. Kept across frames: rebuilding it walks every coord, and a 2 ms
+/// budget that pays that walk each pass admits only the floor.
+#[derive(Default)]
+pub(in crate::world) struct GenCursor {
+    /// Runs for the current data box, nearest-first, not yet submitted.
+    pub(in crate::world) runs: Vec<(u64, GenRun)>,
+    /// What `runs` was gathered for. A mismatch, or `dirty`, rebuilds the queue instead of
+    /// scanning the data box again.
+    key: Option<GenKey>,
+    pub(in crate::world) dirty: bool,
+    /// Velocity the queued runs were last ordered with. A change re-sorts; a standing eye does not.
+    vel: DVec3,
+    ranked: bool,
+}
+
+/// The data box a run list was gathered for, with the loading radii, the travel heading and the
+/// spawn slab.
+#[derive(PartialEq)]
+struct GenKey {
+    center: Coord,
+    data_box: ChunkBox,
+    lh: i32,
+    lv: i32,
+    heading: i8,
+    slab: Option<ChunkBox>,
+}
+
 /// Forward-progress floor for the generation lane: admit at least this many
 /// columns before the deadline can stop it, so a boundary-cross flood still
 /// makes strict progress each frame under a tight budget (the same floor role
@@ -215,13 +242,13 @@ impl World {
         if self.stream_pacer.holding() {
             self.pending_gen.set();
             return Progress::Partial {
-                remaining: self.gen_columns.len() as u32,
+                remaining: self.gen_cursor.runs.len() as u32,
             };
         }
         if !self.gen_cursor_matches(center) {
             self.rebuild_gen_cursor(center);
         }
-        if self.gen_columns.is_empty() {
+        if self.gen_cursor.runs.is_empty() {
             return Progress::Idle;
         }
         let slots = match self.workers.as_ref() {
@@ -231,30 +258,30 @@ impl World {
         if slots == 0 {
             self.pending_gen.set();
             return Progress::Partial {
-                remaining: self.gen_columns.len() as u32,
+                remaining: self.gen_cursor.runs.len() as u32,
             };
         }
         let deadline = super::lanes::paced_deadline(self, budget);
         let vel = self.stream_pacer.travel();
-        if !self.gen_cursor_ranked || self.gen_cursor_vel != vel {
+        if !self.gen_cursor.ranked || self.gen_cursor.vel != vel {
             let up = self.live_up();
             let fold = self.fold;
-            for entry in &mut self.gen_columns {
+            for entry in &mut self.gen_cursor.runs {
                 let anchor = entry.1.anchor();
                 entry.0 = column_order(center, vel, fold.fold(anchor), up);
             }
-            self.gen_columns.sort_by_key(|e| e.0);
-            self.gen_cursor_vel = vel;
-            self.gen_cursor_ranked = true;
+            self.gen_cursor.runs.sort_by_key(|e| e.0);
+            self.gen_cursor.vel = vel;
+            self.gen_cursor.ranked = true;
         }
         let min_admit = self.stream_pacer.floor(GEN_MIN_ADMIT);
         let mut admitted = 0usize;
         let mut consumed = 0usize;
-        while consumed < self.gen_columns.len() {
+        while consumed < self.gen_cursor.runs.len() {
             if super::admission_exhausted(admitted, min_admit, deadline) {
                 break;
             }
-            let run = self.gen_columns[consumed].1;
+            let run = self.gen_cursor.runs[consumed].1;
             if self.run_quarantined(run) || self.run_covered(run) || !self.run_in_load(run) {
                 consumed += 1;
                 continue;
@@ -270,33 +297,38 @@ impl World {
                 break;
             }
         }
-        self.gen_columns.drain(..consumed);
-        if self.gen_columns.is_empty() {
+        self.gen_cursor.runs.drain(..consumed);
+        if self.gen_cursor.runs.is_empty() {
             Progress::Idle
         } else {
             self.pending_gen.set();
             Progress::Partial {
-                remaining: self.gen_columns.len() as u32,
+                remaining: self.gen_cursor.runs.len() as u32,
             }
         }
     }
 
-    /// Whether `gen_columns` is still the run list for `center`'s data box.
+    /// Whether the run list is still the one for `center`'s data box.
     fn gen_cursor_matches(&self, center: Coord) -> bool {
-        if self.gen_cursor_dirty || self.gen_cursor_center != Some(center) {
-            return false;
+        !self.gen_cursor.dirty && self.gen_cursor.key == Some(self.gen_key(center))
+    }
+
+    /// What a run list gathered now for `center` is for. The data box carries the up, the view and
+    /// the grown window; the loading window rides on top.
+    fn gen_key(&self, center: Coord) -> GenKey {
+        GenKey {
+            center,
+            data_box: self.data_box(center),
+            lh: self.load_h,
+            lv: self.load_v,
+            heading: self.load_heading,
+            slab: self.spawn_slab,
         }
-        // The data box carries the up, the view and the grown window; the loading window rides on top.
-        self.gen_cursor_box == Some(self.data_box(center))
-            && self.gen_cursor_lh == self.load_h
-            && self.gen_cursor_lv == self.load_v
-            && self.gen_cursor_heading == self.load_heading
-            && self.gen_cursor_slab == self.spawn_slab
     }
 
     /// Classify the data box once, store uniform chunks, and queue the rest.
     fn rebuild_gen_cursor(&mut self, center: Coord) {
-        self.gen_cursor_rebuilds += 1;
+        self.counters.gen_cursor_rebuilds += 1;
         let mut coords: Vec<Coord> = self.view_coords(self.load_data_box(center)).collect();
         if let Some(slab) = self.spawn_slab {
             coords.extend(self.view_coords(slab));
@@ -324,16 +356,11 @@ impl World {
             false,
             true,
         );
-        self.gen_columns.clear();
-        self.gen_columns.extend(runs.into_iter().map(|run| (0, run)));
-        self.gen_cursor_center = Some(center);
-        self.gen_cursor_box = Some(self.data_box(center));
-        self.gen_cursor_lh = self.load_h;
-        self.gen_cursor_lv = self.load_v;
-        self.gen_cursor_heading = self.load_heading;
-        self.gen_cursor_slab = self.spawn_slab;
-        self.gen_cursor_dirty = false;
-        self.gen_cursor_ranked = false;
+        self.gen_cursor.runs.clear();
+        self.gen_cursor.runs.extend(runs.into_iter().map(|run| (0, run)));
+        self.gen_cursor.key = Some(self.gen_key(center));
+        self.gen_cursor.dirty = false;
+        self.gen_cursor.ranked = false;
     }
 
     /// A quarantined run is dropped, matching `gather_column_runs`'s

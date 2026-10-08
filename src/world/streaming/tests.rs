@@ -153,12 +153,12 @@ fn near_diagonal_flight_keeps_its_heading() {
     pass(&mut world, a);
     let heading = world.load_heading;
     assert_ne!(heading, 0, "a reduced window aims");
-    let rebuilds = world.gen_cursor_rebuilds;
+    let rebuilds = world.counters.gen_cursor_rebuilds;
     for i in 0..20 {
         pass(&mut world, if i % 2 == 0 { b } else { a });
         assert_eq!(world.load_heading, heading, "pass {i} flipped the heading");
     }
-    assert_eq!(world.gen_cursor_rebuilds, rebuilds, "the cursor holds across the diagonal");
+    assert_eq!(world.counters.gen_cursor_rebuilds, rebuilds, "the cursor holds across the diagonal");
     pass(&mut world, DVec3::new(0.0, 0.0, 140.0));
     assert_ne!(world.load_heading, heading, "a clear turn switches");
 }
@@ -1123,8 +1123,8 @@ fn settle_does_not_recount_already_queued_neighbour() {
     world.light_worklist.clear();
     world.light_inflight.clear();
     world.light_worklist.insert(n);
-    world.light_seed_inserts = 0;
-    world.light_seed_split = super::super::LightSeedSplit::default();
+    world.counters.light_seed_inserts = 0;
+    world.counters.light_seed_split = super::super::LightSeedSplit::default();
     world.settle_light(c, light::LightGrid::open_sky());
     assert!(world.light_worklist.contains(&n));
     let other_loaded = Face::ALL
@@ -1135,7 +1135,7 @@ fn settle_does_not_recount_already_queued_neighbour() {
         })
         .count() as u64;
     assert_eq!(
-        world.light_seed_split.border, other_loaded,
+        world.counters.light_seed_split.border, other_loaded,
         "already-queued neighbour is not a counted insert"
     );
 }
@@ -1182,16 +1182,16 @@ fn seed_light_counts_each_source() {
     let mut world = World::generate();
     let c = Coord::new(0, 0, 0);
     world.light_worklist.clear();
-    world.light_seed_inserts = 0;
-    world.light_seed_split = super::super::LightSeedSplit::default();
+    world.counters.light_seed_inserts = 0;
+    world.counters.light_seed_split = super::super::LightSeedSplit::default();
     world.seed_light(c, super::super::LightSeed::Store);
     world.seed_light(c, super::super::LightSeed::Border);
     world.seed_light(c, super::super::LightSeed::Edit);
     world.seed_light(c, super::super::LightSeed::Degrade);
     world.seed_light(c, super::super::LightSeed::Terminal);
     world.seed_light(c, super::super::LightSeed::Remesh);
-    assert_eq!(world.light_seed_inserts, 6);
-    let s = world.light_seed_split;
+    assert_eq!(world.counters.light_seed_inserts, 6);
+    let s = world.counters.light_seed_split;
     assert_eq!(
         (s.store, s.border, s.edit, s.degrade, s.terminal, s.remesh),
         (1, 1, 1, 1, 1, 1)

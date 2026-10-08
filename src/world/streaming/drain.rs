@@ -12,8 +12,8 @@ impl World {
     /// effort signal and keeps a small forward-progress floor.
     pub(in crate::world) fn drain_results(&mut self, eng: &mut Engine, result_budget: Duration) {
         self.integrate_results(result_budget);
-        self.section_upload_bytes = 0;
-        self.drain_upload_bytes = 0;
+        self.counters.section_upload_bytes = 0;
+        self.counters.drain_upload_bytes = 0;
         if self.upload_queue.is_empty()
             && self.section_upload_queue.is_empty()
             && self.light_apply_queue.is_empty()
@@ -85,7 +85,7 @@ impl World {
             {
                 super::adjust_count(&mut self.meshing_sections, true, false);
                 upload_bytes += bytes;
-                self.section_upload_bytes += bytes;
+                self.counters.section_upload_bytes += bytes;
                 *state = SectionState::from_upload_payload(pos, meshes, eng, bend.as_ref());
                 // Slots are born visible (residency implies it for everything but the
                 // far field), so a section that Coverage does not draw — or draws only
@@ -103,7 +103,7 @@ impl World {
                 meshes.release_staging(eng);
             }
         }
-        self.drain_upload_bytes = upload_bytes;
+        self.counters.drain_upload_bytes = upload_bytes;
     }
 
     /// The first block of [`drain_results`](Self::drain_results): integrate finished worker
@@ -159,24 +159,24 @@ impl World {
         };
         match result {
             pipeline::Done::Column { key, chunks, heights } => {
-                self.jobs_completed += 1;
+                self.counters.jobs_completed += 1;
                 self.accept_column(key, chunks, heights)
             }
             m @ pipeline::Done::Mesh { .. } => {
-                self.jobs_completed += 1;
+                self.counters.jobs_completed += 1;
                 MeshLane::integrate(self, m)
             }
             l @ pipeline::Done::Light { .. } => {
-                self.jobs_completed += 1;
+                self.counters.jobs_completed += 1;
                 LightLane::integrate(self, l)
             }
             sc @ pipeline::Done::Section { .. } => {
-                self.jobs_completed += 1;
+                self.counters.jobs_completed += 1;
                 SectionLane::integrate(self, sc)
             }
             pipeline::Done::Failed(key) => self.fail_job(*key),
             pipeline::Done::Cancelled(keys) => {
-                self.jobs_cancelled += keys.len() as u64;
+                self.counters.jobs_cancelled += keys.len() as u64;
                 for key in keys {
                     self.cancel_job(key);
                 }
@@ -216,13 +216,13 @@ impl World {
     pub(in crate::world) fn accept_chunk(&mut self, coord: Coord, chunk: Chunk) {
         if !self.will_accept_chunk(coord) {
             if !self.chunks.contains_key(&coord) {
-                self.gen_discarded += 1;
+                self.counters.gen_discarded += 1;
             }
             return;
         }
-        self.gen_landed += 1;
+        self.counters.gen_landed += 1;
         if self.chunk_landed_behind(coord) {
-            self.gen_landed_behind += 1;
+            self.counters.gen_landed_behind += 1;
         }
         self.store_chunk(coord, chunk);
     }

@@ -807,8 +807,8 @@ impl StreamLane for LightLane {
         world.light_inflight.insert(key);
     }
     fn note_admitted(world: &mut World, n: usize) {
-        world.light_admitted += n as u64;
-        world.light_admitted_last = n;
+        world.counters.light_admitted += n as u64;
+        world.counters.light_admitted_last = n;
     }
     fn integrate(world: &mut World, done: pipeline::Done) {
         // `accept_light` owns the claim rule (release-or-transfer on every

@@ -70,6 +70,34 @@ pub struct StreamGauges {
     pub reactions_mutations: u64,
 }
 
+/// Cumulative counters the flight bench and the stress gauges read.
+#[derive(Default)]
+pub(in crate::world) struct StreamCounters {
+    /// Worker results integrated, and claim keys released by deschedule.
+    /// The flight bench reads these; a quiet frame does not touch them.
+    pub(in crate::world) jobs_completed: u64,
+    pub(in crate::world) jobs_cancelled: u64,
+    /// Chunks stored from a generate result, how many of those were already
+    /// behind the player, and results dropped because the loading window had
+    /// left them (the flight bench's wasted-work counts).
+    pub(in crate::world) gen_landed: u64,
+    pub(in crate::world) gen_landed_behind: u64,
+    pub(in crate::world) gen_discarded: u64,
+    /// Generation run-list rebuilds (the flight bench's regrow cost).
+    pub(in crate::world) gen_cursor_rebuilds: u64,
+    /// Cumulative light-worklist insert attempts (stress: seeds per chunk).
+    pub(in crate::world) light_seed_inserts: u64,
+    pub(in crate::world) light_seed_split: LightSeedSplit,
+    /// Cumulative light jobs accepted by the worker pool.
+    pub(in crate::world) light_admitted: u64,
+    /// Jobs accepted by the most recent [`admit`](crate::world::admit)`<LightLane>` pass.
+    pub(in crate::world) light_admitted_last: usize,
+    /// Vertex bytes uploaded for sections in the current drain (harness peak).
+    pub(in crate::world) section_upload_bytes: usize,
+    /// Chunk + section vertex bytes uploaded in the current drain (harness peak).
+    pub(in crate::world) drain_upload_bytes: usize,
+}
+
 impl World {
     /// World-entry completeness predicate: true once, within the view
     /// radius, every chunk shows a FINAL-light mesh (`Ready`/`Air`, none degraded
@@ -200,9 +228,9 @@ impl World {
             worker_capacity,
             travel_speed_mps: self.stream_pacer.speed_mps(),
             effort: self.stream_pacer.effort(),
-            light_admitted: self.light_admitted,
-            light_admitted_last: self.light_admitted_last,
-            light_seed_inserts: self.light_seed_inserts,
+            light_admitted: self.counters.light_admitted,
+            light_admitted_last: self.counters.light_admitted_last,
+            light_seed_inserts: self.counters.light_seed_inserts,
             mesh_slots: if self.gpu_live_slots != 0 {
                 self.gpu_live_slots as usize
             } else {
@@ -210,7 +238,7 @@ impl World {
             },
             slot_ceiling: self.slot_ceiling as usize,
             section_ready: self.sections.values().filter(|s| s.is_ready()).count(),
-            light_seed_split: self.light_seed_split,
+            light_seed_split: self.counters.light_seed_split,
             remesh_async_calls: self.remesh_stats.remesh_async_calls,
             drop_stale_uploads: self.remesh_stats.drop_stale_uploads,
             drop_stale_this_frame: self.remesh_stats.drop_stale_this_frame,
@@ -220,8 +248,8 @@ impl World {
             mesh_jobs_before_fixpoint_mean: jf_mean,
             mesh_jobs_before_fixpoint_p95: jf_p95,
             mesh_jobs_before_fixpoint_n: jf_n,
-            section_upload_bytes: self.section_upload_bytes,
-            drain_upload_bytes: self.drain_upload_bytes,
+            section_upload_bytes: self.counters.section_upload_bytes,
+            drain_upload_bytes: self.counters.drain_upload_bytes,
             mesh_staged: staging.chunk_staged,
             mesh_fallback: staging.chunk_fallback,
             mesh_ring_full: staging.chunk_ring_full,
