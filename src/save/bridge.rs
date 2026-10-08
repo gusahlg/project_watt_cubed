@@ -361,15 +361,15 @@ fn rebuild(
             _ => AIR,
         })
         .collect();
-    for edit in &doc.edits {
+    world.install_edits(doc.edits.iter().map(|edit| {
         match kinds[usize::from(edit.spec)] {
             SpecKind::Ok(_) => {}
             SpecKind::Legacy => unknown.legacy_edits += 1,
             SpecKind::Full => unknown.full_edits += 1,
             SpecKind::Bad => {}
         }
-        world.set_block(edit.x, edit.y, edit.z, block_ids[usize::from(edit.spec)]);
-    }
+        ((edit.x, edit.y, edit.z), block_ids[usize::from(edit.spec)])
+    }));
 
     let pending = doc
         .pending

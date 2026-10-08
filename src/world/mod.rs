@@ -35,6 +35,8 @@
 //! * `settings.rs` — view distances, the render config, lighting and AO.
 //! * `edits.rs` — player edits: block placement, the edit overlay, and dirty
 //!   marking.
+//! * `ledger.rs` — whole edit ledgers (a save's, a join snapshot's) installed
+//!   in bulk.
 pub mod brick;
 pub mod chunk;
 pub mod connectivity;
@@ -57,6 +59,7 @@ mod coverage;
 mod edits;
 mod heightmip;
 pub(crate) mod lanes;
+mod ledger;
 mod metric;
 mod occlusion;
 mod quadtree;
@@ -201,6 +204,7 @@ impl LightSeedSplit {
 }
 
 pub use census::MemoryCensus;
+pub use ledger::Ledger;
 pub use streaming::StreamGauges;
 use admit::{
     AdmitScratch, LightLane, MeshLane, SectionLane, StreamLane, admission_exhausted, admit, bias_order,

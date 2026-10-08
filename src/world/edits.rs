@@ -8,12 +8,26 @@ use crate::sim::reactions::{self, CellStore, Mutation, Pos, ReactionScheduler};
 use crate::space::FaceFrame;
 
 use super::chunk::Chunk;
+use super::section::SectionPos;
 use super::{ColumnKey, Coord, Sky, World};
 
 impl World {
     /// Set block at world coord; record in edit overlay and mark chunk(s) for remesh.
     /// Returns previous block.
     pub fn set_block(&mut self, x: i32, y: i32, z: i32, id: BlockId) -> BlockId {
+        self.place(x, y, z, id, None)
+    }
+
+    /// [`set_block`](Self::set_block) with the generated block at the cell, when the caller
+    /// already has it.
+    pub(in crate::world) fn place(
+        &mut self,
+        x: i32,
+        y: i32,
+        z: i32,
+        id: BlockId,
+        generated: Option<BlockId>,
+    ) -> BlockId {
         let (coord, local) = BlockCoord::new(x, y, z).split();
         let (lx, ly, lz) = (local.lx(), local.ly(), local.lz());
         let index = Chunk::index(lx, ly, lz);
@@ -36,7 +50,7 @@ impl World {
         // the world's real difference from its seed. One generator query per
         // edit: user-click/network rate, never the voxel hot path.
         let old_edit = self.edits.get(&coord).and_then(|cells| cells.get(&index)).copied();
-        let generated = self.generator.voxel_at(x, y, z);
+        let generated = generated.unwrap_or_else(|| self.generator.voxel_at(x, y, z));
         // Gravity follows the matter: the cell's amount changes from what was really there (the
         // overlay, else generation — never `previous`, which reads unloaded chunks as air).
         let delta = self.registry.amount(id) as i32 - self.registry.amount(old_edit.unwrap_or(generated)) as i32;
@@ -97,7 +111,7 @@ impl World {
         }
         // Invalidate section to re-extract from overlay.
         if self.lod2 {
-            self.mark_dirty_sections_from_edit(coord, x, y, z);
+            self.mark_dirty_sections(coord, [(x, y, z)]);
         }
 
         if let Some(loaded) = self.chunks.get_mut(&coord) {
@@ -164,10 +178,9 @@ impl World {
         }
     }
 
-    /// Mark sections covering this voxel dirty at every active detail so they
-    /// re-extract from the edit overlay. A storage cell dirties its chart section
-    /// (storage +Y is the chart's up). A cube face maps the cell through the face
-    /// frame. A flat world keeps the `[0, 512)` window.
+    /// The body, face, face-local `(u, v)` and altitude of an edited cell's section grid.
+    /// A storage cell dirties its chart section (storage +Y is the chart's up). A cube face maps
+    /// the cell through the face frame. A flat world keeps the `[0, 512)` window.
     fn edit_face_cell(&self, x: i32, y: i32, z: i32) -> Option<(u16, Face, i32, i32, i32)> {
         let s = [i64::from(x), i64::from(y), i64::from(z)];
         for (index, atlas) in self.generator.atlases().iter().enumerate() {
@@ -209,38 +222,51 @@ impl World {
         Some((body.id, face, u, v, a))
     }
 
-    fn edit_in_window(&self, pos: super::section::SectionPos, a: i32) -> bool {
-        let Some((lo, hi)) = self.generator.surface_bounds(pos.body, pos.face, pos.min_x(), pos.min_z(), pos.span()) else {
-            return false;
-        };
-        let (wlo, whi) = super::section::sample_window(lo, hi, pos.cell_size());
-        (wlo..whi).contains(&a)
+    /// The altitudes `[lo, hi)` a section samples, `None` where its square holds no surface.
+    fn section_window(&self, pos: SectionPos) -> Option<(i32, i32)> {
+        let (lo, hi) = self.generator.surface_bounds(pos.body, pos.face, pos.min_x(), pos.min_z(), pos.span())?;
+        Some(super::section::sample_window(lo, hi, pos.cell_size()))
     }
 
-    fn mark_dirty_sections_from_edit(&mut self, chunk: Coord, x: i32, y: i32, z: i32) {
-        let Some((body, face, u, v, a)) = self.edit_face_cell(x, y, z) else { return };
-        let details: Vec<_> = self.section_pyramid.active_lods().collect();
+    /// Mark the sections covering these edited cells of `chunk` dirty at every active detail so
+    /// they re-extract from the edit overlay. Each section's window is read once per call.
+    pub(in crate::world) fn mark_dirty_sections(
+        &mut self,
+        chunk: Coord,
+        cells: impl IntoIterator<Item = (i32, i32, i32)>,
+    ) {
+        // Each section met, its window, and the edits inside that window.
+        let mut hits: Vec<(SectionPos, Option<(i32, i32)>, u64)> = Vec::new();
+        for (x, y, z) in cells {
+            let Some((body, face, u, v, a)) = self.edit_face_cell(x, y, z) else { continue };
+            for detail in self.section_pyramid.active_lods() {
+                let span = super::section::section_span(detail);
+                let pos = SectionPos { body, face, detail, x: u.div_euclid(span), z: v.div_euclid(span) };
+                let at = match hits.iter().position(|hit| hit.0 == pos) {
+                    Some(at) => at,
+                    None => {
+                        hits.push((pos, self.section_window(pos), 0));
+                        hits.len() - 1
+                    }
+                };
+                if hits[at].1.is_some_and(|(lo, hi)| (lo..hi).contains(&a)) {
+                    hits[at].2 += 1;
+                }
+            }
+        }
         let mut any = false;
-        for detail in details {
-            let span = super::section::section_span(detail);
-            let pos = super::section::SectionPos {
-                body,
-                face,
-                detail,
-                x: u.div_euclid(span),
-                z: v.div_euclid(span),
-            };
-            if !self.edit_in_window(pos, a) {
+        for (pos, _, edits) in hits {
+            if edits == 0 {
                 continue;
             }
             any = true;
             self.dirty_sections.insert(pos);
             // The heightmip edit overlay (streaming.rs `refresh_section_overlay`)
             // keys its cache on this same per-section counter, so it re-derives
-            // exactly the cells this edit could have changed.
-            *self.section_edit_rev.entry(pos).or_insert(0) += 1;
+            // exactly the cells these edits could have changed.
+            *self.section_edit_rev.entry(pos).or_insert(0) += edits;
             // Index the edited chunk under every footprint that contains it,
-            // and queue the exact overlay re-derivation this edit requires.
+            // and queue the exact overlay re-derivation these edits require.
             self.section_edit_chunks.entry(pos).or_default().insert(chunk);
             self.section_overlay_dirty.insert(pos);
         }

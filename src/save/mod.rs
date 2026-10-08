@@ -446,6 +446,49 @@ mod tests {
         cleanup(&id);
     }
 
+    /// A save loads through the bulk ledger install to the world the per-edit path rebuilds from
+    /// the same document: overlay, revisions, gravity, columns, sections and pending reactions.
+    #[test]
+    fn a_loaded_save_is_the_per_edit_rebuild() {
+        let unstreamed = |seed, kind, cfg| {
+            World::with_kind_cfg(seed, crate::render_config::RenderConfig::default(), kind, cfg, false)
+        };
+        for kind in [WorldgenKind::Flat, WorldgenKind::Diffusion] {
+            let id = slot(&format!("__unit_test_bulk_load_{kind:?}__"));
+            let mut world = unstreamed(9, kind, TerrainCfg::default());
+            let soil = world.registry().id_by_label("soil").unwrap();
+            let atlases = world.terrain().atlases();
+            let spawn = world.chart_spawn().and_then(|p| atlases.iter().find_map(|a| a.storage_of(p)));
+            let [x0, y0, z0] = spawn.map_or([0, world.surface_y(0, 0), 0], |c| c.map(|v| v as i32));
+            for i in 0..600 {
+                let (x, y, z) = (x0 + i % 10, y0 - 5 + i / 100, z0 + (i / 10) % 10);
+                let block = if world.terrain().voxel_at(x, y, z) == AIR { soil } else { AIR };
+                world.set_block(x, y, z, block);
+            }
+            world.note_cell_changed(x0, y0, z0);
+            let player = Player::new(DVec3::new(0.5, 70.0, 0.5));
+            save(&id, &world, &player, &crate::modding::testing::standard(), meta("bulk")).unwrap();
+
+            let mut mods = crate::modding::testing::standard();
+            let (loaded, _, _, _) = load(&id, &mut mods, unstreamed).unwrap();
+            let (format::Decoded::Intact(doc), _) = store::read(&id).unwrap() else { panic!("an intact save") };
+            let mut rebuilt = unstreamed(doc.meta.seed, kind, TerrainCfg::default());
+            for edit in &doc.edits {
+                let block = parse_block(rebuilt.registry_mut(), &doc.specs[usize::from(edit.spec)]);
+                rebuilt.set_block(edit.x, edit.y, edit.z, block);
+            }
+            let pending: Vec<_> = doc
+                .pending
+                .iter()
+                .map(|c| (c.age, crate::sim::reactions::Contact { lo: (c.x, c.y, c.z), axis: c.axis }))
+                .collect();
+            rebuilt.restore_reactions(&pending);
+            assert!(!pending.is_empty() && loaded.edits().count() == 600);
+            loaded.assert_same_edits(&rebuilt);
+            cleanup(&id);
+        }
+    }
+
     #[test]
     fn far_positions_round_trip_bit_exactly() {
         // f64 precision at 1e8 can't be approximated as f32 without losing 4+ blocks.

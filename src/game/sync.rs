@@ -85,8 +85,30 @@ impl Game {
             Some(net) => net.poll(),
             None => return None,
         };
+        self.apply_incoming(incoming, mods, events)
+    }
+
+    /// The network phase alone, for probes. True once the join overlay is in.
+    #[cfg(test)]
+    pub(crate) fn pump_net(&mut self, mods: &mut Mods) -> bool {
+        self.apply_net_events(mods, &mut Vec::new());
+        self.net.as_ref().is_some_and(|net| net.snapshot_ready())
+    }
+
+    /// Apply one poll's server events in order; runs of snapshot cells install in bulk.
+    pub(super) fn apply_incoming(
+        &mut self,
+        incoming: Vec<Incoming>,
+        mods: &mut Mods,
+        events: &mut Vec<GameEvent>,
+    ) -> Option<String> {
         let mut disconnected = None;
+        let mut ledger = crate::world::Ledger::default();
         for event in incoming {
+            // Every other event lands after the snapshot cells before it.
+            if !matches!(event, Incoming::Mutation { .. }) {
+                self.world.install(&mut ledger);
+            }
             match event {
                 Incoming::Edit { x, y, z, spec } => {
                     // Resolve the portable spec against our own palette, then
@@ -104,11 +126,11 @@ impl Game {
                     });
                 }
                 Incoming::Mutation { x, y, z, spec } => {
-                    // Snapshot content: apply silently. A client is never the reaction
-                    // authority, so there is nothing to note; a cascade of a thousand
-                    // cells must not play a thousand block cues.
+                    // Snapshot content: queued for the bulk install, silently. A client is never
+                    // the reaction authority, so there is nothing to note; a cascade of a
+                    // thousand cells must not play a thousand block cues.
                     let id = save::parse_block(self.world.registry_mut(), &spec);
-                    self.world.set_block(x, y, z, id);
+                    ledger.push((x, y, z), id);
                 }
                 Incoming::EditAccepted { req } => {
                     // Prediction confirmed: the optimistic apply IS the truth.
@@ -195,6 +217,7 @@ impl Game {
                 }
             }
         }
+        self.world.install(&mut ledger);
         disconnected
     }
 
@@ -385,6 +408,49 @@ mod tests {
 
     /// A break whose loot did not fit (full inventory) and that the server refuses gives the cell
     /// back and takes no unit the player already held.
+    /// One poll's snapshot cells install in bulk, and the events between them keep their place:
+    /// an edit lands after the cells before it and under the cells after it, as applying every
+    /// event in order does.
+    #[test]
+    fn a_poll_of_snapshot_cells_installs_in_order_with_the_events_between() {
+        use crate::net::client::Incoming;
+        use crate::player::Player;
+        use crate::render_config::RenderConfig;
+        use crate::world::World;
+        use std::sync::Arc;
+        use voxel_engine::DVec3;
+        let make = || {
+            let flat = crate::world::generation::WorldgenKind::Flat;
+            World::with_kind_cfg(3, RenderConfig::default(), flat, Default::default(), false)
+        };
+        let mut reference = make();
+        let mut game = Game::new(make(), Player::new(DVec3::new(0.5, 80.0, 0.5)), "ledger".into());
+        let soil = reference.registry().id_by_label("soil").unwrap();
+        let rock = reference.registry().id_by_label("rock").unwrap();
+        let ground = reference.surface_y(0, 0);
+        let cells: Vec<(i32, i32, i32)> =
+            (0..2000).map(|i| ((i * 37) % 400 - 200, ground + i % 3, (i * 53) % 400 - 200)).collect();
+        let mut incoming = Vec::new();
+        let cell = |incoming: &mut Vec<Incoming>, reference: &mut World, (x, y, z): (i32, i32, i32), id| {
+            let spec: Arc<str> = reference.registry().spec(id).into();
+            incoming.push(Incoming::Mutation { x, y, z, spec });
+            reference.set_block(x, y, z, id);
+        };
+        for &c in &cells[..1500] {
+            cell(&mut incoming, &mut reference, c, soil);
+        }
+        let (x, y, z) = cells[7];
+        incoming.push(Incoming::Edit { x, y, z, spec: "air".into() });
+        reference.set_block(x, y, z, crate::block::AIR);
+        reference.note_cell_changed(x, y, z);
+        for &c in cells[1500..].iter().chain(&cells[5..6]) {
+            cell(&mut incoming, &mut reference, c, rock);
+        }
+
+        game.apply_incoming(incoming, &mut crate::modding::testing::standard(), &mut Vec::new());
+        game.world.assert_same_edits(&reference);
+    }
+
     #[test]
     fn a_refused_break_with_a_full_inventory_keeps_the_held_unit() {
         use crate::net::client::Connection;
