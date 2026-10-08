@@ -273,12 +273,12 @@ fn fly(speed: f64, secs: f64, settle: f64, view: (i32, i32), lod2: bool, hz: f64
     let mut ms: Vec<f32> = Vec::new();
     let mut cross_ms: Vec<f32> = Vec::new();
     let (mut frontiers, mut occlusions) = (0u32, 0u32);
-    let jobs_done0 = w.jobs_completed;
-    let jobs_cancel0 = w.jobs_cancelled;
-    let gen0 = w.gen_landed;
-    let behind0 = w.gen_landed_behind;
-    let discarded0 = w.gen_discarded;
-    let rebuilds0 = w.gen_cursor_rebuilds;
+    let jobs_done0 = w.counters.jobs_completed;
+    let jobs_cancel0 = w.counters.jobs_cancelled;
+    let gen0 = w.counters.gen_landed;
+    let behind0 = w.counters.gen_landed_behind;
+    let discarded0 = w.counters.gen_discarded;
+    let rebuilds0 = w.counters.gen_cursor_rebuilds;
     let (mut near_sum, mut far_sum) = (0u64, 0u64);
     let (mut near_max, mut far_max) = (0usize, 0usize);
     let (mut workers_min, mut workers_max) = (usize::MAX, 0usize);
@@ -324,7 +324,7 @@ fn fly(speed: f64, secs: f64, settle: f64, view: (i32, i32), lod2: bool, hz: f64
             println!(
                 "  t={flown:.0}s miss absent={absent} generating={generating} building={building} waiting={waiting} \
                  | discarded so far={}",
-                w.gen_discarded - discarded0,
+                w.counters.gen_discarded - discarded0,
             );
             next_sample += 1.0;
         }
@@ -342,12 +342,12 @@ fn fly(speed: f64, secs: f64, settle: f64, view: (i32, i32), lod2: bool, hz: f64
     let end_sections = w.sections.len();
     let end_desired = w.section_desired.len();
     let end_generating = w.generating.len();
-    let jobs_done = w.jobs_completed - jobs_done0;
-    let jobs_cancel = w.jobs_cancelled - jobs_cancel0;
-    let generated = w.gen_landed - gen0;
-    let behind = w.gen_landed_behind - behind0;
-    let discarded = w.gen_discarded - discarded0;
-    let rebuilds = w.gen_cursor_rebuilds - rebuilds0;
+    let jobs_done = w.counters.jobs_completed - jobs_done0;
+    let jobs_cancel = w.counters.jobs_cancelled - jobs_cancel0;
+    let generated = w.counters.gen_landed - gen0;
+    let behind = w.counters.gen_landed_behind - behind0;
+    let discarded = w.counters.gen_discarded - discarded0;
+    let rebuilds = w.counters.gen_cursor_rebuilds - rebuilds0;
     let mut stop = hold_still(&mut w, last_eye, &pace);
     let frames = ms.len();
     let total: f32 = ms.iter().sum();
@@ -435,7 +435,7 @@ fn hold_still(w: &mut World, eye: DVec3, pace: &impl Fn(&mut World, Instant)) ->
     }
     let zero = [Duration::ZERO; PHASES.len()];
     let mut laps = Laps { at: Instant::now(), sum: zero, full: zero, in_full: false };
-    let rebuilds0 = w.gen_cursor_rebuilds;
+    let rebuilds0 = w.counters.gen_cursor_rebuilds;
     let mut regrowing = true;
     let mut next = 1.0f64;
     let t0 = Instant::now();
@@ -450,7 +450,7 @@ fn hold_still(w: &mut World, eye: DVec3, pace: &impl Fn(&mut World, Instant)) ->
         if regrowing && w.loading_full() {
             regrowing = false;
             stop.regrow_frames = stop.ms.len();
-            stop.regrow_rebuilds = w.gen_cursor_rebuilds - rebuilds0;
+            stop.regrow_rebuilds = w.counters.gen_cursor_rebuilds - rebuilds0;
         }
         if held >= next {
             stop.samples.push(Sample::take(w, held));
@@ -460,7 +460,7 @@ fn hold_still(w: &mut World, eye: DVec3, pace: &impl Fn(&mut World, Instant)) ->
     }
     if regrowing {
         stop.regrow_frames = stop.ms.len();
-        stop.regrow_rebuilds = w.gen_cursor_rebuilds - rebuilds0;
+        stop.regrow_rebuilds = w.counters.gen_cursor_rebuilds - rebuilds0;
     }
     stop.samples.push(Sample::take(w, t0.elapsed().as_secs_f64()));
     stop

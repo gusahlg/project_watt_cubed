@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::block::registry::AIR;
-use crate::coord::Face;
+use crate::coord::{BlockCoord, Face};
 use crate::math::Aabb;
 use crate::render_config::RenderConfig;
 use voxel_engine::{DVec3, Pass};
@@ -3783,16 +3783,16 @@ fn open_gen_cursor_drains_across_frames() {
     }
     let budget = voxel_engine::producer::Budget::Millis(0.0);
     world.request_region_data(center, budget);
-    let queued = world.gen_columns.len();
+    let queued = world.gen_cursor.runs.len();
     let inflight = world.generating.len();
     assert!(inflight > 0, "first pass submits");
     assert!(queued > 0, "the rest of the box stays queued");
-    assert!(!world.gen_cursor_dirty);
+    assert!(!world.gen_cursor.dirty);
     world.pending_gen.set();
     world.request_region_data(center, budget);
     assert!(world.generating.len() > inflight, "second pass admits more");
-    assert!(world.gen_columns.len() < queued, "queue shrinks without a rebuild");
-    for (_, run) in &world.gen_columns {
+    assert!(world.gen_cursor.runs.len() < queued, "queue shrinks without a rebuild");
+    for (_, run) in &world.gen_cursor.runs {
         let streaming::GenRun::Open { coord } = *run else {
             panic!("open centre queues one chunk per run");
         };
@@ -3803,7 +3803,7 @@ fn open_gen_cursor_drains_across_frames() {
         for y in center.y - r..=center.y + r {
             for z in center.z - r..=center.z + r {
                 let coord = ChunkCoord::new(x, y, z);
-                let queued = world.gen_columns.iter().any(|(_, run)| {
+                let queued = world.gen_cursor.runs.iter().any(|(_, run)| {
                     matches!(run, streaming::GenRun::Open { coord: c } if *c == coord)
                 });
                 assert!(
@@ -3817,12 +3817,12 @@ fn open_gen_cursor_drains_across_frames() {
     }
     let lost = world.generating.iter().next().copied().expect("in flight");
     world.fail_job(pipeline::JobKey::Open { coord: lost });
-    assert!(world.gen_cursor_dirty, "a retryable failure invalidates the cursor");
+    assert!(world.gen_cursor.dirty, "a retryable failure invalidates the cursor");
     assert!(!world.generating.contains(&lost));
     world.request_region_data(center, budget);
-    assert!(!world.gen_cursor_dirty);
+    assert!(!world.gen_cursor.dirty);
     let back = world.generating.contains(&lost)
-        || world.gen_columns.iter().any(|(_, run)| {
+        || world.gen_cursor.runs.iter().any(|(_, run)| {
             matches!(run, streaming::GenRun::Open { coord } if *coord == lost)
         });
     assert!(back, "the failed chunk is gathered again");
@@ -4028,7 +4028,7 @@ fn asteroid_entry_breakdown() {
         progressed += world.generating.len().saturating_sub(generating_before);
         main_gen += t.elapsed();
         let t = Instant::now();
-        let admitted_before = world.light_admitted;
+        let admitted_before = world.counters.light_admitted;
         if world.lighting {
             admit::<LightLane>(
                 &mut world,
@@ -4036,7 +4036,7 @@ fn asteroid_entry_breakdown() {
                 voxel_engine::producer::Budget::Millis(1.0),
             );
         }
-        progressed += (world.light_admitted - admitted_before) as usize;
+        progressed += (world.counters.light_admitted - admitted_before) as usize;
         main_light += t.elapsed();
         let t = Instant::now();
         let building_before = world.building_meshes;
@@ -4182,4 +4182,220 @@ fn asteroid_entry_breakdown() {
         g.remesh_async_calls
     );
     assert!(finished, "entry did not complete within 300s: {}", world.entry_debug());
+}
+
+/// Where sample ledgers centre: the start world's spawn cell, else the flat world's origin ground.
+fn ledger_centre(world: &World) -> [i32; 3] {
+    let spawn = world.chart_spawn().and_then(|p| world.generator.atlases().iter().find_map(|a| a.storage_of(p)));
+    spawn.map_or([0, world.generator.height(0, 0), 0], |cell| cell.map(|v| v as i32))
+}
+
+fn lcg(seed: &mut u64) -> u64 {
+    *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    *seed >> 33
+}
+
+/// `n` distinct edits around [`ledger_centre`] that each differ from generation: spread
+/// pseudo-randomly over about 12×3×12 chunks, or packed into one cube.
+fn sample_ledger(world: &World, n: usize, spread: bool) -> Vec<((i32, i32, i32), BlockId)> {
+    let soil = world.registry.id_by_label("soil").unwrap();
+    let [x0, y0, z0] = ledger_centre(world);
+    let side = (n as f64).cbrt().ceil() as i32;
+    let mut seen = FastSet::default();
+    let mut out = Vec::with_capacity(n);
+    let (mut seed, mut i) = (0x9E37_79B9_7F4A_7C15u64, 0);
+    while out.len() < n {
+        let (x, y, z) = if spread {
+            let mut next = |m: u64| (lcg(&mut seed) % m) as i32;
+            (x0 - 96 + next(192), y0 - 16 + next(32), z0 - 96 + next(192))
+        } else {
+            (x0 - side / 2 + i % side, y0 - side / 2 + i / (side * side), z0 - side / 2 + (i / side) % side)
+        };
+        i += 1;
+        if seen.insert((x, y, z)) {
+            let id = if world.generator.voxel_at(x, y, z) == AIR { soil } else { AIR };
+            out.push(((x, y, z), id));
+        }
+    }
+    out
+}
+
+/// Every case an install meets, chunks interleaved: dense chunks stacked in a column and sparse
+/// ones, cells set twice, cells set back to generation after an edit and without one, a chunk
+/// emptied by restores then edited again (returned), and a roof raised high above the packed edits.
+fn tricky_ledger(world: &World) -> (Vec<((i32, i32, i32), BlockId)>, Coord) {
+    let rock = world.registry.id_by_label("rock").unwrap();
+    let mut ledger = sample_ledger(world, 1500, false);
+    ledger.extend(sample_ledger(world, 300, true));
+    let lone = BlockCoord::new(ledger[1500].0.0, ledger[1500].0.1, ledger[1500].0.2).split().0;
+    let mut seed = 7u64;
+    for i in (1..ledger.len()).rev() {
+        ledger.swap(i, lcg(&mut seed) as usize % (i + 1));
+    }
+    let generated = |(x, y, z): (i32, i32, i32)| ((x, y, z), world.generator.voxel_at(x, y, z));
+    let restores: Vec<_> = ledger.iter().step_by(10).map(|&(cell, _)| generated(cell)).collect();
+    let twice: Vec<_> = ledger.iter().skip(5).step_by(13).map(|&(cell, _)| (cell, rock)).collect();
+    let emptied: Vec<_> = ledger
+        .iter()
+        .chain(&twice)
+        .filter(|&&((x, y, z), _)| BlockCoord::new(x, y, z).split().0 == lone)
+        .map(|&(cell, _)| generated(cell))
+        .collect();
+    let [x0, y0, z0] = ledger_centre(world);
+    ledger.extend(restores);
+    ledger.extend(twice);
+    ledger.extend(emptied);
+    ledger.push(((lone.x * 16 + 5, lone.y * 16 + 5, lone.z * 16 + 5), rock));
+    ledger.extend((0..40).map(|i| generated((x0 + 300 + i, y0 - 3 + i % 7, z0 - 300))));
+    ledger.extend((0..20).map(|i| ((x0 + i, y0 + 60, z0), rock)));
+    (ledger, lone)
+}
+
+impl World {
+    /// Panics unless `other` holds the same edit state: overlay, edit revisions, edited column
+    /// spans, cached ceilings, gravity ledger, dirty sections and pending reactions.
+    pub(crate) fn assert_same_edits(&self, other: &World) {
+        assert_eq!(self.edits, other.edits, "edit overlay");
+        assert_eq!(self.edit_generation, other.edit_generation, "edit revision");
+        assert_eq!(self.edit_columns, other.edit_columns, "edited column spans");
+        let ceilings = |w: &World| w.ceilings.keys().copied().collect::<FastSet<_>>();
+        assert_eq!(ceilings(self), ceilings(other), "cached ceilings");
+        assert!(self.gravity.same_edits(&other.gravity), "gravity ledger");
+        assert_eq!(self.dirty_sections, other.dirty_sections, "dirty sections");
+        assert_eq!(self.section_edit_rev, other.section_edit_rev, "section revisions");
+        assert_eq!(self.section_edit_chunks, other.section_edit_chunks, "section chunks");
+        assert_eq!(self.section_overlay_dirty, other.section_overlay_dirty, "section overlays");
+        assert_eq!(self.pending_sections.get(), other.pending_sections.get());
+        assert_eq!(self.window.stale, other.window.stale);
+        assert_eq!(self.reactions().snapshot(), other.reactions().snapshot(), "pending reactions");
+    }
+}
+
+/// Per edit into `a`, in bulk into `b`.
+fn install_both(a: &mut World, b: &mut World, ledger: &[((i32, i32, i32), BlockId)]) {
+    for &((x, y, z), id) in ledger {
+        a.set_block(x, y, z, id);
+    }
+    b.install_edits(ledger.iter().copied());
+}
+
+/// Load each chunk of `coords` with two rings of face neighbours into both worlds, settle light,
+/// and compare the chunks' voxels, light and meshes.
+fn assert_same_streamed(a: &mut World, b: &mut World, coords: &[Coord]) {
+    for world in [&mut *a, &mut *b] {
+        for &c in coords {
+            world.ensure_data(c);
+            for f in Face::ALL {
+                let n = world.neighbour(c, f);
+                world.ensure_data(n);
+                for g in Face::ALL {
+                    let m = world.neighbour(n, g);
+                    world.ensure_data(m);
+                }
+            }
+        }
+        drain_light(world);
+        world.refresh_tables();
+    }
+    let s = CHUNK_SIZE as i32;
+    let cells = |w: &World, c: Coord| {
+        (0..chunk::CHUNK_VOLUME)
+            .map(|i| {
+                let (x, y, z) = Chunk::local_of(i);
+                w.block_at(c.x * s + x as i32, c.y * s + y as i32, c.z * s + z as i32)
+            })
+            .collect::<Vec<_>>()
+    };
+    let mesh = |w: &World, c: Coord| {
+        let (_, snap) = w.snapshot(c, false);
+        let mut out = new_chunk_mesh_data();
+        mesh::build_chunk_mesh(&snap.padded, snap.uniform, &snap.tables, &snap.light.expect("lighting on"), &mut out);
+        mesh::content_hash(&out)
+    };
+    for &c in coords {
+        assert_eq!(cells(a, c), cells(b, c), "voxels of {c:?}");
+        assert!(a.chunks[&c].light.is_some(), "{c:?} settled");
+        assert!(a.chunks[&c].light == b.chunks[&c].light, "light of {c:?}");
+        assert_eq!(mesh(a, c), mesh(b, c), "mesh of {c:?}");
+    }
+}
+
+fn ledger_world(kind: generation::WorldgenKind) -> World {
+    World::with_kind_cfg(31, RenderConfig::default(), kind, terrain::TerrainCfg::default(), false)
+}
+
+/// A whole ledger installed in bulk into a world that has not streamed is the per-edit install,
+/// and streams to the same chunks.
+#[test]
+fn a_bulk_install_is_the_per_edit_install() {
+    for kind in [generation::WorldgenKind::Flat, generation::WorldgenKind::Diffusion] {
+        let (mut a, mut b) = (ledger_world(kind), ledger_world(kind));
+        let (ledger, lone) = tricky_ledger(&a);
+        install_both(&mut a, &mut b, &ledger);
+        a.assert_same_edits(&b);
+        assert!(!a.edits.is_empty() && a.gravity_at(DVec3::ZERO).epoch > 0, "{kind:?} ledger did something");
+        let [x, y, z] = ledger_centre(&a);
+        let centre = BlockCoord::new(x, y, z).split().0;
+        assert_same_streamed(&mut a, &mut b, &[centre, centre.step(Face::NegY), lone]);
+    }
+}
+
+/// Beside streamed chunks (loaded, a loaded neighbour, a cached ceiling) the bulk install falls
+/// back to the edit-by-edit path for those chunks and still ends as the per-edit install.
+#[test]
+fn a_bulk_install_beside_streamed_chunks_is_the_per_edit_install() {
+    for kind in [generation::WorldgenKind::Flat, generation::WorldgenKind::Diffusion] {
+        let (mut a, mut b) = (ledger_world(kind), ledger_world(kind));
+        let (ledger, _) = tricky_ledger(&a);
+        let [x, y, z] = ledger_centre(&a);
+        let centre = BlockCoord::new(x, y, z).split().0;
+        for world in [&mut a, &mut b] {
+            world.ensure_data(centre);
+            world.ensure_data(centre.step(Face::PosX).step(Face::PosX));
+        }
+        assert!(!a.ceilings.is_empty());
+        install_both(&mut a, &mut b, &ledger);
+        a.assert_same_edits(&b);
+        for (c, loaded) in &a.chunks {
+            assert_eq!(loaded.rev, b.chunks[c].rev, "rev of {c:?}");
+            assert_eq!(a.light_worklist.contains(c), b.light_worklist.contains(c), "relight of {c:?}");
+        }
+        assert_eq!(a.dirty_worklist, b.dirty_worklist, "remesh set");
+        assert_same_streamed(&mut a, &mut b, &[centre, centre.step(Face::PosX)]);
+    }
+}
+
+/// Probe: the ledger install alone, per edit and in bulk, for 1k, 10k and 100k edits packed into
+/// one cube and spread over a few hundred chunks around the start world's spawn.
+#[test]
+#[ignore]
+fn ledger_install_probe() {
+    use std::time::Instant;
+    let make = || ledger_world(generation::WorldgenKind::Diffusion);
+    let ms = |t: Instant| t.elapsed().as_secs_f64() * 1000.0;
+    for spread in [false, true] {
+        for n in [1_000, 10_000, 100_000] {
+            let ledger = sample_ledger(&make(), n, spread);
+            let chunks: FastSet<Coord> =
+                ledger.iter().map(|&((x, y, z), _)| BlockCoord::new(x, y, z).split().0).collect();
+            let (mut a, mut b) = (make(), make());
+            let t = Instant::now();
+            for &((x, y, z), id) in &ledger {
+                a.set_block(x, y, z, id);
+            }
+            let each = ms(t);
+            let t = Instant::now();
+            b.install_edits(ledger.iter().copied());
+            let bulk = ms(t);
+            assert_eq!(a.edits, b.edits);
+            println!(
+                "{} {n} edits over {} chunks: per edit {each:.1}ms ({:.2}us/edit) | bulk {bulk:.2}ms ({:.3}us/edit) | {:.0}x",
+                if spread { "spread" } else { "packed" },
+                chunks.len(),
+                each * 1000.0 / n as f64,
+                bulk * 1000.0 / n as f64,
+                each / bulk
+            );
+        }
+    }
 }

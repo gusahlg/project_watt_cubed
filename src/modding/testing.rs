@@ -3,12 +3,71 @@
 //! behaviour the core's tests exercise — ids, names, groups, a menu theme, persisted state, the
 //! visual groups and the worldgen knobs — so host, menu and save tests keep their meaning.
 
-use super::{Knob, Mod, Mods, ESSENTIALS};
+use super::{Action, Command, CommandContext, Knob, Mod, Mods, ESSENTIALS};
+use crate::input::intent::Chord;
 use crate::menu::theme::{DefaultTheme, MenuTheme};
 use crate::render_config::VisualGroup;
+use crate::ui::{Line, Role};
 use crate::world::generation::WorldgenKind;
 use crate::world::terrain::TerrainCfg;
 use crate::world::World;
+
+/// A test mod: an id (also its name) and whichever hooks a test gives it. It answers the commands
+/// it lists, raising the player one block per command it runs.
+#[derive(Clone, Copy)]
+pub(crate) struct Stub {
+    id: &'static str,
+    actions: &'static [Action],
+    commands: &'static [Command],
+    visual: Option<VisualGroup>,
+}
+
+impl Stub {
+    pub(crate) const fn new(id: &'static str) -> Self {
+        Self { id, actions: &[], commands: &[], visual: None }
+    }
+
+    pub(crate) const fn actions(self, actions: &'static [Action]) -> Self {
+        Self { actions, ..self }
+    }
+
+    pub(crate) const fn commands(self, commands: &'static [Command]) -> Self {
+        Self { commands, ..self }
+    }
+
+    pub(crate) const fn visual(self, group: VisualGroup) -> Self {
+        Self { visual: Some(group), ..self }
+    }
+}
+
+impl Mod for Stub {
+    fn name(&self) -> &str {
+        self.id
+    }
+    fn id(&self) -> &'static str {
+        self.id
+    }
+    fn actions(&self) -> &[Action] {
+        self.actions
+    }
+    fn commands(&self) -> &[Command] {
+        self.commands
+    }
+    fn visual_group(&self) -> Option<VisualGroup> {
+        self.visual
+    }
+    fn run_command(&mut self, ctx: &mut CommandContext<'_>, cmd: &str, _args: &[&str]) -> Option<Vec<Line>> {
+        self.commands.iter().any(|c| c.name == cmd).then(|| {
+            ctx.player.position.y += 1.0;
+            vec![Line::of(Role::Dim, self.id)]
+        })
+    }
+}
+
+/// An action on `default` that neither repeats nor holds, labelled with its id.
+pub(crate) const fn action(id: &'static str, default: &'static [Chord]) -> Action {
+    Action { id, label: id, default, repeat: false, held: false }
+}
 
 /// A stand-in with a fixed identity and optional behaviours.
 pub(crate) struct Stand {
