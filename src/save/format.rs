@@ -45,7 +45,6 @@
 //! of edits: decoding degrades to [`Decoded::Salvaged`] instead of failing.
 
 use std::collections::HashMap;
-use std::collections::hash_map::Entry;
 
 use glam::DQuat;
 
@@ -230,18 +229,18 @@ pub(crate) struct SpecTable<'a> {
 }
 
 impl<'a> SpecTable<'a> {
-    /// The table index of `spec`, appended on first use.
+    /// The table index of `spec`, appended on first use. A plain lookup first: hits are the
+    /// common case, and `entry` measured slower for them.
     #[inline]
     pub fn index(&mut self, spec: &'a str) -> Result<u16, SaveError> {
-        match self.index.entry(spec) {
-            Entry::Occupied(at) => Ok(*at.get()),
-            Entry::Vacant(slot) => {
-                let at = u16::try_from(self.specs.len())
-                    .map_err(|_| SaveError::Corrupt("too many distinct block specs to save"))?;
-                self.specs.push(spec.to_string());
-                Ok(*slot.insert(at))
-            }
+        if let Some(&at) = self.index.get(spec) {
+            return Ok(at);
         }
+        let at = u16::try_from(self.specs.len())
+            .map_err(|_| SaveError::Corrupt("too many distinct block specs to save"))?;
+        self.specs.push(spec.to_string());
+        self.index.insert(spec, at);
+        Ok(at)
     }
 }
 
