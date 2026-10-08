@@ -493,6 +493,10 @@ fn connect_one(
     })?;
 
     let id = crate::net::content_id(&crate::block::BlockRegistry::with_builtins());
+    let (mods, dropped) = protocol::hello_offers(mods);
+    if dropped > 0 {
+        eprintln!("warning: {dropped} enabled mods are not reported to the server (past the join's count or length limits)");
+    }
     let hello = ClientMessage::Hello {
         protocol: PROTOCOL_VERSION,
         worldgen: id.worldgen,
@@ -501,10 +505,7 @@ fn connect_one(
         palette: id.palette,
         name: name.into(),
         password: password.into(),
-        mods: mods
-            .iter()
-            .map(|(id, version)| protocol::ModOffer { id: id.as_str().into(), version: version.as_str().into() })
-            .collect(),
+        mods,
     };
     let hello_bytes = hello.encode();
     with_stop(rt, stop, "connect timed out", async {

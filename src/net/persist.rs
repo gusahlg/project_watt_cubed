@@ -6,13 +6,18 @@
 //! scheduler's contacts, so a reload continues work in progress. A spec this build
 //! cannot parse stays in the file until a later edit replaces that cell.
 //!
-//! A missing file starts from the caller's flags. A corrupt file, a law mismatch,
-//! or a world from before this universe is an error — the server must not replace
-//! it with a fresh world. When a file loads, its seed and generator win.
+//! A live file that is missing, corrupt, or salvaged loads an intact `.bak` instead,
+//! and the next save then replaces the live file without rotating it over that
+//! backup. With neither file the world starts from the caller's flags. Otherwise a
+//! corrupt file, a law mismatch, or a world from before this universe is an error —
+//! the server must not replace it with a fresh world. When a file loads, its seed
+//! and generator win.
 
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::save::format::{self, Decoded, Edit, PendingContact, PlayerState, SaveDoc, WorldgenStamp};
@@ -54,6 +59,9 @@ pub(crate) struct Store {
     /// Cells whose spec this build could not parse. Re-emitted on the next save
     /// unless the live ledger has since written that cell.
     kept: Mutex<Vec<(i32, i32, i32, String)>>,
+    /// The live file is a world worth keeping as `.bak`. False after loading the backup
+    /// in its place, until the next save has written a good live file.
+    rotate: AtomicBool,
 }
 
 /// Live ledger captured for one save. Specs are the server's shared `Arc`s, so capturing under the
@@ -70,7 +78,10 @@ pub(crate) struct Snapshot {
 
 /// Operators and mod policy that live beside a world file.
 pub(crate) struct SideFiles {
+    /// Lowercased operator names with no secret.
     pub ops: Vec<String>,
+    /// Lowercased operator names and the secret each proves with `/op`.
+    pub op_secrets: Vec<(String, String)>,
     pub allow: Vec<String>,
     pub deny: Vec<String>,
 }
@@ -88,12 +99,15 @@ impl Store {
 
     /// Replace the ledger, clock, generator stamp, and pending reactions.
     /// Player, other mod records, name, created time, and playtime stay.
-    /// The previous file is rotated to `.bak` the way a singleplayer slot is.
+    /// The previous file is rotated to `.bak` the way a singleplayer slot is,
+    /// unless the backup was loaded in its place.
     pub fn write(&self, snap: &Snapshot) -> io::Result<()> {
         let mut doc = self.doc.lock().unwrap_or_else(|p| p.into_inner());
         let mut kept = self.kept.lock().unwrap_or_else(|p| p.into_inner());
-        let bytes = encode_snapshot(&mut doc, snap, &mut kept).map_err(|e| io::Error::other(e))?;
-        write_rotating(&self.path, &bytes)
+        let bytes = encode_snapshot(&mut doc, snap, &mut kept, format::MAX_EDITS as usize).map_err(io::Error::other)?;
+        write_rotating(&self.path, &bytes, self.rotate.load(Ordering::Relaxed))?;
+        self.rotate.store(true, Ordering::Relaxed);
+        Ok(())
     }
 }
 
@@ -104,9 +118,9 @@ fn suffixed(path: &Path, suffix: &str) -> PathBuf {
     path.with_file_name(name)
 }
 
-/// Write `bytes` via a sibling `.tmp`, then rename the live file to `.bak` and
-/// the temp file into place. A failed second rename puts the backup back.
-fn write_rotating(path: &Path, bytes: &[u8]) -> io::Result<()> {
+/// Write `bytes` via a sibling `.tmp`, then rename the live file to `.bak` (when
+/// `rotate`) and the temp file into place. A failed second rename puts the backup back.
+fn write_rotating(path: &Path, bytes: &[u8], rotate: bool) -> io::Result<()> {
     if let Some(dir) = path.parent() {
         if !dir.as_os_str().is_empty() {
             fs::create_dir_all(dir)?;
@@ -124,7 +138,7 @@ fn write_rotating(path: &Path, bytes: &[u8]) -> io::Result<()> {
         let _ = fs::remove_file(&tmp);
         return Err(err);
     }
-    let had_live = path.exists();
+    let had_live = rotate && path.exists();
     if had_live && let Err(err) = fs::rename(path, &bak) {
         let _ = fs::remove_file(&tmp);
         return Err(err);
@@ -152,37 +166,78 @@ pub(crate) fn fresh(flags: &Flags) -> Loaded {
     }
 }
 
-/// Load `path`, or prepare a new file there when it does not exist yet.
+/// What one world file on disk holds.
+enum OnDisk {
+    Missing,
+    Corrupt(String),
+    Doc(Decoded),
+}
+
+fn read_file(path: &Path) -> Result<OnDisk, String> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(match format::decode(&bytes) {
+            Ok(decoded) => OnDisk::Doc(decoded),
+            Err(e) => OnDisk::Corrupt(format!("{}: {e}", path.display())),
+        }),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(OnDisk::Missing),
+        Err(e) => Err(format!("could not read {}: {e}", path.display())),
+    }
+}
+
+/// Load `path`, falling back to an intact `.bak`, or prepare a new file there when
+/// neither exists. Prefers: intact live > intact backup > salvaged live > salvaged
+/// backup in place of a missing live file.
 pub(crate) fn load(path: &Path, flags: &Flags) -> Result<Loaded, String> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == ErrorKind::NotFound => {
-            return Ok(Loaded {
-                seed: flags.seed,
-                worldgen: flags.worldgen,
-                terrain: flags.terrain,
-                day: DEFAULT_DAY,
-                edits: Vec::new(),
-                pending: Vec::new(),
-                store: Some(Store {
-                    path: path.to_path_buf(),
-                    doc: Mutex::new(blank_doc(flags)),
-                    kept: Mutex::new(Vec::new()),
-                }),
-            });
-        }
-        Err(e) => return Err(format!("could not read {}: {e}", path.display())),
+    let bak = suffixed(path, ".bak");
+    let live = read_file(path)?;
+    let backup = match live {
+        OnDisk::Doc(Decoded::Intact(_)) => OnDisk::Missing,
+        _ => read_file(&bak)?,
     };
-    let mut doc = match format::decode(&bytes).map_err(|e| format!("{}: {e}", path.display()))? {
-        Decoded::Intact(doc) => doc,
-        Decoded::Salvaged { doc, recovered, expected } => {
-            eprintln!(
-                "warning: {} was truncated; loaded {recovered} of {expected} edits",
-                path.display()
-            );
-            doc
-        }
+    let truncated = |file: &Path, recovered: u32, expected: u32| {
+        eprintln!("warning: {} was truncated; loaded {recovered} of {expected} edits", file.display());
     };
+    match (live, backup) {
+        (OnDisk::Doc(Decoded::Intact(doc)), _) => open(path, doc, flags, true),
+        (live, OnDisk::Doc(Decoded::Intact(doc))) => {
+            let why = match live {
+                OnDisk::Missing => "missing",
+                OnDisk::Corrupt(_) => "unreadable",
+                OnDisk::Doc(_) => "truncated",
+            };
+            eprintln!("warning: {} is {why}; loading its intact backup {}", path.display(), bak.display());
+            open(path, doc, flags, false)
+        }
+        (OnDisk::Doc(Decoded::Salvaged { doc, recovered, expected }), _) => {
+            truncated(path, recovered, expected);
+            open(path, doc, flags, true)
+        }
+        (OnDisk::Missing, OnDisk::Doc(Decoded::Salvaged { doc, recovered, expected })) => {
+            eprintln!("warning: {} is missing; loading its backup {}", path.display(), bak.display());
+            truncated(&bak, recovered, expected);
+            open(path, doc, flags, false)
+        }
+        (OnDisk::Missing, OnDisk::Missing) => Ok(Loaded {
+            seed: flags.seed,
+            worldgen: flags.worldgen,
+            terrain: flags.terrain,
+            day: DEFAULT_DAY,
+            edits: Vec::new(),
+            pending: Vec::new(),
+            store: Some(Store {
+                path: path.to_path_buf(),
+                doc: Mutex::new(blank_doc(flags)),
+                kept: Mutex::new(Vec::new()),
+                rotate: AtomicBool::new(true),
+            }),
+        }),
+        (OnDisk::Missing, OnDisk::Corrupt(e)) => Err(format!("{} is missing and its backup does not load: {e}", path.display())),
+        (OnDisk::Corrupt(e), _) => Err(e),
+    }
+}
+
+/// A decoded world, ready to host. `rotate` is whether the live file may become the next `.bak`.
+fn open(path: &Path, mut doc: SaveDoc, flags: &Flags, rotate: bool) -> Result<Loaded, String> {
     if doc.law_stamp != material::Law::current().stamp() {
         return Err(format!(
             "{}: save belongs to a different universe (law stamp mismatch)",
@@ -229,6 +284,7 @@ pub(crate) fn load(path: &Path, flags: &Flags) -> Result<Loaded, String> {
             path: path.to_path_buf(),
             doc: Mutex::new(doc),
             kept: Mutex::new(Vec::new()),
+            rotate: AtomicBool::new(rotate),
         }),
     })
 }
@@ -273,28 +329,43 @@ fn blank_doc(flags: &Flags) -> SaveDoc {
     }
 }
 
-fn spec_index(specs: &mut Vec<String>, spec: &str) -> Result<u16, String> {
-    if let Some(index) = specs.iter().position(|have| have == spec) {
-        return u16::try_from(index).map_err(|_| "too many distinct block specs to save".to_string());
-    }
-    let index = u16::try_from(specs.len()).map_err(|_| "too many distinct block specs to save".to_string())?;
-    specs.push(spec.to_string());
-    Ok(index)
-}
-
-fn encode_snapshot(doc: &mut SaveDoc, snap: &Snapshot, kept: &mut Vec<(i32, i32, i32, String)>) -> Result<Vec<u8>, String> {
+/// Encode `snap` plus the cells kept from the file, at most `cap` of them, in one linear pass:
+/// the spec table is filled in cell order through a map from spec to index.
+fn encode_snapshot(
+    doc: &mut SaveDoc,
+    snap: &Snapshot,
+    kept: &mut Vec<(i32, i32, i32, String)>,
+    cap: usize,
+) -> Result<Vec<u8>, String> {
     let mut cells: Vec<(i32, i32, i32, &str)> = snap.edits.iter().map(|(x, y, z, spec)| (*x, *y, *z, spec.as_ref())).collect();
     // A live edit replaces an unparsed one at the same cell. The unparsed text stays only while
     // this build still has no opinion about that cell.
-    kept.retain(|(x, y, z, _)| !snap.edits.iter().any(|edit| edit.0 == *x && edit.1 == *y && edit.2 == *z));
+    if !kept.is_empty() {
+        let live: HashSet<(i32, i32, i32)> = snap.edits.iter().map(|edit| (edit.0, edit.1, edit.2)).collect();
+        kept.retain(|(x, y, z, _)| !live.contains(&(*x, *y, *z)));
+    }
     for (x, y, z, spec) in kept.iter() {
         cells.push((*x, *y, *z, spec.as_str()));
     }
     cells.sort_unstable_by_key(|cell| (cell.0, cell.1, cell.2));
+    if cells.len() > cap {
+        eprintln!("warning: {} edits do not fit a world file; saving the first {cap}", cells.len());
+        cells.truncate(cap);
+    }
     let mut specs: Vec<String> = Vec::new();
+    let mut index: HashMap<&str, u16> = HashMap::new();
     let mut records = Vec::with_capacity(cells.len());
     for (x, y, z, spec) in cells {
-        records.push(Edit { x, y, z, spec: spec_index(&mut specs, spec)? });
+        let at = match index.get(spec) {
+            Some(&at) => at,
+            None => {
+                let at = u16::try_from(specs.len()).map_err(|_| "too many distinct block specs to save".to_string())?;
+                specs.push(spec.to_string());
+                index.insert(spec, at);
+                at
+            }
+        };
+        records.push(Edit { x, y, z, spec: at });
     }
     doc.meta.seed = snap.seed;
     doc.meta.last_played = save::unix_now();
@@ -324,37 +395,50 @@ fn clock_of(mods: &[(String, String)]) -> f32 {
 /// `mods.toml` that is not that shape is an error.
 pub(crate) fn read_side_files(world: &Path) -> Result<SideFiles, String> {
     let Some(dir) = world.parent() else {
-        return Ok(SideFiles { ops: Vec::new(), allow: Vec::new(), deny: Vec::new() });
+        return Ok(SideFiles { ops: Vec::new(), op_secrets: Vec::new(), allow: Vec::new(), deny: Vec::new() });
     };
-    let ops = read_ops(&dir.join("ops.txt"))?;
+    let (ops, op_secrets) = read_ops(&dir.join("ops.txt"))?;
     let (allow, deny) = read_mods_toml(&dir.join("mods.toml"))?;
-    Ok(SideFiles { ops, allow, deny })
+    Ok(SideFiles { ops, op_secrets, allow, deny })
 }
 
-fn read_ops(path: &Path) -> Result<Vec<String>, String> {
+type Ops = (Vec<String>, Vec<(String, String)>);
+
+fn read_ops(path: &Path) -> Result<Ops, String> {
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
-        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok((Vec::new(), Vec::new())),
         Err(e) => return Err(format!("could not read {}: {e}", path.display())),
     };
     Ok(parse_ops(&text))
 }
 
-pub(crate) fn parse_ops(text: &str) -> Vec<String> {
-    let mut ops = Vec::new();
+/// One operator a line: `name`, or `name secret` where the last word is the secret.
+/// Names are lowercased; the first line for a name wins.
+pub(crate) fn parse_ops(text: &str) -> Ops {
+    let clean = |part: &str| part.chars().filter(|c| !c.is_control()).collect::<String>();
+    let mut ops: Vec<String> = Vec::new();
+    let mut secrets: Vec<(String, String)> = Vec::new();
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let name: String = line.chars().filter(|c| !c.is_control()).take(super::MAX_NAME).collect();
+        let (name, secret) = match line.rsplit_once(char::is_whitespace) {
+            Some((name, secret)) => (name, Some(clean(secret))),
+            None => (line, None),
+        };
+        let name: String = clean(name).chars().take(super::MAX_NAME).collect();
         let name = name.trim().to_ascii_lowercase();
-        if name.is_empty() || ops.iter().any(|op: &String| op == &name) {
+        if name.is_empty() || ops.contains(&name) || secrets.iter().any(|(have, _)| have == &name) {
             continue;
         }
-        ops.push(name);
+        match secret {
+            Some(secret) if !secret.is_empty() => secrets.push((name, secret)),
+            _ => ops.push(name),
+        }
     }
-    ops
+    (ops, secrets)
 }
 
 fn read_mods_toml(path: &Path) -> Result<(Vec<String>, Vec<String>), String> {
@@ -500,7 +584,7 @@ mod tests {
     fn side_files_union_ops_and_mod_lists() {
         let dir = crate::save::store::test_temp_path("side");
         fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("ops.txt"), "# staff\nAda\n\n bob \nAda\n").unwrap();
+        fs::write(dir.join("ops.txt"), "# staff\nAda\n\n bob \nAda\ncara  s3cret \nCara other\n").unwrap();
         fs::write(
             dir.join("mods.toml"),
             "allow = [\"pwc.hotbar\", \"pwc.hotbar\"]\ndeny = [\"pwc.dev-toolkit\"]\n",
@@ -508,6 +592,7 @@ mod tests {
         .unwrap();
         let side = read_side_files(&dir.join("world.save")).unwrap();
         assert_eq!(side.ops, vec!["ada".to_string(), "bob".to_string()]);
+        assert_eq!(side.op_secrets, vec![("cara".to_string(), "s3cret".to_string())], "the first line for a name wins");
         assert_eq!(side.allow, vec!["pwc.hotbar".to_string()]);
         assert_eq!(side.deny, vec!["pwc.dev-toolkit".to_string()]);
         let _ = fs::remove_dir_all(&dir);
@@ -608,6 +693,95 @@ mod tests {
         assert!(replaced.edits.iter().all(|edit| edit.3 == "air"));
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(suffixed(&path, ".bak"));
+    }
+
+    fn snapshot(seed: i64, edits: Vec<(i32, i32, i32, Arc<str>)>) -> Snapshot {
+        Snapshot { seed, worldgen: WorldgenKind::Flat, terrain: TerrainCfg::default(), day: 0.3, edits, pending: Vec::new() }
+    }
+
+    fn intact(path: &Path) -> SaveDoc {
+        match format::decode(&fs::read(path).unwrap()).unwrap() {
+            Decoded::Intact(doc) => doc,
+            Decoded::Salvaged { .. } => panic!("{} must be intact", path.display()),
+        }
+    }
+
+    /// A crash between the save's two renames leaves only the backup: it loads, and the next
+    /// saves never rotate a fresh world over it.
+    #[test]
+    fn a_missing_live_file_loads_the_backup() {
+        let path = crate::save::store::test_temp_path("bak-only");
+        let bak = suffixed(&path, ".bak");
+        let stone = vec![Edit { x: 1, y: 2, z: 3, spec: 0 }];
+        write_atomic_file(&bak, &format::encode(&doc_with(42, 0.5f32.to_bits(), stone, vec!["air".into()])).unwrap()).unwrap();
+        let loaded = load(&path, &flags(1)).unwrap();
+        assert_eq!(loaded.seed, 42, "the backup's world, not the flags'");
+        assert_eq!(loaded.edits, vec![(1, 2, 3, "air".to_string())]);
+        let store = loaded.store.unwrap();
+        store.write(&snapshot(42, vec![(1, 2, 3, "air".into()), (4, 5, 6, "air".into())])).unwrap();
+        assert_eq!(intact(&bak).edits.len(), 1, "the first save leaves the backup alone");
+        store.write(&snapshot(42, vec![(4, 5, 6, "air".into())])).unwrap();
+        assert_eq!(intact(&bak).edits.len(), 2, "later saves rotate as usual");
+        assert_eq!(load(&path, &flags(1)).unwrap().edits, vec![(4, 5, 6, "air".to_string())]);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&bak);
+    }
+
+    /// A truncated or unreadable live file loses to an intact backup, and the next save
+    /// replaces the live file without rotating it over that backup.
+    #[test]
+    fn a_damaged_live_file_loads_the_intact_backup_and_keeps_it() {
+        for damage in ["truncated", "garbage"] {
+            let path = crate::save::store::test_temp_path(damage);
+            let bak = suffixed(&path, ".bak");
+            let one = vec![Edit { x: 1, y: 2, z: 3, spec: 0 }];
+            write_atomic_file(&bak, &format::encode(&doc_with(42, 0.5f32.to_bits(), one, vec!["air".into()])).unwrap()).unwrap();
+            let five = (0..5).map(|x| Edit { x, y: 0, z: 0, spec: 0 }).collect();
+            let live = format::encode(&doc_with(42, 0.5f32.to_bits(), five, vec!["air".into()])).unwrap();
+            let damaged = if damage == "truncated" { live[..live.len() - 20].to_vec() } else { b"not a save".to_vec() };
+            fs::write(&path, damaged).unwrap();
+            let loaded = load(&path, &flags(1)).unwrap();
+            assert_eq!(loaded.edits, vec![(1, 2, 3, "air".to_string())], "{damage}: the intact backup wins");
+            loaded.store.unwrap().write(&snapshot(42, vec![(1, 2, 3, "air".into()), (7, 7, 7, "air".into())])).unwrap();
+            assert_eq!(intact(&bak).edits.len(), 1, "{damage}: the backup is still the good world");
+            assert_eq!(intact(&path).edits.len(), 2);
+            let _ = fs::remove_file(&path);
+            let _ = fs::remove_file(&bak);
+        }
+    }
+
+    /// A long-running server's save: many cells over a full spec pool plus unparsed cells
+    /// from an older build. Linear work keeps this well under a second.
+    #[test]
+    fn world_saves_encode_in_linear_time() {
+        let pool: Vec<Arc<str>> = (0..16_384).map(|i| Arc::from(format!("spec-{i}"))).collect();
+        let edits = (0..120_000).map(|i| (i, 0, 0, pool[i as usize % pool.len()].clone())).collect();
+        let mut kept: Vec<(i32, i32, i32, String)> =
+            (0..40_000).map(|i| (i, i % 2, 0, format!("old-{}", i % 7))).collect();
+        let mut doc = blank_doc(&flags(1));
+        let started = std::time::Instant::now();
+        let bytes = encode_snapshot(&mut doc, &snapshot(1, edits), &mut kept, usize::MAX).unwrap();
+        let took = started.elapsed();
+        assert_eq!(kept.len(), 20_000, "a live cell replaces the unparsed one under it");
+        let saved = match format::decode(&bytes).unwrap() {
+            Decoded::Intact(doc) => doc,
+            Decoded::Salvaged { .. } => panic!("intact"),
+        };
+        assert_eq!(saved.edits.len(), 140_000);
+        assert_eq!(saved.specs.len(), pool.len() + 7);
+        assert_eq!(saved.specs[..3], ["spec-0", "spec-1", "old-1"], "the table follows the cells' order");
+        assert!(took < std::time::Duration::from_secs(3), "encoding took {took:?}");
+    }
+
+    #[test]
+    fn a_ledger_past_the_file_limit_saves_what_fits() {
+        let mut doc = blank_doc(&flags(1));
+        let edits = (0..5).map(|x| (x, 0, 0, Arc::from("air"))).collect();
+        let bytes = encode_snapshot(&mut doc, &snapshot(1, edits), &mut Vec::new(), 3).unwrap();
+        match format::decode(&bytes).unwrap() {
+            Decoded::Intact(doc) => assert_eq!(doc.edits.iter().map(|e| e.x).collect::<Vec<_>>(), vec![0, 1, 2]),
+            Decoded::Salvaged { .. } => panic!("intact"),
+        }
     }
 
     /// A minimal v9 flat file: four knobs, the old 33-byte player, one `air` edit.

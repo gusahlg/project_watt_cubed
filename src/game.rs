@@ -1593,11 +1593,18 @@ impl Game {
         }
     }
 
-    /// A submitted console line, short of the engine. A leading `/` is always a command; in
+    /// A submitted console line, short of the engine. A leading `/` is a command, except that in
+    /// multiplayer `/op <secret>` is the server's operator login, sent as chat and not echoed; in
     /// multiplayer any other line is chat (a leading `!` sends it to global chat), while in
     /// singleplayer it stays a command. The first enabled mod that knows the command runs it, then
     /// the core follows up on the state it changed. Returns whether it changed the settings.
     fn run_line(&mut self, line: String, settings: &mut Settings, events: &mut Vec<GameEvent>, mods: &mut Mods) -> bool {
+        if (line == "/op" || line.starts_with("/op "))
+            && let Some(net) = &mut self.net
+        {
+            net.send_chat(chat::GLOBAL, &line);
+            return false;
+        }
         if !line.starts_with('/')
             && let Some(net) = &mut self.net
         {
