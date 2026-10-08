@@ -10,6 +10,13 @@
 //! default `6,3`), `FLIGHT_LOD2` (`0` turns the far field off), `FLIGHT_HZ` (default 240),
 //! `FLIGHT_STOP` (seconds held still after the flight, default 0), `FLIGHT_ASSERT`
 //! (`1` checks the RD16/V5 acceptance numbers).
+//!
+//! Pinned 2026-10-08, louise-pc (10 workers, release, defaults), median of 3, main ms:
+//!   100 m/s: frame mean 0.270 p95 1.133, full pass mean 2.012
+//!   600 m/s: frame mean 0.224 p95 0.550, full pass mean 0.516
+//! These time the real pass. Earlier pins timed a copy of it that skipped the radius-shrink
+//! retire and the section remesh step; interleaved with that copy on the same box the
+//! numbers were within the run-to-run noise (100 m/s mean 0.256, 600 m/s mean 0.229).
 
 use std::time::{Duration, Instant};
 
