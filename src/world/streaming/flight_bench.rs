@@ -1,8 +1,8 @@
 //! Headless fast flight over the round start world: an ignored main-thread timing bench.
-//! Each frame mirrors [`World::stream`] (and the pump inside it) with the GPU stood in:
-//! uploads land as fake handles, frees go to the test log, occlusion masks touch no engine.
-//! Lane budgets match `lanes.rs`; frames are paced like an uncapped game whose render
-//! thread keeps up (`FLIGHT_HZ`).
+//! Each frame is the real stream pass ([`World::stream_steps`]) with the GPU stood in
+//! ([`Headless`]): uploads land as fake handles, frees go to the test log, occlusion masks
+//! touch no engine. Frames are paced like an uncapped game whose render thread keeps up
+//! (`FLIGHT_HZ`).
 //!
 //! `cargo test --release --lib round_flight_breakdown -- --ignored --nocapture`
 //! Env: `FLIGHT_SPEEDS` (m/s, default `100,600`), `FLIGHT_SECS` (default 20),
@@ -13,179 +13,20 @@
 
 use std::time::{Duration, Instant};
 
-use voxel_engine::{MeshHandle, Pass};
-
+use super::headless::{Headless, Laps, PHASE_NAMES};
 use super::*;
 use crate::render_config::RenderConfig;
 use crate::world::generation::WorldgenKind;
-use crate::world::{adjust_count, admit, mesh_free_log};
 
-const PHASES: [&str; 14] = [
-    "begin",
-    "drain",
-    "unload",
-    "cross",
-    "generate",
-    "light",
-    "mesh",
-    "lod_face",
-    "frontier",
-    "sec_unload",
-    "reclaim",
-    "sec_admit",
-    "sec_visible",
-    "occlusion",
-];
-
-struct Laps {
-    at: Instant,
-    sum: [Duration; PHASES.len()],
-    /// The same, over full-pass frames only.
-    full: [Duration; PHASES.len()],
-    in_full: bool,
+/// The timing of a [`Headless::timed`] pass.
+fn laps(steps: &mut Headless) -> &mut Laps {
+    steps.laps.as_mut().expect("timed steps")
 }
 
-impl Laps {
-    fn lap(&mut self, phase: usize) {
-        let now = Instant::now();
-        self.sum[phase] += now - self.at;
-        if self.in_full {
-            self.full[phase] += now - self.at;
-        }
-        self.at = now;
-    }
-}
-
-/// [`World::install_chunk_handles`] without an engine: one fake opaque handle, or `Air`.
-fn fake_install(w: &mut World, coord: Coord, drawn: bool) {
-    let vis = !w.occlusion_active || w.occlusion.is_visible(coord);
-    let handles = ByPass::from_fn(|p| (drawn && p == Pass::Opaque).then(|| MeshHandle::from_raw_parts(1, 1)));
-    if let Some(loaded) = w.chunks.get_mut(&coord) {
-        let was = loaded.state.is_building();
-        loaded.retire_logged(MeshState::from_upload(handles));
-        loaded.mesh_hash = None;
-        adjust_count(&mut w.building_meshes, was, false);
-        loaded.visible = vis;
-    }
-}
-
-/// [`World::drain_results`] without an engine, at the drain lane's 1 ms. The two upload loops
-/// are copies of its own; the engine-free blocks are shared.
-fn fake_drain(w: &mut World) {
-    w.integrate_results(Duration::from_millis(1));
-    let pacer = w.stream_pacer;
-    // The chunk-upload loop, installing through `fake_install` for `upload_chunk_payload`.
-    let budget = pacer.upload_bytes();
-    let (mut bytes, mut uploads, mut pops) = (0usize, 0usize, 0usize);
-    while (uploads == 0 || bytes < budget) && pops < UPLOAD_SCAN_MAX {
-        let Some((coord, rev, data)) = w.upload_queue.pop_front() else {
-            break;
-        };
-        pops += 1;
-        if !w.mesh_result_applies(coord, rev) {
-            w.drop_stale_upload(coord);
-            continue;
-        }
-        let b = mesh_output_bytes(&data);
-        bytes += b;
-        uploads += 1;
-        fake_install(w, coord, b > 0);
-        w.note_settled();
-    }
-    w.apply_light_queue();
-    // The section-upload loop: a section lands `Ready` with no slabs.
-    let mut sections = 0;
-    while sections < pacer.section_uploads() && bytes < budget {
-        let Some((pos, token, b, _)) = w.section_upload_queue.pop_front() else {
-            break;
-        };
-        sections += 1;
-        if let Some(state @ SectionState::Meshing { .. }) = w.sections.get_mut(&pos)
-            && matches!(state, SectionState::Meshing { token: t } if *t == token)
-        {
-            adjust_count(&mut w.meshing_sections, true, false);
-            bytes += b;
-            *state = SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None };
-            w.pending_sections.set();
-            w.section_cover_dirty.set();
-        }
-    }
-}
-
-/// One `stream` frame at `eye`. Returns whether it was a full pass.
-fn frame(w: &mut World, eye: DVec3, laps: &mut Laps) -> bool {
-    laps.at = Instant::now();
-    let (center, far, full_pass, far_moved) = w.begin_stream(eye, None);
-    laps.in_full = full_pass;
-    laps.lap(0);
-    if w.anything_in_flight() {
-        fake_drain(w);
-    }
-    assert!(!w.dirty_pending(), "the flight edits nothing");
-    w.refresh_lod_clip();
-    laps.lap(1);
-    let load_follow = !full_pass && (w.load_moved || w.heading_changed);
-    if full_pass {
-        w.unload_far_with(center, |state, _| state.free_logged());
-        laps.lap(2);
-        w.cross_boundary(center);
-        w.finish_load_window(center, true);
-        laps.lap(3);
-    } else if load_follow {
-        laps.lap(2);
-        w.finish_load_window(center, false);
-        laps.lap(3);
-    }
-    w.request_region_data(center, Budget::Millis(2.0));
-    laps.lap(4);
-    if w.lighting {
-        admit::<LightLane>(w, center, Budget::Millis(1.0));
-    }
-    laps.lap(5);
-    w.tick_light_gate();
-    if !w.upload_backlogged() {
-        admit::<MeshLane>(w, center, Budget::Millis(2.0));
-    }
-    w.flush_degraded_terminal();
-    laps.lap(6);
-    if w.lod2 {
-        w.section_pyramid.unit = w.view.lod_unit();
-        w.update_lod_face(far);
-        w.poll_mip();
-        w.ensure_mip_bake();
-        w.refresh_section_overlay(Budget::Millis(1.0));
-        laps.lap(7);
-        w.refresh_frontier(far);
-        laps.lap(8);
-        if full_pass || far_moved {
-            w.unload_sections_with(far, |_| {});
-            w.pending_sections.set();
-        }
-        laps.lap(9);
-        w.reclaim_blocked_sections(far, None);
-        laps.lap(10);
-        admit::<SectionLane>(w, far, Budget::Millis(1.0));
-        laps.lap(11);
-        if w.section_cover_dirty.take() || w.pending_sections.get() {
-            w.rebuild_section_visible(None);
-        }
-        laps.lap(12);
-    }
-    w.rebuild_occlusion(None, Budget::Millis(0.5));
-    w.refresh_lod_clip();
-    laps.lap(13);
-    full_pass
-}
-
-/// One untimed `stream` frame at `eye`, for the streaming convergence tests, the engine's slot
-/// report stood in.
-pub(super) fn step(w: &mut World, eye: DVec3) -> bool {
-    w.gpu_live_slots = w.local_mesh_slots() as u32;
-    mesh_free_log::take();
-    let zero = [Duration::ZERO; PHASES.len()];
-    let full = frame(w, eye, &mut Laps { at: Instant::now(), sum: zero, full: zero, in_full: false });
-    mesh_free_log::take();
-    full
+/// The last pass's main-thread milliseconds and whether it was a full pass.
+fn last_ms(steps: &mut Headless) -> (f32, bool) {
+    let (took, full) = laps(steps).last;
+    (took.as_secs_f32() * 1e3, full)
 }
 
 fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
@@ -245,12 +86,8 @@ fn fly(speed: f64, secs: f64, settle: f64, view: (i32, i32), lod2: bool, hz: f64
     w.prepare_around(spawn);
     w.drive_spawn_ready();
     let period = Duration::from_secs_f64(1.0 / hz);
-    let zero = [Duration::ZERO; PHASES.len()];
-    let mut laps = Laps { at: Instant::now(), sum: zero, full: zero, in_full: false };
-    let pace = |w: &mut World, start: Instant| {
-        // A real engine reports its live slots each frame; sections here carry none.
-        w.gpu_live_slots = w.local_mesh_slots() as u32;
-        mesh_free_log::take();
+    let mut steps = Headless::timed();
+    let pace = |start: Instant| {
         if let Some(rest) = period.checked_sub(start.elapsed()) {
             std::thread::sleep(rest);
         }
@@ -258,8 +95,8 @@ fn fly(speed: f64, secs: f64, settle: f64, view: (i32, i32), lod2: bool, hz: f64
     let t0 = Instant::now();
     while t0.elapsed().as_secs_f64() < settle && !w.entry_complete() {
         let start = Instant::now();
-        frame(&mut w, spawn, &mut laps);
-        pace(&mut w, start);
+        w.stream_steps(spawn, &mut steps);
+        pace(start);
     }
     println!(
         "flight {speed} m/s: settled={} after {:.1}s view={view:?} lod2={lod2} hz={hz} chunks={} sections={}",
@@ -268,8 +105,7 @@ fn fly(speed: f64, secs: f64, settle: f64, view: (i32, i32), lod2: bool, hz: f64
         w.chunks.len(),
         w.sections.len()
     );
-    laps.sum = zero;
-    laps.full = zero;
+    laps(&mut steps).reset();
     let mut ms: Vec<f32> = Vec::new();
     let mut cross_ms: Vec<f32> = Vec::new();
     let (mut frontiers, mut occlusions) = (0u32, 0u32);
@@ -297,8 +133,8 @@ fn fly(speed: f64, secs: f64, settle: f64, view: (i32, i32), lod2: bool, hz: f64
         let key = w.section_frontier_key;
         let occ = w.last_occlusion_rebuild;
         last_eye = spawn + DVec3::X * (speed * flown);
-        let full = frame(&mut w, last_eye, &mut laps);
-        let took = start.elapsed().as_secs_f32() * 1e3;
+        w.stream_steps(last_eye, &mut steps);
+        let (took, full) = last_ms(&mut steps);
         ms.push(took);
         if full {
             cross_ms.push(took);
@@ -328,7 +164,7 @@ fn fly(speed: f64, secs: f64, settle: f64, view: (i32, i32), lod2: bool, hz: f64
             );
             next_sample += 1.0;
         }
-        pace(&mut w, start);
+        pace(start);
     }
     // Counters and the end window are the flight, not the standstill afterwards.
     let flown = t0.elapsed().as_secs_f64();
@@ -361,13 +197,14 @@ fn fly(speed: f64, secs: f64, settle: f64, view: (i32, i32), lod2: bool, hz: f64
         f64::from(total) / (flown * 10.0),
         cross_ms.len(),
     );
+    let laps = laps(&mut steps);
     let mut line = String::from("  ms/frame by phase:");
-    for (name, d) in PHASES.iter().zip(laps.sum) {
+    for (name, d) in PHASE_NAMES.iter().zip(laps.sum) {
         line.push_str(&format!(" {name}={:.3}", d.as_secs_f64() * 1e3 / frames.max(1) as f64));
     }
     println!("{line}");
     let mut line = String::from("  ms/full pass by phase:");
-    for (name, d) in PHASES.iter().zip(laps.full) {
+    for (name, d) in PHASE_NAMES.iter().zip(laps.full) {
         line.push_str(&format!(" {name}={:.3}", d.as_secs_f64() * 1e3 / cross_ms.len().max(1) as f64));
     }
     println!("{line}");
@@ -427,14 +264,13 @@ struct Stop {
 
 /// Hold `eye` still for `FLIGHT_STOP` seconds so the loading window can grow back to the
 /// full view.
-fn hold_still(w: &mut World, eye: DVec3, pace: &impl Fn(&mut World, Instant)) -> Stop {
+fn hold_still(w: &mut World, eye: DVec3, pace: &impl Fn(Instant)) -> Stop {
     let secs = env_or("FLIGHT_STOP", 0.0);
     let mut stop = Stop { samples: Vec::new(), ms: Vec::new(), regrow_frames: 0, regrow_rebuilds: 0 };
     if secs <= 0.0 {
         return stop;
     }
-    let zero = [Duration::ZERO; PHASES.len()];
-    let mut laps = Laps { at: Instant::now(), sum: zero, full: zero, in_full: false };
+    let mut steps = Headless::timed();
     let rebuilds0 = w.counters.gen_cursor_rebuilds;
     let mut regrowing = true;
     let mut next = 1.0f64;
@@ -445,8 +281,8 @@ fn hold_still(w: &mut World, eye: DVec3, pace: &impl Fn(&mut World, Instant)) ->
             break;
         }
         let start = Instant::now();
-        frame(w, eye, &mut laps);
-        stop.ms.push(start.elapsed().as_secs_f32() * 1e3);
+        w.stream_steps(eye, &mut steps);
+        stop.ms.push(last_ms(&mut steps).0);
         if regrowing && w.loading_full() {
             regrowing = false;
             stop.regrow_frames = stop.ms.len();
@@ -456,7 +292,7 @@ fn hold_still(w: &mut World, eye: DVec3, pace: &impl Fn(&mut World, Instant)) ->
             stop.samples.push(Sample::take(w, held));
             next += 1.0;
         }
-        pace(w, start);
+        pace(start);
     }
     if regrowing {
         stop.regrow_frames = stop.ms.len();

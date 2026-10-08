@@ -55,6 +55,8 @@ mod census;
 mod clip;
 mod coverage;
 mod edits;
+#[cfg(test)]
+mod fixtures;
 mod heightmip;
 mod lanes;
 mod metric;

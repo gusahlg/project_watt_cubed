@@ -115,7 +115,7 @@ stream_lanes! {
     /// to GPU is budgeted. Needs the engine.
     new DrainLane(Budget::Millis(1.0))
         => |world, eng, b| {
-            world.drain_results(eng.expect("drain is a CPU lane; eng required"), duration(b));
+            world.drain_with(duration(b), eng.expect("drain is a CPU lane; eng required"));
             Progress::Idle
         },
     /// Column granularity (one job per `(cx,cz)` span) means this keeps its own

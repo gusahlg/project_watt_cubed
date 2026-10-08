@@ -13,7 +13,7 @@ use std::io::Write;
 
 use voxel_engine::DVec3;
 
-use super::flight_bench::step;
+use super::headless::step;
 use crate::coord::{BlockCoord, ChunkCoord, Face};
 use crate::input::movement::{update_player, update_player_in, MoveInput};
 use crate::math::{block_coord, Aabb, Bounded};

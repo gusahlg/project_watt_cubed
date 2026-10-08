@@ -1103,10 +1103,7 @@ fn upload_byte_accounting_matches_vertex_and_index_sizes() {
     );
     let expected: usize = Pass::ALL.iter().map(|&p| out[p].vertex_bytes()).sum();
     assert!(expected > 0, "a surface chunk yields geometry");
-    assert_eq!(
-        streaming::mesh_output_bytes(&pipeline::MeshPayload::from(out)),
-        expected
-    );
+    assert_eq!(pipeline::MeshPayload::from(out).vertex_bytes(), expected);
 }
 
 /// Staged upload accounting is the same vertex-byte charge as CPU `MeshData`.
@@ -1151,7 +1148,7 @@ fn section_upload_byte_accounting_matches_vertex_sizes() {
     let expected: usize =
         meshes.slabs.iter().flat_map(|s| Pass::ALL.iter().map(move |&p| s.data[p].vertex_bytes())).sum();
     assert!(expected > 0, "a default-seed section yields geometry");
-    assert_eq!(streaming::section_output_bytes(&meshes), expected);
+    assert_eq!(meshes.vertex_bytes(), expected);
 
     world.section_pending_claim = Some((pos, pipeline::ClaimToken(7)));
     <SectionLane as StreamLane>::claim(&mut world, pos);
@@ -1172,7 +1169,7 @@ fn section_upload_byte_accounting_matches_vertex_sizes() {
 #[test]
 fn empty_section_mesh_charges_zero_upload_bytes() {
     let meshes = section::SectionMeshData::default();
-    assert_eq!(streaming::section_output_bytes(&meshes), 0);
+    assert_eq!(meshes.vertex_bytes(), 0);
 }
 
 /// Mesh admission pauses at the upload-queue cap and resumes below it.
@@ -3644,96 +3641,6 @@ fn far_face_home_chart_edit_dirties_the_chart_section() {
     assert!(world.dirty_sections.iter().all(|p| p.body != home), "a chart edit dirtied the catalog id");
 }
 
-fn headless_integrate(world: &mut World, result: pipeline::Done) {
-    match result {
-        pipeline::Done::Column { key, chunks, heights } => world.accept_column(key, chunks, heights),
-        pipeline::Done::Mesh { coord, rev, data } => world.accept_mesh(coord, rev, data),
-        pipeline::Done::Light {
-            coord,
-            epoch,
-            light_gen,
-            grid,
-        } => world.accept_light(coord, epoch, light_gen, grid),
-        pipeline::Done::Section { .. } => {}
-        pipeline::Done::Failed(key) => world.fail_job(*key),
-        pipeline::Done::Cancelled(keys) => {
-            for key in keys.into_vec() {
-                world.cancel_job(key);
-            }
-        }
-    }
-}
-
-/// GPU-free stand-in for the upload half of `drain_results`: an empty mesh is
-/// `Air`, anything else a fake `Ready` that is never engine-freed.
-fn headless_uploads(world: &mut World) -> usize {
-    let mut upload_bytes = 0usize;
-    let mut uploads = 0usize;
-    let mut pops = 0usize;
-    while (uploads == 0 || upload_bytes < UPLOAD_BUDGET_BYTES) && pops < UPLOAD_SCAN_MAX {
-        let Some((coord, rev, data)) = world.upload_queue.pop_front() else {
-            break;
-        };
-        pops += 1;
-        if !world.mesh_result_applies(coord, rev) {
-            if let Some(loaded) = world.chunks.get_mut(&coord) {
-                if loaded.state.release_build() {
-                    adjust_count(&mut world.building_meshes, true, false);
-                }
-            }
-            world.pending_fresh.set();
-            world.mesh_worklist.insert(coord);
-            continue;
-        }
-        let bytes = data.vertex_bytes();
-        upload_bytes += bytes;
-        uploads += 1;
-        let next = if bytes == 0 {
-            MeshState::Air
-        } else {
-            let handle = voxel_engine::MeshHandle::from_raw_parts(1, 1);
-            let meshes = ChunkMeshes::from_upload_handles(ByPass::from_fn(|p| {
-                (p == Pass::Opaque).then_some(handle)
-            }))
-            .expect("one pass");
-            MeshState::Ready(meshes)
-        };
-        if let Some(loaded) = world.chunks.get_mut(&coord) {
-            let was = loaded.state.is_building();
-            loaded.retire_logged(next);
-            adjust_count(&mut world.building_meshes, was, false);
-        }
-    }
-    uploads
-}
-
-fn headless_light_apply(world: &mut World) -> usize {
-    let deadline = pipeline::Deadline::from_budget(pipeline::LIGHT_APPLY_BUDGET);
-    let mut applied = 0usize;
-    while applied == 0 || !deadline.expired() {
-        let Some((coord, grid)) = world.light_apply_queue.pop_front() else {
-            break;
-        };
-        world.settle_light(coord, grid);
-        applied += 1;
-    }
-    applied
-}
-
-fn headless_drain(world: &mut World) -> usize {
-    // `DrainLane` is `Budget::Millis(1.0)` with `RESULT_INTEGRATE_FLOOR` 8.
-    let deadline = pipeline::Deadline::from_budget(std::time::Duration::from_millis(1));
-    let mut integrated = 0usize;
-    while integrated < 8 || !deadline.expired() {
-        let Some(result) = world.workers.as_ref().and_then(pipeline::Workers::try_recv) else {
-            break;
-        };
-        headless_integrate(world, result);
-        integrated += 1;
-    }
-    integrated
-}
-
 /// Three quarters of a radius from the centre of the catalog's greatest rock, along +z.
 fn great_rock_eye(world: &World) -> [i64; 3] {
     let rock = world.terrain().cosmos().and_then(|c| c.great_rock()).expect("a great rock");
@@ -3928,16 +3835,16 @@ fn stone_loaded(coord: ChunkCoord, stone: crate::block::BlockId) -> Loaded {
 }
 
 /// Headless stream to `entry_complete` inside the seed-42 catalog's greatest asteroid
-/// (eye three quarters of a radius from its centre along +z).
-/// Open space streams an isotropic cube, so horizontal 12 is the volume that
-/// loads on the order of 16k chunks. Lane budgets match `lanes.rs`. No engine,
-/// no window. Ignored timing bench:
+/// (eye three quarters of a radius from its centre along +z): the real stream pass with the
+/// GPU stood in, timed by phase. Open space streams an isotropic cube, so horizontal 12 is the
+/// volume that loads on the order of 16k chunks. No engine, no window. Ignored timing bench:
 /// `cargo test --release --lib asteroid_entry_breakdown -- --ignored --nocapture`
 #[test]
 #[ignore]
 fn asteroid_entry_breakdown() {
     use std::time::{Duration, Instant};
 
+    use super::streaming::headless::{Headless, PHASE_NAMES};
     use crate::world::brick::ChunkPayload;
     use crate::world::chunk::{CHUNK_SIZE, CHUNK_VOLUME};
     use crate::world::generation::WorldgenKind;
@@ -3948,54 +3855,18 @@ fn asteroid_entry_breakdown() {
     render.lod2 = false;
     render.occlusion = false;
     let mut world = World::with_kind(42, render, WorldgenKind::Diffusion, false);
-    let eye = great_rock_eye(&world);
+    let [x, y, z] = great_rock_eye(&world);
+    let eye = DVec3::new(x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5);
     world.set_view_distances(VIEW_H, 3);
-    let center = ChunkCoord::new(
-        eye[0].div_euclid(CHUNK_SIZE as i64) as i32,
-        eye[1].div_euclid(CHUNK_SIZE as i64) as i32,
-        eye[2].div_euclid(CHUNK_SIZE as i64) as i32,
-    );
-    world.center = Some(center);
-    world.stream_up = world.resolve_stream_up(center);
-    world.stream_up_set = true;
-    world.section_eye_y = eye[1] as f64;
-    world.pending_gen.set();
-    let up = world.live_up();
-    let rings = world.view.worklist_rings(up, 0);
-    world.mesh_worklist.fit(center, rings, up);
-    world.light_worklist.fit(center, rings, up);
-    assert!(
-        up.is_none(),
-        "open-space eye streams an isotropic cube, up={up:?}"
-    );
-    let cap = {
-        let pool = world.worker_pool();
-        let cap = pool.worker_capacity();
-        // Heavy entry frames stay unboosted: lookahead is `active * 4`.
-        pool.set_pacing(cap, (cap * 4).max(8));
-        pool.set_view(
-            center.x, center.y, center.z, pipeline::FarView::flat(center.x, center.z), VIEW_H, 0.0, 0.0, 0.0, 0.0, up,
-            super::seam::Unfold::IDENTITY,
-        );
-        cap
-    };
     // `None` up: every axis uses the horizontal radius. Data box adds one shell.
     let mesh_n = (2 * VIEW_H as usize + 1).pow(3);
     let data_n = (2 * (VIEW_H as usize + 1) + 1).pow(3);
-    println!(
-        "asteroid_entry setup center={center:?} up={up:?} workers={cap} mesh_box={mesh_n} data_box={data_n} lod2={}",
-        world.lod2
-    );
+    println!("asteroid_entry setup eye={eye:?} mesh_box={mesh_n} data_box={data_n} lod2={}", world.lod2);
 
     pipeline::job_time::reset();
     pipeline::job_time::set_enabled(true);
+    let mut steps = Headless::timed();
     let wall_start = Instant::now();
-    let mut main_gen = Duration::ZERO;
-    let mut main_light = Duration::ZERO;
-    let mut main_mesh = Duration::ZERO;
-    let mut main_integrate = Duration::ZERO;
-    let mut main_apply = Duration::ZERO;
-    let mut main_upload = Duration::ZERO;
     let mut idle = Duration::ZERO;
     let mut frames = 0u32;
     let mut next_report = wall_start + Duration::from_secs(5);
@@ -4003,48 +3874,8 @@ fn asteroid_entry_breakdown() {
     let mut finished = false;
     while Instant::now() < limit {
         frames += 1;
-        let mut progressed = 0usize;
-        let t = Instant::now();
-        progressed += headless_drain(&mut world);
-        main_integrate += t.elapsed();
-        let t = Instant::now();
-        progressed += headless_uploads(&mut world);
-        main_upload += t.elapsed();
-        let t = Instant::now();
-        progressed += headless_light_apply(&mut world);
-        main_apply += t.elapsed();
-        let t = Instant::now();
-        let generating_before = world.generating.len();
-        world.request_region_data(center, voxel_engine::producer::Budget::Millis(2.0));
-        progressed += world.generating.len().saturating_sub(generating_before);
-        main_gen += t.elapsed();
-        let t = Instant::now();
-        let admitted_before = world.counters.light_admitted;
-        if world.lighting {
-            admit::<LightLane>(
-                &mut world,
-                center,
-                voxel_engine::producer::Budget::Millis(1.0),
-            );
-        }
-        progressed += (world.counters.light_admitted - admitted_before) as usize;
-        main_light += t.elapsed();
-        let t = Instant::now();
-        let building_before = world.building_meshes;
-        let mesh_before = world.mesh_worklist.len();
-        world.tick_light_gate();
-        if !world.upload_backlogged() {
-            admit::<MeshLane>(
-                &mut world,
-                center,
-                voxel_engine::producer::Budget::Millis(2.0),
-            );
-        }
-        world.flush_degraded_terminal();
-        progressed += world.building_meshes.saturating_sub(building_before);
-        // Buried solids leave the worklist without a worker claim.
-        progressed += mesh_before.saturating_sub(world.mesh_worklist.len());
-        main_mesh += t.elapsed();
+        let landed = world.counters.jobs_completed + world.counters.jobs_cancelled;
+        world.stream_steps(eye, &mut steps);
         if world.entry_complete() {
             finished = true;
             break;
@@ -4068,12 +3899,8 @@ fn asteroid_entry_breakdown() {
             );
             next_report = Instant::now() + Duration::from_secs(5);
         }
-        if progressed == 0 {
-            let quiet = world.generating.is_empty()
-                && world.light_inflight.is_empty()
-                && world.building_meshes == 0
-                && world.upload_queue.is_empty()
-                && world.light_apply_queue.is_empty()
+        if world.counters.jobs_completed + world.counters.jobs_cancelled == landed {
+            let quiet = !world.anything_in_flight()
                 && !world.pending_gen.get()
                 && !world.pending_fresh.get()
                 && !world.light_pending.get();
@@ -4150,15 +3977,11 @@ fn asteroid_entry_breakdown() {
         secs(idle),
         g.chunks
     );
-    println!(
-        "asteroid_entry main_gen_s={:.3} main_light_s={:.3} main_mesh_s={:.3} main_integrate_s={:.3} main_apply_s={:.3} main_upload_s={:.3}",
-        secs(main_gen),
-        secs(main_light),
-        secs(main_mesh),
-        secs(main_integrate),
-        secs(main_apply),
-        secs(main_upload)
-    );
+    let mut line = String::from("asteroid_entry main s by phase:");
+    for (name, d) in PHASE_NAMES.iter().zip(steps.laps.as_ref().expect("timed steps").sum) {
+        line.push_str(&format!(" {name}={:.3}", secs(d)));
+    }
+    println!("{line}");
     println!(
         "asteroid_entry jobs gen={gn}/{:.3}s light={ln}/{:.3}s mesh={mn}/{:.3}s seeds_store={} seeds_border={} light_admitted={}",
         gns as f64 / 1e9,

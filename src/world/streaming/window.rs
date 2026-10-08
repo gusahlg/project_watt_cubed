@@ -603,7 +603,7 @@ mod tests {
         assert_eq!(w, [0, 11]);
     }
 
-    use super::super::flight_bench::step;
+    use super::super::headless::{step, step_finished};
     use crate::render_config::{RenderConfig, lod_for};
     use crate::world::generation::WorldgenKind;
     use std::time::{Duration, Instant};
@@ -715,17 +715,17 @@ mod tests {
     }
 
     /// Stream at `eye` until the pacer is back to the whole view, the world is complete and the held
-    /// window is the punch window, asserting `bare` finds nothing on any pass. Returns the passes
-    /// taken.
+    /// window is the punch window, asserting `bare` finds nothing on any pass. Each pass lands the
+    /// work it started, so the passes are bounded by work, not by the wall clock. Returns the
+    /// passes taken.
     fn settle(world: &mut World, eye: DVec3, bare: &dyn Fn(&World) -> usize, name: &str) -> usize {
         for pass in 0.. {
             if world.loading_full() && world.entry_complete() && world.window.held == world.window.punch {
                 return pass;
             }
             assert!(pass < 200_000, "{name}: did not settle: {}", world.entry_debug());
-            step(world, eye);
+            step_finished(world, eye);
             assert_eq!(bare(world), 0, "{name}: bare ground on settling pass {pass}");
-            std::thread::sleep(Duration::from_millis(1));
         }
         unreachable!()
     }
@@ -1147,7 +1147,7 @@ mod tests {
             let fold = world.fold;
             let eye = at(&world, f64::from(k) / 41.0);
             walk(&mut world);
-            step(&mut world, eye);
+            step_finished(&mut world, eye);
             crossed |= world.fold != fold;
             assert!(world.window.grounded, "pass {k}: the window let go of the ground");
             let cols = near_columns(&world, world.center.expect("a centre"));

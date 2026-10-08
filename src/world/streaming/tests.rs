@@ -3,8 +3,10 @@
 use super::super::StreamLane;
 use super::*;
 use crate::coord::ChunkCoord;
+use crate::world::fixtures::ready_section;
 use crate::world::{light, mesh};
 use super::far::{inside_xz, storage_eye_block};
+use super::headless::{Headless, finish_jobs, step, step_finished};
 use super::light::LIGHT_WAIT_DEGRADE;
 
 #[test]
@@ -200,12 +202,13 @@ fn assert_data_box_lit(world: &World) {
 #[test]
 fn rest_lights_the_data_box_and_promotes_nothing_on_dark_planes() {
     let (mut world, spawn) = spawned_round_world(4, 2);
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while !world.entry_complete() {
-        assert!(Instant::now() < deadline, "rest did not converge: {}", world.entry_debug());
-        super::flight_bench::step(&mut world, spawn);
+    for pass in 0.. {
+        if world.entry_complete() {
+            break;
+        }
+        assert!(pass < 10_000, "rest did not converge: {}", world.entry_debug());
+        step_finished(&mut world, spawn);
         assert!(world.light_terminal.is_empty(), "a chunk was promoted on dark planes");
-        std::thread::sleep(Duration::from_millis(2));
     }
     assert!(world.loading_full());
     assert_data_box_lit(&world);
@@ -226,7 +229,7 @@ fn flight_then_stop_fills_the_whole_view() {
             let now = Instant::now();
             *eye += DVec3::X * (speed * (now - last).as_secs_f64());
             last = now;
-            super::flight_bench::step(world, *eye);
+            step(world, *eye);
             std::thread::sleep(Duration::from_millis(8));
         }
     };
@@ -234,16 +237,14 @@ fn flight_then_stop_fills_the_whole_view() {
     assert!(world.load_h < world.view.horizontal, "100 m/s reduces the window");
     fly(&mut world, &mut eye, 25.0, 3.5);
     assert!(world.loading_full(), "25 m/s grows the window back to the view");
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        super::flight_bench::step(&mut world, eye);
+    for pass in 0.. {
+        step_finished(&mut world, eye);
         let center = world.center.expect("streamed");
         let whole = world.view_coords(world.mesh_box(center)).all(|c| drawn(&world, c));
         if whole && world.light_owed.is_empty() && world.entry_complete() {
             break;
         }
-        assert!(Instant::now() < deadline, "the view did not fill after stopping: {}", world.entry_debug());
-        std::thread::sleep(Duration::from_millis(4));
+        assert!(pass < 10_000, "the view did not fill after stopping: {}", world.entry_debug());
     }
     assert_data_box_lit(&world);
 }
@@ -474,42 +475,6 @@ fn degraded_ready_chunk_promotes_through_terminal_async_path() {
     );
 }
 
-/// One GPU-free stream pass: light-gate, mesh admit (submit + claim +
-/// install the carried mesh as Ready — tests have no Engine), terminal
-/// flush. Matches the live `stream` order so promotion completes in one
-/// quiescence round after the seed.
-fn pump_terminal_mesh(world: &mut World) {
-    world.tick_light_gate();
-    let seeds: Vec<Coord> = world.mesh_worklist.iter().copied().collect();
-    for key in seeds {
-        if <MeshLane as StreamLane>::in_flight(world, key) {
-            continue;
-        }
-        if !<MeshLane as StreamLane>::ready(world, key) {
-            world.mesh_worklist.remove(&key);
-            <MeshLane as StreamLane>::on_blocked(world, key);
-            continue;
-        }
-        let _job = <MeshLane as StreamLane>::submit(world, key).expect("mesh job");
-        <MeshLane as StreamLane>::claim(world, key);
-        if let Some(loaded) = world.chunks.get_mut(&key) {
-            if let MeshState::NeedsMesh {
-                building: true,
-                prev,
-            } = &mut loaded.state
-            {
-                let next = match prev.take() {
-                    Some(m) => MeshState::Ready(m),
-                    None => MeshState::Air,
-                };
-                loaded.retire_logged(next);
-                super::super::adjust_count(&mut world.building_meshes, true, false);
-            }
-        }
-    }
-    world.flush_degraded_terminal();
-}
-
 /// A degraded mesh whose face neighbour has unloaded (trailing-edge /
 /// load-set-edge) still promotes at quiescence: the terminal mark admits
 /// the rebuild without neighbour data, a stranded `NeedsMesh` is re-seeded,
@@ -592,14 +557,16 @@ fn degraded_chunk_promotes_when_a_neighbour_is_missing() {
     assert!(world.pending_fresh.get());
     assert!(world.light_terminal.contains(&edge));
 
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !world.entry_complete() {
-        assert!(
-            Instant::now() < deadline,
-            "promotion did not settle: {}",
-            world.entry_debug()
-        );
-        pump_terminal_mesh(&mut world);
+    // The real mesh steps, each admitted rebuild landed and uploaded before the next.
+    let mut steps = Headless::default();
+    for pass in 0.. {
+        if world.entry_complete() {
+            break;
+        }
+        assert!(pass < 100, "promotion did not settle: {}", world.entry_debug());
+        world.mesh_steps(&mut steps);
+        finish_jobs(&mut world, |_, _| {});
+        world.pump_steps(&mut steps);
     }
     assert!(
         !world.light_gate.degraded.contains(&edge),
@@ -610,7 +577,10 @@ fn degraded_chunk_promotes_when_a_neighbour_is_missing() {
         "the chunk shows a Ready mesh"
     );
     assert!(world.entry_complete(), "centre is set and the box is final");
-    assert!(world.chunks[&edge].state.live_meshes().unwrap().draws(h));
+    assert!(
+        !world.chunks[&edge].state.live_meshes().unwrap().draws(h),
+        "the rebuild replaced the degraded mesh"
+    );
 
     // A later real neighbour arrival must rebuild the promoted chunk so
     // the dark-plane snapshot is not permanent.
@@ -2004,10 +1974,6 @@ fn fast_frontier_holds_on_a_fixed_grid() {
     assert_ne!(world.section_frontier_key, again, "an altitude-grid step rebuilds the sweep");
 }
 
-fn empty_ready() -> SectionState {
-    SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None }
-}
-
 /// Desired sections with no Ready self or ancestor.
 fn uncovered(world: &World) -> usize {
     world.section_desired.iter().filter(|&&c| !world.section_covered(c)).count()
@@ -2022,55 +1988,29 @@ struct Landed {
     fails: usize,
 }
 
-/// Land worker results and turn queued section uploads into empty Ready meshes. Returns whether
-/// anything landed.
-fn pump_sections(world: &mut World, landed: &mut Landed) -> bool {
-    let mut got = false;
-    while let Some(done) = world.workers.as_ref().and_then(pipeline::Workers::try_recv) {
-        got = true;
-        match &done {
-            pipeline::Done::Cancelled(keys) => {
-                landed.cancels += keys.len();
-                landed.wanted += keys
-                    .iter()
-                    .filter(|k| matches!(k, pipeline::JobKey::Section { pos, .. } if world.section_desired.contains(pos)))
-                    .count();
-            }
-            pipeline::Done::Failed(_) => landed.fails += 1,
-            _ => {}
-        }
-        world.integrate_worker_result(done);
-    }
-    while let Some((pos, token, _, _)) = world.section_upload_queue.pop_front() {
-        if let Some(state @ SectionState::Meshing { .. }) = world.sections.get_mut(&pos)
-            && matches!(state, SectionState::Meshing { token: t } if *t == token)
-        {
-            world.meshing_sections = world.meshing_sections.saturating_sub(1);
-            *state = empty_ready();
-        }
-    }
-    got
-}
-
-/// One pass of the section lanes around the far-field centre, in `stream`'s order: land,
-/// reclaim, admit, then the visible rebuild that re-arms holes. Pending is not forced on from
-/// outside.
+/// One pass of the section steps around the far-field centre: land every job a claim waits on
+/// (counting what landed) and upload it, then reclaim, admit and re-resolve the covering.
+/// Pending is not forced on from outside.
 fn section_pass(world: &mut World, landed: &mut Landed) {
-    let center = world.section_center().expect("a far-field centre");
-    let got = pump_sections(world, landed);
-    world.reclaim_blocked_sections(center, None);
-    super::super::admit::<SectionLane>(world, center, Budget::Millis(8.0));
-    if world.section_cover_dirty.take() || world.pending_sections.get() {
-        world.rebuild_section_visible(None);
-    }
-    if !got {
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    finish_jobs(world, |world, done| match done {
+        pipeline::Done::Cancelled(keys) => {
+            landed.cancels += keys.len();
+            landed.wanted += keys
+                .iter()
+                .filter(|k| matches!(k, pipeline::JobKey::Section { pos, .. } if world.section_desired.contains(pos)))
+                .count();
+        }
+        pipeline::Done::Failed(_) => landed.fails += 1,
+        _ => {}
+    });
+    let mut steps = Headless::default();
+    world.land_uploads(&mut steps);
+    world.section_steps(&mut steps);
 }
 
 /// Run section passes until every desired section is covered and nothing is in flight.
 /// Returns the passes taken.
-fn drive_sections(world: &mut World, name: &str, deadline: Instant, landed: &mut Landed) -> usize {
+fn drive_sections(world: &mut World, name: &str, landed: &mut Landed) -> usize {
     let mut passes = 0usize;
     loop {
         let unc = uncovered(world);
@@ -2081,7 +2021,7 @@ fn drive_sections(world: &mut World, name: &str, deadline: Instant, landed: &mut
         }
         passes += 1;
         assert!(
-            Instant::now() < deadline && passes < 20_000,
+            passes < 20_000,
             "{name}: uncovered {unc} of {} after {passes} passes, cancels {} fails {} meshing {} queued {queued}",
             world.section_desired.len(),
             landed.cancels,
@@ -2144,7 +2084,6 @@ fn far_chart_seam_readiness_converges() {
     sites.push(("corner".into(), storage_from_dir(&world, DVec3::new(1.0, 0.985, 0.97), 0.0)));
     sites.push(("face".into(), storage_from_dir(&world, DVec3::new(0.0, 1.0, 0.0), 0.0)));
 
-    let deadline = Instant::now() + Duration::from_secs(90);
     for (name, storage) in sites {
         let center = Coord::new(
             (storage.x / 16.0).floor() as i32,
@@ -2173,7 +2112,7 @@ fn far_chart_seam_readiness_converges() {
             world.section_desired = tight.clone();
             world.pending_sections.set();
             world.section_cover_dirty.set();
-            drive_sections(&mut world, "symptom cold", deadline, &mut Landed::default());
+            drive_sections(&mut world, "symptom cold", &mut Landed::default());
             assert_eq!(uncovered(&world), 0, "symptom cold start left sections uncovered");
             world.sections.clear();
             world.meshing_sections = 0;
@@ -2186,13 +2125,13 @@ fn far_chart_seam_readiness_converges() {
         prefix.sort_by_key(|s| <SectionLane as StreamLane>::order(&world, center, *s));
         prefix.truncate(tight_allowed.min(prefix.len()));
         for &s in &prefix {
-            world.sections.insert(s, empty_ready());
+            world.sections.insert(s, ready_section());
         }
         world.section_desired = tight;
         world.pending_sections.set();
         world.section_cover_dirty.set();
         let planted = uncovered(&world);
-        drive_sections(&mut world, &name, deadline, &mut Landed::default());
+        drive_sections(&mut world, &name, &mut Landed::default());
         assert_eq!(
             uncovered(&world),
             0,
@@ -2298,13 +2237,12 @@ fn far_chart_altitude_readiness_converges() {
     use crate::world::generation::WorldgenKind;
 
     let mut world = World::with_kind(42, RenderConfig::default(), WorldgenKind::Diffusion, false);
-    let deadline = Instant::now() + Duration::from_secs(240);
     for (site, dir, heights) in World::FAR_SITES {
         for &above in heights {
             let name = &format!("{site} +{above}");
             hover(&mut world, dir, above, name);
             let mut landed = Landed::default();
-            let passes = drive_sections(&mut world, name, deadline, &mut landed);
+            let passes = drive_sections(&mut world, name, &mut landed);
             println!(
                 "{name}: {} sections ready in {passes} passes, {} cancelled",
                 world.section_desired.len(),
@@ -2330,7 +2268,6 @@ fn far_chart_altitude_readiness_converges_while_moving() {
     const MOVES: usize = 48;
     const PASSES_PER_MOVE: usize = 12;
     let mut world = World::with_kind(42, RenderConfig::default(), WorldgenKind::Diffusion, false);
-    let deadline = Instant::now() + Duration::from_secs(240);
     let above = 50_000.0;
     for (site, dir, _) in World::FAR_SITES {
         let name = &format!("{site} +{above} moving");
@@ -2345,7 +2282,7 @@ fn far_chart_altitude_readiness_converges_while_moving() {
             }
         }
         let moving = landed.cancels;
-        let passes = drive_sections(&mut world, name, deadline, &mut landed);
+        let passes = drive_sections(&mut world, name, &mut landed);
         println!(
             "{name}: {} sections ready {passes} passes after stopping, {moving} cancelled while moving",
             world.section_desired.len()
@@ -2366,4 +2303,100 @@ fn span_reach_holds_far_tiles_without_overflow() {
     assert!(near > 1.0e6 && (near - near_want).abs() < 1.0, "near {near} vs {near_want}");
     assert!(far > near);
     assert_eq!(span_reach(s, s.min_x() + 1, s.min_z() + 1).1, 0.0, "inside the tile");
+}
+
+/// Records the steps a stream pass takes, in order, and runs them headless.
+#[derive(Default)]
+struct Record {
+    steps: Headless,
+    log: Vec<String>,
+}
+
+impl Record {
+    fn note(&mut self, step: &str) {
+        self.log.push(step.to_string());
+    }
+}
+
+impl StreamSteps for Record {
+    fn begin(&mut self, world: &mut World) -> Option<voxel_engine::MeshStager> {
+        self.note("begin");
+        self.steps.begin(world)
+    }
+    fn textures(&mut self, world: &mut World) {
+        self.note("textures");
+        self.steps.textures(world);
+    }
+    fn drain(&mut self, world: &mut World) {
+        self.note("drain");
+        self.steps.drain(world);
+    }
+    fn remesh_dirty(&mut self, world: &mut World) {
+        self.note("remesh_dirty");
+        self.steps.remesh_dirty(world);
+    }
+    fn unload(&mut self, world: &mut World, center: Coord) {
+        self.note("unload");
+        self.steps.unload(world, center);
+    }
+    fn retire(&mut self, loaded: &mut Loaded, next: MeshState) {
+        self.note("retire");
+        self.steps.retire(loaded, next);
+    }
+    fn unload_sections(&mut self, world: &mut World, far: Coord) {
+        self.note("unload_sections");
+        self.steps.unload_sections(world, far);
+    }
+    fn remesh_sections(&mut self, world: &mut World) {
+        self.note("remesh_sections");
+        self.steps.remesh_sections(world);
+    }
+    fn reclaim_sections(&mut self, world: &mut World, far: Coord) {
+        self.note("reclaim_sections");
+        self.steps.reclaim_sections(world, far);
+    }
+    fn section_visible(&mut self, world: &mut World) {
+        self.note("section_visible");
+        self.steps.section_visible(world);
+    }
+    fn occlusion(&mut self, world: &mut World) {
+        self.note("occlusion");
+        self.steps.occlusion(world);
+    }
+    fn lap(&mut self, phase: Phase) {
+        self.log.push(format!("{phase:?}"));
+    }
+}
+
+/// The step order of the one stream pass the game, the benches and the tests run: a full pass
+/// (the first, which crosses into its centre) and a follow pass at the same eye, which lands
+/// what the first started and unloads nothing.
+#[test]
+fn a_full_pass_and_a_follow_pass_take_their_steps_in_order() {
+    use crate::render_config::RenderConfig;
+    use crate::world::generation::{FLAT_HEIGHT, WorldgenKind};
+    let render = RenderConfig { lod2: true, ..RenderConfig::default() };
+    let mut world = World::with_kind(1, render, WorldgenKind::Flat, false);
+    world.set_view_distances(2, 1);
+    let eye = DVec3::new(8.0, f64::from(FLAT_HEIGHT) + 2.0, 8.0);
+
+    let mut full = Record::default();
+    world.stream_steps(eye, &mut full);
+    let full_steps = [
+        "begin", "Begin", "textures", "remesh_dirty", "Drain", "unload", "Unload", "Cross", "Generate", "Light",
+        "remesh_dirty", "Mesh", "LodFace", "Frontier", "unload_sections", "SecUnload", "remesh_sections",
+        "reclaim_sections", "Reclaim", "SecAdmit", "section_visible", "SecVisible", "occlusion", "Occlusion",
+    ];
+    assert_eq!(full.log, full_steps, "full pass");
+
+    assert!(world.anything_in_flight(), "the full pass started generation");
+    world.pending_sections.set();
+    let mut follow = Record::default();
+    world.stream_steps(eye, &mut follow);
+    let follow_steps = [
+        "begin", "Begin", "textures", "drain", "remesh_dirty", "Drain", "Cross", "Generate", "Light", "remesh_dirty",
+        "Mesh", "LodFace", "Frontier", "SecUnload", "remesh_sections", "reclaim_sections", "Reclaim", "SecAdmit",
+        "section_visible", "SecVisible", "occlusion", "Occlusion",
+    ];
+    assert_eq!(follow.log, follow_steps, "follow pass");
 }
