@@ -15,7 +15,6 @@ use voxel_engine::Color;
 
 use crate::block::registry::{AIR, BlockId};
 use crate::coord::Face;
-use crate::hash::Fnv64;
 use crate::sky::palette::Rgb;
 use crate::space::atlas::FACES;
 use crate::space::chart::{basis, Map};
