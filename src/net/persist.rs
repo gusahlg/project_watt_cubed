@@ -203,18 +203,13 @@ pub(crate) fn load(path: &Path, flags: &Flags) -> Result<Loaded, LoadError> {
             open(path, doc, flags, false)
         }
         (OnDisk::Missing, OnDisk::Missing) => Ok(Loaded {
-            seed: flags.seed,
-            worldgen: flags.worldgen,
-            terrain: flags.terrain,
-            day: DEFAULT_DAY,
-            edits: Vec::new(),
-            pending: Vec::new(),
             store: Some(Store {
                 path: path.to_path_buf(),
                 doc: Mutex::new(blank_doc(flags)),
                 kept: Mutex::new(Vec::new()),
                 rotate: AtomicBool::new(true),
             }),
+            ..fresh(flags)
         }),
         (OnDisk::Missing, OnDisk::Corrupt(e)) => {
             Err(LoadError::new(path, format!("missing, and its backup does not load: {}", e.reason())))
