@@ -447,25 +447,37 @@ fn nebula_image(out: &str, seed: u64, u: &Universe, cfg: &TerrainCfg, p: &Params
     write_ppm(&format!("{out}/nebula_{seed}.ppm"), w, n * S, &img);
 }
 
-/// One row per suite: a square per mineral (densest left), height by amount; a red bar marks a
-/// fallback suite.
+/// One row per suite: the law's own minerals (densest left; a red corner marks one the rest check
+/// rejected), then the layers the body uses (a red bar marks a fallback suite). Bar height is amount.
 fn suite_image(out: &str, seed: u64, u: &Universe) {
     const CELL: usize = 10;
-    let w = 13 * CELL;
+    const RED: [u8; 3] = [255, 0, 0];
+    let w = 26 * CELL;
     let h = u.suites.len().max(1) * CELL;
     let mut img = vec![16u8; w * h * 3];
+    let mut put = |x: usize, y: usize, c: &[u8; 3]| img[(y * w + x) * 3..][..3].copy_from_slice(c);
     for (r, s) in u.suites.iter().enumerate() {
-        for (k, m) in s.minerals.iter().take(12).enumerate() {
-            let tall = (m.amount as usize * CELL / 32).clamp(2, CELL);
-            for dy in CELL - tall..CELL {
-                for dx in 0..CELL - 1 {
-                    img[((r * CELL + dy) * w + k * CELL + dx) * 3..][..3].copy_from_slice(&m.rgb);
+        let rows = [(0usize, &s.own), (13, &s.minerals)];
+        for (x0, minerals) in rows {
+            for (k, m) in minerals.iter().take(12).enumerate() {
+                let tall = (m.amount as usize * CELL / 32).clamp(2, CELL);
+                for dy in CELL - tall..CELL {
+                    for dx in 0..CELL - 1 {
+                        put((x0 + k) * CELL + dx, r * CELL + dy, &m.rgb);
+                    }
+                }
+                if x0 == 0 && m.replaced {
+                    for d in 0..3 {
+                        put((x0 + k) * CELL + d, r * CELL, &RED);
+                        put((x0 + k) * CELL, r * CELL + d, &RED);
+                    }
                 }
             }
         }
         if s.fallback {
             for dy in 0..CELL - 1 {
-                img[((r * CELL + dy) * w + 12 * CELL + 3) * 3..][..3].copy_from_slice(&[255, 0, 0]);
+                put(25 * CELL + 3, r * CELL + dy, &RED);
+                put(25 * CELL + 4, r * CELL + dy, &RED);
             }
         }
     }
