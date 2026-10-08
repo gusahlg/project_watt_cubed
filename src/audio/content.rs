@@ -158,6 +158,8 @@ impl Catalog {
         self.cues[raw as usize].mode
     }
 
+    /// The response behind a raw symbol index.
+    #[cfg(test)]
     pub(crate) fn response_of(&self, raw: u16) -> Response {
         self.cues[raw as usize].response
     }

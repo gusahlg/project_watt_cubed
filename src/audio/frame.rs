@@ -1,7 +1,8 @@
 //! The Game → runtime snapshot (`AudioFrame`) plus the occurrence and emitter
 //! records it bundles. Construction is the sole validation site: a well-typed
 //! `AudioFrame` is already checked (parse-don't-validate), so `SoundSystem::submit`
-//! can trust its contents and move the Vecs out without a clone.
+//! can trust its contents. It borrows the caller's journal and table, which keep
+//! their capacity across frames.
 
 use std::sync::Arc;
 
@@ -34,11 +35,11 @@ pub struct Emitter {
     pub gain: f32,
 }
 
-pub struct AudioFrame {
+pub struct AudioFrame<'a> {
     dt: f32,
     listener: Listener,
-    occurrences: Vec<Occurrence>, // ordered; ids strictly increasing within the vec
-    emitters: Vec<Emitter>,       // complete table; absence = ceased
+    occurrences: &'a [Occurrence], // ordered; ids strictly increasing
+    emitters: &'a [Emitter],       // complete table; absence = ceased
     /// `None` when nothing this frame (and no live voices) will trace it.
     window: Option<Arc<AcousticWindow>>,
 }
@@ -63,7 +64,7 @@ fn gain_in_range(g: f32) -> bool {
     (0.0..=MAX_GAIN).contains(&g)
 }
 
-impl AudioFrame {
+impl<'a> AudioFrame<'a> {
     /// Sole constructor. Checks: dt finite & (0, 0.5]; all positions/gains finite;
     /// gains in [0, 4]; occurrence ids strictly increasing; len bounds; no duplicate
     /// EmitterId. `window` may be `None` when nothing will trace it. Returns
@@ -71,8 +72,8 @@ impl AudioFrame {
     pub fn new(
         dt: f32,
         listener: Listener,
-        occurrences: Vec<Occurrence>,
-        emitters: Vec<Emitter>,
+        occurrences: &'a [Occurrence],
+        emitters: &'a [Emitter],
         window: Option<Arc<AcousticWindow>>,
     ) -> Result<Self, FrameError> {
         if !dt.is_finite() {
@@ -90,7 +91,7 @@ impl AudioFrame {
         }
 
         let mut prev: Option<OccurrenceId> = None;
-        for o in &occurrences {
+        for o in occurrences {
             if let Some(at) = o.at
                 && !at.is_finite()
             {
@@ -110,8 +111,7 @@ impl AudioFrame {
             prev = Some(o.id);
         }
 
-        let mut seen: Vec<EmitterId> = Vec::with_capacity(emitters.len());
-        for e in &emitters {
+        for (i, e) in emitters.iter().enumerate() {
             if !e.at.is_finite() {
                 return Err(FrameError::NonFinite);
             }
@@ -121,10 +121,9 @@ impl AudioFrame {
             if !gain_in_range(e.gain) {
                 return Err(FrameError::OutOfRange);
             }
-            if seen.contains(&e.id) {
+            if emitters[..i].iter().any(|seen| seen.id == e.id) {
                 return Err(FrameError::DuplicateEmitter);
             }
-            seen.push(e.id);
         }
 
         Ok(Self {
@@ -142,25 +141,24 @@ impl AudioFrame {
     pub fn listener(&self) -> &Listener {
         &self.listener
     }
-    pub fn occurrences(&self) -> &[Occurrence] {
-        &self.occurrences
+    pub fn occurrences(&self) -> &'a [Occurrence] {
+        self.occurrences
     }
-    pub fn emitters(&self) -> &[Emitter] {
-        &self.emitters
+    pub fn emitters(&self) -> &'a [Emitter] {
+        self.emitters
     }
     pub fn window(&self) -> Option<&Arc<AcousticWindow>> {
         self.window.as_ref()
     }
 
-    /// Consume the frame, moving the owned journal and table out without cloning
-    /// — the committer takes ownership at submit.
+    /// Consume the frame into its parts; the window moves out without a clone.
     pub fn into_parts(
         self,
     ) -> (
         f32,
         Listener,
-        Vec<Occurrence>,
-        Vec<Emitter>,
+        &'a [Occurrence],
+        &'a [Emitter],
         Option<Arc<AcousticWindow>>,
     ) {
         (
@@ -217,72 +215,50 @@ mod tests {
 
     #[test]
     fn accepts_valid_frame() {
-        let f = AudioFrame::new(
-            0.016,
-            listener(),
-            vec![occ(1, 1.0), occ(2, 0.5)],
-            vec![emitter(1, 1.0)],
-            window(),
-        );
+        let (occs, emitters) = ([occ(1, 1.0), occ(2, 0.5)], [emitter(1, 1.0)]);
+        let f = AudioFrame::new(0.016, listener(), &occs, &emitters, window());
         assert!(f.is_ok());
     }
 
     #[test]
     fn rejects_non_finite() {
-        let f = AudioFrame::new(f32::NAN, listener(), vec![], vec![], window());
+        let f = AudioFrame::new(f32::NAN, listener(), &[], &[], window());
         assert!(matches!(f, Err(FrameError::NonFinite)));
 
-        let bad = Occurrence {
+        let bad = [Occurrence {
             id: OccurrenceId(1),
             cue: CueId::TEST,
             at: Some(DVec3::new(f64::NAN, 0.0, 0.0)),
             gain: 1.0,
-        };
-        let f = AudioFrame::new(0.016, listener(), vec![bad], vec![], window());
+        }];
+        let f = AudioFrame::new(0.016, listener(), &bad, &[], window());
         assert!(matches!(f, Err(FrameError::NonFinite)));
     }
 
     #[test]
     fn rejects_out_of_range() {
         // dt out of (0, 0.5].
-        let f = AudioFrame::new(1.0, listener(), vec![], vec![], window());
+        let f = AudioFrame::new(1.0, listener(), &[], &[], window());
         assert!(matches!(f, Err(FrameError::OutOfRange)));
 
         // gain outside [0, 4].
-        let f = AudioFrame::new(0.016, listener(), vec![occ(1, 5.0)], vec![], window());
+        let loud = [occ(1, 5.0)];
+        let f = AudioFrame::new(0.016, listener(), &loud, &[], window());
         assert!(matches!(f, Err(FrameError::OutOfRange)));
     }
 
     #[test]
     fn rejects_unordered_occurrences() {
-        let f = AudioFrame::new(
-            0.016,
-            listener(),
-            vec![occ(2, 1.0), occ(2, 1.0)],
-            vec![],
-            window(),
-        );
-        assert!(matches!(f, Err(FrameError::UnorderedOccurrences)));
-
-        let f = AudioFrame::new(
-            0.016,
-            listener(),
-            vec![occ(3, 1.0), occ(1, 1.0)],
-            vec![],
-            window(),
-        );
-        assert!(matches!(f, Err(FrameError::UnorderedOccurrences)));
+        for occs in [[occ(2, 1.0), occ(2, 1.0)], [occ(3, 1.0), occ(1, 1.0)]] {
+            let f = AudioFrame::new(0.016, listener(), &occs, &[], window());
+            assert!(matches!(f, Err(FrameError::UnorderedOccurrences)));
+        }
     }
 
     #[test]
     fn rejects_duplicate_emitter() {
-        let f = AudioFrame::new(
-            0.016,
-            listener(),
-            vec![],
-            vec![emitter(1, 1.0), emitter(1, 1.0)],
-            window(),
-        );
+        let twice = [emitter(1, 1.0), emitter(1, 1.0)];
+        let f = AudioFrame::new(0.016, listener(), &[], &twice, window());
         assert!(matches!(f, Err(FrameError::DuplicateEmitter)));
     }
 
@@ -291,13 +267,13 @@ mod tests {
         let occs: Vec<_> = (0..(MAX_OCCURRENCES as u64 + 1))
             .map(|i| occ(i, 1.0))
             .collect();
-        let f = AudioFrame::new(0.016, listener(), occs, vec![], window());
+        let f = AudioFrame::new(0.016, listener(), &occs, &[], window());
         assert!(matches!(f, Err(FrameError::OverLimit)));
     }
 
     #[test]
     fn accepts_absent_window_when_nothing_traces() {
-        let f = AudioFrame::new(0.016, listener(), vec![], vec![], None);
+        let f = AudioFrame::new(0.016, listener(), &[], &[], None);
         assert!(f.is_ok());
         assert!(f.unwrap().window().is_none());
     }
