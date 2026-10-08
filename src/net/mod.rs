@@ -15,6 +15,8 @@
 //! the [`hooks`] seam (`ServerMod`) without changing the wire.
 pub(crate) mod client;
 pub(crate) mod hooks;
+#[cfg(test)]
+mod mp;
 mod pair;
 pub(crate) mod persist;
 pub(crate) mod protocol;
@@ -156,7 +158,7 @@ pub(crate) mod quic {
 
 /// Wire revision. Client and server must match exactly at join. Bump on any
 /// incompatible frame change; history is `documentation/notes/protocol-history.md`.
-pub(crate) const PROTOCOL_VERSION: u32 = 16;
+pub(crate) const PROTOCOL_VERSION: u32 = 17;
 
 pub const DEFAULT_PORT: u16 = 5555;
 

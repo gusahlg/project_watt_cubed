@@ -1,5 +1,7 @@
 //! Menu screens: input flows router events -> Intent -> Msg -> Command.
 //! Only the App interprets AppEffect; Presentation folds via MenuTheme.
+use std::cell::Cell;
+
 use voxel_engine::Frame;
 
 use crate::menu::theme::MenuTheme;
@@ -137,6 +139,7 @@ impl<A: Copy> Row<A> {
     }
 }
 
+#[derive(Clone)]
 pub struct View<A: Copy> {
     pub title: String,
     pub style: Style,
@@ -320,11 +323,13 @@ impl Cursor {
 pub struct Framed<M: Menu> {
     menu: M,
     cursor: Cursor,
+    /// The view an update built when no message reached the menu, kept for the frame's draw.
+    view: Cell<Option<View<M::Action>>>,
 }
 
 impl<M: Menu> Framed<M> {
     pub fn new(menu: M) -> Self {
-        Self { menu, cursor: Cursor::default() }
+        Self { menu, cursor: Cursor::default(), view: Cell::new(None) }
     }
 
     /// Box a menu into a screen for Push.
@@ -335,8 +340,10 @@ impl<M: Menu> Framed<M> {
         Box::new(Self::new(menu))
     }
 
+    /// The view to show and its selected row: the one the last update built if no message has
+    /// reached the menu since, else a fresh one.
     pub fn view_sel(&self, ctx: &Ctx) -> (View<M::Action>, usize) {
-        let view = self.menu.view(ctx);
+        let view = self.view.take().unwrap_or_else(|| self.menu.view(ctx));
         let sel = self.cursor.resolved(&view);
         (view, sel)
     }
@@ -347,16 +354,20 @@ impl<M: Menu> Screen for Framed<M> {
         let view = self.menu.view(ctx);
         self.cursor.normalize(&view);
         match drive(intents, &view, &mut self.cursor) {
-            Some(msg) => self.menu.update(msg, ctx),
-            None => Command::Stay,
+            Some(msg) => {
+                *self.view.get_mut() = None;
+                self.menu.update(msg, ctx)
+            }
+            None => {
+                *self.view.get_mut() = Some(view);
+                Command::Stay
+            }
         }
     }
 
     fn draw(&self, ctx: &Ctx, theme: &dyn MenuTheme, f: &mut Frame, w: i32, h: i32) {
-        let view = self.menu.view(ctx);
-        let sel = self.cursor.resolved(&view);
-        let pv = present(&view, ctx.settings.menu_scale);
-        theme.draw(f, &pv, sel, w, h);
+        let (view, sel) = self.view_sel(ctx);
+        theme.draw(f, &present(view, ctx.settings.menu_scale), sel, w, h);
     }
 }
 
@@ -488,24 +499,27 @@ fn cancel(intents: &[Intent]) -> bool {
     intents.iter().any(|i| matches!(i, Intent::Cancel))
 }
 
-pub fn present<A: Copy>(view: &View<A>, scale: f32) -> PresentedView {
-    let rows = view
-        .rows
-        .iter()
-        .map(|r| PresentedRow {
-            label: r.label.clone(),
-            detail: r.detail.clone(),
-            kind: r.kind.clone(),
-            selectable: r.tag.is_some(),
-        })
-        .collect();
-    PresentedView {
-        title: view.title.clone(),
-        style: view.style.clone(),
-        rows,
-        scale,
-        hint: view.hint.clone(),
-        notice: view.notice.clone(),
+/// The untyped screen at `scale`. A view passed by value moves its strings; a borrowed one is
+/// cloned.
+pub fn present(view: impl Into<PresentedView>, scale: f32) -> PresentedView {
+    PresentedView { scale, ..view.into() }
+}
+
+/// At scale 1.
+impl<A: Copy> From<View<A>> for PresentedView {
+    fn from(view: View<A>) -> Self {
+        let rows = view
+            .rows
+            .into_iter()
+            .map(|r| PresentedRow { label: r.label, detail: r.detail, kind: r.kind, selectable: r.tag.is_some() })
+            .collect();
+        Self { title: view.title, style: view.style, rows, scale: 1.0, hint: view.hint, notice: view.notice }
+    }
+}
+
+impl<A: Copy> From<&View<A>> for PresentedView {
+    fn from(view: &View<A>) -> Self {
+        view.clone().into()
     }
 }
 
@@ -582,6 +596,38 @@ mod tests {
         let mut cursor = Cursor::default();
         assert_eq!(drive(&[Intent::Edit(TextOp::Char('d'))], &view, &mut cursor), Some(Msg::Key(0, 'd')));
         assert_eq!(drive(&[Intent::Confirm], &view, &mut cursor), Some(Msg::Pick(0)));
+    }
+
+    /// A menu that counts the views it builds.
+    struct Counted(Cell<usize>);
+
+    impl Menu for Counted {
+        type Action = usize;
+        fn view(&self, _ctx: &Ctx) -> View<usize> {
+            self.0.set(self.0.get() + 1);
+            actions(2)
+        }
+        fn update(&mut self, _msg: Msg<usize>, _ctx: &mut Ctx) -> Command {
+            Command::Stay
+        }
+    }
+
+    /// A frame whose update reaches the menu with no message draws the view that update built.
+    #[test]
+    fn a_quiet_frame_builds_the_view_once() {
+        let mut settings = Settings::default();
+        let session = Session::default();
+        let mut ctx = Ctx { settings: &mut settings, saves: &[], mods: &[], session: &session, mods_save_error: None };
+        let mut framed = Framed::new(Counted(Cell::new(0)));
+        let built = |f: &Framed<Counted>| f.menu.0.get();
+        assert!(matches!(framed.update(&[], &mut ctx), Command::Stay));
+        assert_eq!(framed.view_sel(&ctx).1, 0);
+        assert_eq!(built(&framed), 1, "the draw reuses the update's view");
+        let _ = framed.update(&[Intent::Nav(Dir::Next)], &mut ctx);
+        assert_eq!(framed.view_sel(&ctx).1, 1);
+        assert_eq!(built(&framed), 3, "a message reached the menu: the draw builds afresh");
+        let _ = framed.view_sel(&ctx);
+        assert_eq!(built(&framed), 4, "a draw with no update since builds its own");
     }
 
     /// Moving the highlight says where it landed; a frame with no movement says nothing.

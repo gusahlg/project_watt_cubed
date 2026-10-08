@@ -52,3 +52,15 @@ v14/v15 peers must not join.
 v16: `SnapshotEnd` (tag 17) follows the join snapshot batches. The client
 holds its loading screen until that marker, so a later reaction `Snapshot`
 is not the overlay. Mixed v15/v16 peers must not join.
+v17: `PeerMove` (tag 5) becomes `PeerPoses`: once per 20 Hz server tick each
+player gets one frame with the visible peers that moved, as the origin (the
+recipient's position, 3 × f64), a u16 count, then per peer a LEB128 id, a
+flags byte (up face, sneaking, frame present, velocity present), yaw and
+pitch as 16-bit fractions of a turn, the frame as a 32-bit smallest-three
+quaternion unless it is identity, the velocity as 3 × f16 unless it is zero,
+and the position as 3 × i16 in 1/128 block from the origin. Peers farther
+than 48 m arrive every fourth tick. Entering interest range still sends both
+sides a pose at once. `Snapshot` cells carry a palette of the specs the frame
+names, then per cell LEB128 zigzag coordinate deltas, the revision, and the
+palette index; the join overlay is sorted chunk by chunk. Mixed v16/v17 peers
+must not join.

@@ -3302,12 +3302,12 @@ impl World {
     /// `c` is still close enough that walking back across a seam would show its column. The far
     /// edge of the near square is a view-radius inland; a view-radius on the next chart puts that
     /// column `3 * horizontal + 1` away, counting the two edge chunks.
-    /// Only inside the unload box's layers: the skirt is sideways, and a dig or a climb near a seam
-    /// unloads the layers it leaves as anywhere else.
-    fn within_skirt(&self, center: Coord, unload: ChunkBox, c: Coord) -> bool {
+    /// Within the skirt on every axis: a turn-back can bring the column back, and a dig or a climb
+    /// cannot pile up layers past it.
+    fn within_skirt(&self, center: Coord, c: Coord) -> bool {
         let up = self.live_up().unwrap_or(Face::PosY);
         let folded = self.fold.fold(c);
-        folded.across(center, up) <= self.skirt() && unload.spans(folded, up.axis())
+        folded.across(center, up) <= self.skirt() && folded.along(center, up) <= self.skirt()
     }
 
     fn skirt(&self) -> i32 {
@@ -3327,15 +3327,16 @@ impl World {
         inland <= i64::from(self.skirt())
     }
 
-    /// `c` is settled and inside the skirt, and either lies on a neighbour chart or the centre is
-    /// near a seam: it starts waiting for a turn-back. Away from every seam nothing waits: the
+    /// `c` draws something, is inside the skirt, and either lies on a neighbour chart or the centre
+    /// is near a seam: it starts waiting for a turn-back. Air and buried rock draw nothing, so their
+    /// unloading can never show as bare ground. Away from every seam nothing waits: the
     /// unload box and the far field already cover a turn-back there. Once waiting, a chunk stays
     /// (through a crossing, when it may become home) until it is inside the unload box again or
     /// past the skirt.
-    fn keeps_for_far(&self, center: Coord, unload: ChunkBox, c: Coord, near_seam: bool) -> bool {
+    fn keeps_for_far(&self, center: Coord, c: Coord, near_seam: bool) -> bool {
         (near_seam || self.fold.fold(c) != c)
-            && self.chunks.get(&c).is_some_and(|l| l.state.settled())
-            && self.within_skirt(center, unload, c)
+            && self.chunks.get(&c).is_some_and(|l| l.state.settled() && l.state.live_meshes().is_some())
+            && self.within_skirt(center, c)
     }
 
     /// Coords in the previous unload box that have left `new_box`, or every
@@ -3393,7 +3394,7 @@ impl World {
                 if !self.chunks.contains_key(&c) || self.view_contains(unload, c) {
                     return false;
                 }
-                if holding && self.within_skirt(center, unload, c) {
+                if holding && self.within_skirt(center, c) {
                     return true;
                 }
                 far.push(c);
@@ -3405,7 +3406,7 @@ impl World {
             let near_seam = self.near_a_seam(center);
             let mut waiting = std::mem::take(&mut self.far_wait);
             far.retain(|&c| {
-                if waiting.contains(&c) || self.keeps_for_far(center, unload, c, near_seam) {
+                if waiting.contains(&c) || self.keeps_for_far(center, c, near_seam) {
                     waiting.insert(c);
                     false
                 } else {
@@ -7197,12 +7198,15 @@ mod tests {
             assert!(!world.fold.is_identity(), "the eye is on a chart");
             (world, home)
         };
+        // Settled and drawing: a fake one-pass mesh.
         let settle = |world: &mut World, c: Coord| {
             world.ensure_data(c);
-            let loaded = world.chunks.get_mut(&c).expect("ensure_data stores the chunk");
-            if !loaded.state.settled() {
-                loaded.state = MeshState::Air;
-            }
+            let h = voxel_engine::MeshHandle::from_raw_parts(1, 1);
+            let meshes = super::super::ChunkMeshes::from_upload_handles(ByPass::from_fn(|p| {
+                (p == voxel_engine::Pass::Opaque).then_some(h)
+            }))
+            .expect("one pass present");
+            world.chunks.get_mut(&c).expect("ensure_data stores the chunk").state = MeshState::Ready(meshes);
         };
         let walk = |world: &mut World, from: Coord, to: Coord| {
             world.prev_unload_box = Some(world.unload_box(from));
@@ -7266,25 +7270,35 @@ mod tests {
         let eye = world.home_eye(DVec3::new(0.0, 1.0, 1.0 - 6.5e-6), 100.0);
         let (home, _, _, _) = world.begin_stream(eye, None);
         assert!(world.near_a_seam(home));
+        // Settled and drawing: a fake one-pass mesh.
         let settle = |world: &mut World, c: Coord| {
             world.ensure_data(c);
-            let loaded = world.chunks.get_mut(&c).expect("ensure_data stores the chunk");
-            if !loaded.state.settled() {
-                loaded.state = MeshState::Air;
-            }
+            let h = voxel_engine::MeshHandle::from_raw_parts(1, 1);
+            let meshes = super::super::ChunkMeshes::from_upload_handles(ByPass::from_fn(|p| {
+                (p == voxel_engine::Pass::Opaque).then_some(h)
+            }))
+            .expect("one pass present");
+            world.chunks.get_mut(&c).expect("ensure_data stores the chunk").state = MeshState::Ready(meshes);
         };
         settle(&mut world, home);
 
-        // Dig 40 layers straight down with no held window stretching the box: the chunk left above
-        // is past the unload box's layers.
+        // Dig past the skirt straight down: the drawing chunk left above unloads.
         world.window = Window::default();
-        let down = Coord::new(home.x, home.y - 40, home.z);
-        let unload = world.unload_box(down);
-        assert!(!unload.spans(world.fold.fold(home), 1), "the start layer is outside the dug-down box");
+        let down = Coord::new(home.x, home.y - world.skirt() - 2, home.z);
         world.prev_unload_box = Some(world.unload_box(home));
         world.center = Some(down);
         world.unload_far_with(down, |state, _| drop(state));
-        assert!(!world.chunks.contains_key(&home), "a layer left behind vertically unloads near a seam");
+        assert!(!world.chunks.contains_key(&home), "a layer past the skirt vertically unloads near a seam");
+        assert!(world.far_wait.is_empty());
+
+        // Air draws nothing, so it never waits, even inside the skirt near a seam.
+        world.ensure_data(home);
+        world.chunks.get_mut(&home).expect("stored").state = MeshState::Air;
+        let inland = Coord::new(home.x, home.y, home.z - 11);
+        world.prev_unload_box = Some(world.unload_box(home));
+        world.center = Some(inland);
+        world.unload_far_with(inland, |state, _| drop(state));
+        assert!(!world.chunks.contains_key(&home), "an air chunk does not wait");
         assert!(world.far_wait.is_empty());
 
         // Walk inland so the home chunk waits, then turn the far field off: it unloads on the next pass.
