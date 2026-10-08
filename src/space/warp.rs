@@ -260,6 +260,33 @@ mod tests {
         }
     }
 
+    /// `cargo test --release --lib warp_invert_cost -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn warp_invert_cost() {
+        use std::hint::black_box;
+        let warp = warp_at(6_000_000.0);
+        let hi = warp.hi();
+        let span = hi - warp.origin;
+        let mut state = 0x5EED_u64;
+        // Images of points inside the box, and points just past it that the solver pulls back in.
+        let points: Vec<DVec3> = (0..256)
+            .map(|i| {
+                let u = DVec3::new(lcg(&mut state), lcg(&mut state), lcg(&mut state));
+                if i % 2 == 0 { warp.apply(warp.origin + u * span * 0.999) } else { hi + u }
+            })
+            .collect();
+        const ROUNDS: u32 = 40;
+        let t0 = std::time::Instant::now();
+        for _ in 0..ROUNDS {
+            for &p in &points {
+                black_box(warp.invert(black_box(p)));
+            }
+        }
+        let calls = f64::from(ROUNDS) * points.len() as f64;
+        println!("warp_invert_cost: {:.1} ns per invert", t0.elapsed().as_nanos() as f64 / calls);
+    }
+
     #[test]
     fn a_twin_scale_warp_moves_more_than_half_a_block() {
         let warp = warp_at(6_000_000.0);

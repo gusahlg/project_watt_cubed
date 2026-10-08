@@ -819,4 +819,27 @@ mod tests {
         assert!((ray_triangle(DVec3::ZERO, DVec3::X, tri).unwrap() - 1.0).abs() < 1e-12);
         assert!(ray_triangle(DVec3::ZERO, -DVec3::X, tri).is_none());
     }
+
+    /// `cargo test --release --lib genesis_lookup_cost -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn genesis_lookup_cost() {
+        use crate::block::registry::BlockRegistry;
+        use std::hint::black_box;
+        use std::time::Instant;
+        const N: u32 = 200;
+        let t0 = Instant::now();
+        for i in 0..N {
+            black_box(tabulated_layout(black_box(2.0 + f64::from(i) * 0.01), 6_000_000.0));
+        }
+        println!("genesis_lookup_cost tabulated_layout: {:.1} µs", t0.elapsed().as_secs_f64() * 1e6 / f64::from(N));
+        let mut builds = Vec::new();
+        for seed in 0..6 {
+            let mut registry = BlockRegistry::with_builtins();
+            let t0 = Instant::now();
+            black_box(crate::world::terrain::generator(&mut registry, seed, Default::default()));
+            builds.push(t0.elapsed().as_secs_f64() * 1e3);
+        }
+        println!("genesis_lookup_cost world builds (ms): {builds:.2?}");
+    }
 }

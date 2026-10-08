@@ -66,6 +66,11 @@ impl Recorder {
     pub fn set_alive(&self, alive: bool) {
         self.alive.store(alive, Ordering::Relaxed);
     }
+    /// Forget the recorded intents and keep the log's capacity.
+    #[cfg(test)]
+    pub fn clear(&self) {
+        self.log.lock().unwrap().clear();
+    }
 }
 
 impl RecordingBackend {

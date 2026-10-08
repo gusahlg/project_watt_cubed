@@ -784,4 +784,32 @@ mod tests {
         assert!(listed.iter().any(|b| b.seed == hollow.seed && b.shape == FarShape::Sphere));
         assert!(far.sun_override().is_none());
     }
+
+    /// `cargo test --release --lib far_body_update_cost -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn far_body_update_cost() {
+        use std::hint::black_box;
+        let mut registry = BlockRegistry::with_builtins();
+        let terrain = Terrain::new(&mut registry, 42);
+        let cosmos = terrain.cosmos().expect("cosmos");
+        let twin = cosmos.bodies().iter().find(|b| b.kind == Kind::Twin).unwrap();
+        let Shape::Cube { half } = twin.shape else { panic!("a twin is a cube") };
+        let eyes = [
+            ("spawn", DVec3::new(0.5, 8.0, 0.5)),
+            ("twin surface", twin.centre_f() + DVec3::new(half as f64 + 5_000.0, 300.0, -200.0)),
+            ("twin orbit", twin.centre_f() + DVec3::X * twin.reach() * 1.1),
+            ("deep space", DVec3::new(1.0e8, 0.0, 0.0)),
+        ];
+        let mut far = FarBodies::default();
+        const N: u32 = 20_000;
+        for (name, eye) in eyes {
+            let _ = far.update(&terrain, eye);
+            let t0 = std::time::Instant::now();
+            for _ in 0..N {
+                black_box(far.update(&terrain, black_box(eye)).len());
+            }
+            println!("far_body_update_cost {name}: {:.1} ns", t0.elapsed().as_nanos() as f64 / f64::from(N));
+        }
+    }
 }

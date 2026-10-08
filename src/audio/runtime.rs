@@ -1548,4 +1548,54 @@ mod seam_tests {
         rec.set_alive(true);
         sound.set_mix(MixChange::default());
     }
+
+    /// Frame step that keeps one-shots alive for thousands of frames.
+    const SHORT_DT: f32 = 1e-4;
+
+    /// Six sounding one-shots, a voice session and two loop beds. Returns the beds, which every
+    /// later frame resubmits.
+    fn live_sources(sound: &mut SoundSystem, syms: &CueSymbols) -> Vec<Emitter> {
+        let names = ["oneshot", "loud", "quiet"];
+        let occurrences = (0..6)
+            .map(|i| Occurrence {
+                id: OccurrenceId(i),
+                cue: sound.catalog().typed::<OneShot>(syms, names[i as usize % 3]).unwrap(),
+                at: Some(source(2.0 + 3.0 * i as f64)),
+                gain: 1.0,
+            })
+            .collect();
+        let emitters = vec![
+            Emitter { id: EmitterId(1), cue: sound.catalog().typed::<Loop>(syms, "bed").unwrap(), at: DVec3::ZERO, gain: 1.0 },
+            Emitter { id: EmitterId(2), cue: sound.catalog().typed::<Loop>(syms, "layered_bed").unwrap(), at: source(8.0), gain: 1.0 },
+        ];
+        sound.ingest_voice(VoicePacket { session: SessionKey(7), epoch: Epoch(0), seq: Seq(0), payload: Box::new([1, 2, 3]) });
+        sound.set_session_present(SessionKey(7), true, Some(source(6.0)));
+        sound.submit(AudioFrame::new(SHORT_DT, origin_listener(), occurrences, emitters.clone(), open_window()).unwrap());
+        assert_eq!(sound.clip_voices.len(), 6);
+        assert_eq!(sound.emitter_voices.len(), 2);
+        assert_eq!(sound.sessions.len(), 1);
+        emitters
+    }
+
+    /// `cargo test --release --lib submit_cost -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn submit_cost() {
+        let (mut sound, syms, rec) = system(32);
+        let emitters = live_sources(&mut sound, &syms);
+        let window = open_window();
+        const BATCH: u32 = 1_000;
+        let mut ns = 0.0;
+        for _ in 0..5 {
+            rec.clear();
+            let t0 = std::time::Instant::now();
+            for _ in 0..BATCH {
+                let frame = AudioFrame::new(SHORT_DT, origin_listener(), Vec::new(), emitters.clone(), window.clone());
+                sound.submit(std::hint::black_box(frame.unwrap()));
+            }
+            ns += t0.elapsed().as_nanos() as f64;
+        }
+        assert_eq!(sound.clip_voices.len(), 6, "the one-shots outlive the probe");
+        println!("submit_cost: {:.1} ns per frame", ns / f64::from(5 * BATCH));
+    }
 }
