@@ -722,6 +722,58 @@ pub(super) fn peer_color(name: &str) -> Color {
 mod tests {
     use super::*;
 
+    /// A steady multiplayer frame with a visible peer: the one pose sampled per peer feeds both
+    /// the audio and the draw records, and the frame allocates nothing.
+    #[test]
+    fn a_steady_frame_with_peers_allocates_nothing() {
+        use crate::alloc_count;
+        use crate::audio::{AudioService, SoundSystem};
+        use crate::input::router::Router;
+        use crate::net::client::Connection;
+        use crate::net::server::{self, Config};
+        use std::time::{Duration, Instant};
+
+        let server = server::spawn(0, Config { seed: 1, ..Config::default() }).expect("loopback server");
+        let port = server.addr().port();
+        let mut conn = Connection::connect("127.0.0.1", port, "a", "").expect("client a");
+        let mut other = Connection::connect("127.0.0.1", port, "b", "").expect("client b");
+        conn.send_teleport(DVec3::new(8.0, 40.0, 8.0));
+        other.send_teleport(DVec3::new(10.0, 40.0, 8.0));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !conn.peers().any(|peer| peer.visible()) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+            conn.poll();
+            other.poll();
+        }
+        assert!(conn.peers().any(|peer| peer.visible()), "the peer is in range");
+
+        let (game, settings) = crate::game::tests::quiet_minimum_game();
+        let mut game = game.with_net(conn);
+        let (mut sound, symbols) = SoundSystem::mute();
+        let mut audio = AudioService::new();
+        let mut router = Router::new();
+        let mut mods = crate::modding::testing::standard();
+        const DT: f32 = 1.0 / 60.0;
+        for i in 0..10 {
+            alloc_count::reset();
+            game.tick_quiet(DT, &mut router, &mut sound, &mut audio, &symbols, &settings, &mut mods);
+            let pose = game.camera.pose(&game.player, &game.world, 90.0, 0.0);
+            let draws = game.peer_draws((1280, 720), &pose.camera3d(), &pose, DT, true, true);
+            assert_eq!(draws.len(), 1, "the visible peer is drawn");
+            game.drawing.peer_scratch = draws;
+            if i >= 5 {
+                assert_eq!(
+                    alloc_count::alloc_bytes(),
+                    0,
+                    "frame {i} with a peer allocated {} times",
+                    alloc_count::alloc_count()
+                );
+            }
+        }
+        assert_eq!(game.peer_frames.len(), 1, "one sample per peer");
+        server.stop();
+    }
+
     #[test]
     fn hidden_tags_never_query_terrain() {
         for head in [

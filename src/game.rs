@@ -2347,7 +2347,7 @@ mod tests {
 
     /// A settled scripted game at the Minimum preset with input locked, its settings adopted as
     /// world entry adopts them.
-    fn quiet_minimum_game() -> (Game, Settings) {
+    pub(super) fn quiet_minimum_game() -> (Game, Settings) {
         let mut settings = Settings::default();
         assert!(settings.select_preset("minimum"));
         let render = settings.render_config();
