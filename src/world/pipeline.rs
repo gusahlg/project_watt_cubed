@@ -1153,7 +1153,7 @@ fn lock_queue(lock: &Mutex<JobQueue>) -> MutexGuard<'_, JobQueue> {
 /// `stream()`, so headless worlds (dedicated server, tests) never start threads.
 pub struct Workers {
     /// Shared queue plus the condition idle workers wait on for new work.
-    gate: Arc<(Mutex<JobQueue>, Condvar)>,
+    shared: Arc<(Mutex<JobQueue>, Condvar)>,
     results: Receiver<Done>,
     handles: Vec<JoinHandle<()>>,
     capacity: usize,
@@ -1193,20 +1193,20 @@ impl Workers {
         let capacity = threads.max(1);
         let mut queue = JobQueue::default();
         queue.gate.near_cap = near_lookahead(capacity);
-        let gate = Arc::new((Mutex::new(queue), Condvar::new()));
+        let shared = Arc::new((Mutex::new(queue), Condvar::new()));
         let stager = Arc::new(OnceLock::new());
         let staging = Arc::new(StagingStats::new());
         let handles = (0..capacity)
             .map(|_| {
-                let gate = Arc::clone(&gate);
+                let shared = Arc::clone(&shared);
                 let done = done.clone();
                 let stager = Arc::clone(&stager);
                 let staging = Arc::clone(&staging);
-                thread::spawn(move || worker_loop(&gate, &done, &stager, &staging))
+                thread::spawn(move || worker_loop(&shared, &done, &stager, &staging))
             })
             .collect();
         Self {
-            gate,
+            shared,
             results,
             handles,
             capacity,
@@ -1226,7 +1226,7 @@ impl Workers {
     }
 
     fn queue(&self) -> MutexGuard<'_, JobQueue> {
-        lock_queue(&self.gate.0)
+        lock_queue(&self.shared.0)
     }
 
     /// Publish the live view. The queues re-key their backlogs against it and
@@ -1283,7 +1283,7 @@ impl Workers {
         let admitted = queue.push(job);
         drop(queue);
         if admitted {
-            self.gate.1.notify_one();
+            self.shared.1.notify_one();
         }
         admitted
     }
@@ -1303,7 +1303,7 @@ impl Workers {
         let admitted = queue.push_far(job, dist2);
         drop(queue);
         if admitted {
-            self.gate.1.notify_one();
+            self.shared.1.notify_one();
         }
         admitted
     }
@@ -1328,7 +1328,7 @@ impl Drop for Workers {
     /// the join is bounded and GPU-independent.
     fn drop(&mut self) {
         self.queue().closed = true;
-        self.gate.1.notify_all();
+        self.shared.1.notify_all();
         for handle in self.handles.drain(..) {
             let _ = handle.join();
         }
@@ -1408,12 +1408,12 @@ fn job_meter(job: &Job) -> voxel_engine::profile::Meter {
 }
 
 fn worker_loop(
-    gate: &(Mutex<JobQueue>, Condvar),
+    shared: &(Mutex<JobQueue>, Condvar),
     done: &Sender<Done>,
     stager: &OnceLock<MeshStager>,
     stats: &StagingStats,
 ) {
-    let (lock, work) = gate;
+    let (lock, work) = shared;
     // Reused across iterations: descheduling is bursty (one epoch rebuild can
     // shed hundreds of keys), and the buffer's capacity survives the drain.
     let mut cancelled: Vec<JobKey> = Vec::new();
