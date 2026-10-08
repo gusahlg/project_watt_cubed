@@ -19,8 +19,7 @@ pub struct StreamGauges {
     /// Near/far jobs waiting in the shared worker queue (running jobs excluded).
     pub worker_near_queue: usize,
     pub worker_far_queue: usize,
-    /// Velocity-aware worker allowance and the pool's physical ceiling.
-    pub active_workers: usize,
+    /// Worker threads in the pool.
     pub worker_capacity: usize,
     /// Current horizontal travel speed and normalized streaming effort.
     pub travel_speed_mps: f64,
@@ -194,17 +193,12 @@ impl World {
 
     /// Snapshot the streaming-queue depths (see [`super::StreamGauges`]).
     pub fn stream_gauges(&self) -> super::StreamGauges {
-        let (worker_near_queue, worker_far_queue, active_workers, worker_capacity) = self
+        let (worker_near_queue, worker_far_queue, worker_capacity) = self
             .workers
             .as_ref()
             .map(|workers| {
                 let (near, far) = workers.queue_depths();
-                (
-                    near,
-                    far,
-                    workers.active_workers(),
-                    workers.worker_capacity(),
-                )
+                (near, far, workers.worker_capacity())
             })
             .unwrap_or_default();
         let staging = self
@@ -224,7 +218,6 @@ impl World {
             light_apply_queue: self.light_apply_queue.len(),
             worker_near_queue,
             worker_far_queue,
-            active_workers,
             worker_capacity,
             travel_speed_mps: self.stream_pacer.speed_mps(),
             effort: self.stream_pacer.effort(),

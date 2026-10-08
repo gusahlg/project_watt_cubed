@@ -830,7 +830,6 @@ struct StreamPeaks {
     max_light_apply_queue: usize,
     max_worker_near_queue: usize,
     max_worker_far_queue: usize,
-    min_active_workers: usize,
     max_worker_capacity: usize,
     max_speed_mps: f64,
     min_effort: f32,
@@ -854,7 +853,6 @@ impl Default for StreamPeaks {
             max_light_apply_queue: 0,
             max_worker_near_queue: 0,
             max_worker_far_queue: 0,
-            min_active_workers: usize::MAX,
             max_worker_capacity: 0,
             max_speed_mps: 0.0,
             min_effort: 1.0,
@@ -879,9 +877,6 @@ impl StreamPeaks {
         self.max_light_apply_queue = self.max_light_apply_queue.max(g.light_apply_queue);
         self.max_worker_near_queue = self.max_worker_near_queue.max(g.worker_near_queue);
         self.max_worker_far_queue = self.max_worker_far_queue.max(g.worker_far_queue);
-        if g.worker_capacity != 0 {
-            self.min_active_workers = self.min_active_workers.min(g.active_workers);
-        }
         self.max_worker_capacity = self.max_worker_capacity.max(g.worker_capacity);
         self.max_speed_mps = self.max_speed_mps.max(g.travel_speed_mps);
         self.min_effort = self.min_effort.min(g.effort);
@@ -904,14 +899,6 @@ impl StreamPeaks {
             ("light_apply_queue", Json::from(self.max_light_apply_queue)),
             ("worker_near_queue", Json::from(self.max_worker_near_queue)),
             ("worker_far_queue", Json::from(self.max_worker_far_queue)),
-            (
-                "minimum_active_workers",
-                if self.min_active_workers == usize::MAX {
-                    Json::Null
-                } else {
-                    Json::from(self.min_active_workers)
-                },
-            ),
             ("worker_capacity", Json::from(self.max_worker_capacity)),
             ("travel_speed_mps", Json::number(self.max_speed_mps)),
             ("minimum_effort", Json::number(f64::from(self.min_effort))),
@@ -956,7 +943,6 @@ fn stream_gauges_json(g: StreamGauges) -> Json {
         ("light_apply_queue", Json::from(g.light_apply_queue)),
         ("worker_near_queue", Json::from(g.worker_near_queue)),
         ("worker_far_queue", Json::from(g.worker_far_queue)),
-        ("active_workers", Json::from(g.active_workers)),
         ("worker_capacity", Json::from(g.worker_capacity)),
         ("travel_speed_mps", Json::number(g.travel_speed_mps)),
         ("effort", Json::number(f64::from(g.effort))),

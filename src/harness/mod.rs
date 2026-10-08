@@ -401,7 +401,6 @@ pub struct StressOutcome {
     pub max_worker_far_queue: usize,
     /// Peak per-frame section (LOD tile) upload vertex bytes.
     pub max_section_upload_bytes: usize,
-    pub min_active_workers: usize,
     pub min_stream_effort: f32,
     /// Light worklist size and loaded-chunk count at the moment of stop.
     pub light_worklist_at_stop: usize,
@@ -413,7 +412,7 @@ pub struct StressOutcome {
     pub light_seed_split_at_stop: crate::world::LightSeedSplit,
     /// Mean light jobs admitted per second between stop and settle (or cap).
     pub settle_light_admit_per_s: f32,
-    /// Per-second snapshots after stop: admit rate, workers, effort, worklist.
+    /// Per-second snapshots after stop: admit rate, effort, worklist.
     pub settle_samples: Vec<SettleSample>,
     /// `remesh_async` calls per coord between uploads (whole run).
     pub remesh_between_upload_mean: f32,
@@ -444,7 +443,6 @@ pub struct StressOutcome {
 pub struct SettleSample {
     pub sec: u32,
     pub light_admit_per_s: f32,
-    pub active_workers: usize,
     pub effort: f32,
     pub light_worklist: usize,
 }
@@ -467,7 +465,6 @@ struct StressRun {
     max_worker_near: usize,
     max_worker_far: usize,
     max_section_upload_bytes: usize,
-    min_active_workers: usize,
     min_effort: f32,
     stop_admitted: u64,
     stop_worklist: usize,
@@ -510,7 +507,6 @@ impl StressRun {
             max_worker_near: 0,
             max_worker_far: 0,
             max_section_upload_bytes: 0,
-            min_active_workers: usize::MAX,
             min_effort: 1.0,
             stop_admitted: 0,
             stop_worklist: 0,
@@ -554,11 +550,6 @@ impl StressRun {
             max_worker_near_queue: self.max_worker_near,
             max_worker_far_queue: self.max_worker_far,
             max_section_upload_bytes: self.max_section_upload_bytes,
-            min_active_workers: if self.min_active_workers == usize::MAX {
-                0
-            } else {
-                self.min_active_workers
-            },
             min_stream_effort: self.min_effort,
             light_worklist_at_stop: self.stop_worklist,
             chunks_at_stop: self.stop_chunks,
@@ -890,9 +881,6 @@ fn execute(stages: Vec<Stage>, build: &GameBuild) -> Outcomes {
             run.max_worker_far = run.max_worker_far.max(gauges.worker_far_queue);
             run.max_section_upload_bytes =
                 run.max_section_upload_bytes.max(gauges.section_upload_bytes);
-            if gauges.worker_capacity != 0 {
-                run.min_active_workers = run.min_active_workers.min(gauges.active_workers);
-            }
             run.min_effort = run.min_effort.min(gauges.effort);
             run.remesh_between_upload_mean = gauges.remesh_between_upload_mean;
             run.remesh_between_upload_p95 = gauges.remesh_between_upload_p95;
@@ -950,15 +938,13 @@ fn execute(stages: Vec<Stage>, build: &GameBuild) -> Outcomes {
                         run.samples.push(SettleSample {
                             sec,
                             light_admit_per_s: admit_per_s,
-                            active_workers: gauges.active_workers,
                             effort: gauges.effort,
                             light_worklist: gauges.light_worklist,
                         });
                         run.sample_admitted = gauges.light_admitted;
                         run.sample_sec = sec;
                         eprintln!(
-                            "stress {name}: t={sec}s admit/s={admit_per_s:.0} workers={} effort={:.2} light_worklist={}",
-                            gauges.active_workers,
+                            "stress {name}: t={sec}s admit/s={admit_per_s:.0} effort={:.2} light_worklist={}",
                             gauges.effort,
                             gauges.light_worklist
                         );

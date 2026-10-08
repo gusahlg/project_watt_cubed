@@ -307,7 +307,7 @@ fn fly(speed: f64, secs: f64, settle: f64, view: (i32, i32), lod2: bool, hz: f64
         occlusions += u32::from(w.last_occlusion_rebuild != occ);
         let pool = w.worker_pool();
         let (nq, fq) = pool.queue_depths();
-        let active = pool.active_workers();
+        let active = pool.worker_capacity();
         near_sum += nq as u64;
         far_sum += fq as u64;
         near_max = near_max.max(nq);

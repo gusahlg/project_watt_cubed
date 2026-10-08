@@ -4,9 +4,9 @@
 //!
 //! Threading model:
 //! - `clamp(cores - 2, 1, 12)` worker threads share ONE [`JobQueue`] behind a
-//!   `Mutex` and separate work/pace condition variables. A worker holds the
-//!   lock only while dequeuing (or waiting); every job runs unlocked. Fast
-//!   travel shrinks the loading window; speed does not park workers.
+//!   `Mutex` and one condition variable. A worker holds the lock only while
+//!   dequeuing (or waiting); every job runs unlocked. Fast travel shrinks the
+//!   loading window, never the pool.
 //! - Jobs carry owned value data only (a generator clone, a voxel snapshot,
 //!   border planes, an `Arc`'d solidity table). Workers never submit GPU
 //!   commands, touch the `World`, or the live chunk map — they may write
@@ -727,9 +727,8 @@ pub(in crate::world) struct ViewGate {
     /// its jobs always run. `slab_set` keeps the lock off the common path.
     slab: std::sync::RwLock<Option<crate::coord::ChunkBox>>,
     slab_set: std::sync::atomic::AtomicBool,
-    /// Velocity-aware concurrency and near-queue lookahead. Both are published
-    /// by the main thread from the world's single streaming pacer.
-    active_workers: AtomicUsize,
+    /// Near-queue lookahead, published by the main thread from the world's
+    /// streaming pacer.
     near_queue_cap: AtomicUsize,
 }
 
@@ -760,7 +759,6 @@ impl ViewGate {
             far_folded: std::sync::atomic::AtomicBool::new(false),
             slab: std::sync::RwLock::new(None),
             slab_set: std::sync::atomic::AtomicBool::new(false),
-            active_workers: AtomicUsize::new(1),
             // Permissive until a real Workers pool publishes its capacity;
             // direct queue tests and non-streaming users retain legacy behavior.
             near_queue_cap: AtomicUsize::new(usize::MAX),
@@ -868,18 +866,8 @@ impl ViewGate {
         self.vel_z.store(z.to_bits(), Ordering::Relaxed);
     }
 
-    fn set_active_workers(&self, active: usize) {
-        let active = active.max(1);
-        self.set_pacing(active, (active * 4).max(8));
-    }
-
-    fn set_pacing(&self, active: usize, near_cap: usize) {
-        self.active_workers.store(active.max(1), Ordering::Relaxed);
+    fn set_near_cap(&self, near_cap: usize) {
         self.near_queue_cap.store(near_cap.max(1), Ordering::Relaxed);
-    }
-
-    fn active_workers(&self) -> usize {
-        self.active_workers.load(Ordering::Relaxed).max(1)
     }
 
     fn near_queue_cap(&self) -> usize {
@@ -1142,6 +1130,12 @@ pub const LIGHT_APPLY_BUDGET: Duration = Duration::from_millis(2);
 /// forever (a permanent hole + an `entry_complete` hang).
 pub const FAR_QUEUE_CAP: usize = 256;
 
+/// Near-queue lookahead for a pool of `workers` threads: four jobs each, at
+/// least eight. Short enough that a moving window can still drop it.
+pub(in crate::world) fn near_lookahead(workers: usize) -> usize {
+    (workers.max(1) * 4).max(8)
+}
+
 /// One queued job with its scheduling key. `d` is the class metric — near:
 /// live chess distance in chunks; far: squared metres (admission-keyed,
 /// re-keyed live on epoch changes). `(wx, wz)` is the entry's location for
@@ -1382,10 +1376,8 @@ fn lock_queue(lock: &Mutex<JobQueue>) -> MutexGuard<'_, JobQueue> {
 /// The worker pool. Owned by the `World` and spawned lazily on the first
 /// `stream()`, so headless worlds (dedicated server, tests) never start threads.
 pub struct Workers {
-    /// Shared queue plus separate work/pace conditions. Inactive workers wait
-    /// on `pace`, so a `notify_one` for new work cannot be stolen by a worker
-    /// the adaptive limit has parked.
-    gate: Arc<(Mutex<JobQueue>, Condvar, Condvar)>,
+    /// Shared queue plus the condition idle workers wait on for new work.
+    gate: Arc<(Mutex<JobQueue>, Condvar)>,
     /// The live view snapshot the queue re-prioritizes and descheduled against.
     view: Arc<ViewGate>,
     results: Receiver<Done>,
@@ -1425,23 +1417,19 @@ impl Workers {
         // generation, FAR_QUEUE_CAP for sections, one-per-coord for light).
         let (done, results) = mpsc::channel::<Done>();
         let capacity = threads.max(1);
-        let gate = Arc::new((
-            Mutex::new(JobQueue::default()),
-            Condvar::new(),
-            Condvar::new(),
-        ));
+        let gate = Arc::new((Mutex::new(JobQueue::default()), Condvar::new()));
         let view = Arc::new(ViewGate::new());
-        view.set_active_workers(capacity);
+        view.set_near_cap(near_lookahead(capacity));
         let stager = Arc::new(OnceLock::new());
         let staging = Arc::new(StagingStats::new());
         let handles = (0..capacity)
-            .map(|worker_id| {
+            .map(|_| {
                 let gate = Arc::clone(&gate);
                 let view = Arc::clone(&view);
                 let done = done.clone();
                 let stager = Arc::clone(&stager);
                 let staging = Arc::clone(&staging);
-                thread::spawn(move || worker_loop(worker_id, &gate, &view, &done, &stager, &staging))
+                thread::spawn(move || worker_loop(&gate, &view, &done, &stager, &staging))
             })
             .collect();
         Self {
@@ -1536,35 +1524,9 @@ impl Workers {
         self.view.set_slab(slab);
     }
 
-    /// Park/unpark workers and publish near-queue lookahead together. A cap-only
-    /// change does not wake parked workers; an active-count change does.
-    pub(in crate::world) fn set_pacing(&self, active: usize, near_cap: usize) {
-        let active = active.clamp(1, self.capacity);
-        let near_cap = near_cap.max(1);
-        if self.view.active_workers() == active && self.view.near_queue_cap() == near_cap {
-            return;
-        }
-        let (lock, work, pace) = &*self.gate;
-        // The worker's predicate check and Condvar::wait both happen while
-        // holding this mutex. Publish the matching state under that same mutex
-        // so an unpark notification cannot land in the gap between them.
-        let queue = lock_queue(lock);
-        // Keep the in-lock check too: it makes the transition safe even if a
-        // future caller publishes pacing from more than one thread.
-        if self.view.active_workers() == active && self.view.near_queue_cap() == near_cap {
-            return;
-        }
-        let workers_changed = self.view.active_workers() != active;
-        self.view.set_pacing(active, near_cap);
-        drop(queue);
-        if workers_changed {
-            work.notify_all();
-            pace.notify_all();
-        }
-    }
-
-    pub(in crate::world) fn active_workers(&self) -> usize {
-        self.view.active_workers().min(self.capacity)
+    /// Publish the near-queue lookahead: submits past it are declined.
+    pub(in crate::world) fn set_near_cap(&self, near_cap: usize) {
+        self.view.set_near_cap(near_cap);
     }
 
     pub(in crate::world) fn worker_capacity(&self) -> usize {
@@ -1572,7 +1534,7 @@ impl Workers {
     }
 
     pub(in crate::world) fn queue_depths(&self) -> (usize, usize) {
-        let (lock, _, _) = &*self.gate;
+        let (lock, _) = &*self.gate;
         let queue = lock_queue(lock);
         (queue.near.len(), queue.far.len())
     }
@@ -1580,14 +1542,14 @@ impl Workers {
     /// Free near-queue slots against the pacer cap. One lock; `0` means a
     /// submit this pass will be declined.
     pub(in crate::world) fn near_slots_free(&self) -> usize {
-        let (lock, _, _) = &*self.gate;
+        let (lock, _) = &*self.gate;
         let queue = lock_queue(lock);
         self.view.near_queue_cap().saturating_sub(queue.near.len())
     }
 
     /// Free far-queue slots against [`FAR_QUEUE_CAP`]. One lock.
     pub(in crate::world) fn far_slots_free(&self) -> usize {
-        let (lock, _, _) = &*self.gate;
+        let (lock, _) = &*self.gate;
         let queue = lock_queue(lock);
         FAR_QUEUE_CAP.saturating_sub(queue.far.len())
     }
@@ -1596,7 +1558,7 @@ impl Workers {
     /// `false` means shutdown or adaptive near-lookahead backpressure, so the
     /// caller must not claim it and the normal pending lane retries later.
     pub(in crate::world) fn submit(&self, job: Job) -> bool {
-        let (lock, work, _) = &*self.gate;
+        let (lock, work) = &*self.gate;
         let mut queue = lock_queue(lock);
         if queue.closed {
             return false;
@@ -1617,7 +1579,7 @@ impl Workers {
     /// claimed ⇒ owed exactly one `Done`), it just retries on a later frame.
     #[must_use]
     pub(in crate::world) fn submit_far(&self, job: Job, dist2: u64) -> bool {
-        let (lock, work, _) = &*self.gate;
+        let (lock, work) = &*self.gate;
         let mut queue = lock_queue(lock);
         if queue.closed {
             return false;
@@ -1640,7 +1602,7 @@ impl Workers {
     /// whole section lane (configuration change). A worker already executing a
     /// job is unaffected and remains protected by epoch/token validation.
     pub(in crate::world) fn clear_far(&self) -> Vec<JobKey> {
-        let (lock, _, _) = &*self.gate;
+        let (lock, _) = &*self.gate;
         lock_queue(lock).clear_far()
     }
 }
@@ -1650,10 +1612,9 @@ impl Drop for Workers {
     /// either waiting on the condvar (returns at once) or finishing one job, so
     /// the join is bounded and GPU-independent.
     fn drop(&mut self) {
-        let (lock, work, pace) = &*self.gate;
+        let (lock, work) = &*self.gate;
         lock_queue(lock).closed = true;
         work.notify_all();
-        pace.notify_all();
         for handle in self.handles.drain(..) {
             let _ = handle.join();
         }
@@ -1733,14 +1694,13 @@ fn job_meter(job: &Job) -> voxel_engine::profile::Meter {
 }
 
 fn worker_loop(
-    worker_id: usize,
-    gate: &(Mutex<JobQueue>, Condvar, Condvar),
+    gate: &(Mutex<JobQueue>, Condvar),
     view: &ViewGate,
     done: &Sender<Done>,
     stager: &OnceLock<MeshStager>,
     stats: &StagingStats,
 ) {
-    let (lock, work, pace) = gate;
+    let (lock, work) = gate;
     // Reused across iterations: descheduling is bursty (one epoch rebuild can
     // shed hundreds of keys), and the buffer's capacity survives the drain.
     let mut cancelled: Vec<JobKey> = Vec::new();
@@ -1753,10 +1713,6 @@ fn worker_loop(
             loop {
                 if queue.closed {
                     return;
-                }
-                if worker_id >= view.active_workers() {
-                    queue = pace.wait(queue).unwrap_or_else(|p| p.into_inner());
-                    continue;
                 }
                 let job = queue.pop(view, &mut cancelled);
                 if job.is_some() || !cancelled.is_empty() {
@@ -2250,7 +2206,7 @@ mod tests {
         let gate = open_gate();
         gate.set_velocity(100.0, 0.0);
         gate.set(0, 0, 0, 20);
-        gate.set_active_workers(2); // near cap = max(2 * 4, 8)
+        gate.set_near_cap(near_lookahead(2)); // max(2 * 4, 8)
 
         // Equal distance, trailing inserted first: direction must win.
         assert!(q.push(near(-5), &gate));
@@ -2608,10 +2564,7 @@ mod tests {
         let workers = Workers::spawn(4);
         // Spawn publishes a streaming lookahead cap; this probe floods the
         // pool, so lift it. Does not affect production admission.
-        workers
-            .view
-            .near_queue_cap
-            .store(usize::MAX, std::sync::atomic::Ordering::Relaxed);
+        workers.set_near_cap(usize::MAX);
         let start = std::time::Instant::now();
         for i in 0..JOBS {
             assert!(workers.submit(Job::Mesh {
@@ -2718,7 +2671,7 @@ mod tests {
         fn ensure_slots(workers: &Workers, free: usize, terrain: &Generator, col: &mut i32) {
             let (near, _) = workers.queue_depths();
             if free == 0 {
-                workers.set_pacing(workers.active_workers(), near.max(1));
+                workers.set_near_cap(near.max(1));
                 while workers.near_slots_free() > 0 {
                     *col += 1;
                     if !workers.submit(dummy(terrain, *col)) {
@@ -2726,10 +2679,7 @@ mod tests {
                     }
                 }
             } else {
-                workers.set_pacing(
-                    workers.active_workers(),
-                    near.saturating_add(free).max(1),
-                );
+                workers.set_near_cap(near.saturating_add(free).max(1));
             }
         }
 

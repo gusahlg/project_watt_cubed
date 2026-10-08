@@ -34,7 +34,7 @@ const MIN_STREAM_EFFORT: f32 = 0.15;
 const STREAM_RECOVERY_SECS: f64 = 0.75;
 
 /// Last topology pass cheaper than this: leftover light/mesh work at rest may
-/// run at full worker/admission capacity. Half a 60 Hz frame — the post-flight
+/// run at full admission with the deep near queue. Half a 60 Hz frame — the post-flight
 /// frames on this branch sit well below it, while an already-expensive pass
 /// keeps travel shedding.
 const STREAM_HEADROOM_SECS: f64 = 0.008;
@@ -226,8 +226,7 @@ impl StreamPacer {
         self.held
     }
 
-    /// Effort applied to admission deadlines, floors and uploads. The worker
-    /// count does not follow it.
+    /// Effort applied to admission deadlines, floors and uploads.
     fn applied_effort(self) -> f32 {
         if self.boost { 1.0 } else { self.effort }
     }
@@ -261,17 +260,12 @@ impl StreamPacer {
             .clamp(1, SECTION_UPLOAD_BUDGET)
     }
 
-    /// Every worker stays available. Speed shrinks the loading window, not the
-    /// pool: a few workers on the full radius never finish the chunks that matter.
-    fn active_workers(self, capacity: usize) -> usize {
-        capacity.max(1)
-    }
-
-    /// Near-queue lookahead. Travel keeps `capacity * 4` so a short queue can
-    /// still be dropped when the window moves; at rest the deeper cap keeps
-    /// cheap light jobs from idling the pool.
+    /// Near-queue lookahead. Travel keeps the short
+    /// [`near_lookahead`](pipeline::near_lookahead) so the queue can still be
+    /// dropped when the window moves; at rest the deeper cap keeps cheap light
+    /// jobs from idling the pool.
     fn near_queue_cap(self, capacity: usize) -> usize {
-        let travel = (capacity.max(1) * 4).max(8);
+        let travel = pipeline::near_lookahead(capacity);
         if self.boost {
             travel.max(NEAR_REST_QUEUE_CAP)
         } else {
@@ -435,11 +429,7 @@ impl World {
                 fold,
             );
         }
-        let capacity = workers.worker_capacity();
-        workers.set_pacing(
-            pacer.active_workers(capacity),
-            pacer.near_queue_cap(capacity),
-        );
+        workers.set_near_cap(pacer.near_queue_cap(workers.worker_capacity()));
     }
 
     /// The view a spawn request publishes: at rest around near centre `c` and far centre `f`, with
@@ -485,7 +475,6 @@ mod tests {
         let mut pacer = StreamPacer::default();
         pacer.update(DVec3::new(200.0, 0.0, 0.0), 1.0 / 60.0);
         assert_eq!(pacer.effort(), MIN_STREAM_EFFORT, "shedding is immediate");
-        assert_eq!(pacer.active_workers(12), 12, "speed shrinks the window, not the pool");
         assert_eq!(pacer.floor(32), 5);
         assert_eq!(pacer.section_uploads(), 1);
 
@@ -501,23 +490,20 @@ mod tests {
     }
 
     #[test]
-    fn stream_pacer_runs_full_workers_for_queued_work_at_rest() {
+    fn stream_pacer_boosts_queued_work_at_rest() {
         let mut pacer = StreamPacer::default();
         pacer.update(DVec3::new(200.0, 0.0, 0.0), 1.0 / 60.0);
-        assert_eq!(pacer.active_workers(12), 12, "travel keeps every worker");
         pacer.set_boost(true, 0.001);
         assert!(
             !pacer.boosting(),
             "queued work during travel must not lift the floor"
         );
-        assert_eq!(pacer.active_workers(12), 12);
         assert_eq!(pacer.near_queue_cap(12), 48);
         assert!(pacer.floor(32) < 32, "travel still sheds admission");
 
         pacer.update(DVec3::ZERO, 1.0 / 60.0);
         pacer.set_boost(true, 0.001);
         assert!(pacer.boosting(), "cheap rest frame with leftover work");
-        assert_eq!(pacer.active_workers(12), 12);
         assert_eq!(pacer.near_queue_cap(12), NEAR_REST_QUEUE_CAP);
         assert_eq!(pacer.floor(32), 32);
         assert!(
@@ -531,7 +517,6 @@ mod tests {
             "an already-expensive pass keeps the travel floor"
         );
         assert!(pacer.effort() < 1.0, "one rest frame does not restore effort");
-        assert_eq!(pacer.active_workers(12), 12, "worker count does not follow the effort floor");
         assert!(pacer.floor(32) < 32);
     }
 

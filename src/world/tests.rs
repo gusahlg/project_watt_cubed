@@ -3775,7 +3775,7 @@ fn open_gen_cursor_drains_across_frames() {
     {
         let pool = world.worker_pool();
         let cap = pool.worker_capacity();
-        pool.set_pacing(cap, (cap * 4).max(8));
+        pool.set_near_cap(pipeline::near_lookahead(cap));
         pool.set_view(
             center.x, center.y, center.z, pipeline::FarView::flat(center.x, center.z), 1, 0.0, 0.0, 0.0, 0.0, None,
             super::seam::Unfold::IDENTITY,
@@ -3872,7 +3872,7 @@ fn buried_solid_mesh_is_air_and_an_edit_remeshes_it() {
     {
         let pool = world.worker_pool();
         let cap = pool.worker_capacity();
-        pool.set_pacing(cap, (cap * 4).max(8));
+        pool.set_near_cap(pipeline::near_lookahead(cap));
         pool.set_view(
             center.x, center.y, center.z, pipeline::FarView::flat(center.x, center.z), 2, 0.0, 0.0, 0.0, 0.0, up,
             super::seam::Unfold::IDENTITY,
@@ -3981,7 +3981,7 @@ fn asteroid_entry_breakdown() {
         let pool = world.worker_pool();
         let cap = pool.worker_capacity();
         // Heavy entry frames stay unboosted: lookahead is `active * 4`.
-        pool.set_pacing(cap, (cap * 4).max(8));
+        pool.set_near_cap(pipeline::near_lookahead(cap));
         pool.set_view(
             center.x, center.y, center.z, pipeline::FarView::flat(center.x, center.z), VIEW_H, 0.0, 0.0, 0.0, 0.0, up,
             super::seam::Unfold::IDENTITY,

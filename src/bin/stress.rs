@@ -77,8 +77,8 @@ fn main() {
             o.max_section_upload_bytes
         );
         println!(
-            "  adaptive floor: effort={:.2} active_workers={}",
-            o.min_stream_effort, o.min_active_workers
+            "  adaptive floor: effort={:.2}",
+            o.min_stream_effort
         );
         println!(
             "  at stop: light_worklist={} chunks={} seeds={} seeds/chunk={:.2}",
@@ -139,8 +139,8 @@ fn main() {
         );
         for s in &o.settle_samples {
             println!(
-                "  t={}s admit/s={:.0} workers={} effort={:.2} light_worklist={}",
-                s.sec, s.light_admit_per_s, s.active_workers, s.effort, s.light_worklist
+                "  t={}s admit/s={:.0} effort={:.2} light_worklist={}",
+                s.sec, s.light_admit_per_s, s.effort, s.light_worklist
             );
         }
         if !o.stuck.is_empty() {
