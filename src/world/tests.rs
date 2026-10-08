@@ -2350,11 +2350,11 @@ fn flush_degraded_leaves_inflight_and_terminal_clears_on_unload_or_toggle() {
         }
     ));
 
-    world.chunks.remove(&c);
+    world.forget_chunk(c);
     world.tick_light_gate();
     assert!(
         !world.light_terminal.contains(&c),
-        "tick reaps terminal marks for unloaded chunks"
+        "unload drops terminal marks"
     );
     assert!(!world.light_gate.degraded.contains(&c));
 
