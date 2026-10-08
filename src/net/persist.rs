@@ -13,15 +13,15 @@
 //! the server must not replace it with a fresh world. When a file loads, its seed
 //! and generator win.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs;
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::save::format::{self, Decoded, Edit, PendingContact, PlayerState, SaveDoc, WorldgenStamp};
-use crate::save::slot::SaveMeta;
+use crate::save::format::{self, Decoded, Edit, PendingContact, PlayerState, SaveDoc, SpecTable, WorldgenStamp};
+use crate::save::slot::{SaveError, SaveMeta};
 use crate::save::store::{sibling, write_rotating};
 use crate::save;
 use crate::world::generation::WorldgenKind;
@@ -309,13 +309,13 @@ fn blank_doc(flags: &Flags) -> SaveDoc {
 }
 
 /// Encode `snap` plus the cells kept from the file, at most `cap` of them, in one linear pass:
-/// the spec table is filled in cell order through a map from spec to index.
+/// the spec table is filled in cell order.
 fn encode_snapshot(
     doc: &mut SaveDoc,
     snap: &Snapshot,
     kept: &mut Vec<(i32, i32, i32, String)>,
     cap: usize,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, SaveError> {
     let mut cells: Vec<(i32, i32, i32, &str)> = snap.edits.iter().map(|(x, y, z, spec)| (*x, *y, *z, spec.as_ref())).collect();
     // A live edit replaces an unparsed one at the same cell. The unparsed text stays only while
     // this build still has no opinion about that cell.
@@ -331,33 +331,23 @@ fn encode_snapshot(
         eprintln!("warning: {} edits do not fit a world file; saving the first {cap}", cells.len());
         cells.truncate(cap);
     }
-    let mut specs: Vec<String> = Vec::new();
-    let mut index: HashMap<&str, u16> = HashMap::new();
+    let mut table = SpecTable::default();
     let mut records = Vec::with_capacity(cells.len());
     for (x, y, z, spec) in cells {
-        let at = match index.get(spec) {
-            Some(&at) => at,
-            None => {
-                let at = u16::try_from(specs.len()).map_err(|_| "too many distinct block specs to save".to_string())?;
-                specs.push(spec.to_string());
-                index.insert(spec, at);
-                at
-            }
-        };
-        records.push(Edit { x, y, z, spec: at });
+        records.push(Edit { x, y, z, spec: table.index(spec)? });
     }
     doc.meta.seed = snap.seed;
     doc.meta.last_played = save::unix_now();
     doc.meta.edit_count = u32::try_from(records.len()).unwrap_or(u32::MAX);
     doc.worldgen = WorldgenStamp { kind: snap.worldgen.wire(), knobs: snap.terrain.to_wire() };
     doc.law_stamp = material::Law::current().stamp();
-    doc.specs = specs;
+    doc.specs = table.specs;
     doc.edits = records;
     doc.pending = snap.pending.clone();
     doc.mods.retain(|(name, _)| name != CLOCK_MOD);
     let day = if snap.day.is_finite() { snap.day.rem_euclid(1.0) } else { DEFAULT_DAY };
     doc.mods.push((CLOCK_MOD.to_string(), format!("{:08x}", day.to_bits())));
-    format::encode(doc).map_err(|e| e.to_string())
+    format::encode(doc)
 }
 
 fn clock_of(mods: &[(String, String)]) -> f32 {

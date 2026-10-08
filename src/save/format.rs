@@ -44,6 +44,9 @@
 //! a fixed 14 bytes, so a truncated file still yields its longest valid prefix
 //! of edits: decoding degrades to [`Decoded::Salvaged`] instead of failing.
 
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+
 use glam::DQuat;
 
 use crate::ident::codec;
@@ -217,6 +220,28 @@ pub struct Edit {
     pub y: i32,
     pub z: i32,
     pub spec: u16,
+}
+
+/// A document's spec table, filled in first-use order.
+#[derive(Default)]
+pub(crate) struct SpecTable<'a> {
+    pub specs: Vec<String>,
+    index: HashMap<&'a str, u16>,
+}
+
+impl<'a> SpecTable<'a> {
+    /// The table index of `spec`, appended on first use.
+    pub fn index(&mut self, spec: &'a str) -> Result<u16, SaveError> {
+        match self.index.entry(spec) {
+            Entry::Occupied(at) => Ok(*at.get()),
+            Entry::Vacant(slot) => {
+                let at = u16::try_from(self.specs.len())
+                    .map_err(|_| SaveError::Corrupt("too many distinct block specs to save"))?;
+                self.specs.push(spec.to_string());
+                Ok(*slot.insert(at))
+            }
+        }
+    }
 }
 
 /// A decode can't silently lie: a partial read comes back as `Salvaged`, which
