@@ -9,8 +9,9 @@
 //! raylib `while !window_should_close()` loop.
 mod entry;
 
-use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+mod host;
 
 use voxel_engine::{Color, DVec3, Engine};
 
@@ -26,7 +27,7 @@ use crate::modding::{ActionSet, ChoicesFlush, GameBuild, ModDescriptor, Mods};
 #[cfg(test)]
 use crate::net::client::ConnectError;
 use crate::net::client::{Connection, PendingConnect};
-use crate::net::server::{self, Config, NoclipPolicy, ServerHandle, TeleportPolicy};
+use crate::net::server::{Config, NoclipPolicy, TeleportPolicy};
 use crate::ui::{self, Anchor};
 use crate::player::Player;
 use crate::save::{self, Autosaver, SaveMeta, Slot, SlotId, Tick};
@@ -35,6 +36,7 @@ use crate::settings::Settings;
 use crate::world::terrain::TerrainCfg;
 use crate::world::World;
 use entry::{Loading, Recipe};
+use host::Host;
 
 const STARTING_WINDOW_WIDTH: u32 = 1280;
 const STARTING_WINDOW_HEIGHT: u32 = 720;
@@ -72,7 +74,7 @@ struct ConnectJob {
     port: u16,
     name: String,
     password: String,
-    /// Shown once the retry joins.
+    /// Shown once the attempt joins: a skipped save, or mods held for the session.
     notice: Option<String>,
 }
 
@@ -93,9 +95,11 @@ pub struct App {
     screen: Screen,
     /// A world building off the render thread. The menu under it stays as it was; Esc drops it.
     loading: Option<Loading>,
-    /// The integrated server when hosting, kept alive for the session so friends can
-    /// stay connected; stopping it frees the port for a later host.
-    host: Option<ServerHandle>,
+    /// Said in the next world (or on the menu, if it fails or is cancelled): the host stopped for it.
+    entry_notice: Option<&'static str>,
+    /// The integrated server when hosting, kept alive across menu returns so friends
+    /// stay connected. Opening a world, or deleting the hosted one, stops it first.
+    host: Host,
     /// Graphics settings, persisted as `settings.cfg` under the config root.
     settings: Settings,
     /// Last-used connection details, persisted as `session.cfg` under the config root.
@@ -211,7 +215,8 @@ impl App {
             packages,
             screen,
             loading: None,
-            host: None,
+            entry_notice: None,
+            host: Host::default(),
             settings,
             session,
             bench,
@@ -627,10 +632,15 @@ impl App {
             AppEffect::NewWorld => self.start_new_world(eng),
             AppEffect::Load(id) => self.load_world(eng, &id),
             AppEffect::DeleteWorld(id) => {
+                // Stopping saves, so the trashed copy keeps the friends' last edits.
+                let stopped = if self.host.serves(&id) { self.host.stop() } else { None };
                 if let Err(e) = save::delete(&id) {
                     eprintln!("could not delete world {id}: {e}");
                 }
                 self.saves = save::list();
+                if stopped.is_some() {
+                    self.screen = Screen::Menus(Self::start_stack(&self.mods, &self.saves, &self.session, stopped, false));
+                }
             }
             AppEffect::Host(info) => {
                 self.session.port = info.port.to_string();
@@ -767,51 +777,42 @@ impl App {
             &self.saves,
             &self.session,
             notice.as_deref(),
-            self.host.is_some(),
+            self.host.running(),
         ));
     }
 
-    /// The most recent readable save, or a new slot file when the list is empty.
-    fn host_world_path(&self) -> PathBuf {
-        host_save_path(&self.saves)
-    }
-
-    /// Spin up the integrated server on the most recent save and join it on loopback.
-    /// Any previous host is stopped first so its port is free. The host is an
-    /// operator and teleport stays open. A stored seed and generator win.
+    /// Spin up the integrated server on the newest save it can load and join it on
+    /// loopback. Any previous host is stopped first so its port is free. The host is
+    /// an operator and teleport stays open. A stored seed and generator win.
     fn start_host(&mut self, _eng: &mut Engine, info: HostInfo) {
-        if let Some(previous) = self.host.take() {
-            previous.stop();
-        }
-        let config = Config {
+        debug_assert!(self.active.is_none(), "hosting starts from the menu, never over an open world");
+        let worldgen = self.mods.worldgen_kind();
+        let terrain = terrain_cfg_from_mods(&self.mods);
+        let started = self.host.start(&self.saves, info.port, |world| Config {
             password: info.password.clone(),
             seed: fresh_seed(),
-            worldgen: self.mods.worldgen_kind(),
-            terrain: terrain_cfg_from_mods(&self.mods),
+            worldgen,
+            terrain,
             teleport: TeleportPolicy::All,
             noclip: NoclipPolicy::All,
-            world: Some(self.host_world_path()),
+            world: Some(world),
             ops: vec![info.name.clone()],
             warn_world_overrides: false,
             ..Config::default()
-        };
-        match server::spawn(info.port, config) {
-            Ok(handle) => {
-                let port = handle.addr().port();
-                self.host = Some(handle);
-                self.open_connect("127.0.0.1", port, &info.name, &info.password, true);
-            }
+        });
+        match started {
+            Ok((port, skipped)) => self.open_connect("127.0.0.1", port, &info.name, &info.password, true, skipped),
             Err(e) => self.fail_to_menu(format!("could not host on port {}: {e}", info.port)),
         }
     }
 
     /// Connect to a remote server. The attempt runs behind the connecting screen.
     fn start_join(&mut self, _eng: &mut Engine, info: JoinInfo) {
-        self.open_connect(&info.host, info.port, &info.name, &info.password, false);
+        self.open_connect(&info.host, info.port, &info.name, &info.password, false, None);
     }
 
     /// Start one attempt. The render thread polls it; Cancel calls [`PendingConnect::cancel`].
-    fn open_connect(&mut self, host: &str, port: u16, name: &str, password: &str, hosted: bool) {
+    fn open_connect(&mut self, host: &str, port: u16, name: &str, password: &str, hosted: bool, notice: Option<String>) {
         let reports = self.mods.enabled_package_reports(&self.packages);
         let pending = Connection::begin_connect(host, port, name, password, &reports);
         self.screen = Screen::Connecting(ConnectJob {
@@ -822,7 +823,7 @@ impl App {
             port,
             name: name.to_string(),
             password: password.to_string(),
-            notice: None,
+            notice,
         });
     }
 
@@ -885,14 +886,14 @@ impl App {
             }
             _ => false,
         };
-        if hosted && let Some(host) = self.host.take() {
-            host.stop();
+        if hosted {
+            self.host.stop();
         }
         self.return_to_menu(None);
     }
 
     fn standby_menu(&self) -> MenuStack {
-        Self::start_stack(&self.mods, &self.saves, &self.session, None, self.host.is_some())
+        Self::start_stack(&self.mods, &self.saves, &self.session, None, self.host.running())
     }
 
     /// Esc on a waiting screen (connecting, loading).
@@ -912,6 +913,7 @@ impl App {
 
     /// Start a fresh world with a time-seeded generator.
     fn start_new_world(&mut self, eng: &mut Engine) {
+        let stopped = self.host.stop();
         // Benchmarks pin the seed (`WATT_BENCH_SEED`, default when benching) so
         // fps/rss deltas measure the code, not terrain-lottery variance.
         let seed = match (&self.bench, std::env::var("WATT_BENCH_SEED")) {
@@ -928,13 +930,15 @@ impl App {
             kind: self.mods.worldgen_kind(),
             cfg: terrain_cfg_from_mods(&self.mods),
         };
+        self.entry_notice = stopped;
         self.begin_loading(eng, Loading::new_world(recipe));
     }
 
     /// Start loading a save. A save that fails to load returns to the menu.
     fn load_world(&mut self, eng: &mut Engine, id: &SlotId) {
-        // The save header names the generator; the InfiniteDiffusion mod's
-        // enabled flag only chooses the next *new* world.
+        // Stopping saves first, so the world loads with the friends' last edits. The save header
+        // names the generator; the InfiniteDiffusion mod's enabled flag only chooses the next *new* world.
+        self.entry_notice = self.host.stop();
         let render = self.mods.effective_render(&self.settings);
         self.begin_loading(eng, Loading::load(id.clone(), render));
     }
@@ -952,11 +956,21 @@ impl App {
     /// also closes the connection and stops a host we started, as cancelling the connect does.
     fn update_loading(&mut self, eng: &mut Engine) {
         if self.cancel_pressed(eng) {
-            if let Some(Loading::Join { hosted, .. }) = self.loading.take() {
-                if hosted && let Some(host) = self.host.take() {
-                    host.stop();
+            match self.loading.take() {
+                Some(Loading::Join { hosted, .. }) => {
+                    if hosted {
+                        self.host.stop();
+                    }
+                    self.return_to_menu(None);
                 }
-                self.return_to_menu(None);
+                // The menu under a new world or a load was never replaced. Only a stopped host
+                // changes it (its status line), and the notice says why.
+                Some(_) => {
+                    if let Some(notice) = self.entry_notice.take() {
+                        self.return_to_menu(Some(notice.to_string()));
+                    }
+                }
+                None => {}
             }
             return;
         }
@@ -1004,7 +1018,13 @@ impl App {
                     }
                     self.enter_game(eng, game)
                 }
-                Err(e) => self.fail_to_menu(format!("could not load {id}: {e}")),
+                Err(e) => {
+                    let message = match self.entry_notice.take() {
+                        Some(notice) => format!("{notice}; could not load {id}: {e}"),
+                        None => format!("could not load {id}: {e}"),
+                    };
+                    self.fail_to_menu(message);
+                }
             },
             Loading::Join { job, conn, notice, .. } => {
                 let (world, player) = job.wait();
@@ -1021,6 +1041,9 @@ impl App {
 
     /// Install a freshly built game as the active screen.
     fn enter_game(&mut self, eng: &mut Engine, mut game: Game) {
+        if let Some(notice) = self.entry_notice.take() {
+            game.notify(notice);
+        }
         // World-construction lanes apply on entry only, before streaming spins;
         // everything live-applicable goes through the same path `/gfx` uses.
         let render = self.mods.effective_render(&self.settings);
@@ -1198,15 +1221,6 @@ pub(crate) fn join_server(host: &str, port: u16, name: &str, password: &str) -> 
     Connection::connect(host, port, name, password)
 }
 
-/// The most recent readable slot, else a fresh id. `saves` is already ordered
-/// most-recently played first.
-fn host_save_path(saves: &[crate::save::Slot]) -> PathBuf {
-    if let Some(slot) = saves.iter().find(|s| s.meta.is_ok()) {
-        return save::file_path(&slot.id);
-    }
-    save::file_path(&save::fresh_id())
-}
-
 /// Join, reporting the packages this client has enabled. The mod list is what
 /// an honest client says; a modified client can lie. One refusal turns those
 /// packages off for this session and retries once. A second failure restores
@@ -1315,6 +1329,7 @@ fn spawn_player(world: &World) -> Player {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::net::server;
     use crate::render_config::RenderConfig;
     use crate::world::generation::WorldgenKind;
 
@@ -1385,16 +1400,6 @@ mod tests {
         assert_eq!(
             mod_hold_notice(&packages, &["pwc.dev-toolkit".into(), "pwc.hotbar".into()]),
             "This server does not allow: Developer Toolkit; Hotbar; they are off while you are connected"
-        );
-    }
-
-    #[test]
-    fn host_save_path_is_the_newest_readable_slot() {
-        let slots = vec![Slot::for_test("newer", 3, 1), Slot::for_test("older", 1, 0)];
-        assert_eq!(host_save_path(&slots), save::file_path(&slots[0].id));
-        assert_eq!(
-            host_save_path(&[]).extension().and_then(|ext| ext.to_str()),
-            Some("save")
         );
     }
 
