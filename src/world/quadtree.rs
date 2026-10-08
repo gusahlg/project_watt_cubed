@@ -13,7 +13,7 @@ use crate::coord::Face;
 use crate::ident::Detail;
 
 use super::metric::EyeMetric;
-use super::pyramid::PyramidCfg;
+use super::pyramid::{PyramidCfg, RING_SHIFT_RINGS};
 use super::section::{Quadrant, SectionPos};
 use super::summary::{CellSummary, SseBudget};
 use super::{FastMap, FastSet};
@@ -82,11 +82,13 @@ impl CoverCut {
 }
 
 /// Inner and outer distance bounds for a detail level's annulus. Innermost band
-/// starts at 0; coarsest band ends at infinity.
+/// starts at 0; coarsest band ends at infinity. The first rings' outer edges move out by
+/// [`PyramidCfg::ring_shift`].
 fn band_radii(ring: usize, cfg: &PyramidCfg) -> (f32, f32) {
-    let lo = if ring == 0 { 0.0 } else { cfg.unit * cfg.base.powi(ring as i32) };
+    let edge = |r: usize| cfg.unit * cfg.base.powi(r as i32 + 1) + if r < RING_SHIFT_RINGS { cfg.ring_shift } else { 0.0 };
+    let lo = if ring == 0 { 0.0 } else { edge(ring - 1) };
     let coarsest = ring + 1 == cfg.levels.get() as usize;
-    let hi = if coarsest { f32::INFINITY } else { cfg.unit * cfg.base.powi(ring as i32 + 1) };
+    let hi = if coarsest { f32::INFINITY } else { edge(ring) };
     (lo, hi)
 }
 
@@ -1014,5 +1016,71 @@ mod tests {
             assert!(drawable_cover(cell, max, &all_ready).is_some(), "{cell:?} uncovered");
         }
         assert_eq!(desired.is_empty(), cut.iter().count() == 0);
+    }
+
+    /// The drawn quadrant (detail and section) holding point `(x, z)` of an all-ready cut.
+    fn drawn_at(draw: &FastMap<SectionPos, QuadrantMask>, x: i32, z: i32, max: Detail) -> Option<Detail> {
+        (0..=max.0).map(Detail).find(|&d| {
+            let span = SectionPos { body: 0, face: Face::PosY, detail: d, x: 0, z: 0 }.span();
+            let cell = SectionPos { body: 0, face: Face::PosY, detail: d, x: x.div_euclid(span), z: z.div_euclid(span) };
+            draw.get(&cell).is_some_and(|m| m.contains(Quadrant::of_coords(x.div_euclid(span / 2), z.div_euclid(span / 2))))
+        })
+    }
+
+    /// Where the window clips the finest ring, rings 0 and 1 end 1.5 finest spans further out
+    /// (704 and 1216 at render distance 16) and the rest stay. Without the clip (finest wider
+    /// than eight chunks) nothing moves.
+    #[test]
+    fn clipped_rings_shift_the_first_two_edges() {
+        use crate::render_config::lod_for;
+        let (levels, detail) = lod_for(16);
+        let cfg = PyramidCfg::sections_with(256.0, levels, detail).clipped();
+        assert_eq!(cfg.clip_detail(), Some(FINEST_DETAIL));
+        assert_eq!(cfg.ring_shift, 192.0);
+        let rings = cfg.levels.get() as usize;
+        let his: Vec<f32> = (0..rings - 1).map(|r| band_radii(r, &cfg).1).collect();
+        assert_eq!(his[..4], [704.0, 1216.0, 2048.0, 4096.0]);
+        assert!(his.windows(2).all(|w| w[0] < w[1]), "monotone {his:?}");
+        for r in 1..rings {
+            assert_eq!(band_radii(r, &cfg).0, band_radii(r - 1, &cfg).1, "ring {r} starts where {} ends", r - 1);
+        }
+        for rd in 1..=5 {
+            let (levels, detail) = lod_for(rd);
+            let cfg = PyramidCfg::sections_with((rd * 16) as f32, levels, detail).clipped();
+            assert_eq!((cfg.clip_detail(), cfg.ring_shift), (None, 0.0), "render distance {rd}");
+        }
+    }
+
+    /// The shift keeps ring 1 three finest spans inside ring 2 at every render distance that
+    /// clips, and an all-ready cut never draws a quadrant beside one two levels coarser.
+    #[test]
+    fn clipped_rings_keep_two_to_one_balance() {
+        use crate::render_config::lod_for;
+        use crate::world::pyramid::RING_BALANCE_SPANS;
+        for rd in 6..=32 {
+            let (levels, detail) = lod_for(rd);
+            let unit = (rd * 16) as f32;
+            let cfg = PyramidCfg::sections_with(unit, levels, detail).clipped();
+            let span_f = SectionPos { body: 0, face: Face::PosY, detail: cfg.finest, x: 0, z: 0 }.span() as f32;
+            assert!(cfg.clip_detail().is_some(), "render distance {rd} clips");
+            assert!(4.0 * unit - cfg.ring_shift >= RING_BALANCE_SPANS * span_f, "render distance {rd}: shift {}", cfg.ring_shift);
+            let max = cfg.coarsest();
+            for i in 0..64 {
+                let (x, z) = (16 * (i % 8) + 8, 16 * (i / 8) + 8);
+                let desired = desired_sections(&eye(x, z, &cfg), &cfg);
+                let draw: FastMap<SectionPos, QuadrantMask> = resolve_covering(&desired, max, &|_| true).iter().copied().collect();
+                for (&p, &mask) in &draw {
+                    for q in mask.iter() {
+                        let c = p.child(q);
+                        let (x0, z0, w) = (c.min_x(), c.min_z(), c.span());
+                        for (px, pz) in [(x0 - 1, z0 + w / 2), (x0 + w, z0 + w / 2), (x0 + w / 2, z0 - 1), (x0 + w / 2, z0 + w)] {
+                            if let Some(d) = drawn_at(&draw, px, pz, max) {
+                                assert!(d.0 < p.detail.0 + 2, "render distance {rd}, eye ({x}, {z}): {p:?} quadrant {q:?} meets detail {d:?}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }

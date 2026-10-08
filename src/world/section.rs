@@ -31,9 +31,9 @@ use super::generation::TerrainGenerator;
 use super::lod;
 
 /// Submodule keeps mesh representation and consumer together.
-pub(in crate::world) mod mesh;
+mod mesh;
 pub(in crate::world) use mesh::face_edits;
-pub(in crate::world) use mesh::{SectionMeshData, chart_slab_corners, extract_section_mesh, warp_slab_corners};
+pub(in crate::world) use mesh::{SectionMeshData, chart_slab_corners, extract_section_mesh, extract_section_mesh_with, warp_slab_corners};
 
 /// 32 not 64: reduces remesh cost under frequent edits.
 pub(in crate::world) const SECTION_N: usize = 32;
@@ -180,6 +180,97 @@ impl SectionPos {
     #[cfg(test)]
     fn num_bricks(self) -> usize {
         (self.n_cells() as usize).div_ceil(BRICK_DIM).max(1)
+    }
+}
+
+// ColumnClip: the chunk columns a section leaves to the full-res window.
+
+/// Widest section that clips the window's columns: eight chunk columns a side, one bit each.
+pub(in crate::world) const CLIP_MAX_SPAN: i32 = 8 * CS;
+
+/// Chunk columns a section leaves out of its mesh for the full-res window to draw. Bit
+/// `cz * 8 + cx` is the 16-block column `(cx, cz)` from the section's min corner, in its own
+/// storage frame.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug, Hash)]
+pub(in crate::world) struct ColumnClip(pub(in crate::world) u64);
+
+impl ColumnClip {
+    pub const NONE: Self = Self(0);
+
+    /// Columns of `s` a side (at most 8).
+    fn side(s: SectionPos) -> i32 {
+        (s.span() / CS).min(8)
+    }
+
+    /// The columns of `s` inside the 16-aligned storage rect `[u0, v0, u1, v1)`.
+    pub fn of_rect(s: SectionPos, [u0, v0, u1, v1]: [i32; 4]) -> Self {
+        let n = Self::side(s);
+        let mut bits = 0u64;
+        for cz in 0..n {
+            let z = s.min_z() + cz * CS;
+            for cx in 0..n {
+                let x = s.min_x() + cx * CS;
+                if x >= u0 && x + CS <= u1 && z >= v0 && z + CS <= v1 {
+                    bits |= 1 << (cz * 8 + cx);
+                }
+            }
+        }
+        Self(bits)
+    }
+
+    /// The bit of the column holding storage point `(x, z)`, when it lies in `s`.
+    pub fn bit(s: SectionPos, x: i64, z: i64) -> Option<u32> {
+        let (cx, cz) = ((x - i64::from(s.min_x())).div_euclid(i64::from(CS)), (z - i64::from(s.min_z())).div_euclid(i64::from(CS)));
+        let n = i64::from(Self::side(s));
+        (s.span() <= CLIP_MAX_SPAN && (0..n).contains(&cx) && (0..n).contains(&cz)).then(|| (cz * 8 + cx) as u32)
+    }
+
+    /// Whether the column holding storage point `(x, z)` is left out.
+    pub fn masks_point(self, s: SectionPos, x: i64, z: i64) -> bool {
+        self.0 != 0 && Self::bit(s, x, z).is_some_and(|b| self.0 >> b & 1 != 0)
+    }
+
+    pub fn masks(self, cx: i32, cz: i32) -> bool {
+        (0..8).contains(&cx) && (0..8).contains(&cz) && self.0 >> (cz * 8 + cx) & 1 != 0
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    pub fn is_subset_of(self, other: Self) -> bool {
+        self.0 & !other.0 == 0
+    }
+
+    pub fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    pub fn intersect(self, other: Self) -> Self {
+        Self(self.0 & other.0)
+    }
+
+    pub fn without(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
+
+    /// The masked columns as chunk `(x, z)` in `s`'s storage frame.
+    pub fn columns(self, s: SectionPos) -> impl Iterator<Item = (i32, i32)> {
+        let (x0, z0) = (s.min_x().div_euclid(CS), s.min_z().div_euclid(CS));
+        (0..64).filter(move |&b| self.0 >> b & 1 != 0).map(move |b| (x0 + b % 8, z0 + b / 8))
+    }
+
+    /// Each kept column of `s` beside a masked one: `(kept, masked)` as `(cx, cz)` from the min
+    /// corner.
+    pub fn inner_edges(self, s: SectionPos) -> impl Iterator<Item = ((i32, i32), (i32, i32))> {
+        let n = Self::side(s);
+        (0..n * n).flat_map(move |i| {
+            let (cx, cz) = (i % n, i / n);
+            [(1, 0), (-1, 0), (0, 1), (0, -1)].into_iter().filter_map(move |(dx, dz)| {
+                let (mx, mz) = (cx + dx, cz + dz);
+                (!self.masks(cx, cz) && (0..n).contains(&mx) && (0..n).contains(&mz) && self.masks(mx, mz)).then_some(((cx, cz), (mx, mz)))
+            })
+        })
     }
 }
 

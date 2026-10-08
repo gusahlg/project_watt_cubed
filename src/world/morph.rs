@@ -791,8 +791,8 @@ fn morph_quad_overhead_probe() {
         if mask.is_empty() {
             continue;
         }
-        let on = super::section::mesh::extract_section_mesh_dy(s, world.generator.as_ref(), &[], &tables, true);
-        let off = super::section::mesh::extract_section_mesh_dy(s, world.generator.as_ref(), &[], &tables, false);
+        let on = super::section::extract_section_mesh_with(s, world.generator.as_ref(), &[], &tables, super::section::ColumnClip::NONE, true);
+        let off = super::section::extract_section_mesh_with(s, world.generator.as_ref(), &[], &tables, super::section::ColumnClip::NONE, false);
         let e = &mut per[s.detail.0 as usize];
         e.0 += quads(&off);
         e.1 += quads(&on);

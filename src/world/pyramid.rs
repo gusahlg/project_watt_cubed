@@ -18,6 +18,16 @@ pub enum LodChoice {
     BeyondHorizon,
 }
 
+/// Finest-section spans the outer edges of the first rings move out by, where the near window
+/// clips the finest ring (charts): room for that ring's morph band past the window's corners.
+pub const RING_SHIFT_SPANS: f32 = 1.5;
+
+/// Finest spans the shifted ring 1 keeps inside ring 2. 2:1 balance needs `2·√2`.
+pub const RING_BALANCE_SPANS: f32 = 3.0;
+
+/// Rings whose outer edge moves by [`PyramidCfg::ring_shift`].
+pub const RING_SHIFT_RINGS: usize = 2;
+
 /// LOD pyramid configuration. `unit`: ring 0 radius in meters; `base`: cell-size ratio per ring.
 pub struct PyramidCfg {
     pub finest: Detail,
@@ -25,6 +35,8 @@ pub struct PyramidCfg {
     pub unit: f32,
     /// ≥ 2.0 for exponential falloff.
     pub base: f32,
+    /// Metres added to the outer edge of the first [`RING_SHIFT_RINGS`] rings.
+    pub ring_shift: f32,
     /// Cached integer log2(base). Selection and covering query this for every
     /// section, so deriving it once avoids repeated floating-point logarithms.
     step: u8,
@@ -51,6 +63,7 @@ impl PyramidCfg {
             levels: NonZeroU8::new(levels).expect("levels clamped to a nonzero range"),
             unit,
             base: 2.0,
+            ring_shift: 0.0,
             step: 1,
         }
     }
@@ -72,6 +85,30 @@ impl PyramidCfg {
     pub fn outer_m(&self) -> f32 {
         self.unit * self.base.powi(self.levels.get() as i32)
     }
+
+    /// The detail whose tiles crossing the full-res window are kept and clipped by chunk column,
+    /// not split: the finest, when its span fits a [`ColumnClip`](super::section::ColumnClip) and
+    /// its packed column divides a chunk. Coarser finest levels keep the split.
+    pub fn clip_detail(&self) -> Option<Detail> {
+        let packed = 2 * super::lod::cell(self.finest);
+        let chunk = super::chunk::CHUNK_SIZE as i32;
+        (super::section::section_span(self.finest) <= super::section::CLIP_MAX_SPAN && chunk % packed == 0).then_some(self.finest)
+    }
+
+    /// This pyramid with the window clip's ring shift, where it clips.
+    pub fn clipped(mut self) -> Self {
+        self.ring_shift = match self.clip_detail() {
+            Some(d) => ring_shift_for(self.unit, super::section::section_span(d) as f32),
+            None => 0.0,
+        };
+        self
+    }
+}
+
+/// [`PyramidCfg::ring_shift`] for finest spans `span_f` on `unit`: [`RING_SHIFT_SPANS`], cut so the
+/// shifted ring 1 stays [`RING_BALANCE_SPANS`] inside ring 2 (`4·unit`).
+pub fn ring_shift_for(unit: f32, span_f: f32) -> f32 {
+    (RING_SHIFT_SPANS * span_f).min(4.0 * unit - RING_BALANCE_SPANS * span_f).max(0.0)
 }
 
 /// `finest.0 + ring*step` widened to i64 before summing, then clamped into
@@ -131,6 +168,7 @@ mod tests {
             levels: NonZeroU8::new(2).unwrap(),
             unit: 256.0,
             base: 4.0,
+            ring_shift: 0.0,
             step: 2,
         }
     }
