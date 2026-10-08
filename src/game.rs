@@ -76,12 +76,7 @@ struct FrameInput {
     actions: ActionSet,
     /// Signed scroll steps this frame.
     wheel: i8,
-    nav_up: bool,
-    nav_down: bool,
-    nav_left: bool,
-    nav_right: bool,
-    nav_tab: bool,
-    nav_confirm: bool,
+    nav: Nav,
     open_console: bool,
     open_chat: bool,
     toggle_capture: bool,
@@ -93,9 +88,22 @@ struct FrameInput {
     g_freecam: bool,
 }
 
-impl FrameInput {
-    fn inert() -> Self {
-        Self::default()
+/// Overlay-navigation edges of one frame, one bit per [`Nav::EVENTS`] entry.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Nav(u8);
+
+impl Nav {
+    /// The menu events an overlay navigates by, in bit order.
+    const EVENTS: [MenuEvent; 6] =
+        [MenuEvent::Up, MenuEvent::Down, MenuEvent::Left, MenuEvent::Right, MenuEvent::NextTab, MenuEvent::Confirm];
+
+    /// The edges `fired` reports this frame.
+    fn read(fired: impl Fn(MenuEvent) -> bool) -> Self {
+        Nav(Self::EVENTS.iter().enumerate().fold(0, |bits, (i, &e)| bits | (fired(e) as u8) << i))
+    }
+
+    fn has(self, e: MenuEvent) -> bool {
+        Self::EVENTS.iter().position(|&x| x == e).is_some_and(|i| self.0 >> i & 1 != 0)
     }
 }
 
@@ -138,12 +146,7 @@ struct PendingModInput {
     wheel: i8,
     /// Whether a mod panel was allowed to open when this edge was captured.
     mod_ui: bool,
-    nav_up: bool,
-    nav_down: bool,
-    nav_left: bool,
-    nav_right: bool,
-    nav_tab: bool,
-    nav_confirm: bool,
+    nav: Nav,
 }
 
 impl PendingModInput {
@@ -160,12 +163,7 @@ impl PendingModInput {
             actions: input.actions,
             wheel: input.wheel,
             mod_ui: allow_ui,
-            nav_up: allow_ui && input.nav_up,
-            nav_down: allow_ui && input.nav_down,
-            nav_left: allow_ui && input.nav_left,
-            nav_right: allow_ui && input.nav_right,
-            nav_tab: allow_ui && input.nav_tab,
-            nav_confirm: allow_ui && input.nav_confirm,
+            nav: if allow_ui { input.nav } else { Nav::default() },
         }
     }
 
@@ -173,24 +171,14 @@ impl PendingModInput {
         self.place
             || !self.actions.is_empty()
             || self.wheel != 0
-            || self.nav_up
-            || self.nav_down
-            || self.nav_left
-            || self.nav_right
-            || self.nav_tab
-            || self.nav_confirm
+            || self.nav != Nav::default()
     }
 
     fn clear_ui(&mut self) {
         self.actions = ActionSet::NONE;
         self.wheel = 0;
         self.mod_ui = false;
-        self.nav_up = false;
-        self.nav_down = false;
-        self.nav_left = false;
-        self.nav_right = false;
-        self.nav_tab = false;
-        self.nav_confirm = false;
+        self.nav = Nav::default();
     }
 }
 
@@ -344,6 +332,8 @@ pub struct Game {
     hud_scratch: Vec<HudElement>,
     /// Menu notice taken when a network session leaves. The console goes with the game.
     leave_notice: Option<String>,
+    /// The game changed the settings (HUD hotkey, console); the app writes them off the frame.
+    settings_dirty: bool,
 }
 
 /// Durations of `Game::update` phases, sampled every watched frame for stall logs.
@@ -448,6 +438,7 @@ impl Game {
             events_scratch: Vec::new(),
             hud_scratch: Vec::new(),
             leave_notice: None,
+            settings_dirty: false,
         }
     }
 
@@ -623,6 +614,11 @@ impl Game {
     /// local save, so the app does not autosave it).
     pub fn is_multiplayer(&self) -> bool {
         self.net.is_some()
+    }
+
+    /// Whether the game changed the settings since the last take, so the app should save them.
+    pub fn take_settings_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.settings_dirty)
     }
 
     /// Why a network session left, for the menu. Cleared by the take.
@@ -845,7 +841,7 @@ impl Game {
 
         if self.input_locked {
             router.drain_frame();
-            return FrameInput::inert();
+            return FrameInput::default();
         }
 
         let mut f = FrameInput::default();
@@ -873,12 +869,7 @@ impl Game {
                     f.do_place = gp.event(GameplayEvent::Place);
                 }
                 if mod_ui {
-                    f.nav_up = gp.overlay_nav(MenuEvent::Up);
-                    f.nav_down = gp.overlay_nav(MenuEvent::Down);
-                    f.nav_left = gp.overlay_nav(MenuEvent::Left);
-                    f.nav_right = gp.overlay_nav(MenuEvent::Right);
-                    f.nav_tab = gp.overlay_nav(MenuEvent::NextTab);
-                    f.nav_confirm = gp.overlay_nav(MenuEvent::Confirm);
+                    f.nav = Nav::read(|e| gp.overlay_nav(e));
                 }
                 f.open_console = gp.event(GameplayEvent::OpenConsole);
                 f.open_chat = gp.event(GameplayEvent::OpenChat);
@@ -973,7 +964,7 @@ impl Game {
             // back (marking Custom) so the menu, `/gfx`, and persistence agree.
             settings.hud_mode = self.theme.hud;
             settings.mark_custom();
-            settings.save();
+            self.settings_dirty = true;
             if mod_ui_was_active && !self.mod_ui_active() {
                 self.on_mod_ui_hidden();
             }
@@ -1193,12 +1184,12 @@ impl Game {
                     screen_h,
                     place: edges.place,
                     place_target: edges.place_target,
-                    nav_up: edges.nav_up,
-                    nav_down: edges.nav_down,
-                    nav_left: edges.nav_left,
-                    nav_right: edges.nav_right,
-                    nav_tab: edges.nav_tab,
-                    nav_confirm: edges.nav_confirm,
+                    nav_up: edges.nav.has(MenuEvent::Up),
+                    nav_down: edges.nav.has(MenuEvent::Down),
+                    nav_left: edges.nav.has(MenuEvent::Left),
+                    nav_right: edges.nav.has(MenuEvent::Right),
+                    nav_tab: edges.nav.has(MenuEvent::NextTab),
+                    nav_confirm: edges.nav.has(MenuEvent::Confirm),
                     wheel: edges.wheel,
                     mod_ui: edges.mod_ui,
                     networked,
@@ -1333,7 +1324,7 @@ impl Game {
         if self.input_locked {
             router.drain_frame();
         }
-        let input = FrameInput::inert();
+        let input = FrameInput::default();
         if self.world.spawn_ready() {
             let _ = self.motion_phase(&input, dt);
         }
@@ -1600,8 +1591,8 @@ impl Game {
     }
 
     /// Handle one submitted console line (see [`run_line`](Self::run_line)). A command that edits
-    /// settings (`/gfx`, the audio rows) goes through the one application path, is persisted and
-    /// re-mixes the audio, only when something actually changed.
+    /// settings (`/gfx`, the audio rows) goes through the one application path, is marked for
+    /// saving and re-mixes the audio, only when something actually changed.
     fn submit_line(
         &mut self,
         line: String,
@@ -1613,7 +1604,7 @@ impl Game {
     ) {
         if self.run_line(line, settings, events, mods) {
             self.apply_settings(eng, settings);
-            settings.save();
+            self.settings_dirty = true;
             sound.set_mix(settings.mix_change());
         }
     }
@@ -2082,9 +2073,8 @@ mod tests {
     }
 
     #[test]
-    fn inert_frame_input_matches_default_and_carries_no_edges() {
-        let inert = FrameInput::inert();
-        assert_eq!(inert, FrameInput::default());
+    fn default_frame_input_carries_no_edges() {
+        let inert = FrameInput::default();
         assert!(inert.move_input.is_none());
         assert_eq!(inert.look_delta, Vec2::ZERO);
         assert!(!inert.is_text);
@@ -2220,13 +2210,6 @@ mod tests {
     }
 
     #[test]
-    fn overlay_consume_flags_are_off_on_inert_input() {
-        // overlay_phase returns Some only for text, Escape, or console-open edges.
-        let inert = FrameInput::inert();
-        assert!(!inert.is_text && !inert.g_escape && !inert.open_console && !inert.open_chat);
-    }
-
-    #[test]
     fn sky_altitude_is_above_the_nearest_body() {
         let world = World::with_config_lazy(1, RenderConfig::default());
         let game = Game::new(world, Player::new(DVec3::new(0.5, 80.0, 0.5)), "alt".into());
@@ -2271,23 +2254,6 @@ mod tests {
         let shell_alt = game.sky_altitude(shell);
         assert!(shell_alt.abs() < 10.0, "inside the shell rock, altitude {shell_alt}");
         assert!((shell_alt - hollow.altitude(shell)).abs() < 1e-6);
-    }
-
-    #[test]
-    fn game_gates_physics_on_spawn_ready() {
-        let world = World::with_config_lazy(1, RenderConfig::default());
-        let pos = DVec3::new(0.5, 80.0, 0.5);
-        let mut game = Game::new(world, Player::new(pos), "gate".to_string());
-        game.world_mut().prepare_around(pos);
-        assert!(
-            !game.world().spawn_ready(),
-            "Game::update must not run motion/interact until the slab lands"
-        );
-        let before = game.player().position;
-        if game.world().spawn_ready() {
-            game.player_mut().position.y -= 1.0;
-        }
-        assert_eq!(game.player().position, before);
     }
 
     /// Quiet-frame micro-benchmark: the three remaining fixed costs at

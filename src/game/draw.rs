@@ -96,19 +96,6 @@ fn sky_keys(eye: DVec3, up: DVec3) -> ([u32; 3], [f64; 2]) {
     (up_q, plane)
 }
 
-fn hud_label(
-    f: &mut voxel_engine::Frame,
-    theme: &crate::ui::Theme,
-    screen: (i32, i32),
-    at: Anchor,
-    off: (i32, i32),
-    base_fs: i32,
-    color: Color,
-    text: &str,
-) {
-    ui::label(f, theme, screen, at, off, base_fs, color, text);
-}
-
 impl Game {
     /// Render the world and HUD.
     ///
@@ -500,12 +487,12 @@ impl Game {
                 ui::label_fit(f, theme, screen, Anchor::Top, (0, 12), 26, screen.0 - 2 * side, color, coord_text);
             }
             if let Some(fps_text) = self.drawing.fps_cache.get() {
-                hud_label(f, theme, screen, Anchor::TopLeft, (10, 12), 20, ui::Role::Positive.color(), fps_text);
+                ui::label(f, theme, screen, Anchor::TopLeft, (10, 12), 20, ui::Role::Positive.color(), fps_text);
             }
             if self.net.is_some()
                 && let Some(online_text) = self.drawing.online_cache.get()
             {
-                hud_label(f, theme, screen, Anchor::TopRight, (-12, 180), 20, ui::Role::Positive.color(), online_text);
+                ui::label(f, theme, screen, Anchor::TopRight, (-12, 180), 20, ui::Role::Positive.color(), online_text);
             }
         }
 
