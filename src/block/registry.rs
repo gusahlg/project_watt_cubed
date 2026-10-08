@@ -808,6 +808,57 @@ mod tests {
         assert_eq!(r.tool_name(AIR), "hand");
     }
 
+    /// `cargo test --release --lib registry_hit_cost -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn registry_hit_cost() {
+        use std::hint::black_box;
+        let mut r = BlockRegistry::with_builtins();
+        crate::world::terrain::Materials::intern(&mut r);
+        for n in 0..64u8 {
+            r.intern(&cfg(&[[n, 1, 2, 3]; 32])).unwrap();
+        }
+        let ids: Vec<BlockId> = (1..r.block_count()).map(|i| BlockId(i as u16)).collect();
+        let configs: Vec<Configuration> = ids.iter().map(|&id| r.configuration(id).clone()).collect();
+        let specs: Vec<String> = ids.iter().map(|&id| r.spec(id)).collect();
+        let a = r.intern(&cfg(&[[73, 145, 162, 161], [71, 77, 157, 208], [34, 125, 217, 144], [8, 85, 210, 206]])).unwrap();
+        let e = r.intern(&cfg(&[[83, 135, 211, 195], [51, 125, 144, 147], [11, 72, 167, 145], [25, 80, 211, 204]])).unwrap();
+        let reps = 2_000;
+        let report = |label: &str, t: std::time::Instant, n: usize, acc: usize| {
+            println!("{label}: {:.1} ns  ({acc})", t.elapsed().as_secs_f64() * 1e9 / n as f64);
+        };
+        let (mut acc, t) = (0usize, std::time::Instant::now());
+        for _ in 0..reps {
+            for c in &configs {
+                acc += r.intern(black_box(c)).unwrap().0 as usize;
+            }
+        }
+        report("intern hit", t, reps * configs.len(), acc);
+        let (mut acc, t) = (0usize, std::time::Instant::now());
+        for _ in 0..reps {
+            for s in &specs {
+                acc += r.lookup_spec(black_box(s)).unwrap().0 as usize;
+            }
+        }
+        report("lookup_spec hit", t, reps * specs.len(), acc);
+        let (mut acc, t) = (0usize, std::time::Instant::now());
+        for _ in 0..reps {
+            for &id in &ids {
+                acc += r.spec(black_box(id)).len();
+            }
+        }
+        report("spec", t, reps * ids.len(), acc);
+        let (mut acc, t) = (0usize, std::time::Instant::now());
+        for _ in 0..reps * 50 {
+            let (mut ca, mut ce) = (a, e);
+            while let Some((_, na, ne)) = r.react(black_box(ca), ce) {
+                (ca, ce) = (na, ne);
+                acc += 1;
+            }
+        }
+        report("react, known products", t, acc, acc);
+    }
+
     #[test]
     fn intern_returns_none_at_u16_cap() {
         let mut r = BlockRegistry::with_builtins();

@@ -834,8 +834,8 @@ mod tests {
     use super::{
         bake_face, bake_enabled, cache_load, cache_name_parts, cache_path, cache_save, clamp_column, color_hash,
         column_direction, column_linear, column_of, cube_texel_dir, home_chart_n, horizon_sine, impostor_datum,
-        map_key, prune_cache, round_i32, tmp_path, FarSink, Key, MapFeed, PlanetBake, BAKE_VERSION, FULL, HEADER,
-        HOME_MAP, KEPT_KEYS, PREVIEW,
+        map_key, prune_cache, round_i32, tmp_path, world_fingerprint, FarSink, Key, MapFeed, PlanetBake, BAKE_VERSION,
+        FULL, HEADER, HOME_MAP, KEPT_KEYS, PREVIEW,
     };
     use crate::alloc_count;
     use crate::block::registry::{AIR, BlockId, BlockRegistry};
@@ -1274,6 +1274,44 @@ mod tests {
         assert_ne!(base.hash, relief.hash, "relief");
         assert_ne!(base.hash, variety.hash, "variety");
         assert_ne!(relief.hash, variety.hash);
+    }
+
+    /// The bake cache is keyed on these: a change re-bakes every cached map.
+    #[test]
+    fn the_world_fingerprint_and_the_cache_key_are_pinned() {
+        let registry = BlockRegistry::with_builtins();
+        let knobs = TerrainCfg { relief: 150, caves: 50, deep: 25, ..TerrainCfg::default() };
+        let fp = [
+            world_fingerprint(&registry, WorldgenKind::Flat, TerrainCfg::default()),
+            world_fingerprint(&registry, WorldgenKind::Flat, knobs),
+            world_fingerprint(&registry, WorldgenKind::Diffusion, TerrainCfg::default()),
+            world_fingerprint(&registry, WorldgenKind::Diffusion, knobs),
+        ];
+        assert_eq!(fp, [0x2ae6_d587_2d8b_db9a, 0x6ce5_8e44_4cb6_e65b, 0x7cdc_238a_9080_c3e4, 0x725c_01ff_99cd_ef75]);
+        let mut registry = BlockRegistry::with_builtins();
+        let terrain = Terrain::new(&mut registry, 42);
+        let key = map_key(&terrain, &registry, WorldgenKind::Diffusion, knobs).unwrap();
+        assert_eq!((key.seed, key.body, key.hash), (42, 0, 0xc0d8_998d_8559_c507));
+    }
+
+    /// A face cached by an older build still loads, and a save writes the same bytes.
+    #[test]
+    fn a_cached_face_keeps_its_bytes() {
+        let dir = scratch("golden");
+        let key = Key { seed: -7, body: 3, hash: 0x0123_4567_89ab_cdef, version: BAKE_VERSION };
+        let rgba: Vec<u8> = (0..16u8).map(|i| i.wrapping_mul(37)).collect();
+        cache_save(&dir, &key, 2, 4, &rgba);
+        let path = cache_path(&dir, &key, 2, 4);
+        let bytes = std::fs::read(&path).unwrap();
+        const GOLDEN: [u8; HEADER + 16] = [
+            80, 87, 67, 77, 3, 0, 0, 0, 249, 255, 255, 255, 255, 255, 255, 255, 3, 0, 4, 0, 2, 0, 0, 0, 239, 205, 171,
+            137, 103, 69, 35, 1, 53, 71, 62, 183, 21, 152, 109, 55, 0, 37, 74, 111, 148, 185, 222, 3, 40, 77, 114, 151,
+            188, 225, 6, 43,
+        ];
+        assert_eq!(bytes, GOLDEN);
+        std::fs::write(&path, GOLDEN).unwrap();
+        assert_eq!(cache_load(&dir, &key, 2, 4), Some(rgba));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

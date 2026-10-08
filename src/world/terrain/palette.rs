@@ -808,6 +808,14 @@ fn find_reagent(_law: &Law, taken: &[Block], neighbours: &[bool], target: usize,
 mod tests {
     use super::*;
 
+    /// [`BAKED`] is keyed on these two fingerprints: a change re-runs the search at every start.
+    #[test]
+    fn the_palette_fingerprints_are_pinned() {
+        assert_eq!(roles_fingerprint(), 0x5ef1_889b_dc5b_5090);
+        assert_eq!(Law::current().fingerprint(), 0x04ce_0caa_d622_c6eb);
+        assert_eq!((BAKED.roles, BAKED.law), (roles_fingerprint(), Law::current().fingerprint()));
+    }
+
     /// The contact the kernel would actually run, both ways around.
     fn by_contact(a: &Block, b: &Block) -> bool {
         Contact::new(a, b).peek().is_none() && Contact::new(b, a).peek().is_none()

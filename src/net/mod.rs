@@ -382,6 +382,16 @@ mod fingerprint_tests {
         assert!(content_mismatch(id, ContentId { law: id.law ^ 1, ..id }).unwrap().contains("law"));
         assert!(content_mismatch(id, ContentId { palette: id.palette ^ 1, ..id }).unwrap().contains("palette"));
     }
+
+    /// Peers compare this id at join: a change refuses every older client.
+    #[test]
+    fn content_id_is_pinned() {
+        let id = content_id(&crate::block::BlockRegistry::with_builtins());
+        assert_eq!(
+            id,
+            ContentId { worldgen: 10, gravity: 0xbda9_b2eb_c25d_c4d0, law: 0x04ce_0caa_d622_c6eb, palette: 0x95c9_349d_7e12_74b8 }
+        );
+    }
 }
 
 /// Chat channels. Local is proximity-limited; global reaches everyone.

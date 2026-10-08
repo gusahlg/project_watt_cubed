@@ -141,3 +141,19 @@ impl Configuration {
         h
     }
 }
+
+#[cfg(test)]
+mod pins {
+    use super::*;
+
+    /// Saves and the wire carry the encoding; presentation and naming seed from the digest.
+    #[test]
+    fn the_encoding_and_digest_are_pinned() {
+        let c = Configuration::new(vec![Element::new([9, 200, 31, 4]), Element::new([1, 2, 3, 4]), Element::new([1, 2, 3, 4])])
+            .unwrap();
+        assert_eq!(c.encode().as_bytes(), [3, 1, 2, 3, 4, 1, 2, 3, 4, 9, 200, 31, 4], "the save and wire form");
+        assert_eq!(Configuration::void().encode().as_bytes(), [0]);
+        assert_eq!(Configuration::void().digest(), 0xaf63_bd4c_8601_b7df);
+        assert_eq!(c.digest(), 0xf6c4_6a7e_784f_db28);
+    }
+}

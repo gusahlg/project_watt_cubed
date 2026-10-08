@@ -130,3 +130,20 @@ impl Law {
         h
     }
 }
+
+#[cfg(test)]
+mod pins {
+    use super::*;
+
+    /// Saves, `Welcome` and the join id carry these bytes: a change orphans every existing world.
+    #[test]
+    fn the_stamp_and_its_fingerprint_are_pinned() {
+        let law = Law::current();
+        assert_eq!(table_digest(), 0xfafb_33c7_6ff4_2020);
+        assert_eq!(
+            law.stamp(),
+            [2, 0, 32, 32, 32, 244, 111, 199, 51, 251, 250, 232, 40, 176, 64, 160, 240, 32, 120, 64, 128, 192, 240, 237, 94, 237, 94]
+        );
+        assert_eq!(law.fingerprint(), 0x04ce_0caa_d622_c6eb);
+    }
+}
