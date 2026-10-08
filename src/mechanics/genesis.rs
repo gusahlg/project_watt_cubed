@@ -17,12 +17,15 @@
 //! and shear scaled by `(L′/L)²`: `Π_g` is unchanged, the flow pattern is the same, and the shape
 //! scales back by `L/L′`.
 
+use std::sync::OnceLock;
+
 use glam::DVec3;
 
 use super::lattice::Lattice;
 use super::material::Params;
 use super::solver::{Body, Relax, Report};
 use crate::gravity::G;
+use crate::ident::codec::{Reader, Writer};
 use crate::space::datum::DatumField;
 
 /// A relaxed surface tilting more than this from the radial direction keeps its cube grid.
@@ -598,28 +601,28 @@ pub struct Table {
 
 /// Parse a table (version 1: nodes only, no layout figures).
 pub fn read_table(bytes: &[u8]) -> Option<Table> {
-    let mut r = Reader { bytes, at: 0 };
-    if bytes.len() < 16 || r.take(4)? != b"PWCG" {
+    let mut r = Reader::new(bytes);
+    if bytes.len() < 16 || r.take(4).ok()? != b"PWCG" {
         return None;
     }
-    let version = r.u32()?;
+    let version = r.u32().ok()?;
     if version != 1 && version != 2 {
         return None;
     }
-    let elements = r.u32()? as usize;
-    let count = r.u32()? as usize;
-    let samples = if version >= 2 { r.u32()? as usize } else { 0 };
+    let elements = r.u32().ok()? as usize;
+    let count = r.u32().ok()? as usize;
+    let samples = if version >= 2 { r.u32().ok()? as usize } else { 0 };
     let canon = canonical_nodes((elements + 2) / 2).len();
     let mut entries = Vec::with_capacity(count);
     for _ in 0..count {
-        let mut e = TableEntry { log2_pi: r.f32()? as f64, converged: r.u32()? != 0, ..TableEntry::default() };
+        let mut e = TableEntry { log2_pi: r.f32().ok()? as f64, converged: r.u32().ok()? != 0, ..TableEntry::default() };
         if version >= 2 {
-            e.max_tilt = r.f32()? as f64;
-            e.roundness = r.f32()? as f64;
-            e.radius = r.f32()? as f64;
-            e.offsets = (0..samples * samples).map(|_| r.f32()).collect::<Option<_>>()?;
+            e.max_tilt = r.f32().ok()? as f64;
+            e.roundness = r.f32().ok()? as f64;
+            e.radius = r.f32().ok()? as f64;
+            e.offsets = (0..samples * samples).map(|_| r.f32().ok()).collect::<Option<_>>()?;
         }
-        e.nodes = (0..canon).map(|_| Some(DVec3::new(r.f32()? as f64, r.f32()? as f64, r.f32()? as f64))).collect::<Option<_>>()?;
+        e.nodes = (0..canon).map(|_| Some(DVec3::new(r.f32().ok()? as f64, r.f32().ok()? as f64, r.f32().ok()? as f64))).collect::<Option<_>>()?;
         entries.push(e);
     }
     Some(Table { elements, samples, entries })
@@ -627,30 +630,27 @@ pub fn read_table(bytes: &[u8]) -> Option<Table> {
 
 /// Serialise a table in the current format.
 pub fn write_table(t: &Table) -> Vec<u8> {
-    let mut out = Vec::new();
-    let u = |v: u32, out: &mut Vec<u8>| out.extend_from_slice(&v.to_le_bytes());
-    out.extend_from_slice(b"PWCG");
-    u(TABLE_VERSION, &mut out);
-    u(t.elements as u32, &mut out);
-    u(t.entries.len() as u32, &mut out);
-    u(t.samples as u32, &mut out);
-    let f = |v: f64, out: &mut Vec<u8>| out.extend_from_slice(&(v as f32).to_le_bytes());
+    let mut w = Writer::new();
+    w.raw(b"PWCG");
+    for v in [TABLE_VERSION, t.elements as u32, t.entries.len() as u32, t.samples as u32] {
+        w.u32(v);
+    }
     for e in &t.entries {
-        f(e.log2_pi, &mut out);
-        out.extend_from_slice(&u32::from(e.converged).to_le_bytes());
-        f(e.max_tilt, &mut out);
-        f(e.roundness, &mut out);
-        f(e.radius, &mut out);
+        w.f32(e.log2_pi as f32);
+        w.u32(u32::from(e.converged));
+        for v in [e.max_tilt, e.roundness, e.radius] {
+            w.f32(v as f32);
+        }
         for &o in &e.offsets {
-            out.extend_from_slice(&o.to_le_bytes());
+            w.f32(o);
         }
         for p in &e.nodes {
             for a in 0..3 {
-                f(p[a], &mut out);
+                w.f32(p[a] as f32);
             }
         }
     }
-    out
+    w.into_inner()
 }
 
 /// Lattice nodes `(p, q, r)` with `0 ≤ p ≤ q ≤ r ≤ m` (offsets from the centre node; `m` is half the
@@ -705,6 +705,12 @@ pub fn entry_solved(elements: usize, nodes: &[DVec3], converged: bool, pi: f64, 
     Solved { lattice, scale: half / half_c, elements, report, pi, stages: 0, folded: false }
 }
 
+/// [`TABLE`], parsed once. `None` when it does not parse.
+fn table() -> Option<&'static Table> {
+    static PARSED: OnceLock<Option<Table>> = OnceLock::new();
+    PARSED.get_or_init(|| read_table(TABLE)).as_ref()
+}
+
 /// The bracketing entries of `log₂ Π` and the weight of the upper one (clamped at the ends).
 fn bracket(t: &Table, pi: f64) -> Option<(&TableEntry, &TableEntry, f64)> {
     let first = t.entries.first()?;
@@ -722,8 +728,8 @@ fn bracket(t: &Table, pi: f64) -> Option<(&TableEntry, &TableEntry, f64)> {
 /// The tabulated relaxed cube for `Π_g = pi`, scaled to half-size `half`: node positions
 /// interpolated linearly in `log₂ Π` between the bracketing entries. `None` without a table.
 pub fn tabulated(pi: f64, half: f64) -> Option<Solved> {
-    let t = read_table(TABLE)?;
-    let (a, b, w) = bracket(&t, pi)?;
+    let t = table()?;
+    let (a, b, w) = bracket(t, pi)?;
     let nodes: Vec<DVec3> = a.nodes.iter().zip(&b.nodes).map(|(p, q)| *p * (1.0 - w) + *q * w).collect();
     Some(entry_solved(t.elements, &nodes, a.converged && b.converged, pi, half))
 }
@@ -732,11 +738,11 @@ pub fn tabulated(pi: f64, half: f64) -> Option<Solved> {
 /// surface tilt (the same rule as [`choose`], read from the figures stored per entry). `None`
 /// without a table carrying layouts.
 pub fn tabulated_layout(pi: f64, half: f64) -> Option<(Layout, f64)> {
-    let t = read_table(TABLE)?;
+    let t = table()?;
     if t.samples < 2 {
         return None;
     }
-    let (a, b, w) = bracket(&t, pi)?;
+    let (a, b, w) = bracket(t, pi)?;
     let lerp = |x: f64, y: f64| x * (1.0 - w) + y * w;
     let tilt = lerp(a.max_tilt, b.max_tilt);
     if tilt > MAX_TILT_DEG || a.radius <= 0.0 || b.radius <= 0.0 {
@@ -746,25 +752,6 @@ pub fn tabulated_layout(pi: f64, half: f64) -> Option<(Layout, f64)> {
     let g = t.samples;
     let offsets = (0..6).flat_map(|_| face.iter().copied()).collect();
     Some((Layout::Round { radius: lerp(a.radius, b.radius) * half, datum: DatumField { g, offsets }, inner: None }, tilt))
-}
-
-struct Reader<'a> {
-    bytes: &'a [u8],
-    at: usize,
-}
-
-impl Reader<'_> {
-    fn take(&mut self, n: usize) -> Option<&[u8]> {
-        let s = self.bytes.get(self.at..self.at + n)?;
-        self.at += n;
-        Some(s)
-    }
-    fn u32(&mut self) -> Option<u32> {
-        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
-    }
-    fn f32(&mut self) -> Option<f32> {
-        Some(f32::from_le_bytes(self.take(4)?.try_into().ok()?))
-    }
 }
 
 #[cfg(test)]
@@ -792,6 +779,11 @@ mod tests {
     fn the_genesis_table_is_pinned_to_the_worldgen_version() {
         assert_eq!(crate::world::terrain::WORLDGEN_VERSION, 10);
         assert_eq!(crate::hash::fnv1a_32(TABLE), 0xbf9b2d15, "the genesis table changed: bump WORLDGEN_VERSION and re-pin");
+    }
+
+    #[test]
+    fn the_table_writes_back_byte_for_byte() {
+        assert_eq!(write_table(table().expect("the table parses")), TABLE);
     }
 
     #[test]
