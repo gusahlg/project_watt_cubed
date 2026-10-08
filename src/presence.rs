@@ -48,11 +48,15 @@ impl Stance {
     /// Eye height above the feet for a broadcast stance. Reuses [`player::Stance`]'s
     /// offset so the eye/feet gap can't drift from the local player's.
     pub fn eye_offset(self) -> f64 {
+        self.local().eye_offset()
+    }
+
+    /// The local stance with the same heights.
+    fn local(self) -> player::Stance {
         match self {
             Stance::Sneaking => player::Stance::Sneaking,
             Stance::Standing => player::Stance::Standing,
         }
-        .eye_offset()
     }
 
     /// Wire codec: one byte, closed set. `from_wire` rejects unknown values so
@@ -109,9 +113,7 @@ pub struct Feet(pub DVec3);
 impl Eye {
     /// Drop to the feet for the given stance, along `up` (not world −Y).
     pub fn feet(self, stance: Stance, up: Face) -> Feet {
-        let mut feet = self.0;
-        feet[up.axis()] -= up.sign() as f64 * stance.eye_offset();
-        Feet(feet)
+        Feet(player::feet_of(self.0, stance.local(), up))
     }
 }
 
