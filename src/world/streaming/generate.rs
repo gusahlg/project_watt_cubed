@@ -334,7 +334,8 @@ impl World {
             coords.extend(self.view_coords(slab));
         }
         if !self.loading_full() {
-            coords.retain(|c| self.admits_new(*c));
+            let window = self.load_window();
+            coords.retain(|&c| self.admits_new_in(window, c));
         }
         let mut stored = false;
         coords.retain(|c| {
@@ -426,10 +427,18 @@ impl World {
         if self.loading_full() {
             return true;
         }
+        let window = self.load_window();
         match run {
-            GenRun::Open { coord } => self.admits_new(coord),
-            GenRun::Column { key, lo, hi } => (lo..=hi).any(|alt| self.admits_new(key.chunk(alt))),
+            GenRun::Open { coord } => self.admits_new_in(window, coord),
+            GenRun::Column { key, lo, hi } => (lo..=hi).any(|alt| self.admits_new_in(window, key.chunk(alt))),
         }
+    }
+
+    /// [`admits_new`](Self::admits_new) under a reduced loading window the caller already built:
+    /// the spawn slab, or inside `window` (`None` before the first stream).
+    fn admits_new_in(&self, window: Option<LoadWindow>, coord: Coord) -> bool {
+        self.spawn_slab.is_some_and(|slab| self.view_contains(slab, coord))
+            || window.is_some_and(|w| w.covers(self.fold.fold(coord), true))
     }
 
     /// Ensure every chunk within the data box of `center` exists (voxel data

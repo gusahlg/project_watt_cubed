@@ -459,19 +459,31 @@ impl World {
     /// that face stays dark, matching a missing chunk, instead of holding the
     /// surface for [`LIGHT_WAIT_DEGRADE`]. The full window still waits.
     pub(in crate::world) fn light_ready(&self, coord: Coord) -> bool {
+        self.light_ready_in(coord, None)
+    }
+
+    /// [`light_ready`](Self::light_ready) with the loading window when the caller already built
+    /// it. Otherwise the window is built once, at the first neighbour without a grid.
+    fn light_ready_in(&self, coord: Coord, mut window: Option<Option<LoadWindow>>) -> bool {
         if !self.lighting {
             // Nothing to settle: gate meshing on data alone (checked separately).
             return self.chunks.contains_key(&coord);
         }
+        let lit = |c: Coord| self.chunks.get(&c).is_some_and(|l| l.light.is_some());
         !self.light_worklist.contains(&coord)
             && !self.light_inflight.contains(&coord)
-            && self.chunks.get(&coord).is_some_and(|l| l.light.is_some())
-            && Face::ALL.iter().all(|&f| self.neighbour_light_ready(self.neighbour(coord, f)))
+            && lit(coord)
+            && Face::ALL.iter().all(|&f| {
+                // A grid, or the reduced window will not schedule the flood.
+                let n = self.neighbour(coord, f);
+                lit(n) || !self.window_admits(*window.get_or_insert_with(|| self.load_window()), n, true)
+            })
     }
 
-    /// `coord` has a grid, or the reduced window will not schedule its flood.
-    fn neighbour_light_ready(&self, coord: Coord) -> bool {
-        self.chunks.get(&coord).is_some_and(|l| l.light.is_some()) || !self.admits_light(coord)
+    /// [`admits_mesh`](Self::admits_mesh), or [`admits_light`](Self::admits_light) for `data`,
+    /// against a loading window the caller already built.
+    pub(super) fn window_admits(&self, window: Option<LoadWindow>, coord: Coord, data: bool) -> bool {
+        window.is_none_or(|w| w.covers(self.fold.fold(coord), data))
     }
 
     /// True when the 27-neighbourhood has no pending light work. Apply-queue
@@ -534,11 +546,13 @@ impl World {
     /// awaiting a fresh mesh, but its neighbourhood light has not settled. The
     /// [`LightGate`] times exactly these chunks.
     pub(in crate::world) fn chunk_light_blocked(&self, coord: Coord) -> bool {
-        self.is_needs_mesh(coord)
-            && self.in_mesh_box(coord)
-            && self.admits_mesh(coord)
+        if !self.is_needs_mesh(coord) || !self.in_mesh_box(coord) {
+            return false;
+        }
+        let window = self.load_window();
+        self.window_admits(window, coord, false)
             && self.neighbours_have_data(coord)
-            && !self.light_ready(coord)
+            && !self.light_ready_in(coord, Some(window))
     }
 
     /// Whether `coord` has waited on neighbour light past [`LIGHT_WAIT_DEGRADE`] —
