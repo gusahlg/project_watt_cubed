@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::save::format::{self, Decoded, Edit, PendingContact, PlayerState, SaveDoc, WorldgenStamp};
 use crate::save::slot::SaveMeta;
+use crate::save::store::{sibling, write_rotating};
 use crate::save;
 use crate::world::generation::WorldgenKind;
 use crate::world::terrain::{TerrainCfg, WORLDGEN_VERSION};
@@ -137,48 +138,6 @@ impl Store {
     }
 }
 
-/// `{path}.bak` / `{path}.tmp`, matching [`save::store`]'s slot names (`id.save.bak`).
-fn suffixed(path: &Path, suffix: &str) -> PathBuf {
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(suffix);
-    path.with_file_name(name)
-}
-
-/// Write `bytes` via a sibling `.tmp`, then rename the live file to `.bak` (when
-/// `rotate`) and the temp file into place. A failed second rename puts the backup back.
-fn write_rotating(path: &Path, bytes: &[u8], rotate: bool) -> io::Result<()> {
-    if let Some(dir) = path.parent() {
-        if !dir.as_os_str().is_empty() {
-            fs::create_dir_all(dir)?;
-        }
-    }
-    let tmp = suffixed(path, ".tmp");
-    let bak = suffixed(path, ".bak");
-    let wrote = (|| {
-        let mut file = fs::File::create(&tmp)?;
-        std::io::Write::write_all(&mut file, bytes)?;
-        file.sync_all()?;
-        Ok(())
-    })();
-    if let Err(err) = wrote {
-        let _ = fs::remove_file(&tmp);
-        return Err(err);
-    }
-    let had_live = rotate && path.exists();
-    if had_live && let Err(err) = fs::rename(path, &bak) {
-        let _ = fs::remove_file(&tmp);
-        return Err(err);
-    }
-    if let Err(err) = fs::rename(&tmp, path) {
-        if had_live {
-            let _ = fs::rename(&bak, path);
-        }
-        let _ = fs::remove_file(&tmp);
-        return Err(err);
-    }
-    Ok(())
-}
-
 /// No file: the flags are the world, and nothing is saved.
 pub(crate) fn fresh(flags: &Flags) -> Loaded {
     Loaded {
@@ -214,7 +173,7 @@ fn read_file(path: &Path) -> Result<OnDisk, LoadError> {
 /// neither exists. Prefers: intact live > intact backup > salvaged live > salvaged
 /// backup in place of a missing live file.
 pub(crate) fn load(path: &Path, flags: &Flags) -> Result<Loaded, LoadError> {
-    let bak = suffixed(path, ".bak");
+    let bak = sibling(path, ".bak");
     let live = read_file(path)?;
     let backup = match live {
         OnDisk::Doc(Decoded::Intact(_)) => OnDisk::Missing,
@@ -573,7 +532,7 @@ mod tests {
         assert_eq!(saved.pending, pending);
         assert!(saved.mods.iter().any(|(n, d)| n == "inventory" && d == "Stone"));
         let _ = fs::remove_file(&path);
-        let _ = fs::remove_file(suffixed(&path, ".bak"));
+        let _ = fs::remove_file(sibling(&path, ".bak"));
     }
 
     #[test]
@@ -628,7 +587,7 @@ mod tests {
         let id = crate::save::SlotId::new("__pwc_g25_rotate__").unwrap();
         let path = crate::save::store::file_path(&id);
         let _ = fs::remove_file(&path);
-        let _ = fs::remove_file(suffixed(&path, ".bak"));
+        let _ = fs::remove_file(sibling(&path, ".bak"));
         let loaded = load(&path, &flags(1)).unwrap();
         let store = loaded.store.unwrap();
         let pending = vec![PendingContact { x: 4, y: 5, z: 6, axis: 1, age: 2 }];
@@ -662,7 +621,7 @@ mod tests {
         assert_eq!(doc.meta.seed, 1);
         assert_eq!(doc.pending, pending);
         let _ = fs::remove_file(&path);
-        let _ = fs::remove_file(suffixed(&path, ".bak"));
+        let _ = fs::remove_file(sibling(&path, ".bak"));
     }
 
     #[test]
@@ -717,7 +676,7 @@ mod tests {
         let replaced = load(&path, &flags(1)).unwrap();
         assert!(replaced.edits.iter().all(|edit| edit.3 == "air"));
         let _ = fs::remove_file(&path);
-        let _ = fs::remove_file(suffixed(&path, ".bak"));
+        let _ = fs::remove_file(sibling(&path, ".bak"));
     }
 
     fn snapshot(seed: i64, edits: Vec<(i32, i32, i32, Arc<str>)>) -> Snapshot {
@@ -736,7 +695,7 @@ mod tests {
     #[test]
     fn a_missing_live_file_loads_the_backup() {
         let path = crate::save::store::test_temp_path("bak-only");
-        let bak = suffixed(&path, ".bak");
+        let bak = sibling(&path, ".bak");
         let stone = vec![Edit { x: 1, y: 2, z: 3, spec: 0 }];
         write_atomic_file(&bak, &format::encode(&doc_with(42, 0.5f32.to_bits(), stone, vec!["air".into()])).unwrap()).unwrap();
         let loaded = load(&path, &flags(1)).unwrap();
@@ -758,7 +717,7 @@ mod tests {
     fn a_damaged_live_file_loads_the_intact_backup_and_keeps_it() {
         for damage in ["truncated", "garbage"] {
             let path = crate::save::store::test_temp_path(damage);
-            let bak = suffixed(&path, ".bak");
+            let bak = sibling(&path, ".bak");
             let one = vec![Edit { x: 1, y: 2, z: 3, spec: 0 }];
             write_atomic_file(&bak, &format::encode(&doc_with(42, 0.5f32.to_bits(), one, vec!["air".into()])).unwrap()).unwrap();
             let five = (0..5).map(|x| Edit { x, y: 0, z: 0, spec: 0 }).collect();
