@@ -605,6 +605,8 @@ pub struct Mods {
     action_gen: u64,
     /// The enabled mods' visual groups, rebuilt with `action_gen`.
     visuals: VisualMask,
+    /// Bumped whenever what the mods screen lists may have changed.
+    revision: u64,
     /// Package ids the current server refused. Not written to `mods.cfg`.
     server_packages: Vec<String>,
     /// Module ids that were on when the server refused their package. Restored
@@ -632,6 +634,7 @@ impl Mods {
             declared_groups: Vec::new(),
             action_gen: 0,
             visuals: VisualMask::NONE,
+            revision: 0,
             server_packages: Vec::new(),
             server_held: Vec::new(),
         }
@@ -656,12 +659,23 @@ impl Mods {
         self.action_gen = self.action_gen.wrapping_add(1);
         let enabled = self.entries.iter().filter(|e| e.enabled);
         self.visuals = VisualMask::of(enabled.filter_map(|e| e.module.visual_group()));
+        self.revise();
+    }
+
+    fn revise(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
     }
 
     /// Generation of the enabled action lists. Changes when a mod is installed
     /// or switched on or off.
     pub fn action_generation(&self) -> u64 {
         self.action_gen
+    }
+
+    /// Changes whenever what the mods screen lists may have changed: a mod installed or switched,
+    /// a knob stepped or loaded, a group declared, or a server hold set or released.
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     /// Actions of every enabled mod, in install order.
@@ -678,6 +692,7 @@ impl Mods {
     fn declare_group(&mut self, group: Group) {
         if group.id != ESSENTIALS && !self.declared_groups.iter().any(|g| g.id == group.id) {
             self.declared_groups.push(group);
+            self.revise();
         }
     }
 
@@ -906,6 +921,7 @@ impl Mods {
 
     pub fn step_knob(&mut self, index: usize, knob: usize, delta: i32) {
         self.entries[index].module.step_knob(knob, delta);
+        self.revise();
     }
 
     /// Worldgen used for the next world: InfiniteDiffusion if that mod is on, else the flat
@@ -992,6 +1008,7 @@ impl Mods {
             self.set_enabled(id, false);
         }
         self.server_held = turn_off;
+        self.revise();
     }
 
     /// True when the mod at `index` belongs to a package the server refused.
@@ -1005,6 +1022,7 @@ impl Mods {
     pub fn release_server(&mut self) {
         let held = std::mem::take(&mut self.server_held);
         self.server_packages.clear();
+        self.revise();
         for id in held {
             self.set_enabled(&id, true);
         }
@@ -1118,13 +1136,11 @@ impl Mods {
     }
 
     fn apply_choice_state(&mut self, id: &str, data: &str) {
-        if let Some(entry) = self
-            .entries
-            .iter_mut()
-            .find(|e| e.module.id().eq_ignore_ascii_case(id))
-        {
-            entry.module.load_choice_state(data);
-        }
+        let Some(entry) = self.entries.iter_mut().find(|e| e.module.id().eq_ignore_ascii_case(id)) else {
+            return;
+        };
+        entry.module.load_choice_state(data);
+        self.revise();
     }
 
     /// Restore enable/disable choices and knob payloads from `mods.cfg`.
@@ -1153,12 +1169,16 @@ impl Mods {
 /// `mods.cfg` format: 2 since the diffusion mod became the default world generator.
 const CHOICES_VERSION: u32 = 2;
 
-/// Debounces `mods.cfg` writes so a held Left/Right does not rewrite at key-repeat rate.
-pub struct ChoicesFlush {
+/// Debounces file writes so a held Left/Right does not rewrite at key-repeat rate: a write is
+/// due once [`IDLE_MS`](Self::IDLE_MS) pass with no further mark.
+pub struct Debounce {
     last_ms: Option<u64>,
 }
 
-impl ChoicesFlush {
+/// The `mods.cfg` debounce, by its mod API name.
+pub type ChoicesFlush = Debounce;
+
+impl Debounce {
     pub const IDLE_MS: u64 = 250;
 
     pub fn new() -> Self {
@@ -1186,7 +1206,7 @@ impl ChoicesFlush {
     }
 }
 
-impl Default for ChoicesFlush {
+impl Default for Debounce {
     fn default() -> Self {
         Self::new()
     }
@@ -1645,8 +1665,8 @@ mod tests {
     }
 
     #[test]
-    fn choices_flush_waits_250ms_then_resets_on_mark() {
-        let mut flush = ChoicesFlush::new();
+    fn debounce_waits_250ms_then_resets_on_mark() {
+        let mut flush = Debounce::new();
         assert!(!flush.poll(0));
         flush.mark(0);
         assert!(!flush.poll(249));
@@ -1661,7 +1681,32 @@ mod tests {
         flush.mark(10);
         assert!(flush.take());
         assert!(!flush.take());
-        assert!(!flush.poll(10 + ChoicesFlush::IDLE_MS));
+        assert!(!flush.poll(10 + Debounce::IDLE_MS));
+    }
+
+    /// Every host change the mods screen can show moves the revision; reading does not.
+    #[test]
+    fn revision_moves_with_what_the_mods_screen_lists() {
+        let mut mods = crate::modding::testing::standard();
+        let mut last = mods.revision();
+        let _ = (mods.visual_mask(), mods.choices_text(), mods.knobs(index_of(&mods, "diffusion")));
+        assert_eq!(mods.revision(), last, "reads");
+        let mut moved = |mods: &Mods, what: &str| {
+            assert_ne!(mods.revision(), last, "{what}");
+            last = mods.revision();
+        };
+        mods.set_enabled("post", false);
+        moved(&mods, "a switch");
+        mods.step_knob(index_of(&mods, "diffusion"), 0, 1);
+        moved(&mods, "a knob step");
+        mods.apply_choices_text("version=2\ndiffusion.state=relief=150\n");
+        moved(&mods, "a loaded knob payload");
+        mods.hold_packages(&["pwc.visuals".to_string()]);
+        moved(&mods, "a server hold");
+        mods.release_server();
+        moved(&mods, "a release");
+        mods.install(Box::new(Stub::new("extra")), false);
+        moved(&mods, "an install");
     }
 
     fn enabled(mods: &Mods, name: &str) -> bool {
