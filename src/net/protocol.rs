@@ -1,14 +1,15 @@
 //! The wire protocol: the message enums the client and server exchange, a
 //! tiny hand-rolled binary codec for them, and the length-prefixed framing.
 //!
-//! Binary on purpose: the hot message is [`ClientMessage::Move`] /
-//! [`ServerMessage::PeerMove`] at tick rate for every player, so each is a
+//! Binary on purpose: the hot messages are [`ClientMessage::Move`] and
+//! [`ServerMessage::PeerPoses`] at tick rate for every player, so each is a
 //! fixed handful of bytes rather than a line of text. Variable data (names,
 //! chat, block specs) is length-prefixed and bounded by the caps in the
 //! [parent module](super).
 //!
 //! Positions travel as 3x f64 (24 bytes): the game plays out to ±1e9 blocks,
-//! where f32 cannot even represent adjacent positions.
+//! where f32 cannot even represent adjacent positions. Peer poses are the
+//! exception: i16 offsets from the recipient's own position.
 use std::io;
 #[cfg(test)]
 use std::io::{Read, Write};
@@ -24,7 +25,7 @@ use crate::presence::Stance;
 use crate::world::terrain::TerrainCfg;
 use crate::world::generation::WorldgenKind;
 
-use super::{MAX_FRAME, MAX_MOD_BYTES};
+use super::{MAX_FRAME, MAX_MOD_BYTES, MAX_SPEC};
 
 pub(crate) fn law_stamp() -> [u8; material::STAMP_LEN] {
     let v = material::Law::current().stamp();
@@ -263,6 +264,21 @@ impl Wire for ModOffer {
     }
 }
 
+/// The enabled packages a `Hello` carries: at most [`MAX_MOD_OFFERS`], each id and version
+/// 1..=[`MAX_MOD_ID`] bytes, so the encoder never writes a list its decoder refuses. Also how
+/// many packages were left out.
+pub(crate) fn hello_offers(mods: &[(String, String)]) -> (Vec<ModOffer>, usize) {
+    let fits = |text: &str| (1..=MAX_MOD_ID).contains(&text.len());
+    let offers: Vec<ModOffer> = mods
+        .iter()
+        .filter(|(id, version)| fits(id) && fits(version))
+        .take(MAX_MOD_OFFERS)
+        .map(|(id, version)| ModOffer { id: id.as_str().into(), version: version.as_str().into() })
+        .collect();
+    let dropped = mods.len() - offers.len();
+    (offers, dropped)
+}
+
 fn bounded_mod_str(r: &mut codec::Reader) -> Option<Arc<str>> {
     let s = r.str16_lossy().ok()?;
     if s.is_empty() || s.len() > MAX_MOD_ID {
@@ -327,33 +343,457 @@ impl Wire for ModBytes {
     }
 }
 
-/// The snapshot edit list: u32 count, then each cell's coord, revision, and
-/// spec. The pre-reserve is clamped so a forged count can't balloon memory
-/// before the per-entry reads fail on truncation.
-impl Wire for Vec<(i32, i32, i32, u32, Arc<str>)> {
+/// One peer's pose in a [`ServerMessage::PeerPoses`] frame. The wire form is
+/// quantised: see [`PoseBody`] and [`POSE_STEP`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PeerPose {
+    pub id: u32,
+    pub pos: DVec3,
+    pub yaw: f32,
+    pub pitch: f32,
+    pub frame: DQuat,
+    pub velocity: Vec3,
+    pub up: Face,
+    pub stance: Stance,
+}
+
+/// Positions travel as i16 multiples of this from the frame's origin, so a pose
+/// reaches [`POSE_REACH`] blocks from it.
+pub(crate) const POSE_STEP: f64 = 1.0 / 128.0;
+pub(crate) const POSE_REACH: f64 = i16::MAX as f64 * POSE_STEP;
+
+/// Peer poses relative to `origin`, the recipient's own position.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Poses {
+    pub origin: DVec3,
+    pub list: Vec<PeerPose>,
+}
+
+const FACE_BITS: u8 = 0b111;
+const SNEAKING: u8 = 1 << 3;
+const FRAMED: u8 = 1 << 4;
+const MOVING: u8 = 1 << 5;
+/// The shortest record: a one-byte id, flags, yaw, pitch, and the position.
+const POSE_MIN: usize = 1 + 1 + 2 + 2 + 6;
+/// The longest body: flags, yaw, pitch, the frame, and the velocity.
+const BODY_MAX: usize = 1 + 2 + 2 + 4 + 6;
+/// The longest record: a five-byte id, the body, and the position.
+pub(crate) const POSE_MAX: usize = 5 + BODY_MAX + 6;
+/// Tag, origin, and record count.
+pub(crate) const POSES_HEAD: usize = 1 + 24 + 2;
+
+/// A pose without its id and position, in wire form: flags (up face, sneaking,
+/// frame present, velocity present), yaw and pitch (16 bits each), the frame
+/// as smallest-three (32 bits) unless it is identity, and the velocity as three
+/// f16 unless it is zero. Encoded once per move and copied into every
+/// recipient's frame. A record is the id (LEB128), this body, then the position.
+#[derive(Clone, Copy)]
+pub(crate) struct PoseBody {
+    bytes: [u8; BODY_MAX],
+    len: u8,
+}
+
+impl PoseBody {
+    pub(crate) fn new(yaw: f32, pitch: f32, frame: DQuat, velocity: Vec3, up: Face, stance: Stance) -> Self {
+        let mut body = Self { bytes: [0; BODY_MAX], len: 0 };
+        let framed = frame != DQuat::IDENTITY;
+        let moving = velocity != Vec3::ZERO;
+        let mut flags = up as u8;
+        if stance == Stance::Sneaking {
+            flags |= SNEAKING;
+        }
+        if framed {
+            flags |= FRAMED;
+        }
+        if moving {
+            flags |= MOVING;
+        }
+        body.put(&[flags]);
+        body.put(&yaw_bits(yaw).to_le_bytes());
+        body.put(&pitch_bits(pitch).to_le_bytes());
+        if framed {
+            body.put(&pack_frame(frame).to_le_bytes());
+        }
+        if moving {
+            for c in [velocity.x, velocity.y, velocity.z] {
+                body.put(&f16_bits(c).to_le_bytes());
+            }
+        }
+        body
+    }
+
+    fn put(&mut self, b: &[u8]) {
+        let at = self.len as usize;
+        self.bytes[at..at + b.len()].copy_from_slice(b);
+        self.len += b.len() as u8;
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len as usize]
+    }
+}
+
+fn offset_bits(v: f64) -> i16 {
+    (v / POSE_STEP).round().clamp(i16::MIN as f64, i16::MAX as f64) as i16
+}
+
+fn yaw_bits(yaw: f32) -> u16 {
+    use std::f32::consts::TAU;
+    ((yaw.rem_euclid(TAU) / TAU * 65536.0).round() as u32) as u16
+}
+
+fn yaw_of(bits: u16) -> f32 {
+    bits as f32 / 65536.0 * std::f32::consts::TAU
+}
+
+fn pitch_bits(pitch: f32) -> i16 {
+    ((pitch / std::f32::consts::PI).clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16
+}
+
+fn pitch_of(bits: i16) -> f32 {
+    bits as f32 / i16::MAX as f32 * std::f32::consts::PI
+}
+
+/// Smallest-three: the index of the largest component, then the other three in
+/// 10 bits each over ±1/√2. The largest is made positive (q and -q are one rotation).
+fn pack_frame(q: DQuat) -> u32 {
+    let c = [q.x, q.y, q.z, q.w];
+    let mut big = 0;
+    for i in 1..4 {
+        if c[i].abs() > c[big].abs() {
+            big = i;
+        }
+    }
+    let sign = if c[big] < 0.0 { -1.0 } else { 1.0 };
+    let mut bits = big as u32;
+    let mut shift = 2;
+    for (i, v) in c.iter().enumerate() {
+        if i == big {
+            continue;
+        }
+        let unit = (v * sign * std::f64::consts::SQRT_2 + 1.0) * 0.5;
+        bits |= ((unit * 1023.0).round().clamp(0.0, 1023.0) as u32) << shift;
+        shift += 10;
+    }
+    bits
+}
+
+fn unpack_frame(bits: u32) -> DQuat {
+    let big = (bits & 3) as usize;
+    let mut c = [0.0f64; 4];
+    let mut sum = 0.0;
+    let mut shift = 2;
+    for (i, slot) in c.iter_mut().enumerate() {
+        if i == big {
+            continue;
+        }
+        let v = (((bits >> shift) & 1023) as f64 / 1023.0 * 2.0 - 1.0) / std::f64::consts::SQRT_2;
+        *slot = v;
+        sum += v * v;
+        shift += 10;
+    }
+    c[big] = (1.0 - sum).max(0.0).sqrt();
+    codec::quat_from_f32(c[0] as f32, c[1] as f32, c[2] as f32, c[3] as f32)
+}
+
+/// f32 to IEEE half, rounding to nearest even. Past the half range it saturates
+/// at ±65504 rather than becoming infinite.
+fn f16_bits(v: f32) -> u16 {
+    let x = v.to_bits();
+    let sign = ((x >> 16) & 0x8000) as u16;
+    let exp = ((x >> 23) & 0xff) as i32;
+    let man = x & 0x7f_ffff;
+    if exp == 0xff {
+        return sign | 0x7c00 | if man != 0 { 0x200 } else { 0 };
+    }
+    let e = exp - 127 + 15;
+    if e >= 0x1f {
+        return sign | 0x7bff;
+    }
+    let (half, rem, mid) = if e <= 0 {
+        if e < -10 {
+            return sign;
+        }
+        let m = man | 0x80_0000;
+        let shift = (14 - e) as u32;
+        (m >> shift, m & ((1 << shift) - 1), 1u32 << (shift - 1))
+    } else {
+        (((e as u32) << 10) | (man >> 13), man & 0x1fff, 0x1000)
+    };
+    let rounded = if rem > mid || (rem == mid && half & 1 == 1) { half + 1 } else { half };
+    if rounded >= 0x7c00 { sign | 0x7bff } else { sign | rounded as u16 }
+}
+
+fn f16_value(h: u16) -> f32 {
+    let sign = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
+    let exp = ((h >> 10) & 0x1f) as i32;
+    let man = (h & 0x3ff) as f32;
+    let magnitude = match exp {
+        0 => man * (1.0 / 16_777_216.0),
+        0x1f => if man == 0.0 { f32::INFINITY } else { f32::NAN },
+        _ => (1.0 + man / 1024.0) * 2f32.powi(exp - 15),
+    };
+    sign * magnitude
+}
+
+/// LEB128: seven bits per byte, low bits first.
+fn var_into(buf: &mut Vec<u8>, mut v: u64) {
+    while v >= 0x80 {
+        buf.push(v as u8 | 0x80);
+        v >>= 7;
+    }
+    buf.push(v as u8);
+}
+
+fn put_var(w: &mut codec::Writer, v: u64) {
+    let mut bytes = Vec::with_capacity(10);
+    var_into(&mut bytes, v);
+    w.raw(&bytes);
+}
+
+/// `None` when truncated or past 64 bits.
+fn get_var(r: &mut codec::Reader) -> Option<u64> {
+    let mut v = 0u64;
+    for shift in (0..64).step_by(7) {
+        let b = r.u8().ok()?;
+        let low = u64::from(b & 0x7f);
+        if shift == 63 && low > 1 {
+            return None;
+        }
+        v |= low << shift;
+        if b & 0x80 == 0 {
+            return Some(v);
+        }
+    }
+    None
+}
+
+impl Wire for Poses {
     fn put(&self, w: &mut codec::Writer) {
-        w.u32(self.len() as u32);
-        for (x, y, z, rev, spec) in self {
-            w.i32(*x);
-            w.i32(*y);
-            w.i32(*z);
-            w.u32(*rev);
-            w.str16(spec);
+        w.vec3(self.origin);
+        w.u16(self.list.len() as u16);
+        for p in &self.list {
+            put_var(w, u64::from(p.id));
+            w.raw(PoseBody::new(p.yaw, p.pitch, p.frame, p.velocity, p.up, p.stance).as_bytes());
+            let d = p.pos - self.origin;
+            for c in [d.x, d.y, d.z] {
+                w.u16(offset_bits(c) as u16);
+            }
         }
     }
     fn get(r: &mut codec::Reader) -> Option<Self> {
-        let count = r.u32().ok()? as usize;
-        let mut edits = Vec::with_capacity(count.min(1024));
+        let origin = r.vec3().ok()?;
+        let count = r.u16().ok()? as usize;
+        let mut list = Vec::with_capacity(count.min(r.remaining() / POSE_MIN));
         for _ in 0..count {
-            edits.push((
-                r.i32().ok()?,
-                r.i32().ok()?,
-                r.i32().ok()?,
-                r.u32().ok()?,
-                r.str16_lossy().ok()?.into(),
-            ));
+            let id = u32::try_from(get_var(r)?).ok()?;
+            let flags = r.u8().ok()?;
+            if flags & !(FACE_BITS | SNEAKING | FRAMED | MOVING) != 0 {
+                return None;
+            }
+            let up = Face::from_index(flags & FACE_BITS)?;
+            let stance = if flags & SNEAKING != 0 { Stance::Sneaking } else { Stance::Standing };
+            let yaw = yaw_of(r.u16().ok()?);
+            let pitch = pitch_of(r.u16().ok()? as i16);
+            let frame = if flags & FRAMED != 0 { unpack_frame(r.u32().ok()?) } else { DQuat::IDENTITY };
+            let velocity = if flags & MOVING != 0 {
+                Vec3::new(f16_value(r.u16().ok()?), f16_value(r.u16().ok()?), f16_value(r.u16().ok()?))
+            } else {
+                Vec3::ZERO
+            };
+            let mut pos = origin;
+            for axis in 0..3 {
+                pos[axis] += f64::from(r.u16().ok()? as i16) * POSE_STEP;
+            }
+            list.push(PeerPose { id, pos, yaw, pitch, frame, velocity, up, stance });
+        }
+        Some(Self { origin, list })
+    }
+}
+
+/// Builds one [`ServerMessage::PeerPoses`] payload a record at a time, with the
+/// same bytes as its [`Wire`] form. The buffer is reused from frame to frame.
+pub(crate) struct PosesWriter {
+    buf: Vec<u8>,
+    origin: DVec3,
+    count: u16,
+}
+
+impl PosesWriter {
+    pub(crate) fn new() -> Self {
+        Self { buf: Vec::new(), origin: DVec3::ZERO, count: 0 }
+    }
+
+    pub(crate) fn begin(&mut self, origin: DVec3) {
+        self.buf.clear();
+        self.buf.push(tag::PEER_POSES);
+        for c in [origin.x, origin.y, origin.z] {
+            self.buf.extend_from_slice(&c.to_le_bytes());
+        }
+        self.buf.extend_from_slice(&[0, 0]);
+        self.origin = origin;
+        self.count = 0;
+    }
+
+    pub(crate) fn push(&mut self, id: u32, body: &PoseBody, pos: DVec3) {
+        var_into(&mut self.buf, u64::from(id));
+        self.buf.extend_from_slice(body.as_bytes());
+        let d = pos - self.origin;
+        for c in [d.x, d.y, d.z] {
+            self.buf.extend_from_slice(&offset_bits(c).to_le_bytes());
+        }
+        self.count += 1;
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    pub(crate) fn frame(&mut self) -> Arc<[u8]> {
+        self.buf[POSES_HEAD - 2..POSES_HEAD].copy_from_slice(&self.count.to_le_bytes());
+        Arc::from(self.buf.as_slice())
+    }
+
+    /// A frame with one pose.
+    pub(crate) fn single(origin: DVec3, id: u32, body: &PoseBody, pos: DVec3) -> Arc<[u8]> {
+        let mut w = Self::new();
+        w.begin(origin);
+        w.push(id, body, pos);
+        w.frame()
+    }
+}
+
+/// One snapshot cell: the zigzag delta from the previous cell on each axis, the
+/// revision, and the palette index, each LEB128.
+fn cell_into(buf: &mut Vec<u8>, last: &mut (i32, i32, i32), at: (i32, i32, i32), rev: u32, index: u32) {
+    for (a, b) in [(at.0, last.0), (at.1, last.1), (at.2, last.2)] {
+        let d = i64::from(a) - i64::from(b);
+        var_into(buf, ((d << 1) ^ (d >> 63)) as u64);
+    }
+    var_into(buf, u64::from(rev));
+    var_into(buf, u64::from(index));
+    *last = at;
+}
+
+/// Longest cell: three five-byte deltas, a five-byte revision and index.
+const CELL_MAX: usize = 5 * 5;
+/// Shortest cell: one byte for each of its five fields.
+const CELL_MIN: usize = 5;
+/// Tag, palette count, and cell count at their longest.
+const SNAPSHOT_HEAD: usize = 1 + 5 + 10;
+
+/// The snapshot edit list: a palette of the specs it names (count, then each
+/// spec), then the cells (count, then each as [`cell_into`] writes it). Every
+/// allocation is bounded by the bytes left, so a forged count cannot balloon memory.
+impl Wire for Vec<(i32, i32, i32, u32, Arc<str>)> {
+    fn put(&self, w: &mut codec::Writer) {
+        let mut names: Vec<&str> = Vec::new();
+        let mut cells = Vec::new();
+        let mut last = (0, 0, 0);
+        for (x, y, z, rev, spec) in self {
+            let index = names.iter().position(|n| *n == spec.as_ref()).unwrap_or_else(|| {
+                names.push(spec);
+                names.len() - 1
+            });
+            cell_into(&mut cells, &mut last, (*x, *y, *z), *rev, index as u32);
+        }
+        put_var(w, names.len() as u64);
+        for name in names {
+            w.str16(name);
+        }
+        put_var(w, self.len() as u64);
+        w.raw(&cells);
+    }
+    fn get(r: &mut codec::Reader) -> Option<Self> {
+        let names = usize::try_from(get_var(r)?).ok()?;
+        if names > r.remaining() / 2 {
+            return None;
+        }
+        let mut palette: Vec<Arc<str>> = Vec::with_capacity(names);
+        for _ in 0..names {
+            let spec = r.str16_lossy().ok()?;
+            if spec.len() > MAX_SPEC {
+                return None;
+            }
+            palette.push(spec.into());
+        }
+        let count = usize::try_from(get_var(r)?).ok()?;
+        let mut edits = Vec::with_capacity(count.min(r.remaining() / CELL_MIN));
+        let mut at = [0i32; 3];
+        for _ in 0..count {
+            for c in at.iter_mut() {
+                let z = get_var(r)?;
+                let d = (z >> 1) as i64 ^ -((z & 1) as i64);
+                *c = i32::try_from(i64::from(*c).checked_add(d)?).ok()?;
+            }
+            let rev = u32::try_from(get_var(r)?).ok()?;
+            let spec = palette.get(usize::try_from(get_var(r)?).ok()?)?.clone();
+            edits.push((at[0], at[1], at[2], rev, spec));
         }
         Some(edits)
+    }
+}
+
+/// Builds [`ServerMessage::Snapshot`] payloads from borrowed cells, in the bytes
+/// of the [`Wire`] form: each frame stays within [`MAX_FRAME`] and carries its
+/// own palette. `key` names a spec (the server's block id), so a cell never
+/// compares strings.
+pub(crate) struct SnapshotWriter {
+    /// Palette index of each key in this frame; `u32::MAX` when absent.
+    slots: Vec<u32>,
+    used: Vec<u16>,
+    palette: Vec<u8>,
+    cells: Vec<u8>,
+    count: u64,
+    last: (i32, i32, i32),
+}
+
+impl SnapshotWriter {
+    pub(crate) fn new() -> Self {
+        Self { slots: Vec::new(), used: Vec::new(), palette: Vec::new(), cells: Vec::new(), count: 0, last: (0, 0, 0) }
+    }
+
+    /// Add one cell, first handing `emit` the frame so far when this cell would not fit.
+    pub(crate) fn push(&mut self, at: (i32, i32, i32), rev: u32, key: u16, spec: &str, emit: &mut impl FnMut(Arc<[u8]>)) {
+        let k = usize::from(key);
+        if k >= self.slots.len() {
+            self.slots.resize(k + 1, u32::MAX);
+        }
+        let novel = self.slots[k] == u32::MAX;
+        let grow = CELL_MAX + if novel { 2 + spec.len() } else { 0 };
+        if self.count > 0 && SNAPSHOT_HEAD + self.palette.len() + self.cells.len() + grow > MAX_FRAME {
+            self.finish(emit);
+        }
+        if self.slots[k] == u32::MAX {
+            self.slots[k] = self.used.len() as u32;
+            self.used.push(key);
+            let len = spec.len().min(u16::MAX as usize);
+            self.palette.extend_from_slice(&(len as u16).to_le_bytes());
+            self.palette.extend_from_slice(&spec.as_bytes()[..len]);
+        }
+        cell_into(&mut self.cells, &mut self.last, at, rev, self.slots[k]);
+        self.count += 1;
+    }
+
+    /// Hand `emit` the frame being built, if it holds a cell, and start the next.
+    pub(crate) fn finish(&mut self, emit: &mut impl FnMut(Arc<[u8]>)) {
+        if self.count == 0 {
+            return;
+        }
+        let mut frame = Vec::with_capacity(SNAPSHOT_HEAD + self.palette.len() + self.cells.len());
+        frame.push(tag::SNAPSHOT);
+        var_into(&mut frame, self.used.len() as u64);
+        frame.extend_from_slice(&self.palette);
+        var_into(&mut frame, self.count);
+        frame.extend_from_slice(&self.cells);
+        emit(frame.into());
+        for key in self.used.drain(..) {
+            self.slots[usize::from(key)] = u32::MAX;
+        }
+        self.palette.clear();
+        self.cells.clear();
+        self.count = 0;
+        self.last = (0, 0, 0);
     }
 }
 
@@ -423,7 +863,7 @@ mod tag {
     pub const SNAPSHOT: u8 = 2;
     pub const PEER_JOINED: u8 = 3;
     pub const PEER_LEFT: u8 = 4;
-    pub const PEER_MOVE: u8 = 5;
+    pub const PEER_POSES: u8 = 5;
     pub const S_EDIT: u8 = 6;
     pub const S_CHAT: u8 = 7;
     pub const S_TIME: u8 = 8;
@@ -500,21 +940,23 @@ messages! {
         },
         /// The stream closes after this (bad password, version mismatch, server full).
         Reject = tag::REJECT { reason: Arc<str> },
-        /// Sent once right after [`Welcome`](Self::Welcome). Each cell carries its
-        /// authoritative revision so the joiner's future edit expectations line up.
+        /// The join overlay, in frames after [`Welcome`](Self::Welcome), and each
+        /// reaction batch. Each cell carries its authoritative revision so the
+        /// joiner's future edit expectations line up.
         Snapshot = tag::SNAPSHOT { edits: Vec<(i32, i32, i32, u32, Arc<str>)> },
         /// The join overlay is complete. Later [`Snapshot`](Self::Snapshot) frames are
         /// reaction batches and do not reopen the loading screen.
         SnapshotEnd = tag::SNAPSHOT_END,
-        /// Roster only — a peer's pose arrives via [`PeerMove`](Self::PeerMove) once
+        /// Roster only — a peer's pose arrives via [`PeerPoses`](Self::PeerPoses) once
         /// they are inside interest range.
         PeerJoined = tag::PEER_JOINED { id: u32, name: Arc<str> },
         PeerLeft = tag::PEER_LEFT { id: u32 },
-        /// Also the "entered interest range" signal.
-        PeerMove = tag::PEER_MOVE { id: u32, pos: DVec3, yaw: f32, pitch: f32, frame: DQuat, velocity: Vec3, up: Face, stance: Stance },
+        /// The poses of visible peers that moved, one frame per recipient per tick.
+        /// A pose is also the "entered interest range" signal.
+        PeerPoses = tag::PEER_POSES { poses: Poses },
         /// A peer left interest range: hide their avatar instead of drawing a
-        /// frozen ghost at the last heard pose. They re-appear on the next
-        /// [`PeerMove`](Self::PeerMove) for that id.
+        /// frozen ghost at the last heard pose. They re-appear with their next
+        /// [`PeerPoses`](Self::PeerPoses) record.
         PeerExited = tag::PEER_EXITED { id: u32 },
         PeerSwing = tag::PEER_SWING { id: u32 },
         /// Echo of a [`ClientMessage::Ping`], carrying its `nonce` unchanged.
@@ -557,19 +999,10 @@ pub(crate) enum HelloPeek {
     Protocol(u32),
 }
 
-/// Subject id of a [`ServerMessage::PeerMove`] payload, if this frame is one.
-pub(crate) fn peer_move_id(frame: &[u8]) -> Option<u32> {
-    if frame.first().copied() != Some(tag::PEER_MOVE) || frame.len() < 5 {
-        return None;
-    }
-    let mut bytes = [0u8; 4];
-    bytes.copy_from_slice(&frame[1..5]);
-    Some(u32::from_le_bytes(bytes))
-}
-
-/// A [`ServerMessage::PeerSwing`] payload. Cosmetic: a joining backlog may drop it.
-pub(crate) fn is_peer_swing(frame: &[u8]) -> bool {
-    frame.first().copied() == Some(tag::PEER_SWING)
+/// A [`ServerMessage::PeerSwing`] or [`ServerMessage::PeerPoses`] payload. Cosmetic: a
+/// joining backlog may drop it, since a peer entering range sends both poses afresh.
+pub(crate) fn is_cosmetic(frame: &[u8]) -> bool {
+    matches!(frame.first().copied(), Some(tag::PEER_SWING | tag::PEER_POSES))
 }
 
 /// Tag, then the protocol number. A v12 `Hello` laid the same two fields first,
@@ -599,6 +1032,13 @@ fn frame_len(header: [u8; 4]) -> io::Result<usize> {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "frame exceeds cap"));
     }
     Ok(len)
+}
+
+/// Append `payload` with its length header, so many frames go out in one write.
+pub(crate) fn put_frame(buf: &mut Vec<u8>, payload: &[u8]) -> io::Result<()> {
+    buf.extend_from_slice(&frame_header(payload)?);
+    buf.extend_from_slice(payload);
+    Ok(())
 }
 
 /// Refuses to emit an over-cap frame so both ends share one hard size bound.
@@ -719,15 +1159,32 @@ mod tests {
             },
             ServerMessage::PeerJoined { id: 3, name: "friend".into() },
             ServerMessage::PeerLeft { id: 3 },
-            ServerMessage::PeerMove {
-                id: 3,
-                pos: DVec3::new(9.0, 8.0, 7.0),
-                yaw: 1.0,
-                pitch: 0.1,
-                frame: DQuat::from_xyzw(1.0, 0.0, 0.0, 0.0),
-                velocity: Vec3::new(0.25, 0.0, -1.5),
-                up: Face::NegY,
-                stance: Stance::Sneaking,
+            ServerMessage::PeerPoses {
+                poses: Poses {
+                    origin: DVec3::new(1.0e8, -40.0, 3.5),
+                    list: vec![
+                        PeerPose {
+                            id: 3,
+                            pos: DVec3::new(1.0e8 + 9.5, -32.25, 10.0),
+                            yaw: std::f32::consts::PI,
+                            pitch: 0.0,
+                            frame: DQuat::IDENTITY,
+                            velocity: Vec3::new(0.25, 0.0, -1.5),
+                            up: Face::NegY,
+                            stance: Stance::Sneaking,
+                        },
+                        PeerPose {
+                            id: 300,
+                            pos: DVec3::new(1.0e8 - 100.0, -40.0, 3.5),
+                            yaw: 0.0,
+                            pitch: 0.0,
+                            frame: DQuat::IDENTITY,
+                            velocity: Vec3::ZERO,
+                            up: Face::PosY,
+                            stance: Stance::Standing,
+                        },
+                    ],
+                },
             },
             ServerMessage::PeerExited { id: 3 },
             ServerMessage::PeerSwing { id: 3 },
@@ -942,17 +1399,6 @@ mod tests {
             }
             other => panic!("bad decode: {other:?}"),
         }
-        let pm = ServerMessage::PeerMove {
-            id: 7,
-            pos,
-            yaw: 0.0,
-            pitch: 0.0,
-            frame: DQuat::IDENTITY,
-            velocity: Vec3::ZERO,
-            up: Face::PosY,
-            stance: Stance::Standing,
-        };
-        assert_eq!(ServerMessage::decode(&pm.encode()), Some(pm));
         let wl = ServerMessage::Welcome {
             player_id: 1,
             seed: 3,
@@ -1033,17 +1479,6 @@ mod tests {
             }
             other => panic!("bad decode: {other:?}"),
         }
-        let pm = ServerMessage::PeerMove {
-            id: 3,
-            pos: DVec3::new(1.0, 2.0, 3.0),
-            yaw: 0.0,
-            pitch: 0.0,
-            frame,
-            velocity,
-            up: Face::NegZ,
-            stance: Stance::Sneaking,
-        };
-        assert_eq!(ServerMessage::decode(&pm.encode()), Some(pm));
         let pos = ServerMessage::Position { pos: DVec3::new(8.0, 9.0, 10.0), frame, up: Face::PosZ };
         assert_eq!(ServerMessage::decode(&pos.encode()), Some(pos));
 
@@ -1169,6 +1604,172 @@ mod tests {
         hostile.push(0);
         let mut scratch = Vec::new();
         assert!(read_frame(&mut std::io::Cursor::new(hostile), &mut scratch).is_err());
+    }
+
+    /// Frames split at the cap, each with its own palette, and decode back to the
+    /// cells in the order they were pushed.
+    #[test]
+    fn snapshot_frames_stay_within_the_cap_and_keep_their_order() {
+        let mut writer = SnapshotWriter::new();
+        let mut frames: Vec<Arc<[u8]>> = Vec::new();
+        let mut emit = |frame| frames.push(frame);
+        let spec = |key: u16| format!("{key:0>width$}", width = MAX_SPEC);
+        let cell = |i: i32| (i * 7 - 50_000, (i % 40) - 20, 1_100_000_000 + i / 3);
+        for i in 0..30_000 {
+            let key = (i % 300) as u16;
+            writer.push(cell(i), i as u32, key, &spec(key), &mut emit);
+        }
+        writer.finish(&mut emit);
+        writer.finish(&mut emit);
+        assert!(frames.len() > 1);
+        let mut i = 0;
+        for frame in &frames {
+            assert!(frame.len() <= MAX_FRAME, "{}", frame.len());
+            let Some(ServerMessage::Snapshot { edits }) = ServerMessage::decode(frame) else {
+                panic!("a snapshot frame must decode");
+            };
+            for (x, y, z, rev, s) in edits {
+                assert_eq!(((x, y, z), rev, s.as_ref()), (cell(i), i as u32, spec((i % 300) as u16).as_str()));
+                i += 1;
+            }
+        }
+        assert_eq!(i, 30_000);
+    }
+
+    #[test]
+    fn the_snapshot_writer_matches_the_wire_form() {
+        let edits: Vec<(i32, i32, i32, u32, Arc<str>)> = vec![
+            (5, -3, 1_100_000_007, 1, "air".into()),
+            (6, -3, 1_100_000_007, 4, "c:0101020304".into()),
+            (i32::MIN, i32::MAX, 0, u32::MAX, "air".into()),
+        ];
+        let mut writer = SnapshotWriter::new();
+        let mut frames: Vec<Arc<[u8]>> = Vec::new();
+        let mut emit = |frame| frames.push(frame);
+        for (x, y, z, rev, spec) in &edits {
+            writer.push((*x, *y, *z), *rev, if spec.as_ref() == "air" { 0 } else { 9 }, spec, &mut emit);
+        }
+        writer.finish(&mut emit);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(&*frames[0], ServerMessage::Snapshot { edits }.encode().as_slice());
+    }
+
+    #[test]
+    fn malformed_snapshots_are_rejected_without_a_large_allocation() {
+        let frame = |palette: u64, specs: &[&str], count: u64, cells: &[u8]| {
+            let mut w = codec::Writer::new();
+            w.u8(super::tag::SNAPSHOT);
+            put_var(&mut w, palette);
+            for s in specs {
+                w.str16(s);
+            }
+            put_var(&mut w, count);
+            w.raw(cells);
+            ServerMessage::decode(&w.into_inner())
+        };
+        assert!(frame(1, &["air"], 1, &[0, 0, 0, 1, 0]).is_some());
+        assert_eq!(frame(u64::MAX, &[], 0, &[]), None, "a forged palette count");
+        assert_eq!(frame(1, &["air"], u64::MAX, &[0, 0, 0, 1, 0]), None, "a forged cell count");
+        assert_eq!(frame(1, &["air"], 1, &[0, 0, 0, 1, 1]), None, "an index past the palette");
+        assert_eq!(frame(1, &[&"s".repeat(MAX_SPEC + 1)], 0, &[]), None, "a spec past the cap");
+        assert_eq!(frame(0, &[], 1, &[0xfe, 0xff, 0xff, 0xff, 0x0f, 0, 0, 1, 0]), None, "a coordinate past i32");
+        assert_eq!(frame(1, &["air"], 1, &[0x80; 11]), None, "a varint past 64 bits");
+    }
+
+    /// Poses come back within their quantisation: 1/128 block, 16-bit angles,
+    /// a smallest-three frame, and f16 velocity.
+    #[test]
+    fn poses_round_trip_within_their_steps() {
+        let origin = DVec3::new(1.1e9 + 0.3, -7.0e5, 42.0);
+        let frame = DQuat::from_axis_angle(glam::DVec3::new(1.0, 2.0, -0.5).normalize(), 2.1);
+        let pose = PeerPose {
+            id: 1_000_000,
+            pos: origin + DVec3::new(-180.123, 77.7, 0.004),
+            yaw: -2.5,
+            pitch: -1.2,
+            frame,
+            velocity: Vec3::new(3.3, -9.81, 7000.0),
+            up: Face::PosZ,
+            stance: Stance::Sneaking,
+        };
+        let msg = ServerMessage::PeerPoses { poses: Poses { origin, list: vec![pose] } };
+        let Some(ServerMessage::PeerPoses { poses }) = ServerMessage::decode(&msg.encode()) else {
+            panic!("poses must decode");
+        };
+        let got = poses.list[0];
+        assert_eq!((got.id, got.up, got.stance), (pose.id, pose.up, pose.stance));
+        assert!(got.pos.distance(pose.pos) <= POSE_STEP, "{:?}", got.pos - pose.pos);
+        let turn = (got.yaw - pose.yaw).rem_euclid(std::f32::consts::TAU);
+        assert!(turn.min(std::f32::consts::TAU - turn) < 1e-4, "yaw {}", got.yaw);
+        assert!((got.pitch - pose.pitch).abs() < 1e-4);
+        assert!(got.frame.dot(frame).abs() > 0.9999, "{:?}", got.frame);
+        for (a, b) in [(got.velocity.x, 3.3), (got.velocity.y, -9.81), (got.velocity.z, 7000.0f32)] {
+            assert!((a - b).abs() <= b.abs() / 1024.0, "{a} vs {b}");
+        }
+        assert_eq!(f16_value(f16_bits(1.0e9)), 65504.0, "past the half range saturates");
+        assert_eq!(f16_value(f16_bits(-0.0)).to_bits(), (-0.0f32).to_bits());
+        assert_eq!(f16_value(f16_bits(6.0e-8)), 5.960_464_5e-8, "the smallest subnormal");
+    }
+
+    #[test]
+    fn the_pose_writer_matches_the_wire_form() {
+        let origin = DVec3::new(10.0, 20.0, 30.0);
+        let list = vec![
+            PeerPose {
+                id: 5,
+                pos: DVec3::new(12.0, 20.5, 29.0),
+                yaw: 1.0,
+                pitch: 0.5,
+                frame: DQuat::from_rotation_x(0.3),
+                velocity: Vec3::new(1.0, 0.0, 0.0),
+                up: Face::PosX,
+                stance: Stance::Standing,
+            },
+            PeerPose {
+                id: 200,
+                pos: DVec3::new(-100.0, 20.0, 30.0),
+                yaw: 0.0,
+                pitch: 0.0,
+                frame: DQuat::IDENTITY,
+                velocity: Vec3::ZERO,
+                up: Face::NegX,
+                stance: Stance::Sneaking,
+            },
+        ];
+        let mut w = PosesWriter::new();
+        w.begin(origin);
+        assert!(w.is_empty());
+        for p in &list {
+            w.push(p.id, &PoseBody::new(p.yaw, p.pitch, p.frame, p.velocity, p.up, p.stance), p.pos);
+        }
+        let expected = ServerMessage::PeerPoses { poses: Poses { origin, list } }.encode();
+        assert_eq!(&*w.frame(), expected.as_slice());
+    }
+
+    #[test]
+    fn malformed_poses_are_rejected_without_a_large_allocation() {
+        let mut w = codec::Writer::new();
+        w.u8(super::tag::PEER_POSES);
+        w.vec3(DVec3::ZERO);
+        w.u16(u16::MAX);
+        w.u8(1);
+        w.u8(0b1100_0000);
+        assert_eq!(ServerMessage::decode(&w.into_inner()), None, "reserved flag bits");
+        let mut w = codec::Writer::new();
+        w.u8(super::tag::PEER_POSES);
+        w.vec3(DVec3::ZERO);
+        w.u16(1);
+        w.u8(1);
+        w.u8(6);
+        w.raw(&[0; 10]);
+        assert_eq!(ServerMessage::decode(&w.into_inner()), None, "an unknown face");
+        let mut w = codec::Writer::new();
+        w.u8(super::tag::PEER_POSES);
+        w.vec3(DVec3::ZERO);
+        w.u16(1);
+        w.raw(&[0xff, 0xff, 0xff, 0xff, 0x7f]);
+        w.raw(&[0; 11]);
+        assert_eq!(ServerMessage::decode(&w.into_inner()), None, "an id past 32 bits");
     }
 
     struct XorShift(u64);
@@ -1338,5 +1939,31 @@ mod tests {
         read_frame(&mut std::io::Cursor::new(&zero), &mut got).unwrap();
         assert!(got.is_empty());
         zero.extend_from_slice(&[9]); // trailing unread bytes are the caller's problem
+    }
+
+    /// The packages a client reports always decode on the server: over-long ones and those past
+    /// the count are left out and counted, and ones at the limits stay.
+    #[test]
+    fn hello_offers_stay_within_the_decoder_limits() {
+        let mut mods: Vec<(String, String)> = (0..=MAX_MOD_OFFERS).map(|i| (format!("pkg.{i}"), "1.0.0".into())).collect();
+        mods.insert(0, ("pkg.long".into(), "1".repeat(MAX_MOD_ID + 1)));
+        mods.insert(1, ("x".repeat(MAX_MOD_ID), "v".repeat(MAX_MOD_ID)));
+        let hello = |mods: Vec<ModOffer>| ClientMessage::Hello {
+            protocol: 1,
+            worldgen: 0,
+            gravity: 0,
+            law: 0,
+            palette: 0,
+            name: "ada".into(),
+            password: "".into(),
+            mods,
+        };
+        let raw = mods.iter().map(|(id, version)| ModOffer { id: id.as_str().into(), version: version.as_str().into() }).collect();
+        assert_eq!(ClientMessage::decode(&hello(raw).encode()), None, "the unfitted list is refused");
+        let (offers, dropped) = hello_offers(&mods);
+        assert_eq!((offers.len(), dropped), (MAX_MOD_OFFERS, mods.len() - MAX_MOD_OFFERS));
+        assert_eq!(offers[0].id.len(), MAX_MOD_ID, "an id and version at the limit are kept");
+        let sent = hello(offers);
+        assert_eq!(ClientMessage::decode(&sent.encode()), Some(sent));
     }
 }

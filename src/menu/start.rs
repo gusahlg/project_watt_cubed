@@ -14,10 +14,8 @@
 pub use crate::save::slot::{SaveError, SaveMeta, Slot, SlotId};
 use crate::session::Session;
 
-use super::theme::{MenuTheme, PresentedRow, PresentedView};
-use super::{
-    drive, AppEffect, Command, Cursor, Intent, Msg, Notice, Row, RowKind, Screen, Style, View,
-};
+use super::theme::{MenuTheme, PresentedView};
+use super::{drive, AppEffect, Command, Cursor, Intent, Msg, Notice, Row, Screen, Style, View};
 use voxel_engine::Frame;
 
 /// Package version a start screen may show.
@@ -94,25 +92,22 @@ impl<'a> StartFacts<'a> {
 }
 
 /// One start-screen page as data. Core presents it through the theme; the
-/// start screen owns meaning and interaction.
+/// start screen owns meaning and interaction. It reads as its [`PresentedView`].
 pub struct MenuModel {
-    pub title: String,
-    pub style: Style,
-    pub rows: Vec<ModelRow>,
-    pub hint: String,
-    pub notice: Option<Notice>,
+    /// The page as the theme draws it; the core sets the menu scale.
+    pub page: PresentedView,
+    /// Per row, the core action picking it commits, if picking it is a core action.
+    /// Host/Join on the default main menu are `None` — they open forms first.
+    pub row_actions: Vec<Option<StartAction>>,
     pub selected: usize,
 }
 
-/// One row of a [`MenuModel`].
-pub struct ModelRow {
-    pub label: String,
-    pub detail: Option<String>,
-    pub kind: RowKind,
-    pub selectable: bool,
-    /// Core action this row commits on pick, if picking it is a core action.
-    /// Host/Join on the default main menu are `None` — they open forms first.
-    pub action: Option<StartAction>,
+impl std::ops::Deref for MenuModel {
+    type Target = PresentedView;
+
+    fn deref(&self) -> &PresentedView {
+        &self.page
+    }
 }
 
 impl MenuModel {
@@ -121,54 +116,17 @@ impl MenuModel {
         selected: usize,
         mut to_action: impl FnMut(&A) -> Option<StartAction>,
     ) -> Self {
-        let rows = view
-            .rows
-            .into_iter()
-            .map(|r| ModelRow {
-                label: r.label,
-                detail: r.detail,
-                kind: r.kind,
-                selectable: r.tag.is_some(),
-                action: r.tag.as_ref().and_then(&mut to_action),
-            })
-            .collect();
-        Self {
-            title: view.title,
-            style: view.style,
-            rows,
-            hint: view.hint,
-            notice: view.notice,
-            selected,
-        }
-    }
-
-    pub fn into_presented(self, scale: f32) -> PresentedView {
-        PresentedView {
-            title: self.title,
-            style: self.style,
-            rows: self
-                .rows
-                .into_iter()
-                .map(|r| PresentedRow {
-                    label: r.label,
-                    detail: r.detail,
-                    kind: r.kind,
-                    selectable: r.selectable,
-                })
-                .collect(),
-            scale,
-            hint: self.hint,
-            notice: self.notice,
-        }
+        let row_actions = view.rows.iter().map(|r| r.tag.as_ref().and_then(&mut to_action)).collect();
+        Self { page: view.into(), row_actions, selected }
     }
 
     /// Core actions on selectable rows, in display order.
     pub fn actions(&self) -> Vec<StartAction> {
-        self.rows.iter().filter_map(|r| r.action.clone()).collect()
+        self.row_actions.iter().flatten().cloned().collect()
     }
 
     pub fn labels(&self) -> Vec<&str> {
-        self.rows.iter().map(|r| r.label.as_str()).collect()
+        self.page.rows.iter().map(|r| r.label.as_str()).collect()
     }
 }
 
@@ -292,10 +250,9 @@ impl Screen for StartRoot {
     }
 
     fn draw(&self, ctx: &super::Ctx, theme: &dyn MenuTheme, f: &mut Frame, w: i32, h: i32) {
-        let model = self.inner.view(&Self::facts(self.hosting, ctx));
-        let selected = model.selected;
-        let pv = model.into_presented(ctx.settings.menu_scale);
-        theme.draw(f, &pv, selected, w, h);
+        let mut model = self.inner.view(&Self::facts(self.hosting, ctx));
+        model.page.scale = ctx.settings.menu_scale;
+        theme.draw(f, &model.page, model.selected, w, h);
     }
 }
 
@@ -328,6 +285,8 @@ mod tests {
             ]
         );
         assert!(matches!(model.style, Style::Panel));
+        assert_eq!(model.title, "START", "a model reads as its page");
+        assert_eq!(model.rows[0].detail.as_deref(), None);
     }
 
     #[test]
@@ -350,7 +309,7 @@ mod tests {
             ]
         );
         assert!(model.rows[1].selectable);
-        assert_eq!(model.rows[1].action, None);
+        assert_eq!(model.row_actions[1], None);
         // Cursor starts on New world; step to Load and confirm.
         assert_eq!(
             screen.update(&[Intent::Nav(Dir::Next)], &f),

@@ -3,11 +3,12 @@
 //!
 //! **Threading.** One accept thread; per client a blocking reader thread and a
 //! bounded-queue writer thread, coordinated through a single [`Mutex`]-guarded
-//! [`State`]. The lock is held only for short bursts — move fan-out snapshots
-//! its recipients under the lock and pushes to their queues after releasing
-//! it. Comfortably serves hundreds of players; past that the one global lock
-//! and thread-per-client model are the ceiling (join/leave and global chat
-//! stay O(roster)) — an event-loop rewrite would be the next step.
+//! [`State`]. The lock is held only for short bursts — frames are queued in
+//! order under it and the writers are woken after it is released, and poses
+//! go out once per 20 Hz tick per recipient. Comfortably serves hundreds of
+//! players; past that the one global lock and thread-per-client model are the
+//! ceiling (join/leave and global chat stay O(roster)) — an event-loop rewrite
+//! would be the next step.
 //!
 //! **Interest management.** Position broadcasts only reach players within
 //! [`INTEREST_RADIUS`], via a 3D bucket grid ([`State::grid`]): a move consults
@@ -27,7 +28,9 @@
 //!
 //! **Server mods.** [`Config::hooks`] is a [`ServerMod`] table (plain-data
 //! arguments, no protocol change). Calls run outside the [`State`] lock.
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::{BuildHasherDefault, Hasher};
 use std::io;
 use std::net::SocketAddr;
 #[cfg(test)]
@@ -35,9 +38,11 @@ use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::thread::{self, JoinHandle};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
+#[cfg(not(test))]
+use std::sync::MutexGuard;
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::thread::{self, JoinHandle, Thread};
 use std::time::{Duration, Instant};
 
 use quinn::{Endpoint, Incoming, SendStream};
@@ -56,7 +61,7 @@ use crate::net::hooks;
 use crate::sim::reactions::{self, CellStore, Contact, Mutation, Pos, ReactionScheduler};
 pub(crate) use crate::net::hooks::{ChatFacts, EditIntent, JoinFacts, ServerMod, Verdict};
 use crate::net::persist::{self, Store};
-use crate::net::protocol::{self, ClientMessage, ModOffer, ServerMessage};
+use crate::net::protocol::{self, ClientMessage, ModOffer, PoseBody, PosesWriter, ServerMessage, SnapshotWriter};
 use crate::net::{MAX_CHAT, MAX_FRAME, MAX_NAME, MAX_SPEC, PROTOCOL_VERSION, chat, quic};
 use crate::presence::Stance;
 use crate::world::seam::Seams;
@@ -67,14 +72,28 @@ use crate::world::generation::{TerrainGenerator, WorldgenKind};
 /// server down with it — [`State`] is plain data, valid at every point a panic
 /// could interrupt, so recovery is always sound.
 trait LockRecover<T> {
-    fn lock_recover(&self) -> MutexGuard<'_, T>;
+    #[cfg_attr(test, track_caller)]
+    fn lock_recover(&self) -> Guard<'_, T>;
 }
 
-impl<T> LockRecover<T> for Mutex<T> {
-    fn lock_recover(&self) -> MutexGuard<'_, T> {
-        self.lock().unwrap_or_else(PoisonError::into_inner)
+impl<T: 'static> LockRecover<T> for Mutex<T> {
+    #[cfg_attr(test, track_caller)]
+    fn lock_recover(&self) -> Guard<'_, T> {
+        let guard = self.lock().unwrap_or_else(PoisonError::into_inner);
+        #[cfg(test)]
+        let guard = load::Timed::new(guard);
+        guard
     }
 }
+
+#[cfg(not(test))]
+type Guard<'a, T> = MutexGuard<'a, T>;
+/// Test builds time every [`State`] lock hold for the load test.
+#[cfg(test)]
+type Guard<'a, T> = load::Timed<'a, T>;
+
+#[cfg(test)]
+mod load;
 
 /// Hard bound so a flood of connects can't spawn unbounded threads.
 const MAX_PLAYERS: usize = 256;
@@ -105,6 +124,11 @@ const TELEPORT_RATE: u32 = 4;
 /// A 20 ms capture cadence is ~50 frames/s sustained; 100 leaves headroom for
 /// bursts. Excess frames are dropped silently — channel traffic is loss-tolerant.
 const CHANNEL_RATE_LIMIT: u32 = 100;
+/// Mod frames one connection may send per second over all its channels, charged before
+/// the channel's own window, so switching names buys no extra rate.
+const MOD_DATA_RATE: u32 = 2 * CHANNEL_RATE_LIMIT;
+/// Distinct channel names one connection may use. A new name past this is dropped.
+const MAX_CHANNELS: usize = 32;
 /// Tool uses one connection may send per second: each one evaluates the law and may intern two
 /// configurations under the [`State`] lock, so the budget is a human's swing rate, not a flood.
 const TOOL_RATE_LIMIT: u32 = 12;
@@ -115,17 +139,30 @@ const CLIENT_INTERN_RESERVE: usize = crate::block::registry::MAX_BLOCK_TYPES / 4
 const INTEREST_RADIUS: f64 = 160.0 * crate::math::PER_METER;
 /// Squared once so the hot per-listener check in [`on_move`] needs no sqrt.
 const INTEREST_RADIUS_SQ: f64 = INTEREST_RADIUS * INTEREST_RADIUS;
+// Every visible peer's pose fits the offset range of a [`ServerMessage::PeerPoses`] frame.
+const _: () = assert!(INTEREST_RADIUS < protocol::POSE_REACH);
+/// Peers within this distance get each moved pose; farther ones every [`FAR_EVERY`]th tick.
+const NEAR: f64 = 48.0 * crate::math::PER_METER;
+const NEAR_SQ: f64 = NEAR * NEAR;
+const FAR_EVERY: u64 = 4;
+// One tick's frame holds a pose for every player.
+const _: () = assert!(protocol::POSES_HEAD + MAX_PLAYERS * protocol::POSE_MAX <= MAX_FRAME);
 /// A little past the client's own reach constant.
 const EDIT_REACH: f64 = 8.0 * crate::math::PER_METER;
-/// So jitter between a client's send cadence and our receive time never
-/// rejects honest movement.
+/// The distance budget's burst, in seconds at the envelope speed, so a stalled
+/// stream that lands several moves at once still drains at speed.
 const MOVE_SLACK_SECS: f64 = 0.3;
 /// Past this, elapsed time stops buying displacement (an idle client can't
 /// bank a cross-map jump allowance).
 const MOVE_WINDOW_CAP_SECS: f64 = 2.0;
-/// A couple of blocks still fit when the reported speed is zero and the window
-/// has not opened: the old 80 m/s slack, so a standing step is not a teleport.
+/// The smallest burst: the old 80 m/s slack, so a standing step is not a teleport.
+/// It is spent once, not granted per move.
 const MOVE_FLOOR: f64 = 80.0 * crate::math::PER_METER * MOVE_SLACK_SECS;
+/// The swept body check samples the path at most this far apart, the client collision's substep.
+const SWEEP_STEP: f64 = 0.5;
+/// Longest path the swept body check walks. A longer move fails closed, except a cruise move,
+/// which passes through everything on the client and is checked at its destination only.
+const SWEEP_LIMIT: f64 = 512.0;
 /// How fast a reported velocity may grow between moves, above the speed the
 /// client already has. Vacuum falls have no terminal speed; this is several
 /// times surface gravity so an honest fall fits and a forged one does not.
@@ -136,9 +173,6 @@ const NOVEL_SPEC_QUOTA: u32 = 64;
 /// Matches the client palette cap ([`format::MAX_SPECS`](crate::save::format));
 /// a hostile client can exhaust neither server memory nor peers' palettes.
 const MAX_SPEC_POOL: usize = 16_384;
-/// Snapshot payload: tag + u32 count, then each edit is 3×i32 + u32 rev + u16 length + spec.
-const SNAPSHOT_HEAD: usize = 1 + 4;
-const SNAPSHOT_EDIT_FIXED: usize = 12 + 4 + 2;
 /// Who may teleport. `All` is the integrated host and [`Config::default`], so
 /// existing sessions keep today's behaviour. A dedicated server passes [`Ops`](Self::Ops).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -179,6 +213,9 @@ pub struct Config {
     pub world: Option<PathBuf>,
     /// Operator names. Compared case-insensitively after [`clean_name`].
     pub ops: Vec<String>,
+    /// Operators who prove it with the chat line `/op <secret>`: (name, secret).
+    /// A name here needs its secret even when [`ops`](Self::ops) lists it too.
+    pub op_secrets: Vec<(String, String)>,
     /// Movement-envelope cap, in world units per second. The default is
     /// [`crate::player::MAX_SPEED`], which leaves cruise at its own ceiling.
     /// A lower cap also bounds cruise.
@@ -206,6 +243,7 @@ impl Default for Config {
             hooks: Vec::new(),
             world: None,
             ops: Vec::new(),
+            op_secrets: Vec::new(),
             max_speed: crate::player::MAX_SPEED,
             mods_allow: Vec::new(),
             mods_deny: Vec::new(),
@@ -221,21 +259,29 @@ fn clamp_day_secs(s: f32) -> f32 {
     if s.is_nan() { 600.0 } else { s.clamp(10.0, 86_400.0) }
 }
 
-/// One [`RateWindow`] per channel name. The first packet of a channel allocates
-/// the slot; later packets scan the small vec.
+/// The connection's [`MOD_DATA_RATE`] window, then one [`RateWindow`] per channel name.
+/// The first packet of a channel allocates the slot, up to [`MAX_CHANNELS`]; later
+/// packets scan the small vec.
 struct ChannelBudget {
+    total: RateWindow,
     windows: Vec<(Arc<str>, RateWindow)>,
 }
 
 impl ChannelBudget {
     fn new() -> Self {
-        Self { windows: Vec::new() }
+        Self { total: RateWindow::new(MOD_DATA_RATE), windows: Vec::new() }
     }
 
     fn allow(&mut self, channel: &protocol::Channel, now: Instant) -> bool {
+        if !self.total.allow(now) {
+            return false;
+        }
         let name = channel.as_str();
         if let Some((_, window)) = self.windows.iter_mut().find(|(key, _)| key.as_ref() == name) {
             return window.allow(now);
+        }
+        if self.windows.len() >= MAX_CHANNELS {
+            return false;
         }
         let mut window = RateWindow::new(CHANNEL_RATE_LIMIT);
         let ok = window.allow(now);
@@ -339,6 +385,8 @@ struct Ctx {
     hooks: Option<Mutex<hooks::Table>>,
     /// Lowercased operator names.
     ops: Vec<String>,
+    /// Lowercased names and their `/op` secrets.
+    op_secrets: Vec<(String, String)>,
     mods_allow: Vec<String>,
     mods_deny: Vec<String>,
     store: Option<Arc<Store>>,
@@ -357,11 +405,19 @@ struct PlayerHandle {
     stance: Stance,
     /// The movement envelope's time anchor.
     last_move: Instant,
+    /// Distance banked at `last_move`, spent by moves and refilled at the envelope speed.
+    budget: f64,
+    /// Proved an operator secret with `/op`.
+    op: bool,
     /// Ids inside mutual interest range (`a.visible.contains(b) ==
     /// b.visible.contains(a)`). Maintained by [`on_move`]'s diff; drives
     /// PeerExited/re-entry pose events.
-    visible: HashSet<u32>,
-    out: SyncSender<Arc<[u8]>>,
+    visible: HashSet<u32, Ids>,
+    /// The pose in wire form, refreshed when it changes.
+    body: PoseBody,
+    /// The pose tick ([`State::tick`]) the pose last changed before.
+    moved: u64,
+    out: Outbox,
     /// Wakes a misbehaving client's reader out of its blocking read so cleanup
     /// runs. A `Notify` rather than `quinn::Connection` so it's cheap to
     /// fabricate in state-only tests.
@@ -371,8 +427,8 @@ struct PlayerHandle {
     /// onto the wire or interleave between snapshot batches — so they buffer
     /// into `backlog` instead, drained in order once the bootstrap is done.
     ready: bool,
-    /// Frames held until bootstrap finishes, with the instant they were queued.
-    backlog: Vec<Queued>,
+    /// Frames held until bootstrap finishes, with the instant they were queued, oldest first.
+    backlog: VecDeque<Queued>,
     backlog_bytes: usize,
     /// Set by [`kick_slow`] and by a bootstrap send that misses its deadline.
     /// The reader is not in [`client_loop`] yet during bootstrap, so the kick
@@ -388,25 +444,174 @@ struct PlayerHandle {
     novel: u32,
     /// Peer ids whose `PeerJoined` this client has already been queued. A join
     /// both snapshots the roster and may race another joiner's broadcast.
-    announced: HashSet<u32>,
+    announced: HashSet<u32, Ids>,
 }
 
-/// A recipient and its encoded frame, queued after releasing the state lock.
-type PendingSend = (u32, SyncSender<Arc<[u8]>>, Arc<[u8]>);
+/// Hashes server-assigned player ids. No client picks them, so one multiply
+/// spreads them well and costs a fraction of SipHash on the per-move paths.
+#[derive(Default)]
+struct IdHasher(u64);
+
+impl Hasher for IdHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u32(u32::from(b));
+        }
+    }
+
+    fn write_u32(&mut self, v: u32) {
+        self.0 = (self.0 ^ u64::from(v)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+type Ids = BuildHasherDefault<IdHasher>;
+
+/// Buffers [`commit_pose`] reuses so a move allocates nothing.
+#[derive(Default)]
+struct Scratch {
+    near: HashSet<u32, Ids>,
+    gone: Vec<u32>,
+    fresh: Vec<u32>,
+}
+
+/// A recipient and its encoded frame, gathered under the state lock for [`queue`].
+type PendingSend = (u32, Arc<[u8]>);
+
+/// One player's outbound frames, bounded at [`OUT_CAPACITY`]. The writer thread
+/// parks while nothing is queued, and [`push`](Self::push) does not wake it, so a
+/// broadcast under the state lock wakes writers only after the lock is released.
+/// Dropping a sender wakes the writer so it notices when the last one is gone.
+#[derive(Clone)]
+struct Outbox {
+    /// `None` only inside `drop`, which lets go of the sender before waking.
+    tx: Option<SyncSender<Arc<[u8]>>>,
+    writer: Arc<Writer>,
+}
+
+/// What both ends of an [`Outbox`] share. Test builds count the frames waiting.
+#[derive(Default)]
+struct Writer {
+    thread: OnceLock<Thread>,
+    #[cfg(test)]
+    depth: AtomicUsize,
+}
+
+impl Writer {
+    fn wake(&self) {
+        if let Some(thread) = self.thread.get() {
+            thread.unpark();
+        }
+    }
+}
+
+/// The writer thread's end of an [`Outbox`].
+struct Outgoing {
+    rx: Receiver<Arc<[u8]>>,
+    writer: Arc<Writer>,
+}
+
+fn outbox(capacity: usize) -> (Outbox, Outgoing) {
+    let (tx, rx) = sync_channel(capacity);
+    let writer = Arc::new(Writer::default());
+    (Outbox { tx: Some(tx), writer: writer.clone() }, Outgoing { rx, writer })
+}
+
+impl Outbox {
+    /// Queue `frame` and wake the writer.
+    fn try_send(&self, frame: Arc<[u8]>) -> Result<(), TrySendError<Arc<[u8]>>> {
+        self.push(frame)?;
+        self.writer.wake();
+        Ok(())
+    }
+
+    /// Queue `frame` without waking the writer: the caller wakes it later.
+    fn push(&self, frame: Arc<[u8]>) -> Result<(), TrySendError<Arc<[u8]>>> {
+        // Counted before the push, so the writer's decrement can never run first.
+        #[cfg(test)]
+        let depth = self.writer.depth.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        let sent = match &self.tx {
+            Some(tx) => tx.try_send(frame),
+            None => Err(TrySendError::Disconnected(frame)),
+        };
+        #[cfg(test)]
+        match &sent {
+            Ok(()) => load::QUEUE.record(depth as u64),
+            Err(_) => {
+                self.writer.depth.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+        sent
+    }
+}
+
+impl Drop for Outbox {
+    fn drop(&mut self) {
+        drop(self.tx.take());
+        self.writer.wake();
+    }
+}
+
+/// Writers to wake once the state lock is released. Dropping it wakes them.
+struct Wake(Vec<Arc<Writer>>);
+
+impl Wake {
+    fn join(&mut self, mut other: Wake) {
+        self.0.append(&mut other.0);
+    }
+}
+
+impl Drop for Wake {
+    fn drop(&mut self) {
+        for writer in &self.0 {
+            writer.wake();
+        }
+    }
+}
+
+impl Outgoing {
+    /// Frame what is queued into `batch`, up to [`WRITE_BATCH`] bytes, parking while
+    /// nothing is. `Ok(false)` once every sender is gone and the queue is empty; an
+    /// error for a frame past the cap.
+    fn take(&self, batch: &mut Vec<u8>) -> io::Result<bool> {
+        batch.clear();
+        loop {
+            while batch.len() < WRITE_BATCH {
+                match self.rx.try_recv() {
+                    Ok(frame) => {
+                        #[cfg(test)]
+                        self.writer.depth.fetch_sub(1, Ordering::Relaxed);
+                        protocol::put_frame(batch, &frame)?;
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => return Ok(!batch.is_empty()),
+                }
+            }
+            if !batch.is_empty() {
+                return Ok(true);
+            }
+            thread::park();
+        }
+    }
+}
 
 impl PlayerHandle {
     fn correct_position(&self, id: u32, sends: &mut Vec<PendingSend>) {
         if self.ready {
             let frame = ServerMessage::Position { pos: self.pos, frame: self.frame, up: self.up }.encode().into();
-            sends.push((id, self.out.clone(), frame));
+            sends.push((id, frame));
         }
     }
 }
 
 /// A joining client buffers broadcasts until Welcome and the overlay are queued.
 /// The bound is bytes and age, not a frame count: cosmetic frames are dropped
-/// first, and only an essential frame that still does not fit kicks.
-const BACKLOG_BYTES: usize = 64 * 1024;
+/// first, and an essential frame that does not fit or outlives the age kicks.
+/// Several full frames fit, so one large reaction batch never kicks on its own.
+const BACKLOG_BYTES: usize = 4 * MAX_FRAME;
 const BACKLOG_AGE: Duration = Duration::from_secs(15);
 /// How long a bootstrap send may wait for queue space before the joiner is dropped.
 const SEND_DEADLINE: Duration = Duration::from_secs(8);
@@ -414,6 +619,8 @@ const SEND_DEADLINE: Duration = Duration::from_secs(8);
 const TIME_BROADCAST: Duration = Duration::from_secs(60);
 /// Body cells tested for a solid overlap. A larger box fails closed.
 const BODY_CELL_CAP: usize = 64;
+/// Bytes of queued frames a writer sends in one write.
+const WRITE_BATCH: usize = 64 * 1024;
 
 /// One frame waiting out a join, and when it was queued.
 struct Queued {
@@ -421,10 +628,14 @@ struct Queued {
     frame: Arc<[u8]>,
 }
 
-/// The optimistic-concurrency token racing edits compare against.
+/// One edited cell: its block (so reads never parse the spec), the pooled spec
+/// the wire and saves carry, and the revision racing edits compare against.
 struct Cell {
+    block: BlockId,
     spec: Arc<str>,
     rev: u32,
+    /// An edit put back the generated block: kept for its revision, left out of the world file.
+    natural: bool,
 }
 
 struct State {
@@ -436,7 +647,7 @@ struct State {
     /// The same compiled palette clients build, so specs validate/canonicalize
     /// under EXACTLY the rules clients apply.
     registry: BlockRegistry,
-    players: HashMap<u32, PlayerHandle>,
+    players: HashMap<u32, PlayerHandle, Ids>,
     /// Bucket key → ids standing in it, keyed by [`bucket_of`]. Buckets are
     /// exactly one [`INTEREST_RADIUS`] wide on each axis, so anyone in range of
     /// a mover lives in its 3×3×3 neighbourhood; [`on_move`] still applies the
@@ -453,6 +664,11 @@ struct State {
     day_set: Instant,
     /// Server-authoritative reaction scheduler. Clients never run one.
     reactions: ReactionScheduler,
+    /// The next pose tick ([`broadcast_poses`]).
+    tick: u64,
+    poses: PosesWriter,
+    scratch: Scratch,
+    terrain: TerrainCache,
     /// Envelope cap copied from [`Config::max_speed`] at spawn.
     max_speed: f64,
     /// Test hook: the next reaction tick panics once, then clears the flag.
@@ -479,9 +695,9 @@ impl State {
     }
 
     /// The grid narrows candidates; exact distance and readiness decide visibility.
-    fn visible_from(&self, id: u32, pos: DVec3) -> HashSet<u32> {
+    fn visible_from(&self, id: u32, pos: DVec3, visible: &mut HashSet<u32, Ids>) {
         let at = bucket_of(pos);
-        let mut visible = HashSet::new();
+        visible.clear();
         for dx in -1..=1i32 {
             for dy in -1..=1i32 {
                 for dz in -1..=1i32 {
@@ -499,7 +715,6 @@ impl State {
                 }
             }
         }
-        visible
     }
 
     fn day_now(&self, day_secs: f32) -> f32 {
@@ -547,9 +762,52 @@ fn server_block(
     pos: Pos,
 ) -> BlockId {
     if let Some(cell) = state.edits.get(&pos) {
-        state.registry.lookup_spec(&cell.spec).unwrap_or(AIR)
+        cell.block
     } else {
-        generator.voxel_at(pos.0, pos.1, pos.2)
+        state.terrain.get(pos, || generator.voxel_at(pos.0, pos.1, pos.2))
+    }
+}
+
+const TERRAIN_SLOTS: usize = 1 << 14;
+const TERRAIN_WAYS: usize = 4;
+
+/// Generated cells read lately (a generator read costs microseconds), four ways
+/// per set. Terrain never changes under the overlay, so a slot stays right until
+/// another cell takes it. Only touched under the state lock.
+struct TerrainCache(RefCell<Box<[Option<(Pos, BlockId)>]>>);
+
+impl TerrainCache {
+    fn new() -> Self {
+        Self(RefCell::new(vec![None; TERRAIN_SLOTS].into_boxed_slice()))
+    }
+
+    fn get(&self, pos: Pos, generate: impl FnOnce() -> BlockId) -> BlockId {
+        if let Some(id) = self.peek(pos) {
+            return id;
+        }
+        let id = generate();
+        self.store(pos, id);
+        id
+    }
+
+    fn peek(&self, pos: Pos) -> Option<BlockId> {
+        let (set, _) = Self::slot(pos);
+        let cache = self.0.borrow();
+        cache[set..set + TERRAIN_WAYS].iter().find_map(|w| w.filter(|(at, _)| *at == pos).map(|(_, id)| id))
+    }
+
+    fn store(&self, pos: Pos, id: BlockId) {
+        let (set, way) = Self::slot(pos);
+        self.0.borrow_mut()[set + way] = Some((pos, id));
+    }
+
+    /// The set's first slot, and the way a new entry takes.
+    fn slot(pos: Pos) -> (usize, usize) {
+        let h = u64::from(pos.0 as u32).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ u64::from(pos.1 as u32).wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
+            ^ u64::from(pos.2 as u32).wrapping_mul(0x1656_67B1_9E37_79F9);
+        let sets = (TERRAIN_SLOTS / TERRAIN_WAYS).trailing_zeros();
+        ((h >> (64 - sets)) as usize * TERRAIN_WAYS, h as usize % TERRAIN_WAYS)
     }
 }
 
@@ -568,7 +826,7 @@ impl CellStore for ServerCells<'_> {
         let canonical = crate::save::block_spec(&self.state.registry, id);
         let spec = self.state.intern(&canonical)?;
         let rev = self.state.edits.get(&pos).map_or(0, |c| c.rev).saturating_add(1);
-        if let Some(old) = self.state.edits.insert(pos, Cell { spec, rev }) {
+        if let Some(old) = self.state.edits.insert(pos, Cell { block: id, spec, rev, natural: false }) {
             self.state.release(old.spec);
         }
         Some(prev)
@@ -592,6 +850,9 @@ fn reactions_loop(shared: Arc<Mutex<State>>, ctx: Arc<Ctx>, shutdown: Arc<Atomic
         // (the broadcast) so the thread, and the scheduler, both stay.
         if let Err(payload) = catch_unwind(AssertUnwindSafe(|| run_reactions(&shared, &ctx))) {
             eprintln!("reaction tick panicked: {}", panic_text(&payload));
+        }
+        if let Err(payload) = catch_unwind(AssertUnwindSafe(|| broadcast_poses(&shared))) {
+            eprintln!("pose tick panicked: {}", panic_text(&payload));
         }
         if Instant::now() >= next_clock {
             if let Err(payload) = catch_unwind(AssertUnwindSafe(|| broadcast_clock(&shared, &ctx))) {
@@ -638,10 +899,15 @@ fn run_reactions(shared: &Arc<Mutex<State>>, ctx: &Ctx) {
         sched.tick(&mut cells, budget)
     }));
     state.reactions = sched;
-    match tick {
+    let wake = match tick {
         Ok(mutations) => send_reaction_mutations(&mut state, &mutations),
-        Err(payload) => eprintln!("reaction tick panicked: {}", panic_text(&payload)),
-    }
+        Err(payload) => {
+            eprintln!("reaction tick panicked: {}", panic_text(&payload));
+            Wake(Vec::new())
+        }
+    };
+    drop(state);
+    drop(wake);
 }
 
 fn take_panic_tick(state: &mut State) -> bool {
@@ -658,20 +924,59 @@ fn take_panic_tick(state: &mut State) -> bool {
     }
 }
 
+/// One [`ServerMessage::PeerPoses`] frame per ready player with the visible peers
+/// that moved: near peers every tick, far ones every [`FAR_EVERY`]th tick (staggered
+/// by id) when they moved within that window.
+fn broadcast_poses(shared: &Arc<Mutex<State>>) {
+    let mut sends = Vec::new();
+    let wake = {
+        let mut guard = shared.lock_recover();
+        let state = &mut *guard;
+        let tick = state.tick;
+        state.tick += 1;
+        let writer = &mut state.poses;
+        for (&rid, r) in &state.players {
+            if !r.ready || r.visible.is_empty() {
+                continue;
+            }
+            writer.begin(r.pos);
+            for &pid in &r.visible {
+                let Some(p) = state.players.get(&pid) else { continue };
+                let due = if p.pos.distance_squared(r.pos) <= NEAR_SQ {
+                    p.moved == tick
+                } else {
+                    p.moved + FAR_EVERY > tick && (tick + u64::from(pid)) % FAR_EVERY == 0
+                };
+                if due {
+                    writer.push(pid, &p.body, p.pos);
+                }
+            }
+            if !writer.is_empty() {
+                sends.push((rid, writer.frame()));
+            }
+        }
+        queue(state, sends)
+    };
+    drop(wake);
+}
+
 /// The shared clock, sampled now and sent to every connected player.
 fn broadcast_clock(shared: &Arc<Mutex<State>>, ctx: &Ctx) {
     let mut state = shared.lock_recover();
     let day = state.day_now(ctx.day_secs);
-    broadcast(&mut state, &ServerMessage::Time { day, day_secs: ctx.day_secs }, |_, _| true);
+    let wake = broadcast(&mut state, &ServerMessage::Time { day, day_secs: ctx.day_secs }, |_, _| true);
+    drop(state);
+    drop(wake);
 }
 
 /// Authoritative overlay edits from one scheduler tick, as snapshot batches
 /// (the client applies [`ServerMessage::Snapshot`] after bootstrap), one entry
 /// per distinct cell. One `S_Edit` per mutation would overflow [`OUT_CAPACITY`]
 /// on two full ticks.
-fn send_reaction_mutations(state: &mut State, mutations: &[Mutation]) {
+fn send_reaction_mutations(state: &mut State, mutations: &[Mutation]) -> Wake {
+    let mut wake = Wake(Vec::new());
     if mutations.is_empty() {
-        return;
+        return wake;
     }
     // A cell committed by several contacts in one turn is sent once, with its
     // final content, at the point of its last commit (order is preserved).
@@ -679,43 +984,47 @@ fn send_reaction_mutations(state: &mut State, mutations: &[Mutation]) {
     for (i, m) in mutations.iter().enumerate() {
         last.insert(m.pos, i);
     }
-    let mut edits = Vec::with_capacity(last.len());
-    for (i, m) in mutations.iter().enumerate() {
-        if last[&m.pos] != i {
-            continue;
+    let mut frames = Vec::new();
+    {
+        let mut writer = SnapshotWriter::new();
+        let mut emit = |frame| frames.push(frame);
+        for (i, m) in mutations.iter().enumerate() {
+            if last[&m.pos] != i {
+                continue;
+            }
+            let Some(cell) = state.edits.get(&m.pos) else { continue };
+            writer.push(m.pos, cell.rev, cell.block.0, &cell.spec, &mut emit);
         }
-        let Some(cell) = state.edits.get(&m.pos) else { continue };
-        edits.push((m.pos.0, m.pos.1, m.pos.2, cell.rev, cell.spec.clone()));
+        writer.finish(&mut emit);
     }
-    for_snapshot_batches(&edits, |batch| {
-        broadcast(
-            state,
-            &ServerMessage::Snapshot { edits: batch.to_vec() },
-            |pid, _| pid != WORLD_PLAYER,
-        );
-    });
+    for frame in frames {
+        wake.join(broadcast_frame(state, frame, None, |pid, _| pid != WORLD_PLAYER));
+    }
+    wake
 }
 
-/// Split `edits` so each [`ServerMessage::Snapshot`] encodes to at most [`MAX_FRAME`].
-/// A single edit is always emitted, so one oversized spec cannot loop forever.
-fn for_snapshot_batches(
-    edits: &[(i32, i32, i32, u32, Arc<str>)],
-    mut emit: impl FnMut(&[(i32, i32, i32, u32, Arc<str>)]),
-) {
-    let mut start = 0;
-    while start < edits.len() {
-        let mut end = start + 1;
-        let mut size = SNAPSHOT_HEAD + SNAPSHOT_EDIT_FIXED + edits[start].4.len();
-        while end < edits.len() {
-            let add = SNAPSHOT_EDIT_FIXED + edits[end].4.len();
-            if size + add > MAX_FRAME {
-                break;
+/// A joiner's copy of the edit overlay, taken under the lock without touching a spec.
+struct Overlay {
+    cells: Vec<(i32, i32, i32, u32, BlockId)>,
+    /// The spec of each block the cells name, indexed by block id.
+    specs: Vec<Option<Arc<str>>>,
+}
+
+impl Overlay {
+    fn of(state: &State) -> Self {
+        let mut specs: Vec<Option<Arc<str>>> = Vec::new();
+        let mut cells = Vec::with_capacity(state.edits.len());
+        for (&(x, y, z), cell) in &state.edits {
+            let at = usize::from(cell.block.0);
+            if at >= specs.len() {
+                specs.resize(at + 1, None);
             }
-            size += add;
-            end += 1;
+            if specs[at].is_none() {
+                specs[at] = Some(cell.spec.clone());
+            }
+            cells.push((x, y, z, cell.rev, cell.block));
         }
-        emit(&edits[start..end]);
-        start = end;
+        Self { cells, specs }
     }
 }
 
@@ -737,8 +1046,8 @@ fn outside_world(pos: DVec3) -> bool {
         || pos.z.abs() > crate::math::WORLD_BORDER
 }
 
-/// A running server. [`stop`](ServerHandle::stop) saves the world, closes every
-/// connection, and joins the server threads so the port can be bound again.
+/// A running server. [`stop`](ServerHandle::stop) closes every connection, saves
+/// the world, and joins the server threads so the port can be bound again.
 /// Dropping the handle does the same.
 pub(crate) struct ServerHandle {
     shutdown: Arc<AtomicBool>,
@@ -766,17 +1075,18 @@ impl ServerHandle {
         self.addr
     }
 
-    /// Save, close every connection with "server shutting down", and join threads.
-    /// A second call does nothing.
+    /// Close every connection with "server shutting down", save, and join threads.
+    /// Closing first means no edit is acknowledged after the save captures the ledger:
+    /// once the endpoint is closed, no ack reaches a client. A second call does nothing.
     pub fn stop(&self) {
         if self.stopped.swap(true, Ordering::SeqCst) {
             return;
         }
-        self.save_now();
         self.shutdown.store(true, Ordering::SeqCst);
         if let Some(endpoint) = self.endpoint.lock_recover().take() {
             endpoint.close(0u32.into(), b"server shutting down");
         }
+        self.save_now();
         if let Some(handle) = self.accept.lock_recover().take() {
             let _ = handle.join();
         }
@@ -865,12 +1175,16 @@ pub(crate) fn spawn(port: u16, config: Config) -> io::Result<ServerHandle> {
         edits: HashMap::new(),
         spec_pool: HashMap::new(),
         registry,
-        players: HashMap::new(),
+        players: HashMap::default(),
         grid: HashMap::new(),
         next_id: 1,
         day: loaded.day,
         day_set: Instant::now(),
         reactions: ReactionScheduler::new(),
+        tick: 1,
+        poses: PosesWriter::new(),
+        scratch: Scratch::default(),
+        terrain: TerrainCache::new(),
         max_speed: finite_speed(config.max_speed),
         #[cfg(test)]
         panic_tick: false,
@@ -886,6 +1200,8 @@ pub(crate) fn spawn(port: u16, config: Config) -> io::Result<ServerHandle> {
     } else {
         Some(Mutex::new(hooks::Table::new(config.hooks)))
     };
+    let op_secrets: Vec<(String, String)> =
+        config.op_secrets.iter().map(|(name, secret)| (canonical_name(name), secret.clone())).collect();
     let ctx = Arc::new(Ctx {
         password: config.password,
         seed: loaded.seed,
@@ -898,7 +1214,8 @@ pub(crate) fn spawn(port: u16, config: Config) -> io::Result<ServerHandle> {
         seams: Seams::new(generator.atlases().to_vec()),
         generator,
         hooks,
-        ops: canonical_ops(&config.ops),
+        ops: canonical_ops(&config.ops, &op_secrets),
+        op_secrets,
         mods_allow: config.mods_allow,
         mods_deny: config.mods_deny,
         store: loaded.store.map(Arc::new),
@@ -958,11 +1275,13 @@ fn finite_speed(v: f64) -> f64 {
     if v.is_finite() && v >= 0.0 { v } else { crate::player::MAX_SPEED }
 }
 
-fn canonical_ops(names: &[String]) -> Vec<String> {
+/// Name-only operators, minus any name that has a secret.
+fn canonical_ops(names: &[String], secrets: &[(String, String)]) -> Vec<String> {
     let mut ops = Vec::new();
     for name in names {
         let canon = canonical_name(name);
-        if canon.is_empty() || ops.iter().any(|op: &String| op == &canon) {
+        let listed = ops.iter().any(|op: &String| op == &canon) || secrets.iter().any(|(have, _)| have == &canon);
+        if canon.is_empty() || listed {
             continue;
         }
         ops.push(canon);
@@ -974,15 +1293,15 @@ fn canonical_name(raw: &str) -> String {
     clean_name(raw).to_ascii_lowercase()
 }
 
-fn is_operator(ctx: &Ctx, name: &str) -> bool {
-    let name = name.to_ascii_lowercase();
-    ctx.ops.iter().any(|op| op == &name)
+fn is_operator(ctx: &Ctx, h: &PlayerHandle) -> bool {
+    h.op || ctx.ops.iter().any(|op| op.eq_ignore_ascii_case(&h.name))
 }
 
-/// Skip a spec this build cannot parse, and return those cells so the next save
-/// writes them back. Revisions start at 1; the file has none.
+/// Skip a spec this build cannot parse or the pool cannot hold, and return those cells
+/// so the next save writes them back. Revisions start at 1; the file has none.
 fn install_edits(state: &mut State, edits: &[(i32, i32, i32, String)]) -> Vec<(i32, i32, i32, String)> {
     let mut kept = Vec::new();
+    let mut over = 0usize;
     for (x, y, z, spec) in edits {
         let Some(id) = state.registry.parse_spec(spec) else {
             eprintln!("skipping unknown block spec at {x},{y},{z}");
@@ -990,8 +1309,15 @@ fn install_edits(state: &mut State, edits: &[(i32, i32, i32, String)]) -> Vec<(i
             continue;
         };
         let canonical = state.registry.spec(id);
-        let Some(shared) = state.intern(&canonical) else { continue };
-        state.edits.insert((*x, *y, *z), Cell { spec: shared, rev: 1 });
+        let Some(shared) = state.intern(&canonical) else {
+            over += 1;
+            kept.push((*x, *y, *z, spec.clone()));
+            continue;
+        };
+        state.edits.insert((*x, *y, *z), Cell { block: id, spec: shared, rev: 1, natural: false });
+    }
+    if over > 0 {
+        eprintln!("warning: {over} edits name more than {MAX_SPEC_POOL} distinct blocks; they stay in the file but are not served");
     }
     kept
 }
@@ -1011,6 +1337,7 @@ fn save_world(state: &Mutex<State>, ctx: &Ctx, gate: &Mutex<()>) {
         let edits = state
             .edits
             .iter()
+            .filter(|(_, cell)| !cell.natural)
             .map(|(&(x, y, z), cell)| (x, y, z, Arc::clone(&cell.spec)))
             .collect();
         let pending = state
@@ -1061,8 +1388,9 @@ fn autosave_loop(
 }
 
 /// Union `ops.txt` and `mods.toml` beside [`Config::world`] into the flag lists.
-/// A missing file adds nothing. A `mods.toml` that is not `allow` / `deny`
-/// string arrays is an error, so a dedicated server refuses to start open.
+/// An `ops.txt` line with a secret goes to [`Config::op_secrets`]. A missing file
+/// adds nothing. A `mods.toml` that is not `allow` / `deny` string arrays is an
+/// error, so a dedicated server refuses to start open.
 pub fn load_world_policy(config: &mut Config) -> Result<(), String> {
     let Some(world) = config.world.clone() else {
         return Ok(());
@@ -1071,6 +1399,11 @@ pub fn load_world_policy(config: &mut Config) -> Result<(), String> {
     for name in side.ops {
         if !config.ops.iter().any(|op| op.eq_ignore_ascii_case(&name)) {
             config.ops.push(name);
+        }
+    }
+    for (name, secret) in side.op_secrets {
+        if !config.op_secrets.iter().any(|(have, _)| have.eq_ignore_ascii_case(&name)) {
+            config.op_secrets.push((name, secret));
         }
     }
     push_unique(&mut config.mods_allow, side.allow);
@@ -1166,6 +1499,12 @@ fn accept_once(
         Err(_elapsed) => return false,
     };
 
+    // A stateless retry first: a source must prove it receives our packets before it
+    // takes a slot, so spoofed Initials cannot hold the handshake slots.
+    if !incoming.remote_address_validated() {
+        let _ = incoming.retry();
+        return false;
+    }
     // A QUIC CONNECTION_REFUSED past the cap, before any handshake, so a
     // flood of silent connects can't squat handler threads. The accept
     // loop is the only adder, so load-then-add can't overshoot the cap.
@@ -1213,7 +1552,7 @@ fn handle_client(
     // These sends wait, bounded, on this client's handler thread: a built-up
     // world or big roster can exceed the outbound queue, and dropping bootstrap
     // frames would ghost the join. A kick or a missed deadline ends the join.
-    if !send_join(&out, &kicked, &shared, &ctx, id, spawn, &snapshot, &existing) {
+    if !send_join(&out, &kicked, &shared, &ctx, id, spawn, snapshot, &existing) {
         kicked.store(true, Ordering::Relaxed);
         depart(&shared, &ctx, conn, out, writer, id, &name);
         return Ok(());
@@ -1347,25 +1686,25 @@ fn admit_player(
     u32,
     DVec3,
     Vec<(u32, Arc<str>)>,
-    Vec<(i32, i32, i32, u32, Arc<str>)>,
-    SyncSender<Arc<[u8]>>,
-    std::sync::mpsc::Receiver<Arc<[u8]>>,
+    Overlay,
+    Outbox,
+    Outgoing,
     Arc<Notify>,
 )> {
     // Made before the lock, and the writer spawned only after a slot is
     // secured, so the still-owned `send` handles a "server full" reject
     // directly and reliably.
-    let (out, rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
+    let (out, rx) = outbox(OUT_CAPACITY);
     let kick = Arc::new(Notify::new());
 
     // One locked scope so the id, spawn, and roster snapshot are consistent.
     let id;
     let spawn;
     let existing: Vec<(u32, Arc<str>)>;
-    let snapshot: Vec<(i32, i32, i32, u32, Arc<str>)>;
+    let snapshot: Overlay;
     {
         let mut state = shared.lock_recover();
-        if name.eq_ignore_ascii_case("server") {
+        if reserved_name(name) {
             drop(state);
             reject(rt, send, conn, "the name 'server' is reserved");
             return None;
@@ -1384,18 +1723,15 @@ fn admit_player(
         state.next_id += 1;
         spawn = spawn_point(ctx.generator.as_ref(), id);
         let (frame, up) = standing_pose(Field::new(ctx.generator.mass()).sample(spawn).accel);
+        let body = PoseBody::new(0.0, 0.0, frame, Vec3::ZERO, up, Stance::Standing);
 
         // Roster only — poses flow through the visibility machinery once the
         // joiner reports their first move, so a far peer isn't a frozen ghost.
         existing = state.players.iter().map(|(&pid, h)| (pid, h.name.clone())).collect();
-        let announced: HashSet<u32> = existing.iter().map(|(pid, _)| *pid).collect();
-        // The pooled `Arc<str>` spec goes straight onto the wire message: a
-        // built-up world's join snapshot clones refcounts, not strings.
-        snapshot = state
-            .edits
-            .iter()
-            .map(|(&(x, y, z), cell)| (x, y, z, cell.rev, cell.spec.clone()))
-            .collect();
+        let announced: HashSet<u32, Ids> = existing.iter().map(|(pid, _)| *pid).collect();
+        // Coordinates, revisions and block ids only: specs are named once per
+        // block, and the frames are sorted and encoded after the lock.
+        snapshot = Overlay::of(&state);
 
         state.players.insert(
             id,
@@ -1409,11 +1745,15 @@ fn admit_player(
                 up,
                 stance: Stance::Standing,
                 last_move: Instant::now(),
-                visible: HashSet::new(),
+                budget: MOVE_FLOOR,
+                op: false,
+                visible: HashSet::default(),
+                body,
+                moved: 0,
                 out: out.clone(),
                 kick: kick.clone(),
                 ready: false,
-                backlog: Vec::new(),
+                backlog: VecDeque::new(),
                 backlog_bytes: 0,
                 kicked: Arc::new(AtomicBool::new(false)),
                 occupied: Vec::new(),
@@ -1441,32 +1781,38 @@ fn admit_player(
 fn spawn_writer(
     writer_rt: Arc<Runtime>,
     mut send: SendStream,
-    rx: std::sync::mpsc::Receiver<Arc<[u8]>>,
+    rx: Outgoing,
     kick: Arc<Notify>,
 ) -> thread::JoinHandle<()> {
     // A write error ends the writer and wakes the reader, so the client is
     // dropped instead of left half-open. A clean channel close (depart) does
     // not kick: the reader has already exited. QUIC has no user flush.
     thread::spawn(move || {
-        drain_writer(rx, &kick, |frame| {
-            writer_rt.block_on(protocol::write_frame_async(&mut send, frame))
+        drain_writer(rx, &kick, |batch| {
+            writer_rt.block_on(send.write_all(batch)).map_err(io::Error::other)
         });
     })
 }
 
-/// Pull frames until the channel closes. The first write error notifies `kick` and returns.
+/// Write queued frames, one batch per write, until every sender is gone. The
+/// first error (a write, or a frame past the cap) notifies `kick` and returns.
 fn drain_writer(
-    rx: std::sync::mpsc::Receiver<Arc<[u8]>>,
+    rx: Outgoing,
     kick: &Notify,
     mut write: impl FnMut(&[u8]) -> io::Result<()>,
 ) {
-    while let Ok(frame) = rx.recv() {
-        if write(&frame).is_err() {
-            kick.notify_one();
-            return;
-        }
-        while let Ok(frame) = rx.try_recv() {
-            if write(&frame).is_err() {
+    let _ = rx.writer.thread.set(thread::current());
+    let mut batch = Vec::new();
+    loop {
+        match rx.take(&mut batch) {
+            Ok(true) => {
+                if write(&batch).is_err() {
+                    kick.notify_one();
+                    return;
+                }
+            }
+            Ok(false) => return,
+            Err(_) => {
                 kick.notify_one();
                 return;
             }
@@ -1527,11 +1873,12 @@ fn client_loop(
             }
             ClientMessage::Teleport { pos } => on_teleport(shared, ctx, id, pos),
             ClientMessage::Edit { req, x, y, z, expect, spec } => {
-                on_edit(shared, ctx.hooks.as_ref(), ctx.generator.atlases(), id, req, x, y, z, expect, &spec)
+                on_edit(shared, ctx.hooks.as_ref(), &ctx.generator, id, req, x, y, z, expect, &spec)
             }
-            ClientMessage::Chat { channel, text } => {
-                on_chat(shared, ctx.hooks.as_ref(), id, channel, &text)
-            }
+            ClientMessage::Chat { channel, text } => match op_secret(&text) {
+                Some(secret) => on_op_login(shared, ctx, id, &secret),
+                None => on_chat(shared, ctx.hooks.as_ref(), id, channel, &text),
+            },
             ClientMessage::SetTime { day } => on_set_time(shared, ctx, id, day),
             ClientMessage::ModData { channel, seq, bytes } => {
                 if !channels.allow(&channel, now) {
@@ -1576,7 +1923,7 @@ fn depart(
     shared: &Arc<Mutex<State>>,
     ctx: &Ctx,
     conn: quinn::Connection,
-    out: SyncSender<Arc<[u8]>>,
+    out: Outbox,
     writer: thread::JoinHandle<()>,
     id: u32,
     name: &Arc<str>,
@@ -1615,20 +1962,17 @@ fn depart(
     println!("[-] {name} (#{id}) left ({} online)", online(shared));
 }
 
-/// Validation is a plausibility ENVELOPE, not full physics. The allowance follows
-/// the reported speed, capped at [`crate::player::MAX_SPEED`] or the declared cruise,
-/// plus [`GRAVITY_BOUND`] over the elapsed window, and at least [`MOVE_FLOOR`].
+/// Validation is a plausibility ENVELOPE, not full physics. Each player spends a
+/// distance budget ([`move_allowance`]) that refills at the envelope speed and holds
+/// at most one burst, so splitting a move into many messages gains nothing.
 /// An implausible move is not committed — the server keeps its last accepted
 /// position (which edit reach reads), and the client is snapped back with an
 /// authoritative [`ServerMessage::Position`]. `/tp` discontinuities arrive as
 /// [`ClientMessage::Teleport`] instead.
 ///
-/// Runs in two phases to keep the global lock hold minimal. Locked: commit the
-/// move, keep the grid current, diff visibility, and snapshot the recipients'
-/// senders (cheap `SyncSender` clones — one `Arc` bump each). Unlocked: the
-/// `try_send`s. `try_send` never blocks, failures land their owner on the kick
-/// list, [`kick_slow`] tolerates ids that disconnected in the unlocked window,
-/// and ids are never reused, so a late kick can't hit the wrong player.
+/// Locked: commit the move, keep the grid current, diff visibility, and queue the
+/// enter/exit frames in order without waking anyone. Unlocked: wake the writers.
+/// Poses inside range go out on the pose tick ([`broadcast_poses`]).
 /// The orientation a [`ClientMessage::Move`] reports. A teleport passes `None`
 /// and keeps whatever the handle already stored.
 struct ReportedPose {
@@ -1671,28 +2015,30 @@ fn on_move(
         return;
     }
     let mut sends = Vec::new();
-    {
+    let wake = {
         let mut state = shared.lock_recover();
         let max_speed = state.max_speed;
         // Envelope: the speed the client reports (and the one we last accepted),
         // grown by gravity over the gap, capped by the server's speed limit.
         // Cruise raises that cap only after a `Cruise` message, and only up to
         // the game's cruise ceiling unless the server cap is tighter.
-        // Outside the border is refused either way. Solid ground is tested unless
-        // this player's noclip policy allows the pass.
-        let (free, too_far, occupied, occupied_n) = {
+        // Outside the border is refused either way. Solid ground is tested along the
+        // path unless this player's noclip policy allows the pass.
+        let (free, too_far, left, from, cruising, occupied, occupied_n) = {
             let Some(h) = state.players.get(&id) else { return };
-            let free = noclip_allowed(ctx, &h.name);
+            let free = noclip_allowed(ctx, h);
             let elapsed = h.last_move.elapsed().as_secs_f64().min(MOVE_WINDOW_CAP_SECS);
-            let allowed = move_allowance(h, velocity, elapsed, max_speed);
-            let too_far = outside_world(pos) || h.pos.distance_squared(pos) > allowed * allowed;
+            let available = move_allowance(h, velocity, elapsed, max_speed);
+            let distance = h.pos.distance(pos);
+            let too_far = outside_world(pos) || distance > available;
             let mut occupied = [(0i32, 0, 0); BODY_CELL_CAP];
             let occupied_n = h.occupied.len().min(BODY_CELL_CAP);
             occupied[..occupied_n].copy_from_slice(&h.occupied[..occupied_n]);
-            (free, too_far, occupied, occupied_n)
+            (free, too_far, available - distance, h.pos, h.cruising, occupied, occupied_n)
         };
-        let blocked =
-            !free && !too_far && body_blocked(&state, &ctx.generator, &ctx.seams, pos, stance, up, &occupied[..occupied_n]);
+        let blocked = !free
+            && !too_far
+            && move_blocked(&state, ctx, from, pos, cruising, stance, up, &occupied[..occupied_n]);
         if too_far || blocked {
             let Some(h) = state.players.get(&id) else { return };
             h.correct_position(id, &mut sends);
@@ -1704,18 +2050,22 @@ fn on_move(
                 Some(ReportedPose { yaw, pitch, frame, velocity, up, stance }),
                 &mut sends,
             );
-            if !free && let Some(h) = state.players.get_mut(&id) {
-                remember_occupied(h, pos, stance, up);
+            if let Some(h) = state.players.get_mut(&id) {
+                h.budget = left;
+                if !free {
+                    remember_occupied(h, pos, stance, up);
+                }
             }
         }
-    }
-    dispatch(shared, sends);
+        queue(&state, sends)
+    };
+    drop(wake);
 }
 
-fn noclip_allowed(ctx: &Ctx, name: &str) -> bool {
+fn noclip_allowed(ctx: &Ctx, h: &PlayerHandle) -> bool {
     match ctx.noclip {
         NoclipPolicy::All => true,
-        NoclipPolicy::Ops => is_operator(ctx, name),
+        NoclipPolicy::Ops => is_operator(ctx, h),
         NoclipPolicy::Off => false,
     }
 }
@@ -1754,31 +2104,67 @@ fn remember_occupied(h: &mut PlayerHandle, pos: DVec3, stance: Stance, up: Face)
     h.occupied.extend_from_slice(&cells[..n]);
 }
 
-/// True when a newly entered body cell is solid in the edit overlay or the generator.
-/// Cells already in `occupied` are not queried again. Cells are read the way the client's
-/// collision reads them: in storage, with a cell just past a chart's box glued to the
-/// neighbour chart's cell.
-fn body_blocked(
+/// The body's path from the last accepted pose meets solid ground. A path longer than
+/// [`SWEEP_LIMIT`] fails closed, except under cruise, whose destination alone is tested.
+#[allow(clippy::too_many_arguments)] // the move's pose fields, passed separately like on_move's
+fn move_blocked(
     state: &State,
-    generator: &crate::world::terrain::Generator,
-    seams: &Seams,
-    pos: DVec3,
+    ctx: &Ctx,
+    from: DVec3,
+    to: DVec3,
+    cruising: bool,
     stance: Stance,
     up: Face,
     occupied: &[(i32, i32, i32)],
 ) -> bool {
-    let mut cells = [(0i32, 0, 0); BODY_CELL_CAP];
-    let Some(n) = fill_body_cells(pos, stance, up, &mut cells) else {
+    let from = if from.distance(to) <= SWEEP_LIMIT {
+        from
+    } else if cruising {
+        to
+    } else {
         return true;
     };
-    for &(x, y, z) in &cells[..n] {
-        if occupied.contains(&(x, y, z)) {
-            continue;
-        }
-        let query = seams.glue_cell(BlockCoord::new(x, y, z)).map_or((x, y, z), |g| (g.x, g.y, g.z));
-        if state.registry.is_solid(server_block(state, generator, query)) {
+    body_blocked(state, &ctx.generator, &ctx.seams, from, to, stance, up, occupied)
+}
+
+/// True when the body, swept from `from` to `to` in steps of at most [`SWEEP_STEP`], newly
+/// enters a cell that is solid in the edit overlay or the generator. Each step queries only
+/// the cells the step before did not hold; the first skips `occupied`, the cells of the last
+/// accepted pose. A straight path never re-enters a cell it left, so one step back is enough.
+/// Cells are read the way the client's collision reads them: in storage, with a cell just
+/// past a chart's box glued to the neighbour chart's cell.
+#[allow(clippy::too_many_arguments)] // the move's pose fields, passed separately like on_move's
+fn body_blocked(
+    state: &State,
+    generator: &crate::world::terrain::Generator,
+    seams: &Seams,
+    from: DVec3,
+    to: DVec3,
+    stance: Stance,
+    up: Face,
+    occupied: &[(i32, i32, i32)],
+) -> bool {
+    let steps = (from.distance(to) / SWEEP_STEP).ceil().max(1.0) as u32;
+    let mut held = [(0i32, 0, 0); BODY_CELL_CAP];
+    let mut held_n = occupied.len().min(BODY_CELL_CAP);
+    held[..held_n].copy_from_slice(&occupied[..held_n]);
+    let mut cells = [(0i32, 0, 0); BODY_CELL_CAP];
+    for step in 1..=steps {
+        let at = if step == steps { to } else { from.lerp(to, f64::from(step) / f64::from(steps)) };
+        let Some(n) = fill_body_cells(at, stance, up, &mut cells) else {
             return true;
+        };
+        for &(x, y, z) in &cells[..n] {
+            if held[..held_n].contains(&(x, y, z)) {
+                continue;
+            }
+            let query = seams.glue_cell(BlockCoord::new(x, y, z)).map_or((x, y, z), |g| (g.x, g.y, g.z));
+            if state.registry.is_solid(server_block(state, generator, query)) {
+                return true;
+            }
         }
+        std::mem::swap(&mut held, &mut cells);
+        held_n = n;
     }
     false
 }
@@ -1787,13 +2173,14 @@ fn body_blocked(
 /// teleport is over its budget: the client still gets an answer.
 fn refuse_move(shared: &Arc<Mutex<State>>, id: u32) {
     let mut sends = Vec::new();
-    {
+    let wake = {
         let state = shared.lock_recover();
         if let Some(h) = state.players.get(&id) {
             h.correct_position(id, &mut sends);
         }
-    }
-    dispatch(shared, sends);
+        queue(&state, sends)
+    };
+    drop(wake);
 }
 
 fn speed_of(v: Vec3) -> f64 {
@@ -1819,13 +2206,17 @@ fn move_cap(h: &PlayerHandle, max_speed: f64) -> f64 {
     }
 }
 
-/// Blocks the client may have covered since `last_move`. `reported` is a cap
-/// input, not a grant: a cruise declaration does nothing until the velocity
-/// the client reports (bounded by that declaration) justifies the hop.
+/// Distance this move may cover: the banked budget, at most one burst, plus what `elapsed`
+/// refills at the envelope speed. That speed is the reported one (or the last accepted one)
+/// grown by gravity over the gap, capped by [`move_cap`]. `reported` is a cap input, not a
+/// grant: a cruise declaration does nothing until the velocity the client reports (bounded by
+/// that declaration) justifies the hop. The burst is [`MOVE_FLOOR`], or [`MOVE_SLACK_SECS`] at
+/// that speed when larger, so over any window the total stays within one burst plus the
+/// speed times the window, however the client splits it.
 fn move_allowance(h: &PlayerHandle, reported: Vec3, elapsed: f64, max_speed: f64) -> f64 {
     let cap = move_cap(h, max_speed);
     let speed = cap.min(speed_of(reported).max(speed_of(h.velocity)) + GRAVITY_BOUND * elapsed);
-    MOVE_FLOOR.max(speed * (elapsed + MOVE_SLACK_SECS))
+    h.budget.min(MOVE_FLOOR.max(speed * MOVE_SLACK_SECS)) + speed * elapsed
 }
 
 fn clamp_velocity(v: Vec3, cap: f64) -> Vec3 {
@@ -1864,12 +2255,12 @@ fn on_teleport(shared: &Arc<Mutex<State>>, ctx: &Ctx, id: u32, pos: DVec3) {
         return;
     }
     let mut sends = Vec::new();
-    {
+    let wake = {
         let mut state = shared.lock_recover();
         let Some(h) = state.players.get(&id) else { return };
         let allowed = match ctx.teleport {
             TeleportPolicy::All => true,
-            TeleportPolicy::Ops => is_operator(ctx, &h.name),
+            TeleportPolicy::Ops => is_operator(ctx, h),
             TeleportPolicy::Off => false,
         };
         if outside_world(pos) || !allowed {
@@ -1886,12 +2277,16 @@ fn on_teleport(shared: &Arc<Mutex<State>>, ctx: &Ctx, id: u32, pos: DVec3) {
             commit_pose(&mut state, id, pos, None, &mut sends);
             // Echo so a client with an in-flight `/tp` can tell accept from a
             // stale movement snap-back: the last Position is the committed pose.
-            if let Some(h) = state.players.get(&id) {
+            // The destination's cells are the held ones the next swept move starts from.
+            if let Some(h) = state.players.get_mut(&id) {
                 h.correct_position(id, &mut sends);
+                let (stance, up) = (h.stance, h.up);
+                remember_occupied(h, pos, stance, up);
             }
         }
-    }
-    dispatch(shared, sends);
+        queue(&state, sends)
+    };
+    drop(wake);
 }
 
 fn tell(h: &PlayerHandle, id: u32, text: &str, sends: &mut Vec<PendingSend>) {
@@ -1906,12 +2301,13 @@ fn tell(h: &PlayerHandle, id: u32, text: &str, sends: &mut Vec<PendingSend>) {
     }
     .encode()
     .into();
-    sends.push((id, h.out.clone(), frame));
+    sends.push((id, frame));
 }
 
 /// Must run under the state lock; the queued sends go out after it drops.
 /// Peers entering/leaving range get both sides' poses/[`PeerExited`], so
-/// nobody keeps drawing a frozen ghost.
+/// nobody keeps drawing a frozen ghost. Later poses go out on the pose tick
+/// ([`broadcast_poses`]).
 ///
 /// [`PeerExited`]: ServerMessage::PeerExited
 fn commit_pose(
@@ -1922,8 +2318,10 @@ fn commit_pose(
     sends: &mut Vec<PendingSend>,
 ) {
     let max_speed = state.max_speed;
+    let tick = state.tick;
     let Some(h) = state.players.get_mut(&id) else { return };
     let old = h.pos;
+    let before = (h.pos, h.yaw, h.pitch, h.frame, h.velocity, h.up, h.stance);
     h.pos = pos;
     if let Some(r) = reported {
         let cap = move_cap(h, max_speed);
@@ -1935,78 +2333,71 @@ fn commit_pose(
         h.stance = r.stance;
     }
     h.last_move = Instant::now();
-    let (yaw, pitch, frame, velocity, up, stance) = (h.yaw, h.pitch, h.frame, h.velocity, h.up, h.stance);
+    if before != (h.pos, h.yaw, h.pitch, h.frame, h.velocity, h.up, h.stance) {
+        h.moved = tick;
+        h.body = PoseBody::new(h.yaw, h.pitch, h.frame, h.velocity, h.up, h.stance);
+    }
+    let body = h.body;
     let (from, to) = (bucket_of(old), bucket_of(pos));
     if from != to {
         state.grid_remove(id, old);
         state.grid_insert(id, pos);
     }
     // Set membership keeps the visibility diff linear in the nearby player count.
-    let now_visible = state.visible_from(id, pos);
-    let mover_out = state.players[&id].out.clone();
-    let departed: Vec<u32> = state.players[&id]
-        .visible
-        .difference(&now_visible)
-        .copied()
-        .collect();
-    for pid in departed {
-        state.players.get_mut(&id).map(|h| h.visible.remove(&pid));
-        if let Some(other) = state.players.get_mut(&pid) {
+    let Scratch { mut near, mut gone, mut fresh } = std::mem::take(&mut state.scratch);
+    state.visible_from(id, pos, &mut near);
+    {
+        let mover = &state.players[&id];
+        gone.clear();
+        gone.extend(mover.visible.iter().filter(|pid| !near.contains(*pid)));
+        fresh.clear();
+        fresh.extend(near.iter().filter(|pid| !mover.visible.contains(*pid)));
+    }
+    if !gone.is_empty() || !fresh.is_empty() {
+        for &pid in &gone {
+            let Some(other) = state.players.get_mut(&pid) else { continue };
             other.visible.remove(&id);
-            sends.push((
-                pid,
-                other.out.clone(),
-                ServerMessage::PeerExited { id }.encode().into(),
-            ));
-            sends.push((
-                id,
-                mover_out.clone(),
-                ServerMessage::PeerExited { id: pid }.encode().into(),
-            ));
+            sends.push((pid, ServerMessage::PeerExited { id }.encode().into()));
+            sends.push((id, ServerMessage::PeerExited { id: pid }.encode().into()));
         }
-    }
-    // An arriving peer needs the mover's pose AND the mover needs theirs, or
-    // the mover keeps hiding them until they next move.
-    if now_visible.is_empty() {
-        return;
-    }
-    let move_frame: Arc<[u8]> =
-        ServerMessage::PeerMove { id, pos, yaw, pitch, frame, velocity, up, stance }.encode().into();
-    for pid in now_visible {
-        let entered = !state.players[&id].visible.contains(&pid);
-        let Some(other) = state.players.get_mut(&pid) else { continue };
-        sends.push((pid, other.out.clone(), move_frame.clone()));
-        if entered {
+        // An arriving peer needs the mover's pose AND the mover needs theirs, or
+        // the mover keeps hiding them until they next move.
+        for &pid in &fresh {
+            let Some(other) = state.players.get_mut(&pid) else { continue };
             other.visible.insert(id);
-            let pose = ServerMessage::PeerMove {
-                id: pid,
-                pos: other.pos,
-                yaw: other.yaw,
-                pitch: other.pitch,
-                frame: other.frame,
-                velocity: other.velocity,
-                up: other.up,
-                stance: other.stance,
-            };
-            sends.push((id, mover_out.clone(), pose.encode().into()));
-            if let Some(h) = state.players.get_mut(&id) {
-                h.visible.insert(pid);
+            sends.push((pid, PosesWriter::single(other.pos, id, &body, pos)));
+            sends.push((id, PosesWriter::single(pos, pid, &other.body, other.pos)));
+        }
+        if let Some(h) = state.players.get_mut(&id) {
+            for pid in &gone {
+                h.visible.remove(pid);
             }
+            h.visible.extend(fresh.iter().copied());
         }
     }
+    state.scratch = Scratch { near, gone, fresh };
 }
 
-/// A full (or hung-up) queue marks its owner for the kick pass.
-fn dispatch(shared: &Arc<Mutex<State>>, sends: Vec<PendingSend>) {
+/// Queue `sends` in order under the state lock, so no frame overtakes a state change
+/// queued before it. A full queue marks its owner for the kick pass. The returned
+/// [`Wake`] wakes the writers once the caller has dropped the guard.
+fn queue(state: &State, sends: Vec<PendingSend>) -> Wake {
     let mut slow = Vec::new();
-    for (pid, out, frame) in sends {
-        if out.try_send(frame).is_err() && !slow.contains(&pid) {
-            slow.push(pid);
+    let mut wake = Vec::with_capacity(sends.len());
+    for (pid, frame) in sends {
+        let Some(h) = state.players.get(&pid) else { continue };
+        match h.out.push(frame) {
+            Ok(()) => wake.push(h.out.writer.clone()),
+            Err(TrySendError::Full(_)) => {
+                if !slow.contains(&pid) {
+                    slow.push(pid);
+                }
+            }
+            Err(TrySendError::Disconnected(_)) => {}
         }
     }
-    if !slow.is_empty() {
-        kick_slow(&shared.lock_recover(), &slow);
-    }
+    kick_slow(state, &slow);
+    Wake(wake)
 }
 
 /// Novel specs intern only while `block_count()` is below `limit`. A known spec resolves
@@ -2051,7 +2442,9 @@ fn take_novel_spec(state: &mut State, id: u32, spec: &str) -> Option<BlockId> {
 /// revision, installed [`ServerMod::validate_edit`] hooks, the revision again,
 /// then — only if it is still the winner — interning a novel spec under the
 /// per-client quota and the world's reserve. A stale novel spec never enters
-/// the registry. When two players race one cell, the loser rolls back.
+/// the registry. When two players race one cell, the loser rolls back. An edit that
+/// puts back the generated block is a [`Cell::natural`] entry: it keeps the revision
+/// but stays out of the world file, so no-op edits cannot grow it.
 ///
 /// A hook [`Verdict::Deny`] uses this same reject path (no ledger write, one
 /// `EditAck { accepted: false }`, no broadcast), so the client's
@@ -2059,13 +2452,14 @@ fn take_novel_spec(state: &mut State, id: u32, spec: &str) -> Option<BlockId> {
 /// on the cell — identical to a lost race.
 ///
 /// Hook bodies run **outside** the [`State`] lock: facts are collected under
-/// it, the lock is dropped, then the table is called. With no hooks installed
-/// the lock is never dropped, matching the pre-seam path.
+/// it, the lock is dropped, then the table is called. The generated block, when
+/// the terrain cache does not hold it, is read the same way; the revision is
+/// checked again after either.
 #[allow(clippy::too_many_arguments)] // edit validation takes each protocol field separately
 fn on_edit(
     shared: &Arc<Mutex<State>>,
     hooks: Option<&Mutex<hooks::Table>>,
-    atlases: &[Arc<crate::space::atlas::Atlas>],
+    generator: &crate::world::terrain::Generator,
     id: u32,
     req: u32,
     x: i32,
@@ -2079,7 +2473,7 @@ fn on_edit(
     let ack_to = h.ready.then(|| h.out.clone());
     // Cloned before the registry mut-borrow; skipped when no hooks are installed.
     let name = hooks.is_some().then(|| h.name.clone());
-    let reject = |state: &State, out: Option<&SyncSender<Arc<[u8]>>>| {
+    let reject = |state: &State, out: Option<&Outbox>| {
         let rev = state.edits.get(&(x, y, z)).map_or(0, |c| c.rev);
         if let Some(out) = out {
             let _ = out.try_send(
@@ -2092,7 +2486,7 @@ fn on_edit(
     // playable border are still reach-checked (a player AT the border can
     // mine the slack column) but a forged i32::MAX coord is out of reach.
     // A round world's storage cell is judged where its chart embeds it.
-    let target = crate::space::atlas::embed_cell(atlases, (x, y, z))
+    let target = crate::space::atlas::embed_cell(generator.atlases(), (x, y, z))
         .unwrap_or(DVec3::new(x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5));
     if spec.len() > MAX_SPEC || h.pos.distance(target) > EDIT_REACH {
         return reject(&state, ack_to.as_ref());
@@ -2106,6 +2500,21 @@ fn on_edit(
     if expect != current {
         return reject(&state, ack_to.as_ref());
     }
+    // The generated block says whether the edit is natural. A generator read can take
+    // a while, so a cache miss reads it with the lock released, as the hooks do below.
+    let generated = match state.terrain.peek((x, y, z)) {
+        Some(block) => block,
+        None => {
+            drop(state);
+            let block = generator.voxel_at(x, y, z);
+            state = shared.lock_recover();
+            if !state.players.contains_key(&id) {
+                return;
+            }
+            state.terrain.store((x, y, z), block);
+            block
+        }
+    };
     if let (Some(hooks), Some(name)) = (hooks, name) {
         let intent = EditIntent {
             player: id,
@@ -2140,7 +2549,8 @@ fn on_edit(
     let Some(spec) = state.intern(&canonical) else {
         return reject(&state, ack_to.as_ref()); // pool at cap: refuse new content
     };
-    if let Some(old) = state.edits.insert((x, y, z), Cell { spec: spec.clone(), rev }) {
+    let natural = block == generated;
+    if let Some(old) = state.edits.insert((x, y, z), Cell { block, spec: spec.clone(), rev, natural }) {
         state.release(old.spec);
     }
     // Placed or removed: the cell's contacts wake.
@@ -2151,7 +2561,9 @@ fn on_edit(
     }
     // The broadcast carries the SAME pooled Arc the ledger stores.
     let msg = ServerMessage::Edit { x, y, z, rev, spec };
-    broadcast(&mut state, &msg, |pid, _| pid != id);
+    let wake = broadcast(&mut state, &msg, |pid, _| pid != id);
+    drop(state);
+    drop(wake);
 }
 
 /// Answer a tool use with "nothing happened": the cell's current content and the tool unchanged.
@@ -2224,13 +2636,15 @@ fn on_tool_use(
         return reply(&state, false, current, unchanged);
     };
     let rev = current + 1;
-    if let Some(old) = state.edits.insert(pos, Cell { spec: spec.clone(), rev }) {
+    if let Some(old) = state.edits.insert(pos, Cell { block: new_cell, spec: spec.clone(), rev, natural: false }) {
         state.release(old.spec);
     }
     state.reactions.wake_cell(pos);
     let tool_out: Arc<str> = state.registry.spec(new_tool).into();
     reply(&state, true, rev, tool_out);
-    broadcast(&mut state, &ServerMessage::Edit { x, y, z, rev, spec }, |pid, _| pid != id);
+    let wake = broadcast(&mut state, &ServerMessage::Edit { x, y, z, rev, spec }, |pid, _| pid != id);
+    drop(state);
+    drop(wake);
 }
 
 /// A [`Verdict::Deny`] drops the broadcast and delivers `reason` only to the
@@ -2284,9 +2698,39 @@ fn on_chat(
     }
     println!("<{from_name}> {text}");
     let msg = ServerMessage::Chat { from_id: id, from_name, channel, text };
-    broadcast(&mut state, &msg, |_, h| {
+    let wake = broadcast(&mut state, &msg, |_, h| {
         channel == chat::GLOBAL || h.pos.distance(origin) <= chat::RADIUS
     });
+    drop(state);
+    drop(wake);
+}
+
+/// The secret of a `/op <secret>` chat line. Such a line is never relayed, logged, or shown to hooks.
+fn op_secret(text: &str) -> Option<Arc<str>> {
+    let text = clean_chat(text);
+    let rest = text.strip_prefix("/op")?;
+    (rest.is_empty() || rest.starts_with(char::is_whitespace)).then(|| rest.trim().into())
+}
+
+/// An operator listed with a secret proves it. Either way only the sender hears the answer.
+fn on_op_login(shared: &Arc<Mutex<State>>, ctx: &Ctx, id: u32, secret: &str) {
+    let mut sends = Vec::new();
+    let wake = {
+        let mut state = shared.lock_recover();
+        let Some(h) = state.players.get_mut(&id) else { return };
+        let proved = !secret.is_empty()
+            && ctx.op_secrets.iter().any(|(name, want)| name.eq_ignore_ascii_case(&h.name) && want == secret);
+        h.op |= proved;
+        let (reply, log) = if proved {
+            ("you are now an operator", "is now an operator")
+        } else {
+            ("operator secret refused", "sent a wrong operator secret")
+        };
+        println!("[op] {} (#{id}) {log}", h.name);
+        tell(h, id, reply, &mut sends);
+        queue(&state, sends)
+    };
+    drop(wake);
 }
 
 /// Channel traffic is loss-tolerant: `try_send` and DROP on a full/closed queue,
@@ -2300,15 +2744,27 @@ fn on_mod_data(
     seq: u32,
     bytes: protocol::ModBytes,
 ) {
-    let frame: Arc<[u8]> =
-        ServerMessage::PeerModData { channel, sender: id, seq, bytes }.encode().into();
-    let state = shared.lock_recover();
-    let Some(speaker) = state.players.get(&id) else { return };
-    for &pid in &speaker.visible {
-        if let Some(other) = state.players.get(&pid) && other.ready {
-            let _ = other.out.try_send(frame.clone());
+    relay(shared, id, ServerMessage::PeerModData { channel, sender: id, seq, bytes }.encode().into());
+}
+
+/// Loss-tolerant: `frame` reaches `from`'s visible, ready peers, and a full queue drops
+/// it without a kick. The writers wake after the lock is released.
+fn relay(shared: &Arc<Mutex<State>>, from: u32, frame: Arc<[u8]>) {
+    let wake = {
+        let state = shared.lock_recover();
+        let Some(speaker) = state.players.get(&from) else { return };
+        let mut wake = Vec::with_capacity(speaker.visible.len());
+        for &pid in &speaker.visible {
+            if let Some(other) = state.players.get(&pid)
+                && other.ready
+                && other.out.push(Arc::clone(&frame)).is_ok()
+            {
+                wake.push(other.out.writer.clone());
+            }
         }
-    }
+        Wake(wake)
+    };
+    drop(wake);
 }
 
 /// Anchors the shared clock so joiners inherit the CURRENT time. A non-finite
@@ -2323,27 +2779,43 @@ fn on_set_time(shared: &Arc<Mutex<State>>, ctx: &Ctx, id: u32, day: f32) {
     {
         let mut state = shared.lock_recover();
         let Some(h) = state.players.get(&id) else { return };
-        if !is_operator(ctx, &h.name) {
+        if !is_operator(ctx, h) {
             tell(h, id, "only an operator can set the time", &mut sends);
+            let wake = queue(&state, sends);
             drop(state);
-            dispatch(shared, sends);
+            drop(wake);
             return;
         }
         state.day = day;
         state.day_set = Instant::now();
-        broadcast(&mut state, &ServerMessage::Time { day, day_secs: ctx.day_secs }, |_, _| true);
+        let wake = broadcast(&mut state, &ServerMessage::Time { day, day_secs: ctx.day_secs }, |_, _| true);
+        drop(state);
+        drop(wake);
     }
 }
 
 /// Encodes `msg` just once for every recipient. Players whose queue is full
 /// are force-closed (they've fallen too far behind).
-fn broadcast(state: &mut State, msg: &ServerMessage, want: impl Fn(u32, &PlayerHandle) -> bool) {
+/// Frames are queued under the lock, in order; the returned [`Wake`] wakes the
+/// writers, after the lock is released when the caller drops the guard first.
+fn broadcast(state: &mut State, msg: &ServerMessage, want: impl Fn(u32, &PlayerHandle) -> bool) -> Wake {
     let joined = match msg {
         ServerMessage::PeerJoined { id, .. } => Some(*id),
         _ => None,
     };
-    let frame: Arc<[u8]> = msg.encode().into();
+    broadcast_frame(state, msg.encode().into(), joined, want)
+}
+
+/// [`broadcast`] of an encoded frame. `joined` is the peer a `PeerJoined` frame
+/// announces, so each player hears it once.
+fn broadcast_frame(
+    state: &mut State,
+    frame: Arc<[u8]>,
+    joined: Option<u32>,
+    want: impl Fn(u32, &PlayerHandle) -> bool,
+) -> Wake {
     let mut slow = Vec::new();
+    let mut wake = Vec::new();
     for (&pid, h) in state.players.iter_mut() {
         if !want(pid, h) {
             continue;
@@ -2360,18 +2832,21 @@ fn broadcast(state: &mut State, msg: &ServerMessage, want: impl Fn(u32, &PlayerH
             }
             continue;
         }
-        match h.out.try_send(frame.clone()) {
-            Ok(()) => {}
+        match h.out.push(frame.clone()) {
+            Ok(()) => wake.push(h.out.writer.clone()),
             Err(TrySendError::Full(_)) => slow.push(pid),
             Err(TrySendError::Disconnected(_)) => {}
         }
     }
     kick_slow(state, &slow);
+    Wake(wake)
 }
 
 fn broadcast_all(shared: &Arc<Mutex<State>>, msg: &ServerMessage, except: Option<u32>) {
     let mut state = shared.lock_recover();
-    broadcast(&mut state, msg, |pid, _| Some(pid) != except);
+    let wake = broadcast(&mut state, msg, |pid, _| Some(pid) != except);
+    drop(state);
+    drop(wake);
 }
 
 /// Force-close clients that couldn't keep up. Their reader threads then wake, error,
@@ -2388,83 +2863,66 @@ fn kick_slow(state: &State, ids: &[u32]) {
     }
 }
 
-/// Queue `frame` for a player who is not ready yet. False when an essential
-/// frame still does not fit after cosmetic frames have been dropped.
+/// Queue `frame` for a player who is not ready yet. False when an essential frame
+/// does not fit after cosmetic frames have been dropped, when an essential frame has
+/// waited past [`BACKLOG_AGE`], or when the player is already kicked.
 fn enqueue_backlog(h: &mut PlayerHandle, frame: Arc<[u8]>, now: Instant) -> bool {
-    trim_aged(h, now);
-    if let Some(subject) = protocol::peer_move_id(&frame) {
-        drop_peer_moves(h, subject);
+    if h.kicked.load(Ordering::Relaxed) || !trim_aged(h, now) {
+        return false;
     }
-    let swing = protocol::is_peer_swing(&frame);
+    let cosmetic = protocol::is_cosmetic(&frame);
     while h.backlog_bytes + frame.len() > BACKLOG_BYTES {
-        if !drop_oldest_swing(h) {
-            if swing {
-                return true;
-            }
-            return false;
+        if !drop_oldest_cosmetic(h) {
+            return cosmetic;
         }
     }
     h.backlog_bytes += frame.len();
-    h.backlog.push(Queued { at: now, frame });
+    h.backlog.push_back(Queued { at: now, frame });
     true
 }
 
-fn trim_aged(h: &mut PlayerHandle, now: Instant) {
-    let mut index = 0;
-    while index < h.backlog.len() {
-        if now.saturating_duration_since(h.backlog[index].at) >= BACKLOG_AGE {
-            h.backlog_bytes = h.backlog_bytes.saturating_sub(h.backlog[index].frame.len());
-            h.backlog.remove(index);
-        } else {
-            index += 1;
+/// Drop frames older than [`BACKLOG_AGE`]. The backlog is in time order, so only the front
+/// is read. False when an aged frame is essential: dropping it would desync the joiner.
+fn trim_aged(h: &mut PlayerHandle, now: Instant) -> bool {
+    while let Some(front) = h.backlog.front()
+        && now.saturating_duration_since(front.at) >= BACKLOG_AGE
+    {
+        if !protocol::is_cosmetic(&front.frame) {
+            return false;
         }
+        let len = front.frame.len();
+        h.backlog_bytes = h.backlog_bytes.saturating_sub(len);
+        h.backlog.pop_front();
     }
+    true
 }
 
-fn drop_peer_moves(h: &mut PlayerHandle, subject: u32) {
-    let mut index = 0;
-    while index < h.backlog.len() {
-        if protocol::peer_move_id(&h.backlog[index].frame) == Some(subject) {
-            h.backlog_bytes = h.backlog_bytes.saturating_sub(h.backlog[index].frame.len());
-            h.backlog.remove(index);
-        } else {
-            index += 1;
-        }
-    }
-}
-
-fn drop_oldest_swing(h: &mut PlayerHandle) -> bool {
-    let Some(index) = h.backlog.iter().position(|queued| protocol::is_peer_swing(&queued.frame)) else {
+fn drop_oldest_cosmetic(h: &mut PlayerHandle) -> bool {
+    let Some(index) = h.backlog.iter().position(|queued| protocol::is_cosmetic(&queued.frame)) else {
         return false;
     };
-    h.backlog_bytes = h.backlog_bytes.saturating_sub(h.backlog[index].frame.len());
-    h.backlog.remove(index);
+    if let Some(queued) = h.backlog.remove(index) {
+        h.backlog_bytes = h.backlog_bytes.saturating_sub(queued.frame.len());
+    }
     true
 }
 
 /// Swing relay: the swinger's visible set, same as voice. A full queue drops
 /// the frame; a swing is cosmetic and never a kick.
 fn relay_swing(shared: &Arc<Mutex<State>>, id: u32) {
-    let frame: Arc<[u8]> = ServerMessage::PeerSwing { id }.encode().into();
-    let state = shared.lock_recover();
-    let Some(swinger) = state.players.get(&id) else { return };
-    for &pid in &swinger.visible {
-        if let Some(other) = state.players.get(&pid) && other.ready {
-            let _ = other.out.try_send(Arc::clone(&frame));
-        }
-    }
+    relay(shared, id, ServerMessage::PeerSwing { id }.encode().into());
 }
 
 /// Welcome, the edit overlay, [`ServerMessage::SnapshotEnd`], the clock, and
 /// the roster. False when a send misses its deadline or the player was kicked.
 fn send_join(
-    out: &SyncSender<Arc<[u8]>>,
+    out: &Outbox,
     kicked: &AtomicBool,
     shared: &Arc<Mutex<State>>,
     ctx: &Ctx,
     id: u32,
     spawn: DVec3,
-    snapshot: &[(i32, i32, i32, u32, Arc<str>)],
+    overlay: Overlay,
     existing: &[(u32, Arc<str>)],
 ) -> bool {
     if !send_blocking(
@@ -2481,13 +2939,25 @@ fn send_join(
     ) {
         return false;
     }
-    let mut ok = true;
-    for_snapshot_batches(snapshot, |batch| {
-        if ok && !send_blocking(out, kicked, &ServerMessage::Snapshot { edits: batch.to_vec() }) {
-            ok = false;
+    let Overlay { mut cells, specs } = overlay;
+    // Chunk by chunk, so the coordinate deltas stay small.
+    cells.sort_unstable_by_key(|&(x, y, z, _, _)| (x >> 4, z >> 4, y >> 4, x, z, y));
+    let failed = std::cell::Cell::new(false);
+    let mut emit = |frame| {
+        if !failed.get() && !send_until(out, kicked, frame, Instant::now() + SEND_DEADLINE) {
+            failed.set(true);
         }
-    });
-    if !ok || !send_blocking(out, kicked, &ServerMessage::SnapshotEnd) {
+    };
+    let mut writer = SnapshotWriter::new();
+    for &(x, y, z, rev, block) in &cells {
+        let spec = specs.get(usize::from(block.0)).and_then(|s| s.as_deref()).unwrap_or("air");
+        writer.push((x, y, z), rev, block.0, spec, &mut emit);
+        if failed.get() {
+            return false;
+        }
+    }
+    writer.finish(&mut emit);
+    if failed.get() || !send_blocking(out, kicked, &ServerMessage::SnapshotEnd) {
         return false;
     }
     // Read the clock at send time. A snapshot of a built-up world can take long
@@ -2507,11 +2977,11 @@ fn send_join(
 /// Only safe on the receiving client's own handler thread (used for the join
 /// bootstrap, which must not drop frames). Returns false when `kicked` is set,
 /// the queue is gone, or [`SEND_DEADLINE`] passes.
-fn send_blocking(out: &SyncSender<Arc<[u8]>>, kicked: &AtomicBool, msg: &ServerMessage) -> bool {
+fn send_blocking(out: &Outbox, kicked: &AtomicBool, msg: &ServerMessage) -> bool {
     send_until(out, kicked, msg.encode().into(), Instant::now() + SEND_DEADLINE)
 }
 
-fn send_until(out: &SyncSender<Arc<[u8]>>, kicked: &AtomicBool, frame: Arc<[u8]>, deadline: Instant) -> bool {
+fn send_until(out: &Outbox, kicked: &AtomicBool, frame: Arc<[u8]>, deadline: Instant) -> bool {
     loop {
         if kicked.load(Ordering::Relaxed) {
             return false;
@@ -2541,11 +3011,11 @@ fn reject(rt: &Runtime, send: &mut SendStream, conn: &quinn::Connection, reason:
         let _ = send.finish();
         let _ = tokio::time::timeout(REJECT_DRAIN, conn.closed()).await;
     });
-    println!("[x] rejected a connection: {reason}");
+    println!("[x] rejected a connection: {}", console_text(reason));
 }
 
 fn deny_mods(rt: &Runtime, send: &mut SendStream, conn: &quinn::Connection, ids: Vec<Arc<str>>) {
-    let listed = ids.iter().map(|id| id.as_ref()).collect::<Vec<_>>().join(", ");
+    let listed = ids.iter().map(|id| console_text(id)).collect::<Vec<_>>().join(", ");
     rt.block_on(async {
         let _ = protocol::write_frame_async(send, &ServerMessage::ModsDenied { ids }.encode()).await;
         let _ = send.finish();
@@ -2592,6 +3062,25 @@ fn clean_name(raw: &str) -> Arc<str> {
 
 fn clean_chat(raw: &str) -> Arc<str> {
     raw.chars().filter(|c| !c.is_control()).take(MAX_CHAT).collect::<String>().trim().into()
+}
+
+/// Peer text for the server console with control characters escaped, so a peer
+/// cannot drive the operator's terminal.
+fn console_text(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for c in raw.chars() {
+        if c.is_control() {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The server's own chat name: any name whose letters and digits alone spell "server".
+fn reserved_name(name: &str) -> bool {
+    name.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).eq("server".chars())
 }
 
 #[cfg(test)]
@@ -2643,7 +3132,7 @@ mod tests {
     /// A roster entry for direct state tests. `last_move` starts well in the
     /// past so the first envelope window is at its cap (a fresh anchor allows
     /// only ~30 world units); tests re-age it between deliberate big moves.
-    fn test_player(pos: DVec3, out: SyncSender<Arc<[u8]>>, kick: Arc<Notify>) -> PlayerHandle {
+    fn test_player(pos: DVec3, tx: SyncSender<Arc<[u8]>>, kick: Arc<Notify>) -> PlayerHandle {
         PlayerHandle {
             name: "p".into(),
             pos,
@@ -2654,19 +3143,30 @@ mod tests {
             up: Face::PosY,
             stance: Stance::Standing,
             last_move: Instant::now() - Duration::from_secs(10),
-            visible: HashSet::new(),
-            out,
+            budget: MOVE_FLOOR,
+            op: false,
+            visible: HashSet::default(),
+            body: PoseBody::new(0.0, 0.0, DQuat::IDENTITY, Vec3::ZERO, Face::PosY, Stance::Standing),
+            moved: 0,
+            out: Outbox { tx: Some(tx), writer: Arc::default() },
             kick,
             ready: true,
-            backlog: Vec::new(),
+            backlog: VecDeque::new(),
             backlog_bytes: 0,
             kicked: Arc::new(AtomicBool::new(false)),
             occupied: Vec::new(),
             cruising: false,
             cruise_speed: 0.0,
             novel: 0,
-            announced: HashSet::new(),
+            announced: HashSet::default(),
         }
+    }
+
+    /// A world with no charts, so an edit's reach is judged at the cell itself.
+    fn chartless() -> &'static crate::world::terrain::Generator {
+        use std::sync::OnceLock;
+        static FLAT: OnceLock<crate::world::terrain::Generator> = OnceLock::new();
+        FLAT.get_or_init(|| Arc::new(crate::world::generation::FlatTerrain::new(&mut BlockRegistry::with_builtins(), 1)))
     }
 
     /// Noclip is open, so movement-envelope tests do not build a collision world
@@ -2757,12 +3257,16 @@ mod tests {
             edits: HashMap::new(),
             spec_pool: HashMap::new(),
             registry,
-            players,
+            players: players.into_iter().collect(),
             grid: HashMap::new(),
             next_id: 2,
             day: 0.3,
             day_set: Instant::now(),
             reactions: ReactionScheduler::new(),
+            tick: 1,
+            poses: PosesWriter::new(),
+            scratch: Scratch::default(),
+            terrain: TerrainCache::new(),
             max_speed: crate::player::MAX_SPEED,
             panic_tick: false,
         }
@@ -2790,6 +3294,7 @@ mod tests {
             generator: test_generator(),
             hooks: None,
             ops: Vec::new(),
+            op_secrets: Vec::new(),
             mods_allow: Vec::new(),
             mods_deny: Vec::new(),
             store: None,
@@ -2832,7 +3337,7 @@ mod tests {
         let (a, e) = crate::sim::reactions::destructive_pair(&mut state.registry);
         let (sa, se) = (state.registry.spec(a), state.registry.spec(e));
         let spec = state.intern(&sa).unwrap();
-        state.edits.insert(cell, Cell { spec, rev: 1 });
+        state.edits.insert(cell, Cell { block: a, spec, rev: 1, natural: false });
         (sa, se)
     }
 
@@ -2894,8 +3399,8 @@ mod tests {
         let mut state = test_state(players);
         let rock = state.registry.lookup_spec(&rock_spec()).or_else(|| state.registry.parse_spec(&rock_spec())).unwrap();
         let spec = state.intern(&state.registry.spec(rock)).unwrap();
-        state.edits.insert((1, 2, 3), Cell { spec: spec.clone(), rev: 2 });
-        state.edits.insert((4, 5, 6), Cell { spec, rev: 1 });
+        state.edits.insert((1, 2, 3), Cell { block: rock, spec: spec.clone(), rev: 2, natural: false });
+        state.edits.insert((4, 5, 6), Cell { block: rock, spec, rev: 1, natural: false });
         let muts = [
             Mutation { pos: (1, 2, 3), from: AIR, to: rock },
             Mutation { pos: (4, 5, 6), from: AIR, to: rock },
@@ -2918,12 +3423,12 @@ mod tests {
         players.insert(1u32, test_player(DVec3::new(8.5, 20.0, 8.5), out, test_kick()));
         let shared = Arc::new(Mutex::new(test_state(players)));
         let rock = rock_spec();
-        on_edit(&shared, None, &[], 1, 1, 8, 20, 8, 0, &rock);
+        on_edit(&shared, None, chartless(), 1, 1, 8, 20, 8, 0, &rock);
         {
             let state = shared.lock_recover();
             assert_eq!(state.reactions.pending(), 6, "a placement wakes the cell's six contacts");
         }
-        on_edit(&shared, None, &[], 1, 2, 8, 20, 8, 1, "air");
+        on_edit(&shared, None, chartless(), 1, 2, 8, 20, 8, 1, "air");
         let state = shared.lock_recover();
         assert_eq!(state.reactions.pending(), 6, "a removal wakes the same six (deduplicated)");
     }
@@ -2975,8 +3480,8 @@ mod tests {
         players.insert(1u32, test_player(DVec3::new(8.5, 20.0, 8.5), out, test_kick()));
         let shared = Arc::new(Mutex::new(test_state(players)));
 
-        on_edit(&shared, None, &[], 1, 1, 500, 20, 500, 0, "air"); // far away: rejected
-        on_edit(&shared, None, &[], 1, 2, 8, 20, 8, 0, "air"); // in reach: recorded
+        on_edit(&shared, None, chartless(), 1, 1, 500, 20, 500, 0, "air"); // far away: rejected
+        on_edit(&shared, None, chartless(), 1, 2, 8, 20, 8, 0, "air"); // in reach: recorded
 
         let state = shared.lock_recover();
         assert!(state.edits.contains_key(&(8, 20, 8)), "in-reach edit recorded");
@@ -3032,7 +3537,7 @@ mod tests {
             other => panic!("expected a Position snap-back, got {other:?}"),
         }
         // ...so the follow-up edit at the forged position stays out of reach.
-        on_edit(&shared, None, &[], 1, 7, 4000, 20, 4000, 0, "air");
+        on_edit(&shared, None, chartless(), 1, 7, 4000, 20, 4000, 0, "air");
         assert!(!shared.lock_recover().edits.contains_key(&(4000, 20, 4000)));
 
         // Outside the world border: rejected no matter how slow.
@@ -3084,21 +3589,21 @@ mod tests {
         };
 
         // First break wins at revision 1.
-        on_edit(&shared, None, &[], 1, 10, 8, 20, 8, 0, "air");
+        on_edit(&shared, None, chartless(), 1, 10, 8, 20, 8, 0, "air");
         assert_eq!(ack(&rx), (10, true, 1));
 
         // The racing loser expected revision 0 and is rejected — exactly one
         // reward, and its ack is the rollback signal.
-        on_edit(&shared, None, &[], 1, 11, 8, 20, 8, 0, "air");
+        on_edit(&shared, None, chartless(), 1, 11, 8, 20, 8, 0, "air");
         assert_eq!(ack(&rx), (11, false, 1));
 
         // Building on the current revision succeeds.
         let rock = rock_spec();
-        on_edit(&shared, None, &[], 1, 12, 8, 20, 8, 1, &rock);
+        on_edit(&shared, None, chartless(), 1, 12, 8, 20, 8, 1, &rock);
         assert_eq!(ack(&rx), (12, true, 2));
 
         // Junk specs are rejected before touching the overlay or the pool.
-        on_edit(&shared, None, &[], 1, 13, 8, 20, 8, 2, "banana:zzz");
+        on_edit(&shared, None, chartless(), 1, 13, 8, 20, 8, 2, "banana:zzz");
         assert_eq!(ack(&rx), (13, false, 2));
         assert_eq!(shared.lock_recover().edits[&(8, 20, 8)].spec.as_ref(), rock.as_str());
     }
@@ -3114,8 +3619,8 @@ mod tests {
 
         // The same spec interned twice: one canonical entry.
         let rock = rock_spec();
-        on_edit(&shared, None, &[], 1, 1, 8, 20, 8, 0, &rock);
-        on_edit(&shared, None, &[], 1, 2, 8, 21, 8, 0, &rock);
+        on_edit(&shared, None, chartless(), 1, 1, 8, 20, 8, 0, &rock);
+        on_edit(&shared, None, chartless(), 1, 2, 8, 21, 8, 0, &rock);
         {
             let state = shared.lock_recover();
             assert_eq!(state.spec_pool.len(), 1, "equivalent spellings share one entry");
@@ -3126,8 +3631,8 @@ mod tests {
         }
 
         // Overwriting both cells strands the old spec: it must leave the pool.
-        on_edit(&shared, None, &[], 1, 3, 8, 20, 8, 1, "air");
-        on_edit(&shared, None, &[], 1, 4, 8, 21, 8, 1, "air");
+        on_edit(&shared, None, chartless(), 1, 3, 8, 20, 8, 1, "air");
+        on_edit(&shared, None, chartless(), 1, 4, 8, 21, 8, 1, "air");
         {
             let state = shared.lock_recover();
             assert_eq!(state.spec_pool.len(), 1, "only \"air\" remains interned");
@@ -3269,52 +3774,37 @@ mod tests {
                 })
                 .map(|(&id, _)| id)
                 .collect();
+            // (recipient, subject, entered): an exit both ways, and on entry both sides'
+            // poses. Moves inside range wait for the pose tick.
             let mut expected_sends = Vec::new();
             for &id in previous.difference(&expected) {
-                expected_sends.push((id, ServerMessage::PeerExited { id: 1 }));
-                expected_sends.push((1, ServerMessage::PeerExited { id }));
+                expected_sends.push((id, 1, false));
+                expected_sends.push((1, id, false));
             }
-            for &id in &expected {
-                expected_sends.push((
-                    id,
-                    ServerMessage::PeerMove {
-                        id: 1,
-                        pos,
-                        yaw: 0.0,
-                        pitch: 0.0,
-                        frame: DQuat::IDENTITY,
-                        velocity: Vec3::ZERO,
-                        up: Face::PosY,
-                        stance: Stance::Standing,
-                    },
-                ));
-                if !previous.contains(&id) {
-                    let player = &state.players[&id];
-                    expected_sends.push((
-                        1,
-                        ServerMessage::PeerMove {
-                            id,
-                            pos: player.pos,
-                            yaw: player.yaw,
-                            pitch: player.pitch,
-                            frame: player.frame,
-                            velocity: player.velocity,
-                            up: player.up,
-                            stance: player.stance,
-                        },
-                    ));
-                }
+            for &id in expected.difference(&previous) {
+                expected_sends.push((id, 1, true));
+                expected_sends.push((1, id, true));
             }
 
             let mut sends = Vec::new();
             commit_pose(&mut state, 1, pos, None, &mut sends);
-            assert_eq!(state.players[&1].visible, expected, "mover at {pos:?}");
+            assert_eq!(state.players[&1].visible.iter().copied().collect::<HashSet<u32>>(), expected, "mover at {pos:?}");
             for (&id, player) in &state.players {
                 assert_eq!(player.visible.contains(&1), expected.contains(&id), "peer {id}");
             }
             let actual: Vec<_> = sends
                 .into_iter()
-                .map(|(id, _, frame)| (id, ServerMessage::decode(&frame).unwrap()))
+                .map(|(to, frame)| match ServerMessage::decode(&frame).unwrap() {
+                    ServerMessage::PeerExited { id } => (to, id, false),
+                    ServerMessage::PeerPoses { poses } => {
+                        assert_eq!(poses.list.len(), 1);
+                        let pose = poses.list[0];
+                        let subject = &state.players[&pose.id];
+                        assert!(pose.pos.distance(subject.pos) < 0.01, "pose of {} at {pos:?}", pose.id);
+                        (to, pose.id, true)
+                    }
+                    other => panic!("unexpected {other:?}"),
+                })
                 .collect();
             assert_eq!(actual.len(), expected_sends.len());
             for send in expected_sends {
@@ -3630,7 +4120,7 @@ mod tests {
         assert!(!state.players[&2].visible.contains(&1));
         let exited: Vec<_> = sends
             .iter()
-            .filter_map(|(_, _, f)| match ServerMessage::decode(f) {
+            .filter_map(|(_, f)| match ServerMessage::decode(f) {
                 Some(ServerMessage::PeerExited { id }) => Some(id),
                 _ => None,
             })
@@ -3750,18 +4240,18 @@ mod tests {
         let mut players = HashMap::new();
         players.insert(1u32, test_player(at_reach, out, test_kick()));
         let shared = Arc::new(Mutex::new(test_state(players)));
-        on_edit(&shared, None, &[], 1, 1, 8, 20, 8, 0, "air");
+        on_edit(&shared, None, chartless(), 1, 1, 8, 20, 8, 0, "air");
         assert!(shared.lock_recover().edits.contains_key(&(8, 20, 8)), "exact REACH must land");
 
         let just_out = DVec3::new(center.x + EDIT_REACH * 1.001, center.y, center.z);
         shared.lock_recover().players.get_mut(&1).unwrap().pos = just_out;
-        on_edit(&shared, None, &[], 1, 2, 8, 21, 8, 0, "air");
+        on_edit(&shared, None, chartless(), 1, 2, 8, 21, 8, 0, "air");
         assert!(!shared.lock_recover().edits.contains_key(&(8, 21, 8)));
 
-        on_edit(&shared, None, &[], 1, 3, i32::MIN, i32::MIN, i32::MIN, 0, "air");
-        on_edit(&shared, None, &[], 1, 4, i32::MAX, i32::MAX, i32::MAX, 0, "air");
+        on_edit(&shared, None, chartless(), 1, 3, i32::MIN, i32::MIN, i32::MIN, 0, "air");
+        on_edit(&shared, None, chartless(), 1, 4, i32::MAX, i32::MAX, i32::MAX, 0, "air");
         let far = crate::math::WORLD_BORDER as i32 + 64;
-        on_edit(&shared, None, &[], 1, 5, far, 20, far, 0, "air");
+        on_edit(&shared, None, chartless(), 1, 5, far, 20, far, 0, "air");
         assert!(!shared.lock_recover().edits.contains_key(&(far, 20, far)));
         let _ = rx;
     }
@@ -3889,7 +4379,7 @@ mod tests {
         rec.deny_edit = true;
         let table = Mutex::new(hooks::Table::new(vec![Box::new(rec)]));
 
-        on_edit(&shared, Some(&table), &[], 1, 42, 8, 20, 8, 0, "air");
+        on_edit(&shared, Some(&table), chartless(), 1, 42, 8, 20, 8, 0, "air");
 
         let to_editor = drain_msgs(&rx1);
         assert_eq!(to_editor.len(), 1, "exactly one ack");
@@ -3916,7 +4406,7 @@ mod tests {
         rec.panic_edit = true;
         let table = Mutex::new(hooks::Table::new(vec![Box::new(rec)]));
 
-        on_edit(&shared, Some(&table), &[], 1, 1, 8, 20, 8, 0, "air");
+        on_edit(&shared, Some(&table), chartless(), 1, 1, 8, 20, 8, 0, "air");
 
         match &drain_msgs(&rx1)[..] {
             [ServerMessage::EditAck { req, accepted, rev }] => {
@@ -4015,9 +4505,10 @@ mod tests {
         let mut players = HashMap::new();
         players.insert(1u32, test_player(DVec3::new(8.5, 20.0, 8.5), out, test_kick()));
         let shared = Arc::new(Mutex::new(test_state(players)));
-        let spec = {
+        let (block, spec) = {
             let mut state = shared.lock_recover();
-            state.intern(&rock_spec()).expect("spec pool")
+            let block = state.registry.parse_spec(&rock_spec()).unwrap();
+            (block, state.intern(&rock_spec()).expect("spec pool"))
         };
         let mutations: Vec<Mutation> = (0..600)
             .map(|i| Mutation {
@@ -4032,8 +4523,10 @@ mod tests {
                 state.edits.insert(
                     m.pos,
                     Cell {
+                        block,
                         spec: spec.clone(),
                         rev: (m.pos.0 as u32) + 1,
+                        natural: false,
                     },
                 );
             }
@@ -4051,6 +4544,41 @@ mod tests {
             assert_eq!((x, y, z), (i as i32, 20, 0));
             assert_eq!(rev, i as u32 + 1);
             assert_eq!(&*s, &*spec);
+        }
+    }
+
+    /// A join overlay larger than one poll's budget reaches the game over several polls,
+    /// whole, and the loading hold lifts only after the last cell.
+    #[test]
+    fn a_big_overlay_is_handed_to_the_game_over_several_polls() {
+        use crate::net::client::{APPLY_BUDGET, Connection, Incoming};
+        let handle = flat(Config::default());
+        let cells: Vec<_> = (0..(2 * APPLY_BUDGET + 100) as i32).map(|i| (i % 50, -5 - i / 2500, i / 50 % 50, "air".to_string())).collect();
+        assert!(install_edits(&mut handle.state.lock_recover(), &cells).is_empty());
+        let mut conn = Connection::connect("127.0.0.1", handle.addr().port(), "ada", "").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (mut got, mut polls) = (0, 0);
+        while !conn.snapshot_ready() && Instant::now() < deadline {
+            let n = conn.poll().iter().filter(|e| matches!(e, Incoming::Mutation { .. })).count();
+            assert!(n <= APPLY_BUDGET, "{n} cells in one poll");
+            got += n;
+            polls += usize::from(n > 0);
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(got, cells.len(), "every cell, and only then the end of the overlay");
+        assert!(polls >= 3);
+        handle.stop();
+    }
+
+    #[test]
+    fn cached_terrain_reads_match_the_generator() {
+        let state = test_state(HashMap::new());
+        let generator = &lax_ctx().generator;
+        let cells: Vec<Pos> = (0..3 * TERRAIN_SLOTS as i32).map(|i| (i % 61 - 30, i / 61 % 50 - 10, i / 3050)).collect();
+        for _ in 0..2 {
+            for &(x, y, z) in &cells {
+                assert_eq!(server_block(&state, generator, (x, y, z)), generator.voxel_at(x, y, z));
+            }
         }
     }
 
@@ -4117,23 +4645,43 @@ mod tests {
         handle.stop();
     }
 
+    /// The join overlay reaches the joiner sorted chunk by chunk, every cell once, each
+    /// with its own revision and spec.
     #[test]
-    fn snapshot_batches_stay_within_the_frame() {
-        let spec: Arc<str> = "s".repeat(MAX_SPEC).into();
-        let edits: Vec<_> = (0..40).map(|i| (i, 0, 0, 1u32, spec.clone())).collect();
-        let mut n = 0;
-        for_snapshot_batches(&edits, |batch| {
-            let msg = ServerMessage::Snapshot { edits: batch.to_vec() };
-            let encoded = msg.encode();
-            let expect = SNAPSHOT_HEAD + batch.iter().map(|e| SNAPSHOT_EDIT_FIXED + e.4.len()).sum::<usize>();
-            assert_eq!(encoded.len(), expect);
-            assert!(encoded.len() <= MAX_FRAME, "{}", encoded.len());
-            n += batch.len();
-        });
-        assert_eq!(n, edits.len());
-        let mut empty_emitted = false;
-        for_snapshot_batches(&[], |_| empty_emitted = true);
-        assert!(!empty_emitted);
+    fn a_join_overlay_arrives_whole_and_grouped_by_chunk() {
+        let mut state = test_state(HashMap::new());
+        let rock = rock_spec();
+        let cells: Vec<_> = (0..5_000i32)
+            .map(|i| (i % 37 - 18, i / 37 % 9, i / 333 - 7, if i % 3 == 0 { rock.clone() } else { "air".to_string() }))
+            .collect();
+        assert!(install_edits(&mut state, &cells).is_empty());
+        let overlay = Overlay::of(&state);
+        let (out, rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
+        let out = Outbox { tx: Some(out), writer: Arc::default() };
+        let shared = Arc::new(Mutex::new(state));
+        let ctx = lax_ctx();
+        assert!(send_join(&out, &AtomicBool::new(false), &shared, ctx, 1, DVec3::ZERO, overlay, &[]));
+        let mut got = Vec::new();
+        let mut ended = false;
+        for msg in drain(&rx) {
+            match msg {
+                ServerMessage::Snapshot { edits } => {
+                    assert!(!ended, "SnapshotEnd comes after every batch");
+                    got.extend(edits);
+                }
+                ServerMessage::SnapshotEnd => ended = true,
+                _ => {}
+            }
+        }
+        assert!(ended);
+        assert_eq!(got.len(), cells.len());
+        let chunk = |c: &(i32, i32, i32, u32, Arc<str>)| (c.0 >> 4, c.2 >> 4, c.1 >> 4);
+        assert!(got.windows(2).all(|w| chunk(&w[0]) <= chunk(&w[1])), "grouped by chunk");
+        let state = shared.lock_recover();
+        for (x, y, z, rev, spec) in got {
+            let cell = &state.edits[&(x, y, z)];
+            assert_eq!((rev, spec.as_ref()), (cell.rev, cell.spec.as_ref()));
+        }
     }
 
     #[test]
@@ -4151,7 +4699,7 @@ mod tests {
         let mut players = HashMap::new();
         players.insert(1u32, test_player(DVec3::new(8.5, 20.0, 8.5), out, test_kick()));
         let shared = Arc::new(Mutex::new(test_state(players)));
-        on_edit(&shared, None, &[], 1, 1, 8, 20, 8, 0, &spec);
+        on_edit(&shared, None, chartless(), 1, 1, 8, 20, 8, 0, &spec);
         match ServerMessage::decode(&rx.try_recv().unwrap()) {
             Some(ServerMessage::EditAck { accepted: true, .. }) => {}
             other => panic!("a full configuration must be accepted, got {other:?}"),
@@ -4161,13 +4709,13 @@ mod tests {
 
     #[test]
     fn writer_error_kicks_and_a_clean_close_does_not() {
-        let (tx, rx) = sync_channel::<Arc<[u8]>>(4);
+        let (tx, rx) = outbox(4);
         let kick = Arc::new(Notify::new());
         let kick2 = kick.clone();
         let writer = thread::spawn(move || {
             drain_writer(rx, &kick2, |_| Err(io::Error::other("closed")));
         });
-        tx.send(Arc::<[u8]>::from([1u8, 2, 3].as_slice())).unwrap();
+        tx.try_send(Arc::<[u8]>::from([1u8, 2, 3].as_slice())).unwrap();
         writer.join().unwrap();
         let rt = Runtime::new().unwrap();
         let notified = kick.notified();
@@ -4177,13 +4725,13 @@ mod tests {
                 .expect("a write error must kick the reader");
         });
 
-        let (tx, rx) = sync_channel::<Arc<[u8]>>(4);
+        let (tx, rx) = outbox(4);
         let kick = Arc::new(Notify::new());
         let kick2 = kick.clone();
         let writer = thread::spawn(move || {
             drain_writer(rx, &kick2, |_| Ok(()));
         });
-        tx.send(Arc::<[u8]>::from([9u8].as_slice())).unwrap();
+        tx.try_send(Arc::<[u8]>::from([9u8].as_slice())).unwrap();
         drop(tx);
         writer.join().unwrap();
         let notified = kick.notified();
@@ -4202,16 +4750,16 @@ mod tests {
         players.insert(1u32, test_player(DVec3::new(8.5, 20.0, 8.5), out, test_kick()));
         let shared = Arc::new(Mutex::new(test_state(players)));
         let rock = rock_spec();
-        on_edit(&shared, None, &[], 1, 1, 8, 20, 8, 0, &rock);
-        on_edit(&shared, None, &[], 1, 2, 8, 21, 8, 0, &rock);
+        on_edit(&shared, None, chartless(), 1, 1, 8, 20, 8, 0, &rock);
+        on_edit(&shared, None, chartless(), 1, 2, 8, 21, 8, 0, &rock);
         let extra = {
             let state = shared.lock_recover();
             assert_eq!(state.spec_pool.get(rock.as_str()).copied(), Some(2));
             state.edits[&(8, 21, 8)].spec.clone()
         };
-        on_edit(&shared, None, &[], 1, 3, 8, 20, 8, 1, "air");
+        on_edit(&shared, None, chartless(), 1, 3, 8, 20, 8, 1, "air");
         assert_eq!(shared.lock_recover().spec_pool.get(rock.as_str()).copied(), Some(1));
-        on_edit(&shared, None, &[], 1, 4, 8, 21, 8, 1, "air");
+        on_edit(&shared, None, chartless(), 1, 4, 8, 21, 8, 1, "air");
         assert!(!shared.lock_recover().spec_pool.contains_key(rock.as_str()), "zero cells frees the entry");
         drop(extra);
     }
@@ -4233,9 +4781,9 @@ mod tests {
         players.insert(1u32, test_player(DVec3::new(8.5, 20.0, 8.5), out, test_kick()));
         let shared = Arc::new(Mutex::new(test_state(players)));
         let before = shared.lock_recover().registry.block_count();
-        on_edit(&shared, None, &[], 1, 1, 8, 20, 8, 0, &numbered_spec(1));
+        on_edit(&shared, None, chartless(), 1, 1, 8, 20, 8, 0, &numbered_spec(1));
         assert_eq!(shared.lock_recover().registry.block_count(), before + 1);
-        on_edit(&shared, None, &[], 1, 2, 8, 20, 8, 0, &numbered_spec(2));
+        on_edit(&shared, None, chartless(), 1, 2, 8, 20, 8, 0, &numbered_spec(2));
         assert_eq!(shared.lock_recover().registry.block_count(), before + 1, "stale expect must not intern");
         assert_eq!(shared.lock_recover().players[&1].novel, 1);
         let _ = rx;
@@ -4247,23 +4795,24 @@ mod tests {
         let before = shared.lock_recover().registry.block_count();
         let mut expect = 0u32;
         for i in 0..NOVEL_SPEC_QUOTA {
-            on_edit(&shared, None, &[], 1, i + 1, 8, 20, 8, expect, &numbered_spec(i as u8));
+            on_edit(&shared, None, chartless(), 1, i + 1, 8, 20, 8, expect, &numbered_spec(i as u8));
             expect += 1;
         }
         assert_eq!(shared.lock_recover().registry.block_count(), before + NOVEL_SPEC_QUOTA as usize);
         assert_eq!(shared.lock_recover().players[&1].novel, NOVEL_SPEC_QUOTA);
         let count = shared.lock_recover().registry.block_count();
-        on_edit(&shared, None, &[], 1, 1000, 8, 20, 8, expect, &numbered_spec(250));
+        on_edit(&shared, None, chartless(), 1, 1000, 8, 20, 8, expect, &numbered_spec(250));
         assert_eq!(shared.lock_recover().registry.block_count(), count, "past the quota: no intern");
-        on_edit(&shared, None, &[], 1, 1001, 8, 20, 8, expect, "air");
+        on_edit(&shared, None, chartless(), 1, 1001, 8, 20, 8, expect, "air");
         assert!(shared.lock_recover().edits[&(8, 20, 8)].spec.as_ref() == "air");
         assert_eq!(shared.lock_recover().players[&1].novel, NOVEL_SPEC_QUOTA, "air is not novel");
         let _ = rx;
     }
 
-    fn stamp_now(shared: &Arc<Mutex<State>>, id: u32) {
+    /// Anchor the envelope one realistic move gap ago: the next move's budget refills for that long.
+    fn stamp_gap(shared: &Arc<Mutex<State>>, id: u32) {
         if let Some(h) = shared.lock_recover().players.get_mut(&id) {
-            h.last_move = Instant::now();
+            h.last_move = Instant::now() - Duration::from_millis(100);
         }
     }
 
@@ -4274,8 +4823,7 @@ mod tests {
         let mut players = HashMap::new();
         players.insert(1u32, test_player(start, out, test_kick()));
         let shared = Arc::new(Mutex::new(test_state(players)));
-        stamp_now(&shared, 1);
-        shared.lock_recover().players.get_mut(&1).unwrap().last_move = Instant::now() - Duration::from_millis(100);
+        stamp_gap(&shared, 1);
 
         let fall = DVec3::new(start.x, start.y - 2_000.0, start.z);
         on_move(
@@ -4295,15 +4843,14 @@ mod tests {
 
         // The fall left a stored speed. Clear it so the next drop is judged on a zero report.
         shared.lock_recover().players.get_mut(&1).unwrap().velocity = Vec3::ZERO;
-        stamp_now(&shared, 1);
+        stamp_gap(&shared, 1);
         let forged = DVec3::new(fall.x, fall.y - 2_000.0, fall.z);
         on_move(&shared, lax_ctx(), 1, forged, 0.0, 0.0, DQuat::IDENTITY, Vec3::ZERO, Face::PosY, Stance::Standing);
         assert_eq!(shared.lock_recover().players[&1].pos, fall, "the same drop with no speed is a teleport");
 
-        stamp_now(&shared, 1);
+        stamp_gap(&shared, 1);
         let flown = DVec3::new(start.x + 1_000.0, start.y, start.z);
-        // Reset onto a fresh anchor at `fall` then fly. The previous reject did not move the anchor
-        // only if stamp_now ran; it did. Position is still `fall`.
+        // Fly from `fall`, where the refused drop left the player.
         let speed = crate::player::MAX_SPEED as f32;
         on_move(
             &shared,
@@ -4320,7 +4867,7 @@ mod tests {
         assert_eq!(shared.lock_recover().players[&1].pos.x, fall.x + 1_000.0, "fast flight is not snapped");
         let _ = flown;
 
-        stamp_now(&shared, 1);
+        stamp_gap(&shared, 1);
         let too_far = DVec3::new(fall.x + crate::player::MAX_SPEED * 2.0, fall.y, fall.z);
         on_move(
             &shared,
@@ -4340,7 +4887,7 @@ mod tests {
         );
 
         on_cruise(&shared, 1, crate::player::CRUISE_MAX);
-        stamp_now(&shared, 1);
+        stamp_gap(&shared, 1);
         let cruise_to = DVec3::new(fall.x + crate::player::MAX_SPEED * 2.0, fall.y, fall.z);
         on_move(
             &shared,
@@ -4575,7 +5122,8 @@ mod tests {
         }).unwrap();
         let mut conn = Connection::connect("127.0.0.1", handle.addr().port(), "ada", "").unwrap();
         let s = conn.spawn();
-        let (x, y, z) = (crate::math::block_coord(s.x), crate::math::block_coord(s.y), crate::math::block_coord(s.z));
+        // The grass under the spawn: breaking it changes the world, so the file keeps it.
+        let (x, y, z) = (crate::math::block_coord(s.x), crate::world::generation::FLAT_HEIGHT - 1, crate::math::block_coord(s.z));
         let req = conn.send_edit(x, y, z, "air".into()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(3);
         let mut accepted = false;
@@ -4887,48 +5435,76 @@ mod tests {
     }
 
     #[test]
-    fn backlog_drops_superseded_moves_and_aged_frames() {
+    fn backlog_drops_aged_frames() {
         let (out, _rx) = sync_channel::<Arc<[u8]>>(4);
         let mut player = test_player(DVec3::ZERO, out, test_kick());
         player.ready = false;
         let now = Instant::now();
-        let frame = |id, x| {
-            Arc::<[u8]>::from(
-                ServerMessage::PeerMove {
-                    id,
-                    pos: DVec3::new(x, 1.0, 0.0),
-                    yaw: 0.0,
-                    pitch: 0.0,
-                    frame: DQuat::IDENTITY,
-                    velocity: Vec3::ZERO,
-                    up: Face::PosY,
-                    stance: Stance::Standing,
-                }
-                .encode(),
-            )
-        };
-        assert!(enqueue_backlog(&mut player, frame(7, 1.0), now));
-        assert!(enqueue_backlog(&mut player, frame(7, 4.0), now));
-        assert_eq!(player.backlog.len(), 1, "a newer move replaces the older one");
-        assert_eq!(protocol::peer_move_id(&player.backlog[0].frame), Some(7));
+        let swing: Arc<[u8]> = ServerMessage::PeerSwing { id: 7 }.encode().into();
+        assert!(enqueue_backlog(&mut player, swing, now));
         player.backlog[0].at = now - BACKLOG_AGE;
         let pong: Arc<[u8]> = ServerMessage::Pong { nonce: 1 }.encode().into();
         assert!(enqueue_backlog(&mut player, pong, now));
         assert_eq!(player.backlog.len(), 1, "a frame older than the age bound is dropped");
-        assert!(protocol::peer_move_id(&player.backlog[0].frame).is_none());
+        assert!(!protocol::is_cosmetic(&player.backlog[0].frame));
         assert!(!player.kicked.load(Ordering::Relaxed));
+    }
+
+    /// The tick sends a moved near peer every tick and a far one on its slot, once per window.
+    #[test]
+    fn pose_tick_sends_near_peers_each_tick_and_far_peers_less_often() {
+        let (out1, rx1) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
+        let (out2, _rx2) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
+        let (out3, _rx3) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
+        let near = DVec3::new(4.0, 20.0, 0.0);
+        let far = DVec3::new(NEAR + 20.0, 20.0, 0.0);
+        let mut state = test_state(HashMap::new());
+        for (id, pos, out) in [(1u32, DVec3::new(0.0, 20.0, 0.0), out1), (2, near, out2), (3, far, out3)] {
+            state.players.insert(id, test_player(pos, out, test_kick()));
+            state.grid_insert(id, pos);
+        }
+        let mut sends = Vec::new();
+        for (id, pos) in [(1u32, DVec3::new(0.0, 20.0, 0.0)), (2, near), (3, far)] {
+            commit_pose(&mut state, id, pos, None, &mut sends);
+        }
+        let shared = Arc::new(Mutex::new(state));
+        let _ = drain(&rx1);
+        let heard = |ticks: u64, step: f64| {
+            let mut seen = Vec::new();
+            for _ in 0..ticks {
+                for (id, pos) in [(2u32, near), (3, far)] {
+                    let mut state = shared.lock_recover();
+                    let mut sends = Vec::new();
+                    let p = pos + DVec3::new(0.0, 0.0, step * state.tick as f64);
+                    commit_pose(&mut state, id, p, None, &mut sends);
+                    assert!(sends.is_empty(), "a move inside range waits for the tick");
+                }
+                broadcast_poses(&shared);
+                for msg in drain(&rx1) {
+                    if let ServerMessage::PeerPoses { poses } = msg {
+                        seen.extend(poses.list.iter().map(|p| p.id));
+                    }
+                }
+            }
+            seen
+        };
+        let seen = heard(8, 0.5);
+        assert_eq!(seen.iter().filter(|&&id| id == 2).count(), 8, "a near peer every tick");
+        assert_eq!(seen.iter().filter(|&&id| id == 3).count(), 2, "a far peer every fourth tick");
+        let still = heard(8, 0.0);
+        assert!(still.iter().filter(|&&id| id == 2).count() <= 1, "a peer that stays put is not resent");
     }
 
     #[test]
     fn send_blocking_honours_a_kick_and_a_deadline() {
         let kicked = AtomicBool::new(true);
-        let (tx, _rx) = sync_channel::<Arc<[u8]>>(1);
+        let (tx, _rx) = outbox(1);
         let started = Instant::now();
         assert!(!send_until(&tx, &kicked, Arc::from([0u8].as_slice()), Instant::now() + SEND_DEADLINE));
         assert!(started.elapsed() < Duration::from_millis(50), "a kick returns at once");
 
         let kicked = AtomicBool::new(false);
-        let (tx, rx) = sync_channel::<Arc<[u8]>>(1);
+        let (tx, rx) = outbox(1);
         tx.try_send(Arc::from([0u8].as_slice())).unwrap();
         let started = Instant::now();
         assert!(!send_until(
@@ -4961,7 +5537,7 @@ mod tests {
         relay_swing(&shared, 1);
         assert!(rx_a.try_recv().is_err(), "the swinger does not hear their own swing");
         let frame = rx_b.try_recv().expect("a player who can see the swinger hears it");
-        assert!(protocol::is_peer_swing(&frame));
+        assert!(matches!(ServerMessage::decode(&frame), Some(ServerMessage::PeerSwing { id: 1 })));
         assert!(rx_c.try_recv().is_err(), "a peer who is not ready is not in the audience");
     }
 
@@ -5022,12 +5598,16 @@ mod tests {
             edits: HashMap::new(),
             spec_pool: HashMap::new(),
             registry,
-            players,
+            players: players.into_iter().collect(),
             grid: HashMap::new(),
             next_id: 2,
             day: 0.3,
             day_set: Instant::now(),
             reactions: ReactionScheduler::new(),
+            tick: 1,
+            poses: PosesWriter::new(),
+            scratch: Scratch::default(),
+            terrain: TerrainCache::new(),
             max_speed: crate::player::MAX_SPEED,
             panic_tick: false,
         };
@@ -5044,6 +5624,7 @@ mod tests {
             generator,
             hooks: None,
             ops: ops.iter().map(|name| (*name).to_ascii_lowercase()).collect(),
+            op_secrets: Vec::new(),
             mods_allow: Vec::new(),
             mods_deny: Vec::new(),
             store: None,
@@ -5117,7 +5698,7 @@ mod tests {
             assert!(state.registry.is_solid(id));
             let canonical = state.registry.spec(id);
             let shared_spec = state.intern(&canonical).unwrap();
-            state.edits.insert(fresh, Cell { spec: shared_spec, rev: 1 });
+            state.edits.insert(fresh, Cell { block: id, spec: shared_spec, rev: 1, natural: false });
         }
         step(&shared, &ctx, into);
         assert_eq!(shared.lock_recover().players[&1].pos, start, "a solid edit the body newly enters snaps back");
@@ -5136,12 +5717,16 @@ mod tests {
             edits: HashMap::new(),
             spec_pool: HashMap::new(),
             registry,
-            players: HashMap::new(),
+            players: HashMap::default(),
             grid: HashMap::new(),
             next_id: 2,
             day: 0.3,
             day_set: Instant::now(),
             reactions: ReactionScheduler::new(),
+            tick: 1,
+            poses: PosesWriter::new(),
+            scratch: Scratch::default(),
+            terrain: TerrainCache::new(),
             max_speed: crate::player::MAX_SPEED,
             panic_tick: false,
         };
@@ -5169,12 +5754,12 @@ mod tests {
             // Feet on the inside column's top, the body reaching past the box edge.
             let pos = DVec3::new(f64::from(edge) + 0.9, f64::from(inside) + eye, f64::from(z) + 0.5);
             assert!(
-                !body_blocked(&state, &generator, &seams, pos, Stance::Standing, Face::PosY, &[]),
+                !body_blocked(&state, &generator, &seams, pos, pos, Stance::Standing, Face::PosY, &[]),
                 "standing across the edge at z {z} (inside top {inside}, glued top {outside}) was blocked"
             );
             let sunk = pos - DVec3::Y * 1.5;
             assert!(
-                body_blocked(&state, &generator, &seams, sunk, Stance::Standing, Face::PosY, &[]),
+                body_blocked(&state, &generator, &seams, sunk, sunk, Stance::Standing, Face::PosY, &[]),
                 "a body sunk into the edge at z {z} was clear"
             );
             checked += 1;
@@ -5191,18 +5776,22 @@ mod tests {
             edits: HashMap::new(),
             spec_pool: HashMap::new(),
             registry,
-            players: HashMap::new(),
+            players: HashMap::default(),
             grid: HashMap::new(),
             next_id: 2,
             day: 0.3,
             day_set: Instant::now(),
             reactions: ReactionScheduler::new(),
+            tick: 1,
+            poses: PosesWriter::new(),
+            scratch: Scratch::default(),
+            terrain: TerrainCache::new(),
             max_speed: crate::player::MAX_SPEED,
             panic_tick: false,
         };
         let mut pos = DVec3::new(8.5, 80.0, 8.5);
         for _ in 0..40 {
-            if !body_blocked(&state, &generator, &seams, pos, Stance::Standing, Face::PosY, &[]) {
+            if !body_blocked(&state, &generator, &seams, pos, pos, Stance::Standing, Face::PosY, &[]) {
                 break;
             }
             pos.y += 16.0;
@@ -5213,7 +5802,7 @@ mod tests {
         occupied.extend_from_slice(&cells[..n]);
         for _ in 0..8 {
             pos.x += 0.5;
-            let _ = body_blocked(&state, &generator, &seams, pos, Stance::Standing, Face::PosY, &occupied);
+            let _ = body_blocked(&state, &generator, &seams, pos, pos, Stance::Standing, Face::PosY, &occupied);
             let n = fill_body_cells(pos, Stance::Standing, Face::PosY, &mut cells).expect("body fits");
             occupied.clear();
             occupied.extend_from_slice(&cells[..n]);
@@ -5226,6 +5815,7 @@ mod tests {
                 &state,
                 &generator,
                 &seams,
+                pos,
                 next,
                 Stance::Standing,
                 Face::PosY,
@@ -5247,6 +5837,7 @@ mod tests {
                 &generator,
                 &seams,
                 pos,
+                pos,
                 Stance::Standing,
                 Face::PosY,
                 &occupied,
@@ -5256,6 +5847,29 @@ mod tests {
         let stand_us = stand.elapsed().as_secs_f64() * 1.0e6 / f64::from(steps);
         eprintln!("noclip standing: {stand_us:.2} µs/move");
         assert!(us < 1000.0, "newly entered cells took {us:.2} µs/move");
+        // Long sweeps, straight up from the spawn so the whole path is walked.
+        let spawn = generator.chart_spawn().expect("a charted start world");
+        let n = fill_body_cells(spawn, Stance::Standing, Face::PosY, &mut cells).expect("body fits");
+        let mut worst = 0.0f64;
+        for length in [8.0, 64.0, SWEEP_LIMIT] {
+            let to = spawn + DVec3::Y * length;
+            let started = Instant::now();
+            let blocked = std::hint::black_box(body_blocked(
+                &state,
+                &generator,
+                &seams,
+                spawn,
+                to,
+                Stance::Standing,
+                Face::PosY,
+                &cells[..n],
+            ));
+            let sweep_us = started.elapsed().as_secs_f64() * 1.0e6;
+            assert!(!blocked, "the sky above the spawn is clear");
+            eprintln!("noclip sweep of {length} blocks: {sweep_us:.1} µs ({:.2} µs/block)", sweep_us / length);
+            worst = worst.max(sweep_us);
+        }
+        assert!(worst < 200_000.0, "the longest sweep took {worst:.1} µs");
     }
 
     #[test]
@@ -5285,5 +5899,303 @@ mod tests {
         let mut bak = path.file_name().unwrap().to_os_string();
         bak.push(".bak");
         let _ = std::fs::remove_file(path.with_file_name(bak));
+    }
+
+    /// Cycling channel names cannot beat the connection's total, and new names stop at the cap.
+    #[test]
+    fn mod_channels_share_one_budget_and_a_name_cap() {
+        let now = Instant::now();
+        let channel = |i: usize| protocol::Channel::parse(&format!("c{i}")).unwrap();
+        let mut names = ChannelBudget::new();
+        for i in 0..MAX_CHANNELS {
+            assert!(names.allow(&channel(i), now));
+        }
+        assert!(!names.allow(&channel(MAX_CHANNELS), now), "a new name past the cap is dropped");
+        assert!(names.allow(&channel(0), now), "a known name keeps its window");
+        let mut flood = ChannelBudget::new();
+        let passed = (0..4 * MOD_DATA_RATE as usize).filter(|&i| flood.allow(&channel(i % MAX_CHANNELS), now)).count();
+        assert_eq!(passed, MOD_DATA_RATE as usize, "switching channels buys no extra rate");
+    }
+
+    /// Under a speed cap, a move split into many messages covers no more than one burst plus
+    /// the cap over the time taken. A fast stream that stalls and lands at once still passes.
+    #[test]
+    fn split_moves_gain_nothing_over_the_speed_cap() {
+        let cap = 30.0 * crate::math::PER_METER;
+        let (out, _rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
+        let start = DVec3::new(8.5, 40.0, 8.5);
+        let mut players = HashMap::new();
+        players.insert(1u32, test_player(start, out, test_kick()));
+        let shared = Arc::new(Mutex::new(test_state(players)));
+        shared.lock_recover().max_speed = cap;
+        let anchored = Instant::now();
+        shared.lock_recover().players.get_mut(&1).unwrap().last_move = anchored;
+        for _ in 0..40 {
+            let at = shared.lock_recover().players[&1].pos;
+            let to = DVec3::new(at.x + 5.0, at.y, at.z);
+            on_move(&shared, lax_ctx(), 1, to, 0.0, 0.0, DQuat::IDENTITY, Vec3::new(cap as f32, 0.0, 0.0), Face::PosY, Stance::Standing);
+        }
+        let covered = shared.lock_recover().players[&1].pos.x - start.x;
+        let bound = MOVE_FLOOR + cap * anchored.elapsed().as_secs_f64();
+        assert!(covered <= bound + 1e-9, "40 split moves covered {covered} blocks, the bound is {bound}");
+        assert!(covered >= MOVE_FLOOR - 5.0, "the burst is spendable, covered {covered}");
+
+        let fast = 1000.0 * crate::math::PER_METER;
+        let (out, rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
+        let mut players = HashMap::new();
+        players.insert(1u32, test_player(start, out, test_kick()));
+        let shared = Arc::new(Mutex::new(test_state(players)));
+        shared.lock_recover().players.get_mut(&1).unwrap().last_move = Instant::now() - Duration::from_millis(133);
+        let step = fast * 0.033;
+        for i in 1..=4 {
+            let to = DVec3::new(start.x + step * f64::from(i), start.y, start.z);
+            on_move(&shared, lax_ctx(), 1, to, 0.0, 0.0, DQuat::IDENTITY, Vec3::new(fast as f32, 0.0, 0.0), Face::PosY, Stance::Standing);
+            assert_eq!(shared.lock_recover().players[&1].pos, to, "stalled move {i} at 1 km/s");
+        }
+        assert!(rx.try_recv().is_err(), "no snap-back");
+    }
+
+    /// With noclip refused, a move whose destination is open but whose path crosses a wall
+    /// snaps back. A body teleported into ground can still walk out, a path longer than the
+    /// sweep fails closed, and a cruise is judged at its destination.
+    #[test]
+    fn a_move_cannot_pass_through_a_wall() {
+        let eye = crate::player::Stance::Standing.eye_offset();
+        let ground = crate::world::generation::FLAT_HEIGHT;
+        let surface = DVec3::new(0.5, f64::from(ground) + eye, 0.5);
+        let beyond = DVec3::new(6.5, surface.y, 0.5);
+        let step = |shared: &Arc<Mutex<State>>, ctx: &Ctx, pos: DVec3, speed: f32| {
+            on_move(shared, ctx, 1, pos, 0.0, 0.0, DQuat::IDENTITY, Vec3::new(speed, 0.0, 0.0), Face::PosY, Stance::Standing);
+        };
+
+        let (players, _rx) = pose(surface);
+        let (shared, ctx) = flat_shared(players, NoclipPolicy::Off, &[]);
+        step(&shared, &ctx, beyond, 0.0);
+        assert_eq!(shared.lock_recover().players[&1].pos, beyond, "an open path is clear");
+
+        let (players, _rx) = pose(surface);
+        let (shared, ctx) = flat_shared(players, NoclipPolicy::Off, &[]);
+        {
+            let mut state = shared.lock_recover();
+            let rock = state.registry.parse_spec(&rock_spec()).unwrap();
+            let canonical = state.registry.spec(rock);
+            for x in 2..=4 {
+                for y in ground..ground + 3 {
+                    for z in -1..=1 {
+                        let spec = state.intern(&canonical).unwrap();
+                        state.edits.insert((x, y, z), Cell { block: rock, spec, rev: 1, natural: false });
+                    }
+                }
+            }
+        }
+        step(&shared, &ctx, beyond, 0.0);
+        assert_eq!(shared.lock_recover().players[&1].pos, surface, "a three-block wall is not crossed");
+
+        let buried = DVec3::new(0.5, f64::from(ground), 0.5);
+        let (players, _rx) = pose(surface);
+        let (shared, ctx) = flat_shared(players, NoclipPolicy::Off, &[]);
+        on_teleport(&shared, &ctx, 1, buried);
+        step(&shared, &ctx, surface, 0.0);
+        assert_eq!(shared.lock_recover().players[&1].pos, surface, "a body teleported into ground walks out");
+
+        let sky = DVec3::new(surface.x, surface.y + SWEEP_LIMIT + 10.0, surface.z);
+        let fast = crate::player::MAX_SPEED as f32;
+        let (players, _rx) = pose(surface);
+        let (shared, ctx) = flat_shared(players, NoclipPolicy::Off, &[]);
+        step(&shared, &ctx, sky, fast);
+        assert_eq!(shared.lock_recover().players[&1].pos, surface, "a path past the sweep fails closed");
+        on_cruise(&shared, 1, crate::player::CRUISE_MAX);
+        step(&shared, &ctx, sky, fast);
+        assert_eq!(shared.lock_recover().players[&1].pos, sky, "a cruise is judged at its destination");
+    }
+
+    /// The final save waits until every connection has been told to go, so no edit can be
+    /// acknowledged after the save has read the ledger.
+    #[test]
+    fn stop_closes_connections_before_the_final_save() {
+        use crate::net::client::{Connection, Incoming};
+        let path = crate::save::store::test_temp_path("stop-order");
+        let handle = flat(Config { world: Some(path.clone()), ..Config::default() });
+        let mut conn = Connection::connect("127.0.0.1", handle.addr().port(), "ada", "").unwrap();
+        let gate = handle.save_gate.lock_recover();
+        thread::scope(|scope| {
+            let stopping = scope.spawn(|| handle.stop());
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut closed = false;
+            while !closed && Instant::now() < deadline {
+                closed = conn.poll().into_iter().any(|e| matches!(e, Incoming::Disconnected { .. }));
+                if !closed {
+                    thread::sleep(Duration::from_millis(20));
+                }
+            }
+            assert!(!path.exists(), "the save is still waiting");
+            drop(gate);
+            stopping.join().unwrap();
+            assert!(closed, "connections close before the final save");
+        });
+        assert!(path.exists(), "stop still saves");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Chat until a line containing `want` arrives, or three seconds pass.
+    fn chat_until(conn: &mut crate::net::client::Connection, want: &str) -> Vec<String> {
+        let mut texts = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline && !texts.iter().any(|t: &String| t.contains(want)) {
+            for event in conn.poll() {
+                if let crate::net::client::Incoming::Chat { text, .. } = event {
+                    texts.push(text.to_string());
+                }
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        texts
+    }
+
+    /// An `ops.txt` secret beats the bare name: the player is an operator only after `/op` with
+    /// that secret. The line is answered privately and reaches nobody else.
+    #[test]
+    fn an_operator_secret_is_proved_with_op_and_never_relayed() {
+        use crate::net::client::Connection;
+        let handle = flat(Config {
+            teleport: TeleportPolicy::Ops,
+            ops: vec!["ada".into()],
+            op_secrets: vec![("Ada".into(), "s3cret".into())],
+            ..Config::default()
+        });
+        let port = handle.addr().port();
+        let mut ada = Connection::connect("127.0.0.1", port, "ada", "").unwrap();
+        let mut bob = Connection::connect("127.0.0.1", port, "bob", "").unwrap();
+        let far = DVec3::new(300.5, 30.0, 300.5);
+        ada.send_teleport(far);
+        assert!(chat_until(&mut ada, "only an operator").iter().any(|t| t == "only an operator can teleport"));
+        ada.send_chat(chat::GLOBAL, "/op wrong");
+        assert!(chat_until(&mut ada, "refused").iter().any(|t| t == "operator secret refused"));
+        ada.send_chat(chat::GLOBAL, "/op s3cret");
+        assert!(chat_until(&mut ada, "operator").iter().any(|t| t == "you are now an operator"));
+        ada.send_teleport(far);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut moved = false;
+        while !moved && Instant::now() < deadline {
+            moved = handle.state.lock_recover().players.values().any(|h| &*h.name == "ada" && h.pos == far);
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(moved, "a proved operator may teleport");
+        ada.send_chat(chat::GLOBAL, "hello");
+        let heard = chat_until(&mut bob, "hello");
+        assert!(heard.iter().any(|t| t == "hello"), "ordinary chat still flows: {heard:?}");
+        assert!(!heard.iter().any(|t| t.contains("/op") || t.contains("s3cret") || t.contains("wrong")), "{heard:?}");
+        assert_eq!(op_secret("/op  s3cret "), Some(Arc::from("s3cret")));
+        assert_eq!(op_secret("/opera"), None);
+        handle.stop();
+    }
+
+    /// One full frame plus another fits the join backlog, and an essential frame that waits
+    /// past the age bound kicks the joiner instead of vanishing.
+    #[test]
+    fn backlog_holds_a_full_frame_and_kicks_on_an_aged_essential_one() {
+        let (out, _rx) = sync_channel::<Arc<[u8]>>(4);
+        let mut player = test_player(DVec3::ZERO, out, test_kick());
+        player.ready = false;
+        let now = Instant::now();
+        let air: Arc<str> = "air".into();
+        let full: Arc<[u8]> = {
+            let mut frames = Vec::new();
+            let mut writer = SnapshotWriter::new();
+            let mut emit = |frame| frames.push(frame);
+            for i in 0..20_000 {
+                writer.push((i * 1000, 0, 0), 1, 0, "air", &mut emit);
+            }
+            frames.swap_remove(0)
+        };
+        assert!(full.len() > MAX_FRAME - 64 && full.len() <= MAX_FRAME);
+        let edit: Arc<[u8]> = ServerMessage::Edit { x: 1, y: 2, z: 3, rev: 1, spec: air.clone() }.encode().into();
+        assert!(enqueue_backlog(&mut player, full, now));
+        assert!(enqueue_backlog(&mut player, edit.clone(), now), "a full frame and one more fit");
+        assert!(!enqueue_backlog(&mut player, edit, now + BACKLOG_AGE), "an aged edit kicks");
+        assert_eq!(player.backlog.len(), 2, "no essential frame was dropped");
+    }
+
+    #[test]
+    fn edits_past_the_spec_pool_stay_in_the_file() {
+        let mut state = test_state(HashMap::new());
+        for i in 0..MAX_SPEC_POOL {
+            state.intern(&format!("spec-{i}")).unwrap();
+        }
+        let rock = rock_spec();
+        let kept = install_edits(&mut state, &[(1, 2, 3, rock.clone()), (4, 5, 6, "air".into())]);
+        assert_eq!(kept, vec![(1, 2, 3, rock), (4, 5, 6, "air".to_string())]);
+        assert!(state.edits.is_empty());
+    }
+
+    /// An edit that puts back the generated block keeps its revision in memory but is not saved.
+    #[test]
+    fn a_no_op_edit_stays_out_of_the_world_file() {
+        let path = crate::save::store::test_temp_path("no-op");
+        let flags = persist::Flags { seed: 1, worldgen: WorldgenKind::Flat, terrain: TerrainCfg::default(), warn: false };
+        let ground = crate::world::generation::FLAT_HEIGHT;
+        let (players, _rx) = pose(DVec3::new(0.5, f64::from(ground) + 2.0, 0.5));
+        let (shared, mut ctx) = flat_shared(players, NoclipPolicy::All, &[]);
+        ctx.store = Some(Arc::new(persist::load(&path, &flags).unwrap().store.unwrap()));
+        on_edit(&shared, None, &ctx.generator, 1, 1, 0, ground + 1, 0, 0, "air");
+        on_edit(&shared, None, &ctx.generator, 1, 2, 1, ground - 1, 0, 0, "air");
+        assert_eq!(shared.lock_recover().edits.len(), 2, "both edits hold a revision");
+        save_world(&shared, &ctx, &Mutex::new(()));
+        let again = persist::load(&path, &flags).unwrap();
+        assert_eq!(again.edits, vec![(1, ground - 1, 0, "air".to_string())]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Initials from a source that never hears the server (a spoofed address) get a stateless
+    /// retry and take no handshake slot; a real client still joins through the retry.
+    #[test]
+    fn unvalidated_initials_take_no_handshake_slot() {
+        use crate::net::client::Connection;
+        let handle = flat(Config::default());
+        let server = SocketAddr::from((Ipv4Addr::LOCALHOST, handle.addr().port()));
+        let relay = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        relay.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+        let relay_addr = relay.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let relay_stop = stop.clone();
+        // Forward the client's packets to the server; drop every answer.
+        let forward = thread::spawn(move || {
+            let mut buf = [0u8; 2048];
+            while !relay_stop.load(Ordering::Relaxed) {
+                if let Ok((n, from)) = relay.recv_from(&mut buf)
+                    && from != server
+                {
+                    let _ = relay.send_to(&buf[..n], server);
+                }
+            }
+        });
+        let (rt, ep) = client_endpoint();
+        let attempts: Vec<_> = {
+            let _g = rt.enter();
+            (0..4).map(|_| ep.connect(relay_addr, "watt").unwrap()).collect()
+        };
+        rt.block_on(async { tokio::time::sleep(Duration::from_millis(400)).await });
+        assert_eq!(handle.handshake_slots(), 0, "a source that cannot answer holds no slot");
+        stop.store(true, Ordering::Relaxed);
+        forward.join().unwrap();
+        drop(attempts);
+        Connection::connect("127.0.0.1", server.port(), "real", "").expect("a real client passes the retry");
+        handle.stop();
+    }
+
+    #[test]
+    fn console_text_escapes_control_characters() {
+        assert_eq!(console_text("\u{1b}[2Jpwc.hotbar\u{7}"), "\\u{1b}[2Jpwc.hotbar\\u{7}");
+        assert_eq!(console_text("plain ünïcode"), "plain ünïcode");
+    }
+
+    #[test]
+    fn names_that_spell_server_are_reserved() {
+        for name in ["server", "Server", "S.E.R.V.E.R", "<server>", "server>", " _server_ "] {
+            assert!(reserved_name(name), "{name}");
+        }
+        for name in ["servers", "observer", "server2", "serve", "ada"] {
+            assert!(!reserved_name(name), "{name}");
+        }
     }
 }

@@ -143,54 +143,20 @@ impl Capture {
         let error_cb = move |_e: cpal::Error| {
             err_lost.store(true, Ordering::Relaxed);
         };
-        let stream = match format {
-            SampleFormat::F32 => build_stream::<f32>(
-                &device,
-                &config,
-                channels,
-                producer,
-                transmit_epoch.clone(),
-                error_cb,
-            ),
-            SampleFormat::I16 => build_stream::<i16>(
-                &device,
-                &config,
-                channels,
-                producer,
-                transmit_epoch.clone(),
-                error_cb,
-            ),
-            SampleFormat::U16 => build_stream::<u16>(
-                &device,
-                &config,
-                channels,
-                producer,
-                transmit_epoch.clone(),
-                error_cb,
-            ),
-            SampleFormat::I32 => build_stream::<i32>(
-                &device,
-                &config,
-                channels,
-                producer,
-                transmit_epoch.clone(),
-                error_cb,
-            ),
-            SampleFormat::F64 => build_stream::<f64>(
-                &device,
-                &config,
-                channels,
-                producer,
-                transmit_epoch.clone(),
-                error_cb,
-            ),
-            other => {
-                return Err(CaptureError::Stream(format!(
-                    "unsupported sample format {other:?}"
-                )));
-            }
+        macro_rules! stream_of {
+            ($($format:ident => $sample:ty),+) => {
+                match format {
+                    $(SampleFormat::$format => {
+                        build_stream::<$sample>(&device, &config, channels, producer, transmit_epoch.clone(), error_cb)
+                    })+
+                    other => {
+                        return Err(CaptureError::Stream(format!("unsupported sample format {other:?}")));
+                    }
+                }
+            };
         }
-        .map_err(|e| CaptureError::Stream(e.to_string()))?;
+        let stream = stream_of!(F32 => f32, I16 => i16, U16 => u16, I32 => i32, F64 => f64)
+            .map_err(|e| CaptureError::Stream(e.to_string()))?;
         stream
             .play()
             .map_err(|e| CaptureError::Stream(e.to_string()))?;

@@ -14,7 +14,11 @@
 //! `--world` loads and saves the seed, generator, edit ledger, and clock.
 //! A stored seed and generator win over the flags. The world is written every
 //! few minutes and on shutdown (SIGINT, SIGTERM). Next to that file, `ops.txt`
-//! (one name a line) and `mods.toml` are read and united with the flags:
+//! and `mods.toml` are read and united with the flags. An `ops.txt` line is
+//! `name secret`: that player becomes an operator by sending the chat line
+//! `/op secret`. A line with a name alone, like `--ops`, trusts the name, so
+//! anyone who joins under it is an operator; the server warns about those.
+//! A `mods.toml`:
 //! ```toml
 //! deny = ["pwc.dev-toolkit"]
 //! # allow = [...] would admit only the listed packages: name every package players need.
@@ -164,8 +168,21 @@ fn main() {
             config.mods_deny.join(",")
         ),
     }
-    if !config.ops.is_empty() {
-        println!("operators: {}", config.ops.join(", "));
+    if !config.op_secrets.is_empty() {
+        let names: Vec<&str> = config.op_secrets.iter().map(|(name, _)| name.as_str()).collect();
+        println!("operators (after /op): {}", names.join(", "));
+    }
+    let by_name: Vec<&str> = config
+        .ops
+        .iter()
+        .filter(|op| !config.op_secrets.iter().any(|(name, _)| name.eq_ignore_ascii_case(op)))
+        .map(String::as_str)
+        .collect();
+    if !by_name.is_empty() {
+        println!(
+            "warning: operators with no secret, anyone who joins under these names is an operator: {}",
+            by_name.join(", ")
+        );
     }
     if config.password.is_empty() {
         println!("warning: no password set — anyone who can reach the port can join");

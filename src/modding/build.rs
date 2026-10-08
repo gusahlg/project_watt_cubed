@@ -128,29 +128,20 @@ impl<'a> ModRegistrar<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::modding::testing::Stub;
 
     #[derive(Clone)]
     struct Shared(u32);
 
-    struct Named(&'static str);
-    impl Mod for Named {
-        fn name(&self) -> &str {
-            self.0
-        }
-        fn id(&self) -> &'static str {
-            self.0
-        }
-    }
-
     fn provider(r: &mut ModRegistrar) {
         r.provide(Shared(7));
-        r.add(Named("first"));
+        r.add(Stub::new("first"));
     }
 
     fn consumer(r: &mut ModRegistrar) {
         let shared = r.get::<Shared>().expect("the dependency provided it");
         assert_eq!(shared.0, 7);
-        r.add_disabled(Named("second"));
+        r.add_disabled(Stub::new("second"));
         r.declare_group(Group { id: "tools", name: "Tools", description: "" });
     }
 
