@@ -221,28 +221,8 @@ fn map_key(
 ) -> Option<Key> {
     let (body, seed, n) = home_chart_n(generator)?;
     let datum = home_datum(generator)?;
-    let hash = key_hash(&registry.color_snapshot(), world_fingerprint(registry, kind, cfg), n, datum);
+    let hash = key_hash(&registry.color_snapshot(), crate::net::world_fingerprint(registry, kind, cfg), n, datum);
     Some(Key { seed, body, hash, version: BAKE_VERSION })
-}
-
-/// The world's content id (generator version, gravity, law, palette) folded with the worldgen kind
-/// and its knobs: the inputs that change the baked image.
-fn world_fingerprint(
-    registry: &crate::block::registry::BlockRegistry,
-    kind: crate::world::generation::WorldgenKind,
-    cfg: crate::world::terrain::TerrainCfg,
-) -> u64 {
-    let id = crate::net::content_id(registry);
-    let mut h = Fnv64::new();
-    h.bytes(&id.worldgen.to_le_bytes());
-    for word in [id.gravity, id.law, id.palette] {
-        h.bytes(&word.to_le_bytes());
-    }
-    h.bytes(kind.id().as_bytes());
-    for v in cfg.clamp().to_wire() {
-        h.bytes(&v.to_le_bytes());
-    }
-    h.finish()
 }
 
 /// A benchmark or a scripted game does not bake. `WATT_BENCH_PLANET_MAP=1` opts a benchmark back in.
@@ -617,7 +597,7 @@ impl MapFeed {
 mod tests {
     use super::{
         bake_face, bake_enabled, clamp_column, column_direction, column_linear, column_of, cube_texel_dir, home_chart_n,
-        horizon_sine, impostor_datum, map_key, round_i32, world_fingerprint, FarSink, Key, MapFeed, PlanetBake,
+        horizon_sine, impostor_datum, map_key, round_i32, FarSink, Key, MapFeed, PlanetBake,
         BAKE_VERSION, FULL, HOME_MAP, PREVIEW,
     };
     use crate::alloc_count;
@@ -971,18 +951,10 @@ mod tests {
         assert_ne!(relief.hash, variety.hash);
     }
 
-    /// The bake cache is keyed on these: a change re-bakes every cached map.
+    /// The bake cache is keyed on this: a change re-bakes every cached map.
     #[test]
-    fn the_world_fingerprint_and_the_cache_key_are_pinned() {
-        let registry = BlockRegistry::with_builtins();
+    fn the_cache_key_is_pinned() {
         let knobs = TerrainCfg { relief: 150, caves: 50, deep: 25, ..TerrainCfg::default() };
-        let fp = [
-            world_fingerprint(&registry, WorldgenKind::Flat, TerrainCfg::default()),
-            world_fingerprint(&registry, WorldgenKind::Flat, knobs),
-            world_fingerprint(&registry, WorldgenKind::Diffusion, TerrainCfg::default()),
-            world_fingerprint(&registry, WorldgenKind::Diffusion, knobs),
-        ];
-        assert_eq!(fp, [0x2ae6_d587_2d8b_db9a, 0x6ce5_8e44_4cb6_e65b, 0x7cdc_238a_9080_c3e4, 0x725c_01ff_99cd_ef75]);
         let mut registry = BlockRegistry::with_builtins();
         let terrain = Terrain::new(&mut registry, 42);
         let key = map_key(&terrain, &registry, WorldgenKind::Diffusion, knobs).unwrap();

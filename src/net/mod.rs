@@ -208,6 +208,26 @@ pub(crate) fn content_id(registry: &crate::block::BlockRegistry) -> ContentId {
     }
 }
 
+/// The content id folded with the worldgen kind and its knobs: everything that changes what a seed
+/// generates. Keys the planet-map bake cache.
+pub(crate) fn world_fingerprint(
+    registry: &crate::block::BlockRegistry,
+    kind: crate::world::generation::WorldgenKind,
+    cfg: crate::world::terrain::TerrainCfg,
+) -> u64 {
+    let id = content_id(registry);
+    let mut h = crate::hash::Fnv64::new();
+    h.bytes(&id.worldgen.to_le_bytes());
+    for word in [id.gravity, id.law, id.palette] {
+        h.bytes(&word.to_le_bytes());
+    }
+    h.bytes(kind.id().as_bytes());
+    for v in cfg.clamp().to_wire() {
+        h.bytes(&v.to_le_bytes());
+    }
+    h.finish()
+}
+
 /// `None` when `client` may share a world with `server`. Otherwise a reason that names the
 /// first part that differs and contains `content`, so a refusal says what diverged.
 pub(crate) fn content_mismatch(server: ContentId, client: ContentId) -> Option<String> {
@@ -230,124 +250,10 @@ pub(crate) fn content_mismatch(server: ContentId, client: ContentId) -> Option<S
 }
 
 #[cfg(test)]
-pub(crate) fn content_fingerprint() -> u64 {
-    content_fingerprint_kind(crate::world::generation::WorldgenKind::Diffusion)
-}
-
-#[cfg(test)]
-pub(crate) fn content_fingerprint_kind(kind: crate::world::generation::WorldgenKind) -> u64 {
-    content_fingerprint_kind_cfg(kind, crate::world::terrain::TerrainCfg::default())
-}
-
-/// A stable 64-bit digest of everything that determines what a seed GENERATES and how a body
-/// falls, including the worldgen kind and its knobs. The handshake no longer sends this —
-/// kind and knobs arrive in Welcome — the tests keep it so the mix stays characterised.
-#[cfg(test)]
-pub(crate) fn content_fingerprint_kind_cfg(
-    kind: crate::world::generation::WorldgenKind,
-    cfg: crate::world::terrain::TerrainCfg,
-) -> u64 {
-    fingerprint_kind_cfg(&crate::block::BlockRegistry::with_builtins(), kind, cfg)
-}
-
-/// The fingerprint of the gravity law, a registry's material law, and the generator's palette.
-#[cfg(test)]
-pub(crate) fn fingerprint_of(registry: &crate::block::BlockRegistry) -> u64 {
-    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut hash = FNV_OFFSET;
-    let mut eat = |bytes: &[u8]| {
-        for &b in bytes {
-            hash ^= b as u64;
-            hash = hash.wrapping_mul(FNV_PRIME);
-        }
-    };
-    eat(&crate::world::terrain::WORLDGEN_VERSION.to_le_bytes());
-    for word in crate::gravity::law_digest() {
-        eat(&word.to_le_bytes());
-    }
-    eat(&registry.law().fingerprint().to_le_bytes());
-    for entry in crate::world::terrain::palette::of(registry.law()) {
-        eat(entry.config.encode().as_bytes());
-    }
-    hash
-}
-
-/// Same as [`fingerprint_of`], plus the worldgen kind and its knobs.
-#[cfg(test)]
-pub(crate) fn fingerprint_kind_cfg(
-    registry: &crate::block::BlockRegistry,
-    kind: crate::world::generation::WorldgenKind,
-    cfg: crate::world::terrain::TerrainCfg,
-) -> u64 {
-    let mut hash = fingerprint_of(registry);
-    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut eat = |bytes: &[u8]| {
-        for &b in bytes {
-            hash ^= b as u64;
-            hash = hash.wrapping_mul(FNV_PRIME);
-        }
-    };
-    eat(kind.id().as_bytes());
-    if kind == crate::world::generation::WorldgenKind::Diffusion {
-        for v in cfg.clamp().to_wire() {
-            eat(&v.to_le_bytes());
-        }
-    }
-    hash
-}
-
-#[cfg(test)]
 mod fingerprint_tests {
     use super::*;
     use crate::world::generation::WorldgenKind;
     use crate::world::terrain::TerrainCfg;
-
-    #[test]
-    fn flat_fingerprint_ignores_knobs_and_differs_from_diffusion() {
-        let flat = content_fingerprint_kind(WorldgenKind::Flat);
-        let cfg = TerrainCfg { relief: 150, ..Default::default() };
-        assert_eq!(flat, content_fingerprint_kind_cfg(WorldgenKind::Flat, cfg));
-        assert_ne!(flat, content_fingerprint());
-    }
-
-    #[test]
-    fn diffusion_fingerprint_mixes_knobs() {
-        let diff = content_fingerprint_kind(WorldgenKind::Diffusion);
-        for cfg in [
-            TerrainCfg { relief: 150, ..Default::default() },
-            TerrainCfg { caves: 50, ..Default::default() },
-            TerrainCfg { mines: 0, ..Default::default() },
-            TerrainCfg { space: 200, ..Default::default() },
-            TerrainCfg { variety: 50, ..Default::default() },
-            TerrainCfg { features: 0, ..Default::default() },
-            TerrainCfg { structures: 175, ..Default::default() },
-            TerrainCfg { deep: 25, ..Default::default() },
-        ] {
-            assert_ne!(diff, content_fingerprint_kind_cfg(WorldgenKind::Diffusion, cfg));
-        }
-    }
-
-    #[test]
-    fn fingerprint_survives_a_reaction_the_client_never_saw() {
-        use crate::block::BlockRegistry;
-        use material::{Configuration, Element};
-
-        let mut server = BlockRegistry::with_builtins();
-        crate::world::terrain::Materials::intern(&mut server);
-        let before = fingerprint_of(&server);
-        let novel = Configuration::new(vec![Element::new([3, 9, 27, 81]), Element::new([4, 16, 64, 1])]).unwrap();
-        let sid = server.intern(&novel).unwrap();
-        let spec = server.spec(sid);
-        assert_eq!(fingerprint_of(&server), before, "interning does not change the handshake");
-
-        let mut client = BlockRegistry::with_builtins();
-        crate::world::terrain::Materials::intern(&mut client);
-        assert!(client.lookup(&novel).is_none(), "client has not seen the product");
-        let cid = client.parse_spec(&spec).unwrap();
-        assert_eq!(client.configuration(cid), server.configuration(sid));
-        assert_eq!(fingerprint_of(&client), before);
-    }
 
     #[test]
     fn content_id_ignores_interns_and_names_a_mismatch() {
@@ -373,6 +279,20 @@ mod fingerprint_tests {
         assert!(content_mismatch(id, ContentId { gravity: id.gravity ^ 1, ..id }).unwrap().contains("gravity"));
         assert!(content_mismatch(id, ContentId { law: id.law ^ 1, ..id }).unwrap().contains("law"));
         assert!(content_mismatch(id, ContentId { palette: id.palette ^ 1, ..id }).unwrap().contains("palette"));
+    }
+
+    /// The planet-map bake cache is keyed on these: a change re-bakes every cached map.
+    #[test]
+    fn world_fingerprint_is_pinned() {
+        let registry = crate::block::BlockRegistry::with_builtins();
+        let knobs = TerrainCfg { relief: 150, caves: 50, deep: 25, ..TerrainCfg::default() };
+        let fp = [
+            world_fingerprint(&registry, WorldgenKind::Flat, TerrainCfg::default()),
+            world_fingerprint(&registry, WorldgenKind::Flat, knobs),
+            world_fingerprint(&registry, WorldgenKind::Diffusion, TerrainCfg::default()),
+            world_fingerprint(&registry, WorldgenKind::Diffusion, knobs),
+        ];
+        assert_eq!(fp, [0x2ae6_d587_2d8b_db9a, 0x6ce5_8e44_4cb6_e65b, 0x7cdc_238a_9080_c3e4, 0x725c_01ff_99cd_ef75]);
     }
 
     /// Peers compare this id at join: a change refuses every older client.
