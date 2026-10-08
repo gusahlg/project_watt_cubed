@@ -23,7 +23,7 @@ use crate::menu::menus::{ModsMenu, SettingsHub};
 use crate::menu::start::{StartFacts, StartRoot, VERSION};
 use crate::menu::theme::{DefaultTheme, MenuTheme};
 use crate::menu::{AppEffect, Ctx, Framed, HostInfo, JoinInfo, MenuStack, ModRow};
-use crate::modding::{ActionSet, ChoicesFlush, GameBuild, ModDescriptor, Mods};
+use crate::modding::{ActionSet, ChoicesFlush, Debounce, GameBuild, ModDescriptor, Mods};
 #[cfg(test)]
 use crate::net::client::ConnectError;
 use crate::net::client::{Connection, PendingConnect};
@@ -116,6 +116,8 @@ pub struct App {
     last_stall_log: Option<Instant>,
     /// Debounces `mods.cfg` writes (held Left/Right would otherwise rewrite ~22×/s).
     choices_flush: ChoicesFlush,
+    /// In-game settings changes (HUD hotkey, console) wait here and save once they go quiet.
+    settings_flush: Debounce,
     clock: Instant,
     /// True while the Mods screen is on the menu stack.
     mods_open: bool,
@@ -225,6 +227,7 @@ impl App {
             audio,
             last_stall_log: None,
             choices_flush: ChoicesFlush::new(),
+            settings_flush: Debounce::new(),
             clock: Instant::now(),
             mods_open: false,
             mods_save_error: None,
@@ -246,6 +249,12 @@ impl App {
     fn flush_mod_choices_if_dirty(&mut self) {
         if self.choices_flush.take() {
             self.persist_mod_choices();
+        }
+    }
+
+    fn flush_settings_if_dirty(&mut self) {
+        if self.settings_flush.take() && self.bench.is_none() {
+            self.settings.save();
         }
     }
 
@@ -1065,6 +1074,7 @@ impl App {
     /// In-world update: run the game and handle autosave.
     fn update_playing(&mut self, eng: &mut Engine) {
         let dt = eng.frame_time() as f64;
+        let now_ms = self.now_ms();
         let Screen::Playing(game) = &mut self.screen else {
             return;
         };
@@ -1077,7 +1087,14 @@ impl App {
             &mut self.audio,
             &self.cues,
         );
+        if game.take_settings_dirty() {
+            self.settings_flush.mark(now_ms);
+        }
+        if self.settings_flush.poll(now_ms) && self.bench.is_none() {
+            self.settings.save();
+        }
         if let Signal::ExitToMenu = signal {
+            self.flush_settings_if_dirty();
             self.flush_save();
             let notice = if let Screen::Playing(game) = &mut self.screen {
                 let notice = game.take_leave_notice();
