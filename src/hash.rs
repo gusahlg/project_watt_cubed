@@ -1,15 +1,14 @@
 //! Small deterministic hash primitives, single-sourced so every call site that
 //! depends on their exact bit output (terrain generation, procedural block
-//! textures, peer colours) shares one implementation and can never drift.
+//! textures, peer colours, fingerprints and cache keys) shares one implementation
+//! and can never drift. FNV-1a lives in the material crate, which hashes the law.
 
-/// FNV / FNV1a hash over a byte slice (32-bit). Shared by peer-colour and
-/// texture-seed so both use the same algorithm.
+pub use material::{Fnv32, Fnv64};
+
+/// FNV-1a over a byte slice (32-bit). Shared by peer-colour and texture-seed so
+/// both use the same algorithm.
 pub fn fnv1a_32(bytes: &[u8]) -> u32 {
-    let mut h: u32 = 0x811c_9dc5;
-    for &b in bytes {
-        h = (h ^ b as u32).wrapping_mul(0x0100_0193);
-    }
-    h
+    Fnv32::new().bytes(bytes).finish()
 }
 
 /// The splitmix64 finisher: mixes up a 64-bit hash state using xor and

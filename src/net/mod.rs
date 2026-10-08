@@ -187,32 +187,22 @@ pub(crate) struct ContentId {
     pub palette: u64,
 }
 
-const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-
-fn fnv_feed(hash: &mut u64, bytes: &[u8]) {
-    for &b in bytes {
-        *hash ^= b as u64;
-        *hash = hash.wrapping_mul(FNV_PRIME);
-    }
-}
-
 /// Code and content identity of `registry`. Interning a block does not change it: the
 /// palette is a function of the law, not of which configurations have been seen.
 pub(crate) fn content_id(registry: &crate::block::BlockRegistry) -> ContentId {
-    let mut gravity = FNV_OFFSET;
+    let mut gravity = crate::hash::Fnv64::new();
     for word in crate::gravity::law_digest() {
-        fnv_feed(&mut gravity, &word.to_le_bytes());
+        gravity.bytes(&word.to_le_bytes());
     }
-    let mut palette = FNV_OFFSET;
+    let mut palette = crate::hash::Fnv64::new();
     for entry in crate::world::terrain::palette::of(registry.law()) {
-        fnv_feed(&mut palette, entry.config.encode().as_bytes());
+        palette.bytes(entry.config.encode().as_bytes());
     }
     ContentId {
         worldgen: u32::from(crate::world::terrain::WORLDGEN_VERSION),
-        gravity,
+        gravity: gravity.finish(),
         law: registry.law().fingerprint(),
-        palette,
+        palette: palette.finish(),
     }
 }
 

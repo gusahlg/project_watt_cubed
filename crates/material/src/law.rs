@@ -10,6 +10,7 @@
 use crate::configuration::CAPACITY;
 use crate::element::{Element, D};
 use crate::fit_table::FIT;
+use crate::fnv::Fnv64;
 
 /// The identifier of the reaction function this crate implements.
 pub const LAW_ID: &str = "watt-selective-transfer-v1";
@@ -54,14 +55,11 @@ pub const STAMP_LEN: usize = 2 + 1 + 8 + 3 * D + 4;
 
 /// FNV-1a over the committed fit table: part of every stamp.
 fn table_digest() -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut h = Fnv64::new();
     for v in FIT {
-        for b in v.to_le_bytes() {
-            h ^= b as u64;
-            h = h.wrapping_mul(0x0000_0100_0000_01b3);
-        }
+        h.bytes(&v.to_le_bytes());
     }
-    h
+    h.finish()
 }
 
 impl Law {
@@ -122,12 +120,7 @@ impl Law {
 
     /// A 64-bit fingerprint of the stamp (FNV-1a), for the content handshake.
     pub fn fingerprint(&self) -> u64 {
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        for b in self.stamp() {
-            h ^= b as u64;
-            h = h.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        h
+        Fnv64::new().bytes(&self.stamp()).finish()
     }
 }
 

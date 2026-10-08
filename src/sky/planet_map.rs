@@ -16,6 +16,7 @@ use voxel_engine::Color;
 
 use crate::block::registry::{AIR, BlockId};
 use crate::coord::Face;
+use crate::hash::Fnv64;
 use crate::sky::palette::Rgb;
 use crate::space::atlas::FACES;
 use crate::space::chart::{basis, Map};
@@ -38,8 +39,6 @@ const TMP_MAX_AGE: Duration = Duration::from_secs(60);
 const MAGIC: &[u8; 4] = b"PWCM";
 /// magic, version, seed, body, face, size, key hash, payload checksum.
 const HEADER: usize = 40;
-const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-const FNV_PRIME: u64 = 0x100_0000_01b3;
 
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -177,43 +176,18 @@ pub(crate) fn horizon_sine(dist: f64, hi: f64, air: f64) -> f32 {
     if h.is_finite() { h as f32 } else { 1.0 }
 }
 
-fn fnv_byte(mut h: u64, b: u8) -> u64 {
-    h ^= b as u64;
-    h.wrapping_mul(FNV_PRIME)
-}
-
-fn fnv_bytes(mut h: u64, bytes: &[u8]) -> u64 {
-    for &b in bytes {
-        h = fnv_byte(h, b);
+/// The cache key's hash: FNV-1a 64 over every channel of the colour snapshot, then the worldgen
+/// fingerprint, chart `n`, and the FNV-1a 64 of the datum offsets' little-endian bits.
+fn key_hash(colors: &[Color], fingerprint: u64, n: i64, datum: &[f32]) -> u64 {
+    let mut offsets = Fnv64::new();
+    for o in datum {
+        offsets.bytes(&o.to_le_bytes());
     }
-    h
-}
-
-/// FNV-1a 64 over every channel of the colour snapshot.
-pub(crate) fn color_hash(colors: &[Color]) -> u64 {
-    let mut h = FNV_OFFSET;
+    let mut h = Fnv64::new();
     for c in colors {
-        for b in [c.r, c.g, c.b, c.a] {
-            h = fnv_byte(h, b);
-        }
+        h.bytes(&[c.r, c.g, c.b, c.a]);
     }
-    h
-}
-
-/// FNV-1a 64 over the datum offsets' little-endian bits.
-fn datum_hash(offsets: &[f32]) -> u64 {
-    let mut h = FNV_OFFSET;
-    for o in offsets {
-        h = fnv_bytes(h, &o.to_le_bytes());
-    }
-    h
-}
-
-/// Colour hash, worldgen fingerprint, chart `n`, and the datum hash, folded into the cache key.
-fn fold_key(color: u64, fingerprint: u64, n: i64, datum: u64) -> u64 {
-    let mut h = fnv_bytes(color, &fingerprint.to_le_bytes());
-    h = fnv_bytes(h, &n.to_le_bytes());
-    fnv_bytes(h, &datum.to_le_bytes())
+    h.bytes(&fingerprint.to_le_bytes()).bytes(&n.to_le_bytes()).bytes(&offsets.finish().to_le_bytes()).finish()
 }
 
 #[derive(Clone, Copy)]
@@ -341,7 +315,7 @@ fn cache_save(dir: &Path, key: &Key, size: u32, face: usize, rgba: &[u8]) {
     }
     let path = cache_path(dir, key, size, face);
     let tmp = tmp_path(&path);
-    let sum = fnv_bytes(FNV_OFFSET, rgba);
+    let sum = Fnv64::new().bytes(rgba).finish();
     let mut bytes = Vec::with_capacity(HEADER + rgba.len());
     bytes.extend_from_slice(MAGIC);
     push_u32(&mut bytes, key.version);
@@ -376,7 +350,7 @@ fn cache_load(dir: &Path, key: &Key, size: u32, face: usize) -> Option<Vec<u8>> 
         || u16_at(&bytes, 18)? != face as u16
         || u32_at(&bytes, 20)? != size
         || u64_at(&bytes, 24)? != key.hash
-        || u64_at(&bytes, 32)? != fnv_bytes(FNV_OFFSET, &bytes[HEADER..])
+        || u64_at(&bytes, 32)? != Fnv64::new().bytes(&bytes[HEADER..]).finish()
     {
         return None;
     }
@@ -436,9 +410,7 @@ fn map_key(
 ) -> Option<Key> {
     let (body, seed, n) = home_chart_n(generator)?;
     let datum = home_datum(generator)?;
-    let colors = registry.color_snapshot();
-    let fp = world_fingerprint(registry, kind, cfg);
-    let hash = fold_key(color_hash(&colors), fp, n, datum_hash(datum));
+    let hash = key_hash(&registry.color_snapshot(), world_fingerprint(registry, kind, cfg), n, datum);
     Some(Key { seed, body, hash, version: BAKE_VERSION })
 }
 
@@ -450,15 +422,16 @@ fn world_fingerprint(
     cfg: crate::world::terrain::TerrainCfg,
 ) -> u64 {
     let id = crate::net::content_id(registry);
-    let mut h = fnv_bytes(0xcbf2_9ce4_8422_2325, &id.worldgen.to_le_bytes());
+    let mut h = Fnv64::new();
+    h.bytes(&id.worldgen.to_le_bytes());
     for word in [id.gravity, id.law, id.palette] {
-        h = fnv_bytes(h, &word.to_le_bytes());
+        h.bytes(&word.to_le_bytes());
     }
-    h = fnv_bytes(h, kind.id().as_bytes());
+    h.bytes(kind.id().as_bytes());
     for v in cfg.clamp().to_wire() {
-        h = fnv_bytes(h, &v.to_le_bytes());
+        h.bytes(&v.to_le_bytes());
     }
-    h
+    h.finish()
 }
 
 /// A benchmark or a scripted game does not bake. `WATT_BENCH_PLANET_MAP=1` opts a benchmark back in.
@@ -832,7 +805,7 @@ impl MapFeed {
 #[cfg(test)]
 mod tests {
     use super::{
-        bake_face, bake_enabled, cache_load, cache_name_parts, cache_path, cache_save, clamp_column, color_hash,
+        bake_face, bake_enabled, cache_load, cache_name_parts, cache_path, cache_save, clamp_column,
         column_direction, column_linear, column_of, cube_texel_dir, home_chart_n, horizon_sine, impostor_datum,
         map_key, prune_cache, round_i32, tmp_path, world_fingerprint, FarSink, Key, MapFeed, PlanetBake, BAKE_VERSION,
         FULL, HEADER, HOME_MAP, KEPT_KEYS, PREVIEW,
@@ -1473,7 +1446,7 @@ mod tests {
         let mut colors = vec![Color::rgb(0, 0, 0); 3].into_boxed_slice();
         colors[1] = Color::rgb(20, 160, 40);
         colors[2] = Color::rgb(180, 20, 20);
-        let key = Key { seed: 7, body: 1, hash: color_hash(&colors), version: BAKE_VERSION };
+        let key = Key { seed: 7, body: 1, hash: 0x5eed, version: BAKE_VERSION };
         let mut bake = PlanetBake::default();
         alloc_count::reset();
         bake.poll();

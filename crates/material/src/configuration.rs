@@ -2,6 +2,7 @@
 //! equal multisets have equal bytes; multiplicity is kept (`[x, x, y]` is not `[x, y]`).
 
 use crate::element::{Element, D};
+use crate::fnv::Fnv64;
 
 /// At most this many occurrences fit in one voxel (law constant).
 pub const CAPACITY: usize = 32;
@@ -127,18 +128,12 @@ impl Configuration {
 
     /// A 64-bit hash of the canonical bytes (FNV-1a): a stable seed for presentation and naming.
     pub fn digest(&self) -> u64 {
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        let mut eat = |b: u8| {
-            h ^= b as u64;
-            h = h.wrapping_mul(0x0000_0100_0000_01b3);
-        };
-        eat(self.0.len() as u8);
+        let mut h = Fnv64::new();
+        h.bytes(&[self.0.len() as u8]);
         for e in self.0.iter() {
-            for b in e.0 {
-                eat(b);
-            }
+            h.bytes(&e.0);
         }
-        h
+        h.finish()
     }
 }
 

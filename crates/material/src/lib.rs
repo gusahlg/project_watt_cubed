@@ -15,6 +15,7 @@ mod configuration;
 mod element;
 #[rustfmt::skip]
 mod fit_table;
+mod fnv;
 mod kernel;
 mod law;
 mod observe;
@@ -22,6 +23,7 @@ mod visual;
 
 pub use configuration::{ConfigError, Configuration, DecodeError, Encoding, CAPACITY};
 pub use element::{Element, D};
+pub use fnv::{Fnv32, Fnv64};
 pub use kernel::{fit_raw, react_once, Block, Change, Contact, Operation, QUANTUM};
 pub use law::{Law, LawError, Probes, LAW_ID, STAMP_LEN};
 pub use observe::{cohesion, observe, probe_response, Acoustic, Observation};

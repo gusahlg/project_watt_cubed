@@ -26,6 +26,7 @@ use material::{
 };
 
 use super::noise::hash2;
+use crate::hash::Fnv64;
 
 /// What a role needs from its configuration besides its colour.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -306,14 +307,9 @@ fn decode_hex(hex: &str) -> Option<Configuration> {
 /// FNV-1a over every input of [`search`] that is data: the roles, the underground set, and the
 /// search constants.
 fn roles_fingerprint() -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut h = Fnv64::new();
     let mut feed = |bytes: &[u8]| {
-        for &b in bytes {
-            h ^= u64::from(b);
-            h = h.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        h ^= 0xff;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        h.bytes(bytes).bytes(&[0xff]);
     };
     for r in ROLES {
         feed(r.label.as_bytes());
@@ -337,7 +333,7 @@ fn roles_fingerprint() -> u64 {
     for k in [GAP, MAX_REAGENT_SPILL as u32, NEAREST as u32, PANEL as u32, SHORTLIST as u32, BANK as u32, BANK_SCAN, BASES, PROBE_BASES, u32::from(STEP)] {
         feed(&k.to_le_bytes());
     }
-    h
+    h.finish()
 }
 
 /// The palette of `law`.
