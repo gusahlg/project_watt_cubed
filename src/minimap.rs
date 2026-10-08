@@ -73,6 +73,12 @@ pub struct MapSample {
 }
 
 impl MapSample {
+    /// [`from_player`](Self::from_player) for `player`'s pose.
+    pub fn of(world: &World, player: &crate::player::Player) -> Self {
+        let o = &player.orientation;
+        Self::from_player(world, player.position, player.up_axis, o.frame, o.yaw)
+    }
+
     pub fn from_player(world: &World, eye: DVec3, up: Face, frame: DQuat, yaw: f32) -> Self {
         if let Some(storage) = world.chart_eye(eye) {
             let heading = chart_heading(world, eye, frame, yaw)

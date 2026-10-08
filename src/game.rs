@@ -252,6 +252,9 @@ pub struct Game {
     /// `None` when the minimap lane is disabled — no raster state retained,
     /// no refresh clock read, no draw.
     minimap: Option<Minimap>,
+    /// The minimap's view of the player when the stream phase already took it this frame; the
+    /// HUD takes it instead of sampling again.
+    map_sample: Option<MapSample>,
     /// What the app renders: `Normal` play, or `TerrainKey` for the
     /// harness's sky-hole detector (flat terrain key, sky/fog passes disabled).
     debug_view: DebugView,
@@ -336,12 +339,14 @@ pub struct Game {
     peer_up_scratch: Vec<crate::coord::Face>,
     /// Last frame's named-phase durations, for the stall detector.
     phases: FramePhases,
+    /// The frame's audio facts; empty between frames.
+    events_scratch: Vec<GameEvent>,
     hud_scratch: Vec<HudElement>,
     /// Menu notice taken when a network session leaves. The console goes with the game.
     leave_notice: Option<String>,
 }
 
-/// Durations of `Game::update` phases, sampled every frame for stall logs.
+/// Durations of `Game::update` phases, sampled every watched frame for stall logs.
 #[derive(Clone, Copy, Default)]
 struct FramePhases {
     net: Duration,
@@ -351,6 +356,21 @@ struct FramePhases {
     interact: Duration,
     stream: Duration,
     audio: Duration,
+}
+
+/// A phase stopwatch for [`FramePhases`]; reads no clock unless watching.
+struct Lap(Option<Instant>);
+
+impl Lap {
+    fn start(watch: bool) -> Self {
+        Lap(watch.then(Instant::now))
+    }
+
+    fn stop(self, slot: &mut Duration) {
+        if let Some(start) = self.0 {
+            *slot = start.elapsed();
+        }
+    }
 }
 
 impl Game {
@@ -396,6 +416,7 @@ impl Game {
             // historical presentation; `apply_settings` drops it when the
             // minimap lane is disabled.
             minimap: Some(Minimap::new(MinimapConfig::DEFAULT)),
+            map_sample: None,
             debug_view: DebugView::Normal,
             scripted: false,
             input_locked: false,
@@ -424,6 +445,7 @@ impl Game {
             peer_pose_scratch: Vec::new(),
             peer_up_scratch: Vec::new(),
             phases: FramePhases::default(),
+            events_scratch: Vec::new(),
             hud_scratch: Vec::new(),
             leave_notice: None,
         }
@@ -694,23 +716,28 @@ impl Game {
 
         // This frame's audio facts, accumulated across the phases. Footsteps are
         // added at the audio commit; mods choose the cues and the voice sessions.
-        let mut events: Vec<GameEvent> = Vec::new();
+        let mut events = std::mem::take(&mut self.events_scratch);
 
-        self.phases = FramePhases::default();
-        let t = Instant::now();
+        // Phase timings feed the stall log, which only debug builds and
+        // benchmarks (the input-locked mode) print.
+        let watch = cfg!(debug_assertions) || self.input_locked;
+        if watch {
+            self.phases = FramePhases::default();
+        }
+        let t = Lap::start(watch);
         if let Some(signal) = self.net_phase(mods, &mut events) {
             return signal;
         }
-        self.phases.net = t.elapsed();
-        let t = Instant::now();
+        t.stop(&mut self.phases.net);
+        let t = Lap::start(watch);
         let input = self.input_phase(eng, router, mods, dt);
-        self.phases.input = t.elapsed();
+        t.stop(&mut self.phases.input);
         // The overlay may consume the frame (console typing, opening chat): movement
         // and interaction run only on an unconsumed frame. Streaming still runs
         // while a spawn/teleport slab is outstanding so loading progresses with
         // the console open. A still singleplayer frame skips the mixer when
         // nothing is sounding; only a real exit short-circuits the rest of the frame.
-        let t = Instant::now();
+        let t = Lap::start(watch);
         let overlay = self.overlay_phase(OverlayPhase {
             input: &input,
             eng,
@@ -720,7 +747,7 @@ impl Game {
             sound,
             events: &mut events,
         });
-        self.phases.overlay = t.elapsed();
+        t.stop(&mut self.phases.overlay);
         let consumed = match overlay {
             Some(Signal::ExitToMenu) => return Signal::ExitToMenu,
             Some(Signal::Continue) => true,
@@ -728,20 +755,20 @@ impl Game {
         };
         let ready = self.world.spawn_ready();
         if !consumed && ready {
-            let t = Instant::now();
+            let t = Lap::start(watch);
             let detached = self.motion_phase(&input, dt);
-            self.phases.motion = t.elapsed();
-            let t = Instant::now();
+            t.stop(&mut self.phases.motion);
+            let t = Lap::start(watch);
             self.interact_phase(&input, detached, dt, eng, mods, &mut events, router.action_ids());
-            self.phases.interact = t.elapsed();
+            t.stop(&mut self.phases.interact);
         }
         if !consumed || !ready {
-            let t = Instant::now();
+            let t = Lap::start(watch);
             self.stream_phase(eng, dt, mods);
-            self.phases.stream = t.elapsed();
+            t.stop(&mut self.phases.stream);
         }
         let active = !consumed;
-        let t = Instant::now();
+        let t = Lap::start(watch);
         self.sample_peers();
         let ids = router.action_ids();
         self.commit_audio(AudioPhase {
@@ -756,7 +783,7 @@ impl Game {
             mods,
             ids,
         });
-        self.phases.audio = t.elapsed();
+        t.stop(&mut self.phases.audio);
         Signal::Continue
     }
 
@@ -1053,7 +1080,7 @@ impl Game {
                             Some(atlas) => movement::update_player_in(
                                 &mut self.player,
                                 &self.world,
-                                &atlas.clone(),
+                                atlas,
                                 &tick_input,
                                 step_dt,
                                 gravity,
@@ -1256,13 +1283,8 @@ impl Game {
             // The map follows the body, not the freecam. The throttle rides the
             // scheduler's interval gate (advanced in clocks() above); the recenter
             // half stays inside Minimap::due.
-            let sample = MapSample::from_player(
-                &self.world,
-                self.player.position,
-                self.player.up_axis,
-                self.player.orientation.frame,
-                self.player.orientation.yaw,
-            );
+            let sample = MapSample::of(&self.world, &self.player);
+            self.map_sample = Some(sample);
             let due = self.sched.interval_due(self.minimap_interval);
             if minimap.refresh(eng, &self.world, sample, due) {
                 self.sched.interval_reset(self.minimap_interval);
@@ -1293,7 +1315,7 @@ impl Game {
         } else {
             self.sky_gate.reset();
         }
-        let events: Vec<GameEvent> = Vec::new();
+        let events = std::mem::take(&mut self.events_scratch);
         if self.input_locked {
             router.drain_frame();
         }
@@ -1366,53 +1388,53 @@ impl Game {
             ids,
         } = phase;
         let idle = events.is_empty() && input.actions.is_empty();
-        let skip = self.net.is_none() && audio.can_skip(sound, idle, self.player.position);
-        if skip {
+        if self.net.is_none() && audio.can_skip(sound, idle, self.player.position) {
             self.dispatch_audio(dt, input, sound, audio, cues, settings, mods, ids, &[], &events);
-            if !audio.dirty() {
+            if audio.dirty() {
+                self.submit_audio(dt, sound, audio);
+            } else {
                 sound.poll_starvation();
-                return;
             }
+        } else {
+            let mut peers = std::mem::take(&mut self.peer_pose_scratch);
+            let mut ups = std::mem::take(&mut self.peer_up_scratch);
+            peers.clear();
+            ups.clear();
+            for frame in &self.peer_frames {
+                let r = &frame.rendered;
+                peers.push(PeerAudio {
+                    id: frame.id,
+                    at: r.pos.0,
+                    feet: r.pos.feet(r.stance, r.up).0,
+                    visible: frame.visible,
+                    gait: r.phase,
+                    speed: r.speed,
+                });
+                ups.push(r.up);
+            }
+            // A console-owned frame does not step the player, so a stale walk speed
+            // must not fire a footstep.
+            let velocity = if active { self.player.velocity() } else { DVec3::ZERO };
+            audio.footsteps(
+                StepPose {
+                    feet: self.player.feet(),
+                    velocity,
+                    on_ground: self.player.on_ground(),
+                    up: self.player.up_axis,
+                },
+                &self.world,
+                dt,
+                &peers,
+                &ups,
+                &mut events,
+            );
+            self.dispatch_audio(dt, input, sound, audio, cues, settings, mods, ids, &peers, &events);
             self.submit_audio(dt, sound, audio);
-            return;
+            self.peer_pose_scratch = peers;
+            self.peer_up_scratch = ups;
         }
-
-        let mut peers = std::mem::take(&mut self.peer_pose_scratch);
-        let mut ups = std::mem::take(&mut self.peer_up_scratch);
-        peers.clear();
-        ups.clear();
-        for frame in &self.peer_frames {
-            let r = &frame.rendered;
-            peers.push(PeerAudio {
-                id: frame.id,
-                at: r.pos.0,
-                feet: r.pos.feet(r.stance, r.up).0,
-                visible: frame.visible,
-                gait: r.phase,
-                speed: r.speed,
-            });
-            ups.push(r.up);
-        }
-        // A console-owned frame does not step the player, so a stale walk speed
-        // must not fire a footstep.
-        let velocity = if active { self.player.velocity() } else { DVec3::ZERO };
-        audio.footsteps(
-            StepPose {
-                feet: self.player.feet(),
-                velocity,
-                on_ground: self.player.on_ground(),
-                up: self.player.up_axis,
-            },
-            &self.world,
-            dt,
-            &peers,
-            &ups,
-            &mut events,
-        );
-        self.dispatch_audio(dt, input, sound, audio, cues, settings, mods, ids, &peers, &events);
-        self.submit_audio(dt, sound, audio);
-        self.peer_pose_scratch = peers;
-        self.peer_up_scratch = ups;
+        events.clear();
+        self.events_scratch = events;
     }
 
     fn dispatch_audio(

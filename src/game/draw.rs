@@ -409,6 +409,7 @@ impl Game {
     /// mods' HUD data (rendered by the core — mods never touch the frame), and
     /// the console on top.
     fn hud_phase(&mut self, f: &mut voxel_engine::Frame, mods: &mut Mods, scene: &Scene) {
+        let map_sample = self.map_sample.take();
         // HUD Off records nothing at all — unless the console is open, which
         // must stay reachable in every mode.
         if matches!(self.theme.hud, HudMode::Off) && !self.console.is_open() {
@@ -422,13 +423,7 @@ impl Game {
         if theme.hud.shows_minimap()
             && let Some(minimap) = &self.minimap
         {
-            let sample = crate::minimap::MapSample::from_player(
-                &self.world,
-                self.player.position,
-                self.player.up_axis,
-                self.player.orientation.frame,
-                self.player.orientation.yaw,
-            );
+            let sample = map_sample.unwrap_or_else(|| crate::minimap::MapSample::of(&self.world, &self.player));
             minimap.draw(f, screen, sample);
         }
 
