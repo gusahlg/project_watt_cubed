@@ -85,12 +85,14 @@ defaults to the id and is only for logs and saves older than ids). A mod is *act
 core suspended its package for the session (see [Suspension](#suspension)). When several active
 mods implement a hook:
 
-- Fan-out, in installation order: `update`, `on_toggle_fly`, `on_block_break`, `on_break_rejected`,
-  `on_place_rejected`, `on_tool_changed`, `on_tool_used`, `on_game_event`, `on_audio`. `hud` uses the same order as z-order (later draws on
-  top), and `commands` lists concatenate in it. `actions` are collected from every active mod.
-  `on_audio` runs every frame, menus included. `on_options` reaches every mod, suspended ones too.
+- Fan-out, in installation order: `update`, `on_frame`, `on_message`, `on_block_break`,
+  `on_break_rejected`, `on_place_rejected`, `on_tool_changed`, `on_tool_used`, `on_game_event`,
+  `on_audio`. `hud` uses the same order as z-order (later draws on top). `actions` are collected
+  from every active mod. `on_audio` runs every frame, menus included. `on_options` reaches every
+  mod, suspended ones too.
 - First active wins: `close_overlay` (first `true`), `root_screen`, `pause_screen`, `tool`,
-  `namer`, `appearance`, `worldgen`, `worldgen_config`, `run_command` (first `Some`).
+  `namer`, `appearance`, `worldgen`, `worldgen_config` (first `Some`). The keyboard capture belongs
+  to the first mod that asks until it gives it back or Escape ends it.
 - Compose: `visual_group` bits OR into the render mask: a lane is allowed when an installed,
   unsuspended package provides its group.
 
@@ -109,14 +111,13 @@ future one will show, and rebinding is left for later. HUD output is data
 `note_block_moved(from, to)`). Chunk load, generation, meshing and saving never wake anything; on
 a client connected to a server the authority runs the scheduler.
 
-The core has no console commands and no flight toggle of its own. `run_command(ctx, cmd, args)`
-handles a console line (its default asks the context-free `command(cmd, args)`) with the player,
-world, settings and sky in a `CommandContext`; the core follows up on what changed (applies and
-saves changed settings, re-mixes the audio, sends a changed clock to the server, streams a moved
-player's destination and reports it as a teleport). `commands()` lists a mod's commands for
-`/help` and Tab completion; a line no enabled mod handles gets a short hint. `on_toggle_fly(ctx)`
-receives the flight key (`F`), latched and replayed at the mod tick like the other edges. The
-Developer Toolkit package (`pwc.dev-toolkit`) provides the commands and flight.
+The core has no console, no commands and no flight key of its own. `on_frame(ctx)` runs every
+in-world frame with the immediate actions, the keyboard capture (`FrameContext::capture_text`) and
+the game state in a `GameContext`; the core follows up on what it changed (applies and saves
+changed settings, re-mixes the audio, sends a changed clock to the server, streams a moved
+player's destination and reports it as a teleport). `on_message` hands over chat lines, joins,
+leaves and the core's notices. `pwc.chat`, `pwc.commands` and `pwc.dev-toolkit` provide the chat,
+the commands and flight on top of them.
 
 `id()` is a stable key: world saves (per-mod `save_state`) are keyed by it.
 
