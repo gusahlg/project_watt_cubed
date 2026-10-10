@@ -30,7 +30,7 @@ use crate::menu::start::{StartFacts, StartScreen};
 use crate::menu::theme::MenuTheme;
 use crate::player::Player;
 use crate::render_config::{RenderConfig, VisualGroup};
-use crate::settings::Settings;
+use crate::settings::{Options, Settings};
 use crate::sky::Sky;
 use crate::ui::{HudElement, Line};
 use crate::world::generation::WorldgenKind;
@@ -344,6 +344,14 @@ pub trait Mod {
     /// fallback for saves older than ids.
     fn id(&self) -> &'static str;
 
+    /// The options changed: the values are loaded, or a player changed one. Copy what this mod
+    /// reads (by the [`OptionId`](crate::settings::OptionId)s its package got from
+    /// [`ModRegistrar::option`]); [`Options::revision`] moves with every change. Called once after
+    /// registration, once more when `settings.cfg` is read, then at event granularity.
+    fn on_options(&mut self, options: &Options) {
+        let _ = options;
+    }
+
     /// Clear per-world state (crafted blocks, open panels) when entering a
     /// different world. The inventory lives on the player, not here.
     fn reset(&mut self) {}
@@ -544,6 +552,8 @@ pub struct Mods {
     /// Package ids suspended now: the pinned ones plus what the current server refused. Never
     /// saved.
     suspended: Vec<String>,
+    /// The options the packages declared, and their values.
+    options: Options,
 }
 
 impl Mods {
@@ -559,6 +569,7 @@ impl Mods {
             let mut registrar = ModRegistrar::new(package, info, &mut mods, &mut resources);
             register(&mut registrar);
         }
+        mods.options_changed();
         mods
     }
 
@@ -571,7 +582,31 @@ impl Mods {
             revision: 0,
             pinned: Vec::new(),
             suspended: Vec::new(),
+            options: Options::new(),
         }
+    }
+
+    /// The options the packages declared.
+    pub fn options(&self) -> &Options {
+        &self.options
+    }
+
+    /// The options, to change or load. Call [`options_changed`](Self::options_changed) after.
+    pub fn options_mut(&mut self) -> &mut Options {
+        &mut self.options
+    }
+
+    /// Tell every mod, suspended ones too, that the options changed.
+    pub fn options_changed(&mut self) {
+        for entry in &mut self.entries {
+            entry.module.on_options(&self.options);
+        }
+    }
+
+    /// What a menu reads beside the options it changes: the suspended packages and the visual
+    /// mask, borrowed alongside the options.
+    pub fn menu_parts(&mut self) -> (&[String], VisualMask, &mut Options) {
+        (&self.suspended, self.visuals, &mut self.options)
     }
 
     /// Install a mod directly (tests, the vanilla harness). Packages install through
@@ -1223,6 +1258,59 @@ mod tests {
         assert!(flush.take());
         assert!(!flush.take());
         assert!(!flush.poll(10 + Debounce::IDLE_MS));
+    }
+
+    /// A worldgen mod with one option: it reads the value in `on_options` and builds its payload
+    /// from it, so a change reaches the next new world.
+    struct Knobbed {
+        relief_id: crate::settings::OptionId,
+        relief: i32,
+    }
+
+    impl Mod for Knobbed {
+        fn id(&self) -> &'static str {
+            "knobbed"
+        }
+        fn on_options(&mut self, options: &Options) {
+            self.relief = options.int(self.relief_id);
+        }
+        fn worldgen(&self) -> Option<WorldgenKind> {
+            Some(WorldgenKind::Diffusion)
+        }
+        fn worldgen_config(&self) -> Option<String> {
+            Some(format!("relief={}", self.relief))
+        }
+    }
+
+    fn register_knobbed(r: &mut ModRegistrar) {
+        use crate::settings::{Category, OptionSpec};
+        let relief_id = r.option(OptionSpec::percent("relief", "Relief", Category::World, (25, 300, 25), 100).next_world());
+        r.add(Knobbed { relief_id, relief: 0 });
+    }
+
+    #[test]
+    fn a_package_option_reaches_its_mod_and_the_next_new_world() {
+        use crate::settings::{Applies, OptionValue};
+        static PACKAGES: &[PackageInfo] = &[PackageInfo {
+            id: "test.worldgen",
+            name: "Worldgen",
+            version: "1.0.0",
+            description: "",
+            kind: PackageKind::Mod,
+            dependencies: &[],
+            register: Some(register_knobbed),
+        }];
+        let mut mods = GameBuild::from_static("sha256:03", PACKAGES).mods();
+        assert_eq!(mods.worldgen_config().as_deref(), Some("relief=100"), "registration ends with the defaults delivered");
+        let id = mods.options().find("test.worldgen.relief").expect("declared under the package id");
+        assert_eq!(mods.options().spec(id).applies, Applies::NextWorld);
+        assert_eq!(mods.options().owner(id), "test.worldgen");
+        assert!(mods.options_mut().set(id, OptionValue::Int(175)));
+        assert_eq!(mods.worldgen_config().as_deref(), Some("relief=100"), "the mod hears at the next fan-out");
+        mods.suspend_packages(&["test.worldgen".to_string()]);
+        mods.options_changed();
+        mods.resume_packages();
+        assert_eq!(mods.worldgen_config().as_deref(), Some("relief=175"), "suspended mods hear too");
     }
 
     /// Every host change a mods screen can show moves the revision; reading does not.

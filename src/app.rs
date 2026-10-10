@@ -106,6 +106,8 @@ pub struct App {
     clock: Instant,
     /// `WATT_BENCH_WORLDGEN`: the generator new worlds use, whatever the mods say.
     worldgen_pin: Option<WorldgenKind>,
+    /// The options revision the mods last heard about ([`Mod::on_options`](crate::modding::Mod::on_options)).
+    options_seen: u64,
     /// Last graphics stamp pushed to the engine; `apply` runs only on change.
     gfx_applied: Option<GfxKey>,
 }
@@ -223,7 +225,9 @@ impl App {
             mods.pin_suspended(&pinned);
         }
         let saves = save::list();
-        let mut settings = Settings::load();
+        let mut settings = Settings::load(mods.options_mut());
+        mods.options_changed();
+        let options_seen = mods.options().revision();
         let (caps, display) = crate::benchmark::graphics_caps();
         settings.set_device_caps(caps, display);
         let session = Session::load();
@@ -273,6 +277,7 @@ impl App {
             settings_flush: Debounce::new(),
             clock: Instant::now(),
             worldgen_pin: pins.worldgen,
+            options_seen,
             gfx_applied: None,
         }
     }
@@ -281,9 +286,18 @@ impl App {
         self.clock.elapsed().as_millis() as u64
     }
 
+    /// Tell the mods once the options moved since they last heard.
+    fn tell_options(&mut self) {
+        let revision = self.mods.options().revision();
+        if revision != self.options_seen {
+            self.options_seen = revision;
+            self.mods.options_changed();
+        }
+    }
+
     fn flush_settings_if_dirty(&mut self) {
         if self.settings_flush.take() && self.bench.is_none() {
-            self.settings.save();
+            self.settings.save(self.mods.options());
         }
     }
 
@@ -326,7 +340,7 @@ impl App {
         // mid-edit on the Settings screen.
         if eng.should_close() {
             if self.bench.is_none() {
-                self.settings.save();
+                self.settings.save(self.mods.options());
             }
             self.flush_save();
             return false;
@@ -361,7 +375,7 @@ impl App {
         let update_dt = t_update.map(|t| t.elapsed()).unwrap_or_default();
         if quit {
             if self.bench.is_none() {
-                self.settings.save();
+                self.settings.save(self.mods.options());
             }
             self.flush_save();
             self.note_frame_stall(t0, update_dt);
@@ -445,27 +459,31 @@ impl App {
             None
         };
         self.fan_audio(dt, false, click);
-        let before = self.settings.clone();
+        let before = self.mods.options().revision();
         let now_ms = self.now_ms();
         let mut effect = None;
         if let Screen::Menus(stack) = &mut self.screen {
+            let (suspended, visuals, options) = self.mods.menu_parts();
             let mut ctx = Ctx {
                 settings: &mut self.settings,
+                options,
                 saves: &self.saves,
                 session: &self.session,
                 build: &self.build,
-                suspended: self.mods.suspended(),
-                visuals: self.mods.visual_mask(),
+                suspended,
+                visuals,
             };
             effect = stack.update(&intents, &mut ctx);
         }
-        // Persist whenever a step (or a hardware clamp) moved a value, once the steps go quiet.
-        let changed = self.settings != before;
+        // Every write goes through the options view, which moves the revision. Persist once the
+        // steps go quiet.
+        let changed = self.mods.options().revision() != before;
+        self.tell_options();
         if changed {
             self.sound.set_mix(self.settings.mix_change());
         }
         if settings_write_due(&mut self.settings_flush, changed, now_ms) {
-            self.settings.save();
+            self.settings.save(self.mods.options());
         }
         match effect {
             Some(effect) => self.handle_effect(eng, effect),
@@ -549,7 +567,6 @@ impl App {
             pos: DVec3::ZERO,
             peers: EMPTY,
             in_world,
-            voice_enabled: self.settings.voice_enabled,
             hear_voice: self.settings.voice_incoming,
             actions: ActionSet::NONE,
             ids: NO_IDS,
@@ -779,7 +796,7 @@ impl App {
             &self.cues,
         );
         if settings_write_due(&mut self.settings_flush, game.take_settings_dirty(), now_ms) && self.bench.is_none() {
-            self.settings.save();
+            self.settings.save(self.mods.options());
         }
         if let Signal::ExitToMenu = signal {
             self.flush_settings_if_dirty();
@@ -900,12 +917,15 @@ impl App {
             );
             return;
         }
+        // The draw only reads; the options step aside for the theme's borrow (a move, no copy).
+        let mut options = std::mem::take(self.mods.options_mut());
         let fallback = DefaultTheme;
         let theme: &dyn MenuTheme = self.mods.menu_theme().unwrap_or(&fallback);
         let mut f = eng.begin_frame(MENU_CLEAR.to_linear());
         if let Screen::Menus(stack) = &self.screen {
             let ctx = Ctx {
                 settings: &mut self.settings,
+                options: &mut options,
                 saves: &self.saves,
                 session: &self.session,
                 build: &self.build,
@@ -914,6 +934,8 @@ impl App {
             };
             stack.draw(&ctx, theme, &mut f, w, h);
         }
+        drop(f);
+        *self.mods.options_mut() = options;
     }
 }
 
@@ -1316,6 +1338,7 @@ mod tests {
         use crate::menu::menus::SettingsPage;
         use crate::menu::{Dir, Intent};
         let mut settings = Settings::default();
+        let mut options = crate::settings::Options::new();
         let session = Session::default();
         let mut stack = MenuStack::new(Framed::boxed(SettingsPage::new(crate::settings::Category::Video)));
         let mut flush = Debounce::new();
@@ -1325,7 +1348,7 @@ mod tests {
             let held = now_ms < 2000 && frame % 4 == 0;
             let intents = if held { vec![Intent::Adjust(Dir::Prev)] } else { Vec::new() };
             let before = settings.clone();
-            let mut ctx = Ctx::bare(&mut settings, &session);
+            let mut ctx = Ctx::bare(&mut settings, &mut options, &session);
             stack.update(&intents, &mut ctx);
             let changed = settings != before;
             steps += changed as u32;

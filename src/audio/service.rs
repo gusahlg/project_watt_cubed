@@ -76,7 +76,6 @@ pub struct AudioView<'a> {
     pub pos: DVec3,
     pub peers: &'a [PeerAudio],
     pub in_world: bool,
-    pub voice_enabled: bool,
     /// The inverse of deafen: the saved "hear voice" row.
     pub hear_voice: bool,
     pub actions: ActionSet,

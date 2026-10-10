@@ -7,7 +7,7 @@ use voxel_engine::Frame;
 use crate::menu::theme::MenuTheme;
 use crate::modding::{BuildInfo, VisualMask};
 use crate::session::Session;
-use crate::settings::Settings;
+use crate::settings::{Options, OptionsView, Settings};
 
 pub mod input;
 pub mod menus;
@@ -205,6 +205,8 @@ pub enum AppEffect {
 /// everything else is read and turned into AppEffect.
 pub struct Ctx<'a> {
     pub settings: &'a mut Settings,
+    /// The packages' options; settings pages list them beside the core's settings.
+    pub options: &'a mut Options,
     pub saves: &'a [crate::save::Slot],
     pub session: &'a Session,
     /// Every package compiled into this build.
@@ -216,11 +218,16 @@ pub struct Ctx<'a> {
 }
 
 impl<'a> Ctx<'a> {
-    /// A context over `settings` and `session` with no saves, an empty build and every visual
-    /// group provided.
-    pub fn bare(settings: &'a mut Settings, session: &'a Session) -> Self {
+    /// A context over `settings`, `options` and `session` with no saves, an empty build and every
+    /// visual group provided.
+    pub fn bare(settings: &'a mut Settings, options: &'a mut Options, session: &'a Session) -> Self {
         const EMPTY: &BuildInfo = &BuildInfo::EMPTY;
-        Self { settings, saves: &[], session, build: EMPTY, suspended: &[], visuals: VisualMask::ALL }
+        Self { settings, options, saves: &[], session, build: EMPTY, suspended: &[], visuals: VisualMask::ALL }
+    }
+
+    /// Every tunable, the core's settings and the packages' options, through one interface.
+    pub fn view(&mut self) -> OptionsView<'_> {
+        OptionsView::new(self.settings, self.options)
     }
 }
 
@@ -587,8 +594,9 @@ mod tests {
     #[test]
     fn a_quiet_frame_builds_the_view_once() {
         let mut settings = Settings::default();
+        let mut options = Options::new();
         let session = Session::default();
-        let mut ctx = Ctx::bare(&mut settings, &session);
+        let mut ctx = Ctx::bare(&mut settings, &mut options, &session);
         let mut framed = Framed::new(Counted(Cell::new(0)));
         let built = |f: &Framed<Counted>| f.menu.0.get();
         assert!(matches!(framed.update(&[], &mut ctx), Command::Stay));

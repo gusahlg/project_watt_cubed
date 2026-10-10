@@ -137,6 +137,7 @@ pub const API_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub mod prelude {
     pub use crate::block::{BlockId, BlockRegistry};
     pub use crate::player::Player;
+    pub use crate::settings::{Category, OptionId, OptionSpec, Options};
     pub use crate::ui::{Anchor, HudElement, Line, Panel, Role, Row};
     pub use crate::world::World;
     pub use crate::{Command, CommandContext, Mod, ModContext, ModRegistrar};

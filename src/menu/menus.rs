@@ -2,7 +2,7 @@
 //! The start screen (main/load/host/join) lives in the Start mod.
 use crate::menu::{Command, Ctx, Framed, Menu, Msg, Notice, Row, Style, ValueView, View};
 use crate::modding::PackageKind;
-use crate::settings::{Category, MenuKind, SETTINGS};
+use crate::settings::{Category, MenuKind};
 
 // Mods menu.
 
@@ -81,7 +81,8 @@ impl Menu for SettingsHub {
     }
 }
 
-/// Settings page for a category; field semantics stay table-side.
+/// Settings page for a category: the core's settings and every package option on that page,
+/// through one [`OptionsView`](crate::settings::OptionsView).
 pub struct SettingsPage {
     category: Category,
 }
@@ -101,20 +102,24 @@ impl Menu for SettingsPage {
             .find(|(c, _)| *c == self.category)
             .map_or("SETTINGS", |(_, n)| n)
             .to_uppercase();
-        let rows = SETTINGS
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| s.category() == self.category)
-            .map(|(i, s)| {
-                let stored = s.show(ctx.settings);
-                let stripped = ctx.visuals.strips(s.key());
+        let view = crate::settings::OptionsRef::new(ctx.settings, ctx.options);
+        let rows = (0..view.len())
+            .filter(|&i| view.info(i).page == self.category)
+            .map(|i| {
+                let info = view.info(i);
+                let stored = view.show(i);
+                let stripped = info.owner == crate::settings::options::CORE && ctx.visuals.strips(info.key);
                 let shown = if stripped { format!("{stored} {UNAVAILABLE}") } else { stored.clone() };
-                let value = match s.menu_kind() {
-                    MenuKind::Toggle if !stripped => ValueView::Toggle(stored == "On"),
+                let value = match info.menu_kind {
+                    MenuKind::Toggle if !stripped => ValueView::Toggle(view.toggled(i).unwrap_or(false)),
                     MenuKind::Toggle | MenuKind::Choice => ValueView::Choice(shown),
-                    MenuKind::Bar => ValueView::Bar { t: s.fraction(ctx.settings), label: shown },
+                    MenuKind::Bar => ValueView::Bar { t: view.fraction(i), label: shown },
                 };
-                Row::value(s.label(), value, i)
+                let row = Row::value(info.label, value, i);
+                match info.applies {
+                    crate::settings::Applies::NextWorld => row.detail("next new world"),
+                    crate::settings::Applies::Live => row,
+                }
             })
             .collect();
         View {
@@ -130,7 +135,7 @@ impl Menu for SettingsPage {
     fn update(&mut self, msg: Msg<usize>, ctx: &mut Ctx) -> Command {
         match msg {
             Msg::Step(i, dir) => {
-                SETTINGS[i].step(ctx.settings, dir.delta());
+                ctx.view().step(i, dir.delta());
                 Command::Stay
             }
             Msg::Back => Command::Pop,
@@ -163,7 +168,8 @@ mod tests {
         let mut settings = Settings::default();
         let session = Session::default();
         let suspended = ["pwc.dev-toolkit".to_string()];
-        let mut ctx = Ctx { build: &build, suspended: &suspended, ..Ctx::bare(&mut settings, &session) };
+        let mut options = crate::settings::Options::new();
+        let mut ctx = Ctx { build: &build, suspended: &suspended, ..Ctx::bare(&mut settings, &mut options, &session) };
         let view = ModsMenu.view(&ctx);
         let labels: Vec<&str> = view.rows.iter().map(|r| r.label.as_str()).collect();
         assert_eq!(labels, ["Developer Toolkit 1.0.0 (off on this server)", "UI kit 1.0.0"], "bundles are not rows");
@@ -179,12 +185,13 @@ mod tests {
     fn settings_rows_mark_exactly_the_lanes_the_renderer_strips() {
         let mask = VisualMask::of([VisualGroup::Atmosphere, VisualGroup::Lighting]);
         let mut settings = Settings::default();
+        let mut options = crate::settings::Options::new();
         let session = Session::default();
-        let ctx = Ctx { visuals: mask, ..Ctx::bare(&mut settings, &session) };
+        let ctx = Ctx { visuals: mask, ..Ctx::bare(&mut settings, &mut options, &session) };
         let mut lanes = 0;
         for (category, _) in Category::ALL {
             for row in SettingsPage::new(category).view(&ctx).rows {
-                let key = SETTINGS[row.tag.expect("settings rows are selectable")].key();
+                let key = crate::settings::SETTINGS[row.tag.expect("settings rows are selectable")].key();
                 let shown = match &row.kind {
                     crate::menu::RowKind::Value(ValueView::Choice(s) | ValueView::Bar { label: s, .. }) => s.as_str(),
                     _ => "",
@@ -196,5 +203,29 @@ mod tests {
         assert!(lanes > 0, "the settings pages list the visual lanes");
         let bloom = SettingsPage::new(Category::Video).view(&ctx).rows.into_iter().find(|r| r.label == "Bloom").expect("bloom row");
         assert!(matches!(bloom.kind, crate::menu::RowKind::Value(ValueView::Choice(ref s)) if s == "On (unavailable in this build)"));
+    }
+
+    /// A package's option is a row on its page beside the core's settings, and stepping it moves
+    /// the value and the revision the host saves on.
+    #[test]
+    fn settings_pages_list_package_options_beside_core_settings() {
+        use crate::settings::{OptionSpec, Options};
+        let mut settings = Settings::default();
+        let mut options = Options::new();
+        let relief = options.declare("pwc.worldgen", OptionSpec::percent("relief", "Relief", Category::World, (25, 300, 25), 100).next_world());
+        let session = Session::default();
+        let mut ctx = Ctx::bare(&mut settings, &mut options, &session);
+        let mut page = SettingsPage::new(Category::World);
+        let view = page.view(&ctx);
+        let row = view.rows.iter().find(|r| r.label == "Relief").expect("the option is on the World page");
+        assert_eq!(row.detail.as_deref(), Some("next new world"));
+        assert!(view.rows.iter().any(|r| r.label == "Render Distance"), "beside the core's settings");
+        assert!(matches!(&row.kind, crate::menu::RowKind::Value(ValueView::Bar { label, .. }) if label == "100%"));
+        let tag = row.tag.expect("selectable");
+        let before = ctx.options.revision();
+        page.update(Msg::Step(tag, crate::menu::Dir::Next), &mut ctx);
+        assert_eq!(ctx.options.int(relief), 125);
+        assert_ne!(ctx.options.revision(), before);
+        assert!(SettingsPage::new(Category::Video).view(&ctx).rows.iter().all(|r| r.label != "Relief"));
     }
 }

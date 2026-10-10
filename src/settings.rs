@@ -1,7 +1,8 @@
-//! Persistent graphics settings.
+//! Persistent graphics settings, and the options registry they share `settings.cfg` with.
 //!
 //! Stored as plain `key=value` lines in `settings.cfg` under the config root
-//! (std-only, no dependencies). The settings menu and the `/gfx` console command both edit
+//! (std-only, no dependencies): the core's keys, then each package option as
+//! `<package-id>.<key>=` ([`options`]). A settings screen and the `/gfx` console command both edit
 //! a [`Settings`] value; [`Settings::apply`] pushes it to the engine, which
 //! no-ops for values that didn't change.
 //!
@@ -20,6 +21,10 @@ use std::ops::RangeInclusive;
 use std::path::PathBuf;
 
 use voxel_engine::{Engine, GpuCaps, RenderFlags};
+
+pub mod options;
+
+pub use options::{Applies, OptionId, OptionInfo, OptionKind, OptionSpec, OptionValue, Options, OptionsRef, OptionsView};
 
 use crate::render_config::{
     DeviceCaps, RenderConfig, SessionGraphics, VRS_AUTO_MIN_PIXELS, VrsChoice,
@@ -226,7 +231,6 @@ settings_fields! {
     master_volume: u8 = 80,
     effects_volume: u8 = 100,
     voice_volume: u8 = 100,
-    voice_enabled: bool = true,
     voice_incoming: bool = true,
     /// Runtime-only `/mute` state; absent from [`SETTINGS`].
     muted: bool = false,
@@ -643,7 +647,7 @@ const PHYSICS_RATES: &[i32] = &[0, 30, 60, 120, 240, 500, 1000];
 
 /// Every setting, in menu/persistence order. The single source of the field set;
 /// persistence, `/gfx`, the menu, and [`Settings::clamp`] all fold over it.
-pub const SETTINGS: [Setting; 47] = [
+pub const SETTINGS: [Setting; 46] = [
     enum_setting!(
         apply, Profile::Personal, Category::Performance, preset, Preset, "Performance Preset",
         "preset custom|minimum|fast|default", &["profile"], "performance preset",
@@ -925,14 +929,6 @@ pub const SETTINGS: [Setting; 47] = [
     toggle_setting!(
         Profile::Personal,
         Category::Audio,
-        voice_enabled,
-        "voice_enabled",
-        "Voice Chat",
-        &["voice", "mic"]
-    ),
-    toggle_setting!(
-        Profile::Personal,
-        Category::Audio,
         voice_incoming,
         "voice_incoming",
         "Hear Voice",
@@ -1036,11 +1032,13 @@ impl Settings {
         s
     }
 
-    /// Load from disk, falling back to defaults for missing/invalid entries.
-    pub fn load() -> Self {
+    /// Load from disk, falling back to defaults for missing/invalid entries. The packages'
+    /// option lines in the same file go to `options` (declare the options first).
+    pub fn load(options: &mut Options) -> Self {
         let mut settings = Self::default();
         if let Ok(text) = fs::read_to_string(settings_path()) {
             settings.parse_from(&text);
+            options.read_text(&text, |key| SETTINGS.iter().any(|f| f.matches(key)));
         }
         // The engine picks the six-way cull itself; `WATT_CULL=0|1` forces it (env-only, not in the
         // persisted table). Read after the file parse so it can't be overwritten.
@@ -1061,10 +1059,11 @@ impl Settings {
         });
     }
 
-    /// Serialize every field to `key=value` lines — the exact text [`save`] writes.
+    /// Serialize every field to `key=value` lines, then the options' lines — the exact text
+    /// [`save`] writes.
     ///
     /// [`save`]: Settings::save
-    fn to_text(&self) -> String {
+    fn to_text(&self, options: &Options) -> String {
         let mut text = String::new();
         for field in &SETTINGS {
             text.push_str(field.key);
@@ -1072,13 +1071,15 @@ impl Settings {
             (field.write)(self, &mut text);
             text.push('\n');
         }
+        options.write_text(&mut text);
         text
     }
 
-    /// Best-effort save (a failed write shouldn't crash the game).
-    pub fn save(&self) {
+    /// Best-effort save of the settings and the packages' options (a failed write shouldn't
+    /// crash the game).
+    pub fn save(&self, options: &Options) {
         let path = settings_path();
-        if let Err(e) = crate::save::write_atomic_file(&path, self.to_text().as_bytes()) {
+        if let Err(e) = crate::save::write_atomic_file(&path, self.to_text(options).as_bytes()) {
             crate::save::log_fs_err("write", &path, &e);
         }
     }
@@ -1629,7 +1630,7 @@ mod tests {
         };
         // Same table-driven serialization as `save`, so this can't drift from
         // what `parse_from` reads.
-        let text = s.to_text();
+        let text = s.to_text(&Options::new());
         let mut loaded = Settings::default();
         loaded.parse_from(&text);
         loaded.clamp();
@@ -1642,10 +1643,18 @@ mod tests {
         assert!(path.starts_with(&crate::paths::Paths::get().config));
         assert_ne!(path, PathBuf::from("saves/settings.cfg"));
         let s = Settings { fov: 110.0, ..Default::default() };
-        s.save();
+        let mut options = Options::new();
+        let relief = options.declare("test.worldgen", OptionSpec::percent("relief", "Relief", Category::World, (25, 300, 25), 100));
+        options.set(relief, OptionValue::Int(150));
+        s.save(&options);
         assert!(path.exists());
-        let loaded = Settings::load();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\nfov=110\n") && text.ends_with("test.worldgen.relief=150\n"), "{text}");
+        let mut fresh = Options::new();
+        let relief = fresh.declare("test.worldgen", OptionSpec::percent("relief", "Relief", Category::World, (25, 300, 25), 100));
+        let loaded = Settings::load(&mut fresh);
         assert_eq!(loaded.fov, 110.0);
+        assert_eq!(fresh.int(relief), 150, "a package option shares the file");
         let _ = fs::remove_file(path);
     }
 
@@ -1817,7 +1826,7 @@ mod tests {
         }
         // The composed roundtrip lands the exact struct.
         let mut back = Settings::default();
-        back.parse_from(&samples.to_text());
+        back.parse_from(&samples.to_text(&Options::new()));
         back.clamp();
         assert_eq!(back, samples);
     }
@@ -1830,12 +1839,11 @@ mod tests {
             master_volume: 45,
             effects_volume: 0,
             voice_volume: 75,
-            voice_enabled: false,
             voice_incoming: false,
             ..Settings::default()
         };
         let mut back = Settings::default();
-        back.parse_from(&s.to_text());
+        back.parse_from(&s.to_text(&Options::new()));
         back.clamp();
         assert_eq!(back, s);
 
@@ -2004,7 +2012,7 @@ mod tests {
             (8, 2),
             "stored ladder keys do not override the render distance"
         );
-        let text = loaded.to_text();
+        let text = loaded.to_text(&Options::new());
         assert!(text.lines().any(|line| line == "render_distance=16"));
         assert!(text.lines().any(|line| line == "lod2=true"));
         assert!(text.lines().all(|line| {
@@ -2119,12 +2127,12 @@ mod tests {
         loaded.parse_from("vrs=auto\n");
         assert_eq!(loaded.vrs, VrsChoice::Auto);
         assert!(
-            loaded.to_text().lines().any(|line| line == "vrs=auto"),
+            loaded.to_text(&Options::new()).lines().any(|line| line == "vrs=auto"),
             "new files persist the word form"
         );
 
         let mut round = Settings::default();
-        round.parse_from(&loaded.to_text());
+        round.parse_from(&loaded.to_text(&Options::new()));
         assert_eq!(round.vrs, VrsChoice::Auto);
     }
 

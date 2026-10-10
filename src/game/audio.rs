@@ -125,7 +125,6 @@ impl Game {
             pos,
             peers,
             in_world: true,
-            voice_enabled: settings.voice_enabled,
             hear_voice: settings.voice_incoming,
             actions: input.actions,
             ids,

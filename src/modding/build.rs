@@ -15,6 +15,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 
 use super::{Mod, Mods};
+use crate::settings::{OptionId, OptionSpec};
 
 /// What a package is: `kind` in its `mod.toml`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -221,6 +222,15 @@ impl<'a> ModRegistrar<'a> {
     /// package for a session.
     pub fn add(&mut self, module: impl Mod + 'static) {
         self.mods.install_from(Some(self.package.id), Box::new(module));
+    }
+
+    /// Declare one tunable of this package in the core's options registry, and get the index
+    /// its value is read by ([`Options::bool`](crate::settings::Options::bool), `int`, `float`,
+    /// `choice`). It persists in `settings.cfg` as `<package-id>.<key>=`, and any settings screen
+    /// lists it on `spec.page` without knowing this package. Read it in
+    /// [`Mod::on_options`](super::Mod::on_options).
+    pub fn option(&mut self, spec: OptionSpec) -> OptionId {
+        self.mods.options.declare(self.package.id, spec)
     }
 
     /// Share a value with the packages registered after this one (handles are usually `Rc`s).

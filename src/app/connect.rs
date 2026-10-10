@@ -287,7 +287,8 @@ mod tests {
         let build = GameBuild::new().with_package(packages[0]).with_package(packages[1]);
         let mut settings = Settings::default();
         let session = Session::default();
-        let ctx = crate::menu::Ctx { build: build.info(), suspended: mods.suspended(), ..crate::menu::Ctx::bare(&mut settings, &session) };
+        let mut options = crate::settings::Options::new();
+        let ctx = crate::menu::Ctx { build: build.info(), suspended: mods.suspended(), ..crate::menu::Ctx::bare(&mut settings, &mut options, &session) };
         let view = ModsMenu.view(&ctx);
         let row = view.rows.iter().find(|row| row.label.contains("Developer Toolkit")).expect("row");
         assert_eq!(row.label, "Developer Toolkit 1.0.0 (off on this server)");
