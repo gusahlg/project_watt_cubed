@@ -74,6 +74,27 @@ enum EscapeAction {
     Quit,
 }
 
+/// Set by SIGTERM or SIGINT: the next frame saves and quits, as the window's close button does.
+static QUIT_SIGNAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// SIGTERM (a logout, `kill`) and SIGINT (Ctrl+C in a terminal) save and quit at the next frame
+/// instead of killing the game with its settings and world unsaved. A second signal exits at once,
+/// so a game that stopped running frames can still be stopped.
+fn install_quit_signals() {
+    extern "C" fn on_signal(_: libc::c_int) {
+        if QUIT_SIGNAL.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            // Async-signal-safe: a second request leaves without unwinding.
+            unsafe { libc::_exit(130) };
+        }
+    }
+    let handler = on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
+    // SAFETY: the handler only touches an atomic and calls `_exit`, both async-signal-safe.
+    unsafe {
+        libc::signal(libc::SIGTERM, handler);
+        libc::signal(libc::SIGINT, handler);
+    }
+}
+
 /// Esc's meaning in a world: the pause screen if a mod gives one, else leave to the root screen,
 /// else quit.
 fn escape_action(pause_screen: bool, root_screen: bool) -> EscapeAction {
@@ -448,6 +469,7 @@ impl App {
             // Engine-side render lanes from the effective (mod-masked) config.
             flags: app.mods.effective_render(&app.settings).engine_flags(),
         };
+        install_quit_signals();
         voxel_engine::run(config, move |eng| app.frame(eng));
     }
 
@@ -461,9 +483,9 @@ impl App {
 
     /// One engine frame: update and draw the active screen.
     fn frame(&mut self, eng: &mut Engine) -> bool {
-        // OS close button: save and go. Settings save too — the player may be
+        // OS close button (or SIGTERM/SIGINT): save and go. Settings save too — the player may be
         // mid-edit on the Settings screen.
-        if eng.should_close() {
+        if eng.should_close() || QUIT_SIGNAL.load(std::sync::atomic::Ordering::Relaxed) {
             self.save_on_quit();
             return false;
         }
@@ -707,8 +729,14 @@ impl App {
     /// A build without a root screen: enter the most recent save, else a new world.
     fn enter_default(&mut self, eng: &mut Engine) {
         match default_entry(&self.saves).cloned() {
-            Some(id) => self.load_world(eng, &id),
-            None => self.start_new_world(eng),
+            Some(id) => {
+                eprintln!("PWC: loading the newest world, {id}");
+                self.load_world(eng, &id);
+            }
+            None => {
+                eprintln!("PWC: no saved world; making a new one");
+                self.start_new_world(eng);
+            }
         }
     }
 
@@ -885,6 +913,7 @@ impl App {
         self.menus = None;
         self.pause = None;
         self.resuming = false;
+        eprintln!("PWC: in world {}", game.save_name());
         self.screen = Screen::Playing(Box::new(game));
     }
 
