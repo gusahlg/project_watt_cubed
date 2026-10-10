@@ -24,7 +24,7 @@ use crate::menu::menus::{ModsMenu, SettingsHub};
 use crate::menu::start::{StartFacts, StartRoot, VERSION};
 use crate::menu::theme::{DefaultTheme, MenuTheme};
 use crate::menu::{AppEffect, Ctx, Framed, MenuStack, ModRow};
-use crate::modding::{ActionSet, ChoicesFlush, Debounce, GameBuild, ModDescriptor, Mods, VisualMask};
+use crate::modding::{ActionSet, BuildInfo, ChoicesFlush, Debounce, GameBuild, Mods, VisualMask};
 use crate::ui::{self, Anchor};
 use crate::player::Player;
 use crate::save::{self, Autosaver, SaveMeta, Slot, SlotId, Tick};
@@ -75,8 +75,8 @@ pub struct App {
     router: Router,
     /// Installed mods and their on/off state; shared with the game while playing.
     mods: Mods,
-    /// Packages compiled into this executable. `Hello` reports the enabled ones.
-    packages: Vec<ModDescriptor>,
+    /// Packages compiled into this executable, of every kind. `Hello` reports the enabled mods.
+    build: BuildInfo,
     screen: Screen,
     /// A world building off the render thread. The menu under it stays as it was; Esc drops it.
     loading: Option<Loading>,
@@ -204,13 +204,12 @@ impl App {
     pub fn new(build: &GameBuild) -> Self {
         crate::paths::Paths::init(None);
         match build.environment() {
-            Some(env) => eprintln!("PWC: {} mod packages, environment {env}", build.packages().len()),
-            None if build.packages().is_empty() => eprintln!("PWC: vanilla build (no mod packages)"),
-            None => eprintln!("PWC: {} mod packages", build.packages().len()),
+            Some(env) => eprintln!("PWC: {} packages, environment {env}", build.packages().len()),
+            None if build.packages().is_empty() => eprintln!("PWC: vanilla build (no packages)"),
+            None => eprintln!("PWC: {} packages", build.packages().len()),
         }
         // While the menu is up, so the first world's frame does not pay for it.
         crate::world::terrain::prewarm();
-        let packages = build.packages().to_vec();
         let mut mods = Mods::from_build(build);
         mods.load_choices();
         let pins = Benchmark::mod_pins_from_env();
@@ -251,7 +250,7 @@ impl App {
             active: None,
             router: Router::new(),
             mods,
-            packages,
+            build: build.info().clone(),
             screen,
             loading: None,
             entry_notice: None,

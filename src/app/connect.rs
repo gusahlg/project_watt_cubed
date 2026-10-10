@@ -7,7 +7,7 @@ use voxel_engine::Engine;
 use super::{App, Screen, fresh_seed, terrain_cfg_from_mods};
 use super::entry::Loading;
 use crate::menu::{HostInfo, JoinInfo};
-use crate::modding::{ModDescriptor, Mods};
+use crate::modding::{Mods, PackageInfo};
 use crate::net::client::{Connection, PendingConnect};
 use crate::net::server::{Config, NoclipPolicy, TeleportPolicy};
 
@@ -44,7 +44,7 @@ impl ConnectJob {
     pub(super) fn begin(
         target: (&str, u16, &str, &str),
         mods: &Mods,
-        packages: &[ModDescriptor],
+        packages: &[PackageInfo],
         hosted: bool,
         notice: Option<String>,
     ) -> Self {
@@ -65,7 +65,7 @@ impl ConnectJob {
     /// `None` while the attempt runs, and after a mod refusal has started the retry: the denied
     /// packages are held off in `mods` and the hold notice replaces any earlier one. A failure
     /// after the retry lifts the hold again.
-    pub(super) fn poll(&mut self, mods: &mut Mods, packages: &[ModDescriptor]) -> Option<Landed> {
+    pub(super) fn poll(&mut self, mods: &mut Mods, packages: &[PackageInfo]) -> Option<Landed> {
         match self.pending.poll()? {
             Ok(conn) => Some(Landed::Joined { conn, notice: self.notice.take(), hosted: self.hosted }),
             Err(err) if retry_after(&err.mods_denied, self.retried) => {
@@ -101,7 +101,7 @@ impl ConnectJob {
 /// "This server does not allow: Developer Toolkit; it is off while you are connected".
 /// Several names use "they are". Display names come from the build; an unknown
 /// id is shown as itself.
-fn mod_hold_notice(packages: &[ModDescriptor], ids: &[String]) -> String {
+fn mod_hold_notice(packages: &[PackageInfo], ids: &[String]) -> String {
     let names: Vec<&str> = ids
         .iter()
         .map(|id| packages.iter().find(|pkg| pkg.id == id).map(|pkg| pkg.name).unwrap_or(id.as_str()))
@@ -136,7 +136,7 @@ impl App {
         });
         match started {
             Ok((port, skipped)) => {
-                let job = ConnectJob::begin(("127.0.0.1", port, &info.name, &info.password), &self.mods, &self.packages, true, skipped);
+                let job = ConnectJob::begin(("127.0.0.1", port, &info.name, &info.password), &self.mods, self.build.packages(), true, skipped);
                 self.screen = Screen::Connecting(job);
             }
             Err(e) => self.fail_to_menu(format!("could not host on port {}: {e}", info.port)),
@@ -145,7 +145,7 @@ impl App {
 
     /// Connect to a remote server. The attempt runs behind the connecting screen.
     pub(super) fn start_join(&mut self, info: JoinInfo) {
-        let job = ConnectJob::begin((&info.host, info.port, &info.name, &info.password), &self.mods, &self.packages, false, None);
+        let job = ConnectJob::begin((&info.host, info.port, &info.name, &info.password), &self.mods, self.build.packages(), false, None);
         self.screen = Screen::Connecting(job);
     }
 
@@ -157,7 +157,7 @@ impl App {
             return;
         }
         let Screen::Connecting(job) = &mut self.screen else { return };
-        let Some(landed) = job.poll(&mut self.mods, &self.packages) else { return };
+        let Some(landed) = job.poll(&mut self.mods, self.build.packages()) else { return };
         self.screen = Screen::Menus(self.standby_menu());
         match landed {
             Landed::Joined { conn, notice, hosted } => {
@@ -189,7 +189,7 @@ mod tests {
 
     use super::*;
     use crate::menu::ModRow;
-    use crate::modding::GameBuild;
+    use crate::modding::{GameBuild, PackageKind};
     use crate::net::server;
     use crate::session::Session;
     use crate::settings::Settings;
@@ -214,24 +214,33 @@ mod tests {
         reg.add(Named("hotbar", "Hotbar"));
     }
 
-    fn sample_packages() -> [ModDescriptor; 2] {
+    fn sample_packages() -> [PackageInfo; 2] {
+        let package = |id, name, version, register: fn(&mut crate::modding::ModRegistrar)| PackageInfo {
+            id,
+            name,
+            version,
+            description: "",
+            kind: PackageKind::Mod,
+            dependencies: &[],
+            register: Some(register),
+        };
         [
-            ModDescriptor { id: "pwc.dev-toolkit", name: "Developer Toolkit", version: "1.0.0", register: register_toolkit },
-            ModDescriptor { id: "pwc.hotbar", name: "Hotbar", version: "0.1.0", register: register_hotbar },
+            package("pwc.dev-toolkit", "Developer Toolkit", "1.0.0", register_toolkit),
+            package("pwc.hotbar", "Hotbar", "0.1.0", register_hotbar),
         ]
     }
 
     const TOOLKIT_HELD: &str = "This server does not allow: Developer Toolkit; it is off while you are connected";
 
     /// The mods of a client built with both sample packages, and the toolkit's index.
-    fn sample_mods(packages: &[ModDescriptor; 2]) -> (Mods, usize) {
-        let mods = GameBuild::new().with_mod(packages[0]).with_mod(packages[1]).mods();
+    fn sample_mods(packages: &[PackageInfo; 2]) -> (Mods, usize) {
+        let mods = GameBuild::new().with_package(packages[0]).with_package(packages[1]).mods();
         let toolkit = (0..mods.len()).find(|&i| mods.id(i) == "dev-toolkit").expect("toolkit");
         (mods, toolkit)
     }
 
     /// Poll `job` as the connecting screen does, every frame, until it lands.
-    fn land(job: &mut ConnectJob, mods: &mut Mods, packages: &[ModDescriptor]) -> Landed {
+    fn land(job: &mut ConnectJob, mods: &mut Mods, packages: &[PackageInfo]) -> Landed {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             if let Some(landed) = job.poll(mods, packages) {
@@ -338,7 +347,7 @@ mod tests {
     }
 
     /// Join as the connecting screen does until the server answers (it may still be starting).
-    fn join_when_up(port: u16, name: &str, mods: &mut Mods, packages: &[ModDescriptor]) -> (Connection, Option<String>) {
+    fn join_when_up(port: u16, name: &str, mods: &mut Mods, packages: &[PackageInfo]) -> (Connection, Option<String>) {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             let mut job = ConnectJob::begin(("127.0.0.1", port, name, ""), mods, packages, false, None);

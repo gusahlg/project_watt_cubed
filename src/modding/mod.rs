@@ -18,7 +18,7 @@ mod build;
 #[cfg(test)]
 pub(crate) mod testing;
 
-pub use build::{GameBuild, ModDescriptor, ModRegistrar};
+pub use build::{BuildInfo, GameBuild, ModDescriptor, ModRegistrar, PackageInfo, PackageKind};
 
 use std::fs;
 use std::io;
@@ -615,14 +615,17 @@ pub struct Mods {
 }
 
 impl Mods {
-    /// Instantiate every package of `build`, in its (dependency) order. Each package's
-    /// `register` sees the resources its dependencies provided.
+    /// Instantiate every package of `build` that has an entry point, in its (dependency) order.
+    /// Each package's `register` sees the resources its dependencies provided and the whole
+    /// package list.
     pub fn from_build(build: &GameBuild) -> Self {
         let mut mods = Self::empty();
         let mut resources = build::Resources::default();
-        for package in build.packages() {
-            let mut registrar = ModRegistrar::new(package, &mut mods, &mut resources);
-            (package.register)(&mut registrar);
+        let info = build.info();
+        for package in info.packages() {
+            let Some(register) = package.register else { continue };
+            let mut registrar = ModRegistrar::new(package, info, &mut mods, &mut resources);
+            register(&mut registrar);
         }
         mods
     }
@@ -1028,12 +1031,12 @@ impl Mods {
         }
     }
 
-    /// Enabled packages, as `(id, version)`, in build order. A package is
-    /// included when any of its modules is enabled. This is what an honest
-    /// client puts on `Hello`.
-    pub fn enabled_package_reports(&self, packages: &[ModDescriptor]) -> Vec<(String, String)> {
+    /// Enabled mod packages, as `(id, version)`, in build order. A package is
+    /// included when it is of kind mod and any of its modules is enabled; libraries
+    /// and bundles are never reported. This is what an honest client puts on `Hello`.
+    pub fn enabled_package_reports(&self, packages: &[PackageInfo]) -> Vec<(String, String)> {
         let mut out = Vec::new();
-        for desc in packages {
+        for desc in packages.iter().filter(|p| p.kind == PackageKind::Mod) {
             let on = self.entries.iter().any(|e| e.enabled && e.package == Some(desc.id));
             if on {
                 out.push((desc.id.to_string(), desc.version.to_string()));
@@ -1577,6 +1580,39 @@ mod tests {
         assert!(mods.is_enabled(0));
         assert!(!mods.server_off(0));
         assert!(mods.toggle(0));
+    }
+
+    fn register_tools(r: &mut ModRegistrar) {
+        r.add(Stub::new("tools"));
+    }
+
+    fn register_hud(r: &mut ModRegistrar) {
+        r.add(Stub::new("hud"));
+    }
+
+    fn register_nothing(_: &mut ModRegistrar) {}
+
+    #[test]
+    fn hello_reports_only_enabled_mod_packages() {
+        const fn package(id: &'static str, kind: PackageKind, register: Option<fn(&mut ModRegistrar)>) -> PackageInfo {
+            PackageInfo { id, name: id, version: "1.0.0", description: "", kind, dependencies: &[], register }
+        }
+        static PACKAGES: &[PackageInfo] = &[
+            package("test.names", PackageKind::Library, None),
+            package("test.tools", PackageKind::Mod, Some(register_tools)),
+            package("test.hud", PackageKind::Mod, Some(register_hud)),
+            package("test.empty", PackageKind::Mod, Some(register_nothing)),
+            package("test.bundle", PackageKind::Bundle, None),
+        ];
+        let build = GameBuild::from_static("sha256:02", PACKAGES);
+        let mut mods = build.mods();
+        let report = |mods: &Mods| mods.enabled_package_reports(build.packages());
+        let both = vec![("test.tools".to_string(), "1.0.0".to_string()), ("test.hud".to_string(), "1.0.0".to_string())];
+        assert_eq!(report(&mods), both, "libraries, bundles and mod packages with no mod are not reported");
+        mods.hold_packages(&["test.tools".to_string()]);
+        assert_eq!(report(&mods), both[1..], "a held package is off");
+        mods.release_server();
+        assert_eq!(report(&mods), both);
     }
 
     #[test]
