@@ -1797,8 +1797,7 @@ mod tests {
 
     /// Two-process check: set `WATT_LIVE_ADDR=host:port` (and optional `WATT_LIVE_PW`)
     /// to join a real `watt_server`. Otherwise the server is spawned in-process.
-    /// Joins through [`crate::app::join_server`], edits, moves faster than the old
-    /// 80 m/s cap, and leaves.
+    /// Joins, edits, moves faster than the old 80 m/s cap, and leaves.
     #[test]
     #[ignore]
     fn live_join_edits_fast_move_and_leaves() {
@@ -1816,7 +1815,7 @@ mod tests {
             let handle = owned.as_ref().unwrap();
             ("127.0.0.1".into(), handle.addr().port(), String::new())
         };
-        let mut conn = crate::app::join_server(&host, port, "live", &pw).expect("join");
+        let mut conn = Connection::connect(&host, port, "live", &pw).expect("join");
         println!(
             "joined id {} seed {} worldgen {:?}",
             conn.player_id(),

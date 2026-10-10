@@ -299,7 +299,7 @@ mod tests {
         let terrain = TerrainCfg { relief: 150, ..TerrainCfg::default() }.clamp();
         let config = Config { seed: 77, worldgen: WorldgenKind::Diffusion, terrain, ..Config::default() };
         let handle = server::spawn(0, config).unwrap();
-        let conn = crate::app::join_server("127.0.0.1", handle.addr().port(), "ada", "").expect("join");
+        let conn = Connection::connect("127.0.0.1", handle.addr().port(), "ada", "").expect("join");
         let spawn = conn.spawn();
         let loading = Loading::join(conn, RenderConfig::default(), Some("hi".into()), true);
         let Loading::Join { job, conn, notice, hosted } = loading else { unreachable!() };
