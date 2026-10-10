@@ -48,20 +48,20 @@ impl Mod for HelloHud {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pwc_mod_api::testing::Harness;
     use pwc_mod_api::{GameBuild, ModDescriptor};
 
     #[test]
     fn registers_one_mod() {
-        let build = GameBuild::new().with_mod(ModDescriptor {
+        let harness = Harness::new(GameBuild::new().with_mod(ModDescriptor {
             id: "example.hello-hud",
             name: "Hello HUD",
-            version: "1.0.0",
+            version: "1.1.0",
             register,
-        });
-        let mods = build.mods();
-        assert_eq!(mods.len(), 1);
-        assert_eq!(mods.id(0), "hello_hud");
-        assert_eq!(mods.package(0), Some("example.hello-hud"));
-        assert!(mods.is_active(0));
+        }));
+        assert_eq!(harness.len(), 1);
+        assert_eq!(harness.id(0), "hello_hud");
+        assert_eq!(harness.package(0), Some("example.hello-hud"));
+        assert!(harness.is_active(0));
     }
 }

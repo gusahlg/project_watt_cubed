@@ -3,13 +3,13 @@ format = 1
 [package]
 id = "example.hello-hud"
 name = "Hello HUD"
-version = "1.0.0"
+version = "1.1.0"
 description = "The smallest useful PWC mod: a HUD line counting the blocks you broke."
 authors = ["Project Watt Cubed contributors"]
 license = "Apache-2.0 OR MIT"
 license-files = ["LICENSES/Apache-2.0.txt", "LICENSES/MIT.txt"]
 kind = "mod"
-pwc-api = "^2.0"
+pwc-api = "^3.0"
 repository = "https://github.com/gusahlg/project_watt_cubed"
 keywords = ["example", "hud"]
 categories = ["interface"]

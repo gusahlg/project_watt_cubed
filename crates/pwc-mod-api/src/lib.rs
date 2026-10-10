@@ -17,6 +17,66 @@
 //! requires a major version bump. The [`prelude`] covers what most mods need; the module
 //! re-exports give access to the game's subsystems a mod may read or drive.
 //!
+//! # 3.0.0
+//!
+//! The mods-v3 release: chat, commands, every menu and the mod list are mods, the build decides
+//! what is installed, and every tunable lives in one registry. Breaking changes from 2.x:
+//!
+//! **Builds and the installed set** (the build decides; nothing is switched in the game)
+//! - Mods have no on/off state. `Group`, `ESSENTIALS`/`ESSENTIALS_GROUP`, `ModRegistrar::declare_group`,
+//!   `ModRegistrar::add_disabled`, `Knob`, `Mod::knobs`/`step_knob`/`save_choice_state`/
+//!   `load_choice_state`, `Mod::on_enable`/`on_disable`, `ChoicesFlush`, `annotate_setting`,
+//!   `forced_off_marker` and `mods.cfg` are gone.
+//! - `Mod::description` and `Mod::group` are gone: a package's `mod.toml` is what menus show.
+//!   [`Mod::name`] defaults to the id and only names old saves and logs.
+//! - The core can *suspend* a package for a session (a server that refuses it; benchmarks pin
+//!   it). A suspended mod's hooks do not run. Nothing is saved and there is no UI for it.
+//!   [`VisualMask::strips`] says whether a lane's visual group is unprovided.
+//! - The host type `Mods` is no longer part of the API. Tests drive packages through
+//!   [`testing::Harness`].
+//!
+//! **Options** (one registry for every tunable)
+//! - [`ModRegistrar::option`] declares a package's option ([`settings::OptionSpec`]: toggle,
+//!   choice, percent or float, its label, settings page, whether it applies to the next world, an
+//!   optional legacy key) and returns an [`settings::OptionId`]. [`Mod::on_options`] delivers the
+//!   values at registration, after `settings.cfg` loads, and on every change; reads are by index.
+//!   Values persist in `settings.cfg` as `<package-id>.<key>=`.
+//! - [`settings::OptionsView`] lists the core's settings (owner `"core"`) and every package's
+//!   options through one interface. [`GameContext::options_mut`] and the screens'
+//!   `ScreenContext::options_mut` change them.
+//! - The core settings `mod_hud`, `simulation` and `voice_enabled` are gone (`WATT_SIMULATION=0`
+//!   is the bench override; Voice Chat is `pwc.proximity-chat`'s option).
+//!
+//! **Screens** (every menu is a mod, see [`screen`])
+//! - [`screen::Screen`] reads `MenuInput` and `ScreenFacts` and answers a `ScreenOutcome`
+//!   (`Stay`, `Back`, `Push`, `Open(entry)`, `Request(AppRequest)`); it draws [`screen::UiElement`]s.
+//! - Slots [`Mod::root_screen`] (out of a world; replaces `start_screen` and `menu_theme`) and
+//!   [`Mod::pause_screen`] (Esc in a world). [`ModRegistrar::screen_entry`] offers a screen on the
+//!   main menu and/or the pause screen. Without a root screen the game enters the newest world and
+//!   Esc saves and quits.
+//! - The `menu` module is gone: the menu framework, the default look and the text widgets
+//!   (`TextInput`, `EditBuf`, `Ring`) live in the `pwc.ui-kit` library package.
+//!
+//! **Frame input, chat and messages**
+//! - [`Mod::on_frame`] runs every in-world frame with a [`FrameContext`]: immediate actions
+//!   ([`Action::immediate`], sampled even with mod logic off; every `Action` literal names it),
+//!   the keyboard capture ([`FrameContext::capture_text`], [`TextFrame`]) and the game state in a
+//!   [`GameContext`] (player, world, sky, settings, options, `send_chat`, `notice`). The core follows
+//!   up on what a hook changed.
+//! - [`Mod::on_message`] gets chat lines, joins, leaves and the core's notices ([`Message`],
+//!   [`Notice`]).
+//! - `Command`, `CommandContext`, `Mod::command`/`run_command`/`commands` and `Mod::on_toggle_fly`
+//!   are gone: `pwc.chat`, `pwc.commands` and `pwc.dev-toolkit` provide chat, commands and flight.
+//!
+//! **HUD**
+//! - [`Mod::hud`] takes [`HudFacts`] (screen, frame rate, ping, players, loading, the link, the HUD
+//!   mode, the UI scale, cruise) and is asked in every HUD mode, Off included. The core draws no HUD
+//!   text: `pwc.game-ui` draws the reticle and readouts.
+//!
+//! **Build metadata** (from 2.2, unchanged)
+//! - [`PackageInfo`], [`PackageKind`], [`BuildInfo`], [`GameBuild::from_static`],
+//!   [`ModRegistrar::build`] and [`bundles_of`].
+//!
 //! # 2.2.0
 //!
 //! Additive on 2.1.0 (`^2.0` still matches):
@@ -70,9 +130,11 @@
 //! granularity, never per voxel.
 
 pub use project_watt_cubed::modding::{
-    Action, ActionSet, BuildInfo, GameBuild, Mod, ModContext, ModDescriptor, ModRegistrar, Mods, PackageInfo,
-    PackageKind, ToolUse, VisualMask,
+    Action, ActionSet, BuildInfo, GameBuild, Mod, ModContext, ModDescriptor, ModRegistrar, PackageInfo, PackageKind,
+    ToolUse, VisualMask,
 };
+
+pub mod testing;
 /// The frame hook, text capture, the chat send queue, the message stream and the HUD facts
 /// (track B of 3.0).
 pub use project_watt_cubed::modding::{

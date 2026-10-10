@@ -1,10 +1,10 @@
 [package]
 name = "pwc-mod-api"
-# The mod API version. Mods declare `pwc-api = "^2.0"` in mod.toml; the PWC package manager
+# The mod API version. Mods declare `pwc-api = "^3.0"` in mod.toml; the PWC package manager
 # checks that requirement against this version. A break old mods cannot compile through needs a
-# major bump. 2.1 adds `Action::held` (literals name it) and two defaulted hooks; 2.2 adds the build's
-# package list (`PackageInfo`, `ModRegistrar::build`, `bundles_of`). `^2.0` still matches.
-version = "2.2.0"
+# major bump. 3.0 is mods-v3: no switches, one options registry, screens, the frame hook, messages
+# and HUD facts (the changelog is at the top of src/lib.rs).
+version = "3.0.0"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 description = "The interface PWC mods compile against: the mod trait, the registrar and the mod-facing parts of the game."

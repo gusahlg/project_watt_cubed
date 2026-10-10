@@ -63,7 +63,8 @@ loads code at run time. The build decides which mods are in: there is no switch 
 
 ## Registration
 
-`Mods::from_build(&build)` calls the `register` of each package that has one, in order. The
+`Mods::from_build(&build, &mut options)` calls the `register` of each package that has one, in
+order; the options the packages declare go into the app's `Options`, beside the settings. The
 `ModRegistrar` it gets:
 
 - `add(m)` installs a value implementing `Mod`; it runs for as long as the build has it;
@@ -146,12 +147,19 @@ self.value = options.int(self.relief); // by index: no strings on any frame path
 ```
 
 Kinds are `toggle`, `choice`, `percent` and `float`; `next_world()` marks an option that applies to
-new worlds, and `legacy_key(k)` reads an older `settings.cfg` key once. The core keeps the values,
-calls `Mod::on_options` after registration, after loading `settings.cfg`, and whenever
-`Options::revision` moves, and persists them after its own keys as `<package-id>.<key>=`. Lines no
-declared option claims are kept and written back. `OptionsView` lists core settings and package
-options through one interface, by index, so a settings screen renders both without naming a
-package and no package depends on a settings screen.
+new worlds, and `legacy_key(k)` reads a value saved under an older key once: an old core
+`settings.cfg` key (Voice Chat reads `voice_enabled`), or a knob an older game kept in `mods.cfg`,
+flattened as `<mod-id>.state.<knob>` (InfiniteDiffusion reads `diffusion.state.relief`). The core
+reads `mods.cfg` only until `settings.cfg` records `options_format=1`, and never writes or deletes
+it. The app keeps the values beside the settings, calls `Mod::on_options` after registration, after
+loading `settings.cfg`, and whenever `Options::revision` moves, and persists them after its own keys
+as `<package-id>.<key>=`. Lines no declared option claims are kept and written back.
+
+`OptionsView` lists core settings and package options through one interface, by index (with
+`full_key`, `show`, `hint`, `step` and `parse`), so a settings screen renders both without naming a
+package and no package depends on a settings screen. A frame hook gets the same view through
+`GameContext::options_mut` (that is how `pwc.commands`' `/set` reaches every setting and option),
+and a screen through `ScreenContext::options_mut`; the core applies and saves what changed.
 
 ## Screens
 
@@ -169,7 +177,8 @@ Screens reach the player through two slots and an entry registry, so no menu nam
 - `Mod::root_screen(facts)`: the screen out of a world (a start screen), built each time the
   player returns to it; it also draws the connecting and loading page from `facts.phase`.
 - `Mod::pause_screen(facts)`: opened by Esc in a world after text capture and every overlay
-  declined the key. The world keeps running; the game reads no input meanwhile.
+  declined the key. The world keeps running and is drawn behind the screen (the screen paints a
+  translucent backdrop; `facts.in_world` is true); the game reads no input meanwhile.
 - `ModRegistrar::screen_entry(ScreenEntry { id, label, places, order, open })`: a screen offered
   on `Places::MAIN`, `Places::PAUSE` or both. A root or pause screen lists
   `facts.entries_for(place)` and opens one with `ScreenOutcome::Open(id)`.
@@ -191,10 +200,12 @@ proximity-chat mod the microphone stays closed and voice is neither sent nor pla
 (`Mod`, `ModContext`, `ModRegistrar`, `GameBuild`, `BuildInfo`, `PackageInfo`, `VisualMask`, …), the game
 modules mods may use (`block`, `world`, `player`, `ui`, `screen`, `settings`, `inventory`, `render_config`,
 `net`, `session`, `sim`, `input`, `derived`, `engine`, `material`, `audio`) and a `prelude`. Its version is
-the **mod API version** a package's `mod.toml` requires (`pwc-api = "^2.0"`); a breaking change to
-what it re-exports needs a major version bump. The 2.2.0 and 2.1.0 additions and the 2.0.0 breaks
-are listed at the top of `crates/pwc-mod-api/src/lib.rs`. `audio` plays cues and voice; it does not
-expose the device. Besides re-exports it has one function of its own, `bundles_of`.
+the **mod API version** a package's `mod.toml` requires (`pwc-api = "^3.0"`); a breaking change to
+what it re-exports needs a major version bump. The 3.0.0 breaks (everything mods-v3 changed) and
+the earlier versions are listed at the top of `crates/pwc-mod-api/src/lib.rs`. `audio` plays cues
+and voice; it does not expose the device. Besides re-exports it has `bundles_of` and
+`testing::Harness`. The host type `Mods` is not part of the API: a mod cannot reach the other mods
+of a build.
 
 ## First-party mods
 
@@ -214,7 +225,10 @@ a package with its own README, licence (`Apache-2.0 OR MIT`) and tests:
 | `pwc.neural-textures` | `neural_textures` — per-configuration CPPN textures |
 | `pwc.material-names` | `material_names` — Markov-model names for blocks and tools |
 | `pwc.infinite-diffusion` | `diffusion` — selects the InfiniteDiffusion world generator and declares its options |
-| `pwc.game-ui` | `game_ui` — in-world HUD pieces, starting with the facing indicator |
+| `pwc.game-ui` | `game_ui` — the HUD: reticle, coordinates, frame rate, players, loading and link notices, facing indicator |
+| `pwc.chat` | `chat` — the text chat on § and the scrollback of the game's messages |
+| `pwc.commands` | `commands` — slash commands (`/help`, `/set`, `/time`, audio, `/op`) and a registry for other mods' commands |
+| `pwc.chat-commands` | bundle of `pwc.chat` and `pwc.commands` |
 | `pwc.sounds` | `sounds` — footsteps, blocks, tools, swings and menu clicks |
 | `pwc.proximity-chat` | `proximity_chat` — push-to-talk voice for visible peers |
 | `pwc.essentials` | bundle of all of the above |
@@ -226,7 +240,8 @@ options.
 ## Persistence
 
 Package options live in `settings.cfg` (config root) after the core's keys, as
-`<package-id>.<key>=`. There is no `mods.cfg`. Per-world state (`save_state`) lives in the world
+`<package-id>.<key>=`. An old `mods.cfg` is read once for knob values (see [Options](#options)) and
+left on disk. Per-world state (`save_state`) lives in the world
 save, keyed by mod id. A `pwc`-built instance has its own data directory (`WATT_DATA_DIR`), so its
 worlds and settings never mix with the vanilla build's.
 
@@ -235,4 +250,6 @@ worlds and settings never mix with the vanilla build's.
 The core cannot link the real mods in its own tests (they depend on it), so `src/modding/testing.rs`
 provides stand-ins with the same ids, installed under their package ids, and the behaviours the
 host and save tests exercise. Each package tests its own behaviour in the package manager
-repository; `pwc_ui_kit::testing::Fixture` builds a `ScreenContext` for screen tests.
+repository through `pwc_mod_api::testing::Harness` (the packages of a build registered as the game
+registers them, with their options and the hooks as the game arbitrates them);
+`pwc_ui_kit::testing::Fixture` builds a `ScreenContext` for screen tests.
