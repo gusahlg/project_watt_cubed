@@ -67,7 +67,6 @@ mod occlusion;
 mod quadtree;
 mod query;
 mod resident;
-#[cfg(test)]
 mod rule;
 pub(crate) mod seam;
 mod settings;
@@ -103,8 +102,10 @@ use section::{SectionMeshData, SectionPos};
 /// `max(SECTION_SLOT_FLOOR, cpu_cull_max - near_chunk_slots)`.
 const CPU_CULL_MAX: u32 = 1024;
 /// Floor on the far lane's section-slot budget so a large near field cannot
-/// starve covering: chunks never count against sections.
-pub(in crate::world) const SECTION_SLOT_FLOOR: usize = 512;
+/// starve covering: chunks never count against sections. The rule's cut is bounded by
+/// construction (about 640 tiles on a chart at the largest render distance), so a cut past this
+/// is a bug, asserted in debug builds.
+pub(in crate::world) const SECTION_SLOT_FLOOR: usize = 768;
 
 /// Default number of chunk rings meshed and drawn around the player.
 const DEFAULT_VIEW_RADIUS: i32 = 6;
@@ -388,14 +389,12 @@ pub struct World {
     pub(crate) edit_generation: u64,
     /// Last chunk centre; `None` forces a full stream pass. Streams only react to boundary crosses.
     center: Option<Coord>,
-    /// The near window's span along the up axis around [`center`](Self::center): the eye band,
-    /// grown over the near square's terrain.
-    window: streaming::Window,
-    /// Surface bounds of the near square's chunk columns, kept while they stay in the square.
-    window_ground: streaming::NearBounds,
-    /// The unload box of a window frame just left (another up face), in its chart net: its chunks
-    /// stay loaded until the far field draws the new window.
-    retired: Option<(ChunkBox, seam::Unfold)>,
+    /// The near field around [`center`](Self::center): the chunk columns whose ground is within
+    /// the render distance, and the eye band.
+    near: streaming::NearField,
+    /// The physical eye of the last [`place_eyes`](Self::place_eyes), with the near and far
+    /// centres it stood on.
+    eye_at: Option<(Coord, Coord, DVec3)>,
     /// Chunk-y extent of the edits in each chunk column `(x, z)`, never shrunk. The generator's
     /// surface bounds miss a pit dug below them or a tower built above.
     edit_columns: FastMap<(i32, i32), [i32; 2]>,
@@ -411,10 +410,6 @@ pub struct World {
     far_fold: seam::Unfold,
     /// Atlas whose chart the far field stood on last pass (its reach gets the hold margin).
     far_atlas: Option<usize>,
-    /// Doublings of the chart ring unit for the eye's height above the ground.
-    far_scale: u8,
-    /// The far eye's storage column `(x, z)` and its generated ground.
-    far_ground: Option<((i32, i32), i32)>,
     /// Up face committed for the streaming centre. `None` is isotropic.
     /// Meaningful only once [`stream_up_set`](Self::stream_up_set) is true.
     stream_up: Option<Face>,
@@ -656,26 +651,6 @@ pub struct World {
     /// edits touched since the last overlay refresh. Empty on a quiet frame,
     /// so the refresh lane is a set-emptiness check and nothing more.
     section_overlay_dirty: FastSet<SectionPos>,
-    /// Consecutive fully-[`settled`](MeshState::settled) chunk rings around
-    /// the centre, `0..=horizontal+1` (`horizontal+1` = the whole mesh box).
-    /// THE input to the settled LOD clip: far sections keep drawing over any
-    /// column whose chunks are not yet on screen, so a loading edge shows
-    /// coarse terrain instead of a hole. Maintained incrementally — grown
-    /// outward on upload/air events (each ring re-scanned at most once per
-    /// loading wave), reset by centre moves, unloads, and mesh teardown.
-    lod_clip_rings: i32,
-    /// The chunk range along the up axis the settled rings are proven over: the
-    /// near window's, or `None` for the centre's eye band.
-    lod_clip_span: Option<[i32; 2]>,
-    /// A grown window span still being proven, with its settled rings. The clip
-    /// keeps to the proven span until these catch up.
-    lod_clip_next: Option<([i32; 2], i32)>,
-    /// A settle event landed (chunk mesh upload, born-air store): try to
-    /// extend [`lod_clip_rings`](Self::lod_clip_rings) outward.
-    lod_clip_grow: Sticky,
-    /// The ring geometry or settledness regressed (centre moved, chunks
-    /// unloaded or meshes freed): restart the ring scan from zero.
-    lod_clip_shrunk: Sticky,
     /// The far covering must be re-resolved: set by every event that can move
     /// it (a section landing Ready, an unload/free, a claim release, a
     /// frontier change, a ladder change). While clear AND no admission is
@@ -707,14 +682,19 @@ pub struct World {
     /// from. While they are unchanged the frontier is retained across streaming
     /// passes — a still camera repeats no grid walk or relief coarsening.
     section_frontier_key: Option<SectionFrontierKey>,
-    /// Surface bounds the near-window punch read, kept across frontier recomputes.
-    near_bounds: streaming::NearBounds,
-    /// Desired sections the near window holds whose ground has not all settled, with the chunk
-    /// layers that ground spans. They keep drawing until those chunks do. Admission skips one
-    /// only once a Ready section already draws it.
-    section_held: FastMap<SectionPos, [i32; 2]>,
-    /// A chunk settled since the held sections were last checked.
-    held_recheck: Sticky,
+    /// Generator bounds of the nodes the rule measured.
+    rule_memo: rule::RuleMemo,
+    /// The rule's cut: each desired section's distance from the eye cell, for load priority.
+    section_dist: FastMap<SectionPos, f64>,
+    /// The far tiles' clips over the near columns.
+    clips: streaming::Clips,
+    /// A chunk settled since the waiting clips were last checked.
+    clip_recheck: Sticky,
+    /// Chunk meshes the near field no longer draws are to be retired: it moved, or a clip that
+    /// kept some landed.
+    retire_check: Sticky,
+    /// The near field revision the last retire pass and unload scan saw.
+    near_seen: (u32, u32),
     /// Far-lane configuration epoch: bumped by every live ladder change so an
     /// in-flight worker result from a retired configuration can never land.
     section_epoch: u32,
@@ -729,32 +709,19 @@ pub struct World {
     reactions_authority: bool,
 }
 
-/// The exact inputs the desired-section frontier depends on, as cheap bit
-/// patterns. Equality means the cached frontier is still the right answer.
-/// Edits are handled separately: a dirty section forces a recompute (see
-/// `World::stream`) because relief coarsening consults the edit overlay.
+/// The exact inputs the desired-section frontier depends on. Equality means the cached cut is
+/// still the right answer. Edits are handled separately: a dirty section forces a recompute
+/// because its bounds read the edit overlay.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct SectionFrontierKey {
-    center_xz: [i32; 2],
-    center_y: i32,
-    body: u16,
-    face: u8,
-    /// The altitude the selection reads: the exact eye on a cube face, the block on a chart.
-    eye_y: u64,
-    /// The prediction the selection reads (see `World::refresh_frontier`).
-    velocity: [u64; 3],
-    /// The full-res window's height and up face; a chart punches sections the window holds.
-    vertical: i32,
-    up: Option<Face>,
-    /// The span a chart's punch tests against (`None` off charts).
-    window: Option<[i32; 2]>,
-    unit: u32,
-    finest: i8,
-    levels: u8,
-    step: u8,
+    ground: Option<rule::Ground>,
+    /// The eye cell's block corner.
+    eye_cell: [i64; 3],
+    /// Render distance in chunks.
+    horizontal: i32,
     mip_ready: bool,
-    /// Far-lane section-slot budget the selection coarsens to.
-    allowed: u32,
+    /// The near field revision the clips were taken from.
+    near: u32,
 }
 
 impl World {
@@ -830,16 +797,13 @@ impl World {
             edits: FastMap::default(),
             edit_generation: 0,
             center: None,
-            window: streaming::Window::default(),
-            window_ground: streaming::NearBounds::default(),
-            retired: None,
+            near: streaming::NearField::default(),
+            eye_at: None,
             edit_columns: FastMap::default(),
             edit_column_chunks: FastMap::default(),
             far_center: None,
             far_fold: seam::Unfold::IDENTITY,
             far_atlas: None,
-            far_scale: 0,
-            far_ground: None,
             stream_up: None,
             stream_up_set: false,
             view: ViewVolume::view(DEFAULT_VIEW_RADIUS),
@@ -929,14 +893,12 @@ impl World {
             section_visible: Vec::new(),
             section_fade: coverage::Coverage::default(),
             section_frontier_key: None,
-            near_bounds: streaming::NearBounds::default(),
-            section_held: FastMap::default(),
-            held_recheck: Sticky::default(),
-            lod_clip_rings: 0,
-            lod_clip_span: None,
-            lod_clip_next: None,
-            lod_clip_grow: Sticky::default(),
-            lod_clip_shrunk: Sticky::raised(),
+            rule_memo: rule::RuleMemo::default(),
+            section_dist: FastMap::default(),
+            clips: streaming::Clips::default(),
+            clip_recheck: Sticky::default(),
+            retire_check: Sticky::default(),
+            near_seen: (u32::MAX, u32::MAX),
             section_epoch: 0,
             section_claim_seq: 0,
             reactions: crate::sim::reactions::ReactionScheduler::new(),

@@ -68,8 +68,6 @@ impl World {
             self.section_mip = Some(mip);
             self.section_mip_rx = None;
             self.pending_sections.set();
-            // Off a chart the window's ground comes from this bake.
-            self.window.stale = true;
         }
     }
 
@@ -123,8 +121,6 @@ impl World {
                     self.section_overlay.remove(&pos);
                 }
             }
-            // Off a chart the window's ground is read from this overlay.
-            self.window.stale = true;
         }
         match self.section_overlay_dirty.len() {
             0 => Progress::Idle,
@@ -156,38 +152,37 @@ impl World {
         (i64::from(ox) + i64::from(pos.min_x()) + half, i64::from(oz) + i64::from(pos.min_z()) + half)
     }
 
-    /// The chart tile counted from its patch that storage-frame tile `s` (face +Y, storage `x`, `z`)
-    /// is. Any other tile stays.
-    pub(in crate::world) fn patch_tile(&self, s: SectionPos) -> SectionPos {
-        let Some(atlas) = s.body.checked_sub(super::section::CHART_BODY_BASE).and_then(|i| self.seams.atlases().get(usize::from(i))) else {
-            return s;
-        };
-        let Some((crate::space::atlas::Patch::Shell { band: 0, face }, _, _)) = atlas.column(i64::from(s.min_x()), i64::from(s.min_z())) else {
-            return s;
-        };
-        let Some((ox, oz)) = self.generator.chart_origin(s.body, face) else { return s };
-        let span = s.span();
-        SectionPos { face, x: s.x - ox / span, z: s.z - oz / span, ..s }
+    /// Tile `s`'s footprint `[x0, z0, x1, z1)`: storage blocks on a chart, its face frame elsewhere.
+    pub(in crate::world) fn tile_rect(&self, s: SectionPos) -> [i64; 4] {
+        let (ox, oz) = self.generator.chart_origin(s.body, s.face).unwrap_or((0, 0));
+        let (x0, z0, w) = (i64::from(ox) + i64::from(s.min_x()), i64::from(oz) + i64::from(s.min_z()), i64::from(s.span()));
+        [x0, z0, x0 + w, z0 + w]
     }
 
-    /// The generator's surface over storage rect `[x0, x1) × [z0, z1)` of chart `body`: callers still
-    /// on the storage grid read through its +Y patch's frame, which spans all of storage.
+    /// The tile of chart `body` at `detail` holding storage column `(x, z)`, counted from the
+    /// band-0 patch that holds it. `None` off its patches.
+    #[cfg(test)]
+    pub(in crate::world) fn tile_at(&self, body: u16, detail: crate::ident::Detail, x: i64, z: i64) -> Option<SectionPos> {
+        let atlas = self.seams.atlases().get(usize::from(body.checked_sub(super::section::CHART_BODY_BASE)?))?;
+        let (crate::space::atlas::Patch::Shell { band: 0, face }, _, _) = atlas.column(x, z)? else { return None };
+        let (ox, oz) = self.generator.chart_origin(body, face)?;
+        let span = i64::from(super::section::section_span(detail));
+        let (lx, lz) = ((x - i64::from(ox)).div_euclid(span), (z - i64::from(oz)).div_euclid(span));
+        Some(SectionPos { detail, body, face, x: i32::try_from(lx).ok()?, z: i32::try_from(lz).ok()? })
+    }
+
+    /// The generator's surface over storage rect `[x0, x1) × [z0, z1)` of chart `body`: callers on
+    /// the storage grid read through its +Y patch's frame, which spans all of storage.
     pub(in crate::world) fn storage_rect(&self, body: u16, x0: i32, z0: i32, x1: i32, z1: i32) -> Option<(i32, i32)> {
         let (ox, oz) = self.generator.chart_origin(body, Face::PosY).unwrap_or((0, 0));
         self.generator.surface_rect(body, Face::PosY, x0 - ox, z0 - oz, x1 - ox, z1 - oz)
     }
 
     /// [`storage_rect`](Self::storage_rect) over the `span` square at storage `(x0, z0)`.
+    #[cfg(test)]
     pub(in crate::world) fn storage_bounds(&self, body: u16, x0: i32, z0: i32, span: i32) -> Option<(i32, i32)> {
         let (ox, oz) = self.generator.chart_origin(body, Face::PosY).unwrap_or((0, 0));
         self.generator.surface_bounds(body, Face::PosY, x0 - ox, z0 - oz, span)
-    }
-
-    /// The storage-frame tile (face +Y, storage `x`, `z`) of chart tile `s`. Any other tile stays.
-    pub(in crate::world) fn storage_tile(&self, s: SectionPos) -> SectionPos {
-        let Some((ox, oz)) = self.generator.chart_origin(s.body, s.face) else { return s };
-        let span = s.span();
-        SectionPos { face: Face::PosY, x: s.x + ox / span, z: s.z + oz / span, ..s }
     }
 
     /// Ready tiles under an uncovered desired cell, once the section floor is full.
@@ -231,7 +226,7 @@ impl World {
     }
 
     /// Section `p` is loaded and Ready.
-    fn section_ready(&self, p: SectionPos) -> bool {
+    pub(in crate::world) fn section_ready(&self, p: SectionPos) -> bool {
         self.sections.get(&p).is_some_and(|s| s.is_ready())
     }
 
@@ -275,23 +270,18 @@ impl World {
     /// covering permanently behind the live frontier, drawing a couple of
     /// stale coarse cubes over an otherwise missing far field.
     pub(in crate::world) fn rebuild_section_visible(&mut self, eng: Option<&mut Engine>) {
-        let Some(center) = self.section_center() else {
+        if self.section_center().is_none() {
             return;
-        };
+        }
         let desired = std::mem::take(&mut self.section_desired);
         let ready = |p: SectionPos| self.section_ready(p);
-        // A cell the settled full-res chunks already draw hands over at once, ahead of the clip.
-        let mut drawn: Vec<SectionPos> = desired.iter().copied().filter(|&c| !self.full_res_covers(center, c)).collect();
+        let mut drawn: Vec<SectionPos> = desired.clone();
         // A finer Ready tile keeps drawing while the cut that replaces it is still meshing.
         // Dropping it first opens a hole; the coarser tile takes over the frame it lands.
         let standins = self.ready_tiles_under(&drawn);
         drawn.extend(standins);
         let cut = quadtree::resolve_covering(&drawn, COARSEST, &ready);
-        let backlog = desired.iter().any(|&c| {
-            !self.sections.contains_key(&c)
-                && quadtree::drawable_cover(c, COARSEST, &ready).is_none()
-                && !self.coverage_skips(center, c)
-        });
+        let backlog = desired.iter().any(|&c| !self.sections.contains_key(&c) && quadtree::drawable_cover(c, COARSEST, &ready).is_none());
         self.section_desired = desired;
         if backlog {
             self.pending_sections.set();
@@ -332,7 +322,6 @@ impl World {
             .filter(|&&c| {
                 !self.sections.contains_key(&c)
                     && !self.section_covered(c)
-                    && !self.coverage_skips(center, c)
                     && !self.quarantined.contains(&FailKey::Section { pos: c })
             })
             .count();
@@ -401,65 +390,31 @@ impl World {
         self.unload_sections_with(center, |state| state.free(eng));
     }
 
-    /// [`unload_sections`](Self::unload_sections) with the GPU release passed in.
+    /// [`unload_sections`](Self::unload_sections) with the GPU release passed in. A section stays
+    /// while it is desired, drawn or fading, stands in under a hole, or is within a quarter of the
+    /// rule's ranges of being the detail its distance gives (so turning back reuses it).
     pub(in crate::world) fn unload_sections_with(&mut self, center: Coord, mut free: impl FnMut(SectionState)) {
-        // KEEP reads the frame's cached frontier (already velocity-unioned),
-        // so sections stay kept even as a fast-moving eye passes.
         let desired: FastSet<SectionPos> = self.section_desired.iter().copied().collect();
         let holes = self.section_holes(&self.section_desired);
         let visible: FastSet<SectionPos> = self.section_visible.iter().map(|(p, _)| *p).collect();
         // Fading sections still draw this frame. Keep meshes until fade completes
         // or outgoing section vanishes mid-fade.
         let fading: FastSet<SectionPos> = self.section_fade.tracked().collect();
-        let cfg = &self.far_pyramid();
-        let (metric_body, metric_face, metric) = if self.section_on_chart(center) {
-            let body = self
-                .seams
-                .chart_seat(center)
-                .map(|s| super::section::CHART_BODY_BASE + s.index as u16)
-                .unwrap_or(u16::MAX);
-            (body, Face::PosY, self.chart_metric(center, DVec3::ZERO, cfg))
-        } else {
-            let metric_face = self.section_lod_face.map(|(_, f)| f).unwrap_or(Face::PosY);
-            let metric_body = self.section_lod_face.map(|(b, _)| b).unwrap_or(0);
-            let metric = self.section_metric_on(
-                center,
-                DVec3::ZERO,
-                metric_face,
-                self.generator.face_datum(metric_body, metric_face),
-            );
-            (metric_body, metric_face, metric)
-        };
+        let ground = self.far_ground(center);
+        let eye = super::super::rule::PhysBox::eye_cell(self.phys_eye(center, true));
         let stale: Vec<SectionPos> = self
             .sections
             .keys()
             .copied()
             .filter(|s| {
-                if visible.contains(s) || fading.contains(s) {
+                if visible.contains(s) || fading.contains(s) || desired.contains(s) {
                     return false;
-                }
-                if desired.contains(s) {
-                    // Settled full-res chunks draw it: hand it over (a chart punches it instead).
-                    return self.full_res_covers(center, *s);
                 }
                 // A finer tile still drawing a hole. The visible rebuild stands it in after this.
                 if self.stands_under_hole(*s, &holes) {
                     return false;
                 }
-                // In the chart net. A neighbour's own storage is a different box, so the raw
-                // column reads as past the horizon and the fold deletes a section the player
-                // is about to walk back onto.
-                let (cx, cz) = self.tile_centre(*s);
-                let (cx, cz) = self.net_column(center, cx, cz);
-                // A section on another face is kept only while it is still desired. Every patch
-                // of a chart is measured in its storage.
-                let chart = s.body >= super::section::CHART_BODY_BASE;
-                let dist = if s.body == metric_body && (chart || s.face == metric_face) {
-                    metric.point(cx as f64, cz as f64)
-                } else {
-                    EyeDist::new(f32::MAX)
-                };
-                !pyramid::acceptable(dist, s.detail, cfg)
+                !ground.is_some_and(|g| self.rule_keeps(g, *s, &eye))
             })
             .collect();
         // Removals move the covering (a freed cell may re-expose an ancestor).
@@ -468,6 +423,31 @@ impl World {
                 free(state);
             }
         }
+    }
+
+    /// Section `s` of `ground` is within the hold of what the rule draws from `eye`: inside its
+    /// horizon, its parent would split, and it would not split well inside its own range.
+    fn rule_keeps(&self, ground: super::super::rule::Ground, s: SectionPos, eye: &super::super::rule::PhysBox) -> bool {
+        use super::super::rule::Ground;
+        const HOLD: f64 = 1.25;
+        let on = match ground {
+            Ground::Chart { index } => s.body == super::section::CHART_BODY_BASE + index as u16,
+            Ground::Cube { body } => s.body == body,
+            Ground::Flat => s.body == 0,
+        };
+        if !on {
+            return false;
+        }
+        let rule = self.rule_on(ground);
+        let Some(b) = self.node_box(s) else { return false };
+        let d = b.dist_box(eye);
+        if d >= rule.horizon() * HOLD || s.detail.0 > rule.coarsest {
+            return false;
+        }
+        if s.detail.0 < rule.coarsest && self.node_box(s.parent()).is_some_and(|p| p.dist_box(eye) >= rule.range(s.detail.0 + 1) * HOLD) {
+            return false;
+        }
+        !(s.detail.0 > rule.finest && d < rule.range(s.detail.0) / HOLD)
     }
 
     /// Free GPU meshes so edited sections re-extract from the updated overlay.

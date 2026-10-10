@@ -79,7 +79,7 @@ impl World {
         };
         self.edit_generation += 1;
         // The window's ground may have moved with this edit.
-        self.window.stale = true;
+        self.near.stale = true;
         // Skylight ceiling upkeep: a roof appearing above a column's
         // current ceiling raises it; the topmost edited roof disappearing
         // lowers it. Either way the cached window is stale, and every loaded

@@ -181,7 +181,7 @@ impl World {
             self.index_edited_chunk(coord, sky);
         }
         self.edit_generation += cells.len() as u64;
-        self.window.stale = true;
+        self.near.stale = true;
         if self.lod2 {
             self.mark_dirty_sections(coord, cells.iter().map(|&(index, _)| cell_of(coord, index)));
         }

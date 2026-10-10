@@ -9,78 +9,6 @@ use crate::math::Aabb;
 use crate::render_config::RenderConfig;
 use voxel_engine::{DVec3, Pass};
 
-/// The settled LOD clip: full-res radius only where chunks are actually
-/// drawn (or born-air), ring by ring — the far field covers everything
-/// beyond, so a loading edge shows coarse terrain, never a hole.
-#[test]
-fn lod_clip_tracks_the_settled_rings() {
-    let mut world = World::generate();
-    world.set_view_radius(3);
-    let center = ChunkCoord::new(0, 2, 0);
-    world.center = Some(center);
-    world.ensure_region_data(center);
-
-    // Nothing is drawn yet: the whole far field must stay visible.
-    world.refresh_lod_clip();
-    assert_eq!(
-        world.lod_clip().half.x,
-        0.0,
-        "unmeshed centre keeps the clip closed"
-    );
-    assert_eq!(world.lod_clip().half.z, 0.0);
-    assert_eq!(world.lod_clip().half.y, world.view.coverage().half.y);
-
-    // Settle every chunk in the mesh box (Air is settled by definition).
-    let coords: Vec<Coord> = world.chunks.keys().copied().collect();
-    for coord in coords {
-        world.chunks.get_mut(&coord).unwrap().state = MeshState::Air;
-    }
-    world.lod_clip_grow.set();
-    world.refresh_lod_clip();
-    assert_eq!(
-        world.lod_clip().half,
-        world.view.coverage().half,
-        "fully settled must be bit-identical to the full-res clip"
-    );
-
-    // A drawn mesh counts settled the same as Air (edited chunks keep their
-    // previous mesh on screen, so they must not reopen the clip).
-    let h = MeshHandle::from_raw_parts(7, 1);
-    let probe = ChunkCoord::new(1, center.y, 0);
-    world.chunks.get_mut(&probe).unwrap().state = MeshState::Dirty { prev: Some(meshes(h)) };
-    world.lod_clip_shrunk.set();
-    world.refresh_lod_clip();
-    assert_eq!(world.lod_clip().half, world.view.coverage().half);
-
-    // Unsettle one column at ring 2: the clip retreats to one ring inside it
-    // (the nearest face of ring 2 can be 16 m from an off-centre eye).
-    world.chunks.get_mut(&ChunkCoord::new(2, center.y, -1)).unwrap().state =
-        MeshState::NeedsMesh { building: false, prev: None };
-    world.lod_clip_shrunk.set();
-    world.refresh_lod_clip();
-    assert_eq!(
-        world.lod_clip().half.x,
-        CHUNK_SIZE as f32,
-        "rings 0..=1 settled, ring 2 open"
-    );
-    assert_eq!(world.lod_clip().half.z, CHUNK_SIZE as f32);
-    assert_eq!(world.lod_clip().half.y, world.view.coverage().half.y);
-
-    // Events are the only triggers: without a flag the cached value stands,
-    // and growth resumes from the frontier ring once the column settles.
-    world.chunks.get_mut(&ChunkCoord::new(2, center.y, -1)).unwrap().state = MeshState::Air;
-    world.refresh_lod_clip();
-    assert_eq!(
-        world.lod_clip().half.x,
-        CHUNK_SIZE as f32,
-        "no event, no rescan"
-    );
-    assert_eq!(world.lod_clip().half.z, CHUNK_SIZE as f32);
-    world.lod_clip_grow.set();
-    world.refresh_lod_clip();
-    assert_eq!(world.lod_clip().half, world.view.coverage().half);
-}
-
 /// InfiniteDiffusion at a quarter of its relief: real hills (so LOD selection has error to
 /// refine) that still fit inside the near slab the coverage tests reason about.
 fn lod2_world() -> World {
@@ -432,117 +360,6 @@ fn desired_frontier_responds_to_altitude() {
         sky.iter().all(|s| s.detail > finest),
         "wholly-overhead near rings must drop out at altitude"
     );
-}
-
-/// Verify coverage_skips skips only provably-covered sections inside the slab,
-/// and only when backed by settled chunks.
-#[test]
-fn coverage_skip_is_sound_and_backed() {
-    use super::heightmip::BakeExtent;
-    let mut world = lod2_world();
-    let twin = world
-        .terrain()
-        .cosmos()
-        .expect("cosmos")
-        .bodies()
-        .iter()
-        .copied()
-        .find(|b| b.kind == terrain::cosmos::Kind::Twin)
-        .expect("a twin");
-    let (center, cu, cv, surf) = face_centre_stand(&world, &twin, Face::PosY);
-    world.center = Some(center);
-    world.view = ViewVolume::view(20);
-    // World altitude of the face. The bake stores height above the datum, and the
-    // metric subtracts the datum, so the eye has to be the surface itself.
-    world.section_eye_y = surf as f64;
-    let span = section::section_span(section::FINEST_DETAIL);
-    let cell = SectionPos {
-        body: twin.id,
-        face: Face::PosY,
-        detail: section::FINEST_DETAIL,
-        x: cu.div_euclid(span),
-        z: cv.div_euclid(span),
-    };
-    world.section_mip = Some(HeightMip::bake_at(
-        &*world.generator,
-        &world.registry.color_snapshot(),
-        BakeExtent::new(2048, Detail(section::FINEST_DETAIL.0 + 3)),
-        cu,
-        cv,
-        Face::PosY,
-        twin.id,
-    ));
-    let mip = world.section_mip.clone().unwrap();
-
-    let (lo, hi) = mip.relief_band(cell).expect("near cell is baked");
-
-    // Selection stays total: skip is invisible to covering.
-    assert!(world.desired_sections(center).contains(&cell), "cell still desired");
-
-    // With nothing loaded, footprint is unbacked, so don't skip.
-    assert!(!world.coverage_skips(center, cell), "unbacked near disc must not be skipped");
-
-    // Back the footprint with settled chunks.
-    let cs = CHUNK_SIZE as i32;
-    let nchunks = cell.span() / cs;
-    let (cx0, cz0) = (cell.min_x().div_euclid(cs), cell.min_z().div_euclid(cs));
-    let (cy_lo, cy_hi) = (world.baked_world_y(cell, lo).div_euclid(cs), world.baked_world_y(cell, hi).div_euclid(cs));
-    for cy in cy_lo..=cy_hi {
-        for dz in 0..nchunks {
-            for dx in 0..nchunks {
-                let (cx, cz) = (cx0 + dx, cz0 + dz);
-                world.chunks.insert(ChunkCoord::new(cx, cy, cz), air_loaded(cx, cy, cz));
-            }
-        }
-    }
-    assert!(world.coverage_skips(center, cell), "backed near disc inside the slab is skipped");
-
-    // If any chunk is in-flight, don't skip (fast-descent guard).
-    world.chunks.insert(ChunkCoord::new(cx0, cy_lo, cz0), Loaded {
-        state: MeshState::NeedsMesh { building: true, prev: None },
-        ..air_loaded(cx0, cy_lo, cz0)
-    });
-    assert!(!world.coverage_skips(center, cell), "an in-flight covering chunk blocks the skip");
-}
-
-/// Verify sections outside the skipped core are never skipped.
-#[test]
-fn coverage_skip_never_skips_outside_the_core() {
-    use super::heightmip::BakeExtent;
-    let mut world = lod2_world();
-    let twin = world
-        .terrain()
-        .cosmos()
-        .expect("cosmos")
-        .bodies()
-        .iter()
-        .copied()
-        .find(|b| b.kind == terrain::cosmos::Kind::Twin)
-        .expect("a twin");
-    let (center, cu, cv, surf) = face_centre_stand(&world, &twin, Face::PosY);
-    world.center = Some(center);
-    world.view = ViewVolume::view(20);
-    world.section_eye_y = surf as f64;
-    let span = section::section_span(section::FINEST_DETAIL);
-    let (sx, sz) = (cu.div_euclid(span), cv.div_euclid(span));
-    world.section_mip = Some(HeightMip::bake_at(
-        &*world.generator,
-        &world.registry.color_snapshot(),
-        BakeExtent::new(2048, Detail(section::FINEST_DETAIL.0 + 3)),
-        cu,
-        cv,
-        Face::PosY,
-        twin.id,
-    ));
-
-    // Far section: clip draws it, so don't skip it.
-    let far = SectionPos { body: twin.id, face: Face::PosY, detail: section::FINEST_DETAIL, x: sx + 5, z: sz };
-    assert!(!world.coverage_skips(center, far), "a far section is never skipped");
-
-    // Near section but eye is high above it: terrain pokes out of slab, so don't skip.
-    let near = SectionPos { body: twin.id, face: Face::PosY, detail: section::FINEST_DETAIL, x: sx, z: sz };
-    world.section_eye_y = surf as f64 + 5000.0;
-    assert!(!world.coverage_skips(center, near), "high eye over low ground is not skipped");
 }
 
 /// A `Ready` state drawing a single opaque mesh `h` (the common test shape).
@@ -987,46 +804,6 @@ fn async_rebuild_claim_and_stale_release_preserve_the_drawn_mesh() {
     assert!(state.live_meshes().unwrap().draws(h), "a stale drop keeps drawing");
     assert!(world.mesh_worklist.contains(&coord), "re-seeded for the retry");
     assert!(world.pending_fresh.get());
-}
-
-/// A boundary cross SHIFTS the settled LOD-clip rings by the move's chess
-/// distance instead of resetting them to zero: the far clip no longer
-/// collapses (and far LOD no longer pops over the settled near field) on
-/// every crossed boundary while flying — only a vertical move restarts,
-/// because `ring_settled`'s proof doesn't transfer across chunk layers.
-#[test]
-fn boundary_cross_shifts_the_settled_rings_by_chess_distance() {
-    let mut world = World::generate();
-    world.set_view_radius(3);
-    let center = ChunkCoord::new(0, 2, 0);
-    world.center = Some(center);
-    world.ensure_region_data(center);
-    let coords: Vec<Coord> = world.chunks.keys().copied().collect();
-    for coord in coords {
-        world.chunks.get_mut(&coord).unwrap().state = MeshState::Air;
-    }
-    world.lod_clip_grow.set();
-    world.refresh_lod_clip();
-    let full = world.lod_clip_rings;
-    assert_eq!(full, world.view.horizontal + 1, "settled through the whole box");
-
-    // A one-chunk horizontal move: the proven rings shift down by one — no
-    // reset, and the outward scan re-arms from the shifted frontier.
-    world.shift_lod_clip(Some(center), ChunkCoord::new(1, 2, 0));
-    assert_eq!(world.lod_clip_rings, full - 1);
-    assert!(world.lod_clip_grow.get(), "growth resumes from the frontier");
-    assert!(!world.lod_clip_shrunk.get(), "a horizontal move never resets");
-
-    // A diagonal move is chess distance 1 too (shifts accumulate).
-    world.shift_lod_clip(Some(ChunkCoord::new(1, 2, 0)), ChunkCoord::new(2, 2, 1));
-    assert_eq!(world.lod_clip_rings, full - 2);
-
-    // A vertical move restarts the scan; the next refresh re-proves from zero
-    // (everything here is still settled, so it regrows to full).
-    world.shift_lod_clip(Some(ChunkCoord::new(2, 2, 1)), ChunkCoord::new(2, 3, 1));
-    assert!(world.lod_clip_shrunk.get(), "a layer change resets");
-    world.refresh_lod_clip();
-    assert_eq!(world.lod_clip_rings, full, "reset then regrown over settled chunks");
 }
 
 /// A boundary cross prunes STALE upload entries in one pass — releasing each
@@ -1522,51 +1299,6 @@ impl crate::world::generation::TerrainGenerator for EdgeBand {
     fn sky(&self, c: ChunkCoord) -> Sky {
         if c.x < 0 { Sky::Axis(Face::PosX) } else { Sky::Open }
     }
-}
-
-#[test]
-fn shift_lod_clip_follows_the_up_axis() {
-    let mut world = World::generate();
-    world.stream_up = Some(Face::PosX);
-    world.stream_up_set = true;
-    world.lod_clip_shrunk.take();
-    world.lod_clip_rings = 4;
-    world.shift_lod_clip(Some(ChunkCoord::new(0, 0, 0)), ChunkCoord::new(0, 1, 1));
-    assert_eq!(world.lod_clip_rings, 3, "a tangent move shifts by chess distance");
-    assert!(!world.lod_clip_shrunk.get());
-    world.shift_lod_clip(Some(ChunkCoord::new(0, 1, 1)), ChunkCoord::new(1, 1, 1));
-    assert!(world.lod_clip_shrunk.get(), "a move along X resets");
-
-    world.lod_clip_shrunk.take();
-    world.stream_up = None;
-    world.lod_clip_rings = 4;
-    world.shift_lod_clip(Some(ChunkCoord::new(0, 0, 0)), ChunkCoord::new(0, 2, 0));
-    assert_eq!(world.lod_clip_rings, 2, "isotropic space shifts by 3-D chess");
-    assert!(!world.lod_clip_shrunk.get());
-}
-
-#[test]
-fn ring_settled_scans_along_the_up_axis() {
-    let mut world = World::generate();
-    world.set_view_radius(2);
-    let center = ChunkCoord::new(0, 0, 0);
-    world.center = Some(center);
-    let v = world.view.vertical;
-    for y in -v..=v {
-        let c = ChunkCoord::new(0, y, 0);
-        world.ensure_data(c);
-        world.chunks.get_mut(&c).unwrap().state = MeshState::Air;
-    }
-    assert!(world.ring_settled(center, 0), "+Y ring 0 is the Y column");
-    world.stream_up = Some(Face::PosX);
-    world.stream_up_set = true;
-    assert!(!world.ring_settled(center, 0), "+X ring 0 is the X column");
-    for x in -v..=v {
-        let c = ChunkCoord::new(x, 0, 0);
-        world.ensure_data(c);
-        world.chunks.get_mut(&c).unwrap().state = MeshState::Air;
-    }
-    assert!(world.ring_settled(center, 0));
 }
 
 #[test]
@@ -3366,114 +3098,89 @@ fn verdance_column(world: &World, from_pos_x: Option<i64>) -> (usize, std::sync:
 }
 
 /// A streaming centre on Verdance selects chart sections around the storage eye, bent through
-/// the chart. Re-pins `far_face_storage_selects_none`: a storage centre used to select nothing.
-/// A span-32 tile may cross the full-res edge; that tile draws the sliver beside the box.
+/// the chart. Every tile lies inside its own patch (a chart is a tree of its own), keeps the chord
+/// rule, and the tiles over the eye are the finest far level. Re-pins
+/// `far_face_storage_selects_none`: a storage centre used to select nothing.
 #[test]
 fn far_face_storage_selects_chart_sections() {
     use crate::space::atlas::Patch;
     use std::time::Instant;
     let mut world = lod2_world();
     let (index, atlas, si, sj) = verdance_column(&world, None);
-    let top = Patch::Shell { band: 0, face: Face::PosY };
-    let (o, size) = atlas.storage_box(top);
     let ground = world.terrain().surface(Face::PosY, si, sj);
     assert_ne!(ground, i32::MIN, "the chart has no surface");
     let centre = chunk_holding(si, ground, sj);
     assert!(world.adopt_fold(centre), "storage centre did not fold");
     assert!(!world.fold.is_identity());
     world.section_eye_y = ground as f64;
-    let desired: Vec<SectionPos> = world.desired_sections(centre).into_iter().map(|s| world.storage_tile(s)).collect();
+    let desired = world.desired_sections(centre);
     assert!(!desired.is_empty(), "Verdance selected no chart sections");
     let body = section::CHART_BODY_BASE + index as u16;
-    assert!(desired.iter().all(|s| s.body == body && s.face == Face::PosY), "frontier left the chart: {desired:?}");
-    assert!(
-        desired.iter().any(|s| (s.min_x() as i64 - si as i64).abs() < 50_000 && (s.min_z() as i64 - sj as i64).abs() < 50_000),
-        "frontier is not around the storage eye"
-    );
-    let h = world.view.horizontal as i64;
-    let cs = CHUNK_SIZE as i64;
-    let (x0, x1) = ((centre.x as i64 - h) * cs, (centre.x as i64 + h + 1) * cs);
-    let (z0, z1) = ((centre.z as i64 - h) * cs, (centre.z as i64 + h + 1) * cs);
-    for s in &desired {
-        let span = s.span() as i64;
-        let (x, z) = (s.min_x() as i64, s.min_z() as i64);
+    assert!(desired.iter().all(|s| s.body == body), "frontier left the chart: {desired:?}");
+    let finest = world.rule_on(crate::world::rule::Ground::Chart { index }).finest;
+    for &s in &desired {
+        let [x0, z0, x1, z1] = world.tile_rect(s);
+        let (o, size) = atlas.storage_box(Patch::Shell { band: 0, face: s.face });
         assert!(section::section_fits(s.span(), atlas.radius), "section {s:?} exceeds the chord cap");
-        assert!(x >= o[0] && x + span <= o[0] + size[0] && z >= o[2] && z + span <= o[2] + size[2], "{s:?} leaves the home chart");
-        // Overlap is only the span-32 border: it also extends outside, so the sliver beside the box is drawn.
-        let overlaps = x < x1 && x + span > x0 && z < z1 && z + span > z0;
-        if overlaps {
-            assert_eq!(
-                span,
-                section::section_span(Detail(0)) as i64,
-                "{s:?} covers the full-res box above the border grid"
-            );
-            assert!(
-                x < x0 || x + span > x1 || z < z0 || z + span > z1,
-                "{s:?} sits inside the full-res box"
-            );
+        assert!(x0 >= o[0] && x1 <= o[0] + size[0] && z0 >= o[2] && z1 <= o[2] + size[2], "{s:?} leaves its patch");
+        if (x0..x1).contains(&i64::from(si)) && (z0..z1).contains(&i64::from(sj)) {
+            assert_eq!(s.detail.0, finest, "{s:?} over the eye is not the finest far level");
         }
     }
-    let clip = world.lod_clip();
-    assert!(clip.half.x <= 0.0 && clip.half.y <= 0.0 && clip.half.z <= 0.0, "chart clip is not empty: {:?}", clip.half);
-    let stored = desired
+    let pos = desired
         .iter()
         .copied()
-        .filter(|s| s.detail == section::FINEST_DETAIL)
-        .min_by_key(|s| (s.min_x() - si).abs() + (s.min_z() - sj).abs())
+        .filter(|s| s.detail.0 == finest)
+        .min_by_key(|&s| {
+            let [x0, z0, ..] = world.tile_rect(s);
+            (x0 - i64::from(si)).abs() + (z0 - i64::from(sj)).abs()
+        })
         .expect("a finest chart section");
     let tables = world.registry().hot_tables();
     let t0 = Instant::now();
-    let mesh = section::extract_section_mesh(world.patch_tile(stored), world.terrain(), &[], &tables);
-    let pos = stored;
+    let mesh = section::extract_section_mesh(pos, world.terrain(), &[], &tables);
     let ms = t0.elapsed().as_secs_f64() * 1.0e3;
     println!("chart section extract+mesh: {ms:.1} ms, {} vertex bytes, shift {}", mesh.vertex_bytes(), mesh.shift);
     assert!(mesh.vertex_bytes() > 0, "chart section meshed empty");
-    let (patch, _) = atlas.locate([pos.min_x() as i64, 0, pos.min_z() as i64]).expect("section patch");
+    let patch = Patch::Shell { band: 0, face: pos.face };
+    let [x0, z0, ..] = world.tile_rect(pos);
+    let (x0, z0) = (x0 as i32, z0 as i32);
     assert!(!mesh.slabs.is_empty());
     for slab in &mesh.slabs {
         let detail = Detail(pos.detail.0.saturating_add(mesh.shift as i8));
         let extent = 16i32 << detail.0;
         let y0 = mesh.altitude_floor + slab.origin_y as i32 * pos.cell_size();
-        let (anchor, corners) = section::chart_slab_corners(&atlas, patch, pos.min_x(), y0, pos.min_z(), extent).expect("cage");
+        let (anchor, corners) = section::chart_slab_corners(&atlas, patch, x0, y0, z0, extent).expect("cage");
         for c in 0..8 {
             let d = DVec3::new(((c & 1) as f64) * extent as f64, (((c >> 1) & 1) as f64) * extent as f64, (((c >> 2) & 1) as f64) * extent as f64);
-            let physical = atlas.embed_storage(patch, DVec3::new(pos.min_x() as f64 + d.x, y0 as f64 + d.y, pos.min_z() as f64 + d.z));
+            let physical = atlas.embed_storage(patch, DVec3::new(x0 as f64 + d.x, y0 as f64 + d.y, z0 as f64 + d.z));
             let got = DVec3::new(anchor.x as f64 + corners[c].x as f64, anchor.y as f64 + corners[c].y as f64, anchor.z as f64 + corners[c].z as f64);
             assert!((physical - got).length() < 1.0e-2, "cage corner {c} off by {}", (physical - got).length());
         }
     }
 }
 
-/// Within two finest sections of a chart edge, the neighbour chart joins the frontier.
+/// Near a chart's edge the neighbour chart's own tiles join the cut, each inside its patch.
 #[test]
 fn far_face_chart_edge_selects_the_neighbour() {
     use crate::space::atlas::Patch;
     let mut world = lod2_world();
     let (index, atlas, si, sj) = verdance_column(&world, Some(100));
-    let top = Patch::Shell { band: 0, face: Face::PosY };
-    let (o, size) = atlas.storage_box(top);
     let ground = world.terrain().surface(Face::PosY, si, sj);
     assert_ne!(ground, i32::MIN, "the edge column has no surface");
     let centre = chunk_holding(si, ground, sj);
     assert!(world.adopt_fold(centre), "edge centre did not fold");
     world.section_eye_y = ground as f64;
-    let desired: Vec<SectionPos> = world.desired_sections(centre).into_iter().map(|s| world.storage_tile(s)).collect();
+    let desired = world.desired_sections(centre);
     let body = section::CHART_BODY_BASE + index as u16;
-    assert!(desired.iter().all(|s| s.body == body && s.face == Face::PosY));
-    let outside: Vec<_> = desired
-        .iter()
-        .copied()
-        .filter(|s| {
-            let span = s.span() as i64;
-            let (x, z) = (s.min_x() as i64, s.min_z() as i64);
-            x < o[0] || x + span > o[0] + size[0] || z < o[2] || z + span > o[2] + size[2]
-        })
-        .collect();
-    assert!(!outside.is_empty(), "no section crossed the +X edge ({} selected)", desired.len());
-    for s in &outside {
+    assert!(desired.iter().all(|s| s.body == body));
+    let neighbour: Vec<_> = desired.iter().copied().filter(|s| s.face != Face::PosY).collect();
+    assert!(!neighbour.is_empty(), "no neighbour chart's tile joined ({} selected)", desired.len());
+    for s in &neighbour {
         assert!(section::section_fits(s.span(), atlas.radius), "{s:?} exceeds the chord cap");
-        let (patch, _) = atlas.locate([s.min_x() as i64, 0, s.min_z() as i64]).unwrap_or_else(|| panic!("{s:?} is outside every box"));
-        assert!(matches!(patch, Patch::Shell { band: 0, .. }), "{s:?} landed on {patch:?}");
+        let [x0, z0, x1, z1] = world.tile_rect(*s);
+        let (o, size) = atlas.storage_box(Patch::Shell { band: 0, face: s.face });
+        assert!(x0 >= o[0] && x1 <= o[0] + size[0] && z0 >= o[2] && z1 <= o[2] + size[2], "{s:?} leaves its patch");
     }
 }
 
@@ -3536,7 +3243,7 @@ fn home_storage_column(world: &World, face: Face) -> (usize, i32, i32, i32) {
     (index, x, z, ground)
 }
 
-/// The start world's far field is its chart sections, read in storage, on every face.
+/// The start world's far field is its chart sections, on every face.
 #[test]
 fn far_face_home_chart_selects_chart_sections() {
     for face in [Face::PosY, Face::PosX] {
@@ -3551,17 +3258,15 @@ fn far_face_home_chart_selects_chart_sections() {
         }
         assert!(!world.fold.is_identity(), "{face:?} fold stayed physical");
         world.section_eye_y = ground as f64;
-        let desired: Vec<SectionPos> = world.desired_sections(centre).into_iter().map(|s| world.storage_tile(s)).collect();
+        let desired = world.desired_sections(centre);
         let body = section::CHART_BODY_BASE + index as u16;
         assert!(!desired.is_empty(), "{face:?} selected nothing");
-        assert!(
-            desired.iter().all(|s| s.body == body && s.face == Face::PosY),
-            "{face:?} frontier left the chart: {desired:?}"
-        );
-        assert!(
-            desired.iter().any(|s| (s.min_x() as i64 - i64::from(x)).abs() < 50_000 && (s.min_z() as i64 - i64::from(z)).abs() < 50_000),
-            "{face:?} frontier is not around the storage column"
-        );
+        assert!(desired.iter().all(|s| s.body == body), "{face:?} frontier left the chart: {desired:?}");
+        let near = |s: &SectionPos| {
+            let [x0, z0, ..] = world.tile_rect(*s);
+            (x0 - i64::from(x)).abs() < 50_000 && (z0 - i64::from(z)).abs() < 50_000
+        };
+        assert!(desired.iter().any(near), "{face:?} frontier is not around the storage column");
     }
 }
 
@@ -3575,9 +3280,9 @@ fn far_face_home_chart_edit_dirties_the_chart_section() {
     let span = section::section_span(section::FINEST_DETAIL);
     let body = section::CHART_BODY_BASE + index as u16;
     let home = world.terrain().cosmos().unwrap().home().id;
-    let stored = SectionPos { body, face: Face::PosY, detail: section::FINEST_DETAIL, x: x.div_euclid(span), z: z.div_euclid(span) };
-    let want = world.patch_tile(stored);
-    assert_ne!(want, stored, "the chart section is counted from its patch");
+    let want = world.tile_at(body, section::FINEST_DETAIL, i64::from(x), i64::from(z)).expect("a chart tile");
+    let [x0, z0, x1, z1] = world.tile_rect(want);
+    assert!((x0..x1).contains(&i64::from(x)) && (z0..z1).contains(&i64::from(z)) && x1 - x0 == i64::from(span), "{want:?} does not hold the edit");
     assert!(
         world.dirty_sections.contains(&want),
         "dirty set {:?} missed the chart section",
@@ -4012,7 +3717,7 @@ impl World {
         assert_eq!(self.section_edit_chunks, other.section_edit_chunks, "section chunks");
         assert_eq!(self.section_overlay_dirty, other.section_overlay_dirty, "section overlays");
         assert_eq!(self.pending_sections.get(), other.pending_sections.get());
-        assert_eq!(self.window.stale, other.window.stale);
+        assert_eq!(self.near.stale, other.near.stale);
         assert_eq!(self.reactions().snapshot(), other.reactions().snapshot(), "pending reactions");
     }
 }

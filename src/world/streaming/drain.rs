@@ -18,6 +18,10 @@ pub(in crate::world) trait Landing {
     fn release_section(&mut self, data: pipeline::SectionPayload) {
         drop(data);
     }
+    /// Free a Ready section an in-place re-extract replaced.
+    fn free_section(&mut self, state: SectionState) {
+        drop(state);
+    }
 }
 
 impl Landing for Engine {
@@ -46,6 +50,10 @@ impl Landing for Engine {
 
     fn release_section(&mut self, data: pipeline::SectionPayload) {
         data.release_staging(self);
+    }
+
+    fn free_section(&mut self, state: SectionState) {
+        state.free(self);
     }
 }
 
@@ -114,23 +122,19 @@ impl World {
         let section_budget = pacer.section_uploads();
         let mut section_uploads = 0;
         while section_uploads < section_budget && upload_bytes < upload_budget {
-            let Some(pipeline::SectionUpload { pos, token, bytes, clip, meshes }) = self.section_upload_queue.pop_front() else {
+            let Some(up) = self.section_upload_queue.pop_front() else {
                 break;
             };
             section_uploads += 1;
-            if !matches!(self.sections.get(&pos), Some(SectionState::Meshing { token: t }) if *t == token) {
-                landing.release_section(meshes);
+            if !self.section_claim_live(up.pos, up.token) {
+                landing.release_section(up.meshes);
                 continue;
             }
-            super::adjust_count(&mut self.meshing_sections, true, false);
-            upload_bytes += bytes;
-            self.counters.section_upload_bytes += bytes;
-            let state = landing.section(self, pos, clip, meshes);
-            self.sections.insert(pos, state);
-            // A new Ready section moves the covering: re-arm the lane so
-            // any refinement it exposes loads immediately.
-            self.pending_sections.set();
-            self.section_cover_dirty.set();
+            let bytes = up.bytes;
+            if self.land_section(up, landing) {
+                upload_bytes += bytes;
+                self.counters.section_upload_bytes += bytes;
+            }
         }
         self.counters.drain_upload_bytes = upload_bytes;
     }
@@ -230,8 +234,7 @@ impl World {
         if let Some((pos, epoch, token)) = section_audit {
             debug_assert!(
                 epoch != self.section_epoch
-                    || !matches!(self.sections.get(&pos),
-                        Some(SectionState::Meshing { token: t }) if *t == token)
+                    || !self.section_claim_live(pos, token)
                     || self.section_upload_queue.iter().any(|u| u.pos == pos && u.token == token),
                 "section Done for {pos:?} matched the live claim but was not transferred"
             );

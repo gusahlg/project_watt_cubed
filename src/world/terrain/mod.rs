@@ -78,13 +78,13 @@ fn chart_storage(storage: &storage::StorageWorlds, body: u16, face: Face, u: i32
     Some((index, ox.checked_add(u)?, oz.checked_add(v)?))
 }
 
-/// Storage `(x, z)` atlas `index`'s band-0 patch `face` counts its tiles from.
+/// Storage `(x, z)` atlas `index`'s band-0 patch `face` counts its tiles from: its storage box's
+/// corner, so every tile of every level lies inside the patch.
 fn chart_patch_origin(storage: &storage::StorageWorlds, index: usize, face: Face) -> Option<(i32, i32)> {
     let atlas = storage.chart(index)?;
     atlas.bands.first()?;
     let (o, _) = atlas.storage_box(crate::space::atlas::Patch::Shell { band: 0, face });
-    let align = super::section::CHART_ALIGN;
-    Some((i32::try_from(o[0].div_euclid(align) * align).ok()?, i32::try_from(o[2].div_euclid(align) * align).ok()?))
+    Some((i32::try_from(o[0]).ok()?, i32::try_from(o[2]).ok()?))
 }
 
 /// The generator's knobs, in percent of the default (100 = as designed).

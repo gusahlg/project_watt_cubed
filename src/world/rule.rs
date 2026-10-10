@@ -4,6 +4,10 @@
 //! far out and twice as coarse as the one inside it, and each shell holds the same count of tiles
 //! at every render distance. Charts, chart seams, cube faces, twins and flat worlds are one case:
 //! every box is measured where it really is.
+//!
+//! The eye is the 16-block physical cell that holds it ([`PhysBox::eye_cell`]): the cut and the
+//! near columns are measured from the nearest point of that cell, so they change only when the
+//! eye crosses into another cell, and anything within `R` of the eye itself is within `R` of it.
 
 use voxel_engine::DVec3;
 
@@ -19,10 +23,13 @@ const SPLIT_SPANS: f64 = 2.0;
 const FINEST_RATIO: f64 = 64.0;
 
 /// Blocks a node's terrain bounds are widened by below (digs) and above (plants) the sampled tops.
-const DRESS: f64 = 8.0;
+pub(in crate::world) const DRESS: f64 = 8.0;
 
 /// Doublings of the render distance the far field reaches: its horizon is `R·2^8`.
 const HORIZON_DOUBLINGS: i32 = 8;
+
+/// Side of the physical cell the eye is measured from.
+pub(in crate::world) const EYE_CELL: f64 = 16.0;
 
 /// The rule at one render distance.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -42,7 +49,8 @@ impl Rule {
         Rule { r, finest, coarsest }
     }
 
-    /// Distance out to which detail `d` splits into detail `d − 1`.
+    /// Distance out to which detail `d` splits into detail `d − 1`. Tied to the tile's size; it
+    /// equals `R·2^(d − finest)` when `R = 64·2^k`.
     pub fn range(&self, d: i8) -> f64 {
         SPLIT_SPANS * 32.0 * 2f64.powi(i32::from(d))
     }
@@ -57,9 +65,11 @@ impl Rule {
         self.r * 2f64.powi(HORIZON_DOUBLINGS)
     }
 
-    /// This rule never coarser than `coarsest` (a chart's chord rule).
+    /// This rule never coarser than `coarsest` (a chart's chord rule): a ladder that short ends
+    /// there at both ends.
     pub fn capped(self, coarsest: i8) -> Rule {
-        Rule { coarsest: self.coarsest.min(coarsest).max(self.finest), ..self }
+        let coarsest = self.coarsest.min(coarsest);
+        Rule { coarsest, finest: self.finest.min(coarsest), ..self }
     }
 }
 
@@ -72,7 +82,7 @@ pub(in crate::world) struct PhysBox {
 
 impl PhysBox {
     /// The smallest box holding `points`, widened by `pad`.
-    fn around(points: impl IntoIterator<Item = DVec3>, pad: f64) -> Option<PhysBox> {
+    pub fn around(points: impl IntoIterator<Item = DVec3>, pad: f64) -> Option<PhysBox> {
         let mut it = points.into_iter();
         let first = it.next()?;
         let (lo, hi) = it.fold((first, first), |(lo, hi), p| (lo.min(p), hi.max(p)));
@@ -80,32 +90,59 @@ impl PhysBox {
         (lo.is_finite() && hi.is_finite()).then_some(PhysBox { lo: lo - pad, hi: hi + pad })
     }
 
+    /// The box holding only `p`.
+    pub fn point(p: DVec3) -> PhysBox {
+        PhysBox { lo: p, hi: p }
+    }
+
+    /// The [`EYE_CELL`] cell holding physical eye `eye`.
+    pub fn eye_cell(eye: DVec3) -> PhysBox {
+        let lo = (eye / EYE_CELL).floor() * EYE_CELL;
+        PhysBox { lo, hi: lo + DVec3::splat(EYE_CELL) }
+    }
+
     /// Euclidean distance from `p` to the nearest point of the box (`0` inside).
     pub fn dist(&self, p: DVec3) -> f64 {
         (self.lo - p).max(p - self.hi).max(DVec3::ZERO).length()
     }
+
+    /// Euclidean distance between the nearest points of the two boxes (`0` when they meet).
+    pub fn dist_box(&self, other: &PhysBox) -> f64 {
+        (self.lo - other.hi).max(other.lo - self.hi).max(DVec3::ZERO).length()
+    }
+
+    pub fn centre(&self) -> DVec3 {
+        (self.lo + self.hi) * 0.5
+    }
 }
 
 impl World {
-    /// The terrain altitudes of `s`'s footprint, in its own frame (chart storage `y`, a cube face's
-    /// local altitude), widened for digs and plants. An edited square reads its overlay, a baked one
-    /// the relief bake, the rest the generator's bounds.
-    fn node_bounds(&self, s: SectionPos) -> Option<(f64, f64)> {
-        let baked = self.section_relief_band(s).map(|(lo, hi)| (f64::from(self.baked_world_y(s, lo)), f64::from(self.baked_world_y(s, hi))));
-        let (lo, hi) = match baked {
-            Some(b) => b,
-            None => {
-                let (lo, hi) = self.generator.surface_bounds(s.body, s.face, s.min_x(), s.min_z(), s.span())?;
-                (f64::from(lo), f64::from(hi))
-            }
-        };
+    /// The terrain altitudes of `s`'s footprint in its own frame (chart storage `y`, a cube face's
+    /// local altitude) from an edit overlay or the relief bake, widened for digs and plants. `None`
+    /// where neither has the square.
+    pub(in crate::world) fn baked_bounds(&self, s: SectionPos) -> Option<(f64, f64)> {
+        let (lo, hi) = self.section_relief_band(s)?;
+        let (lo, hi) = (f64::from(self.baked_world_y(s, lo)), f64::from(self.baked_world_y(s, hi)));
+        Some((lo.min(hi) - DRESS, lo.max(hi) + DRESS))
+    }
+
+    /// [`baked_bounds`](Self::baked_bounds) from the generator's surface bounds: what the square
+    /// can hold before anything is baked or edited. Pure, so it may be kept.
+    pub(in crate::world) fn generator_bounds(&self, s: SectionPos) -> Option<(f64, f64)> {
+        let (lo, hi) = self.generator.surface_bounds(s.body, s.face, s.min_x(), s.min_z(), s.span())?;
+        let (lo, hi) = (f64::from(lo), f64::from(hi));
         Some((lo.min(hi) - DRESS, lo.max(hi) + DRESS))
     }
 
     /// Section `s`'s physical box: its footprint between its lowest and highest terrain, placed
     /// through its chart, the warp of its cube, or its face frame.
     pub(in crate::world) fn node_box(&self, s: SectionPos) -> Option<PhysBox> {
-        let (lo, hi) = self.node_bounds(s)?;
+        let (lo, hi) = self.baked_bounds(s).or_else(|| self.generator_bounds(s))?;
+        self.place_box(s, lo, hi)
+    }
+
+    /// `s`'s footprint between frame altitudes `lo` and `hi`, in physical space.
+    pub(in crate::world) fn place_box(&self, s: SectionPos, lo: f64, hi: f64) -> Option<PhysBox> {
         let span = f64::from(s.span());
         let (cx, cz) = self.tile_centre(s);
         let (x0, z0) = (cx as f64 - span / 2.0, cz as f64 - span / 2.0);
@@ -130,8 +167,12 @@ impl World {
 }
 
 mod select;
+mod surface;
 #[cfg(test)]
 mod probes;
+
+pub(in crate::world) use select::Leaf;
+pub(in crate::world) use surface::{Ground, RuleMemo};
 
 #[cfg(test)]
 mod tests {

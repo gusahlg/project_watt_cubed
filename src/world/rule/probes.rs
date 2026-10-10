@@ -1,12 +1,12 @@
 //! The owner's three LOD symptoms as probes (LOD-RULE step 0). Each streams the owner's view
 //! (render distance 16, vertical 5) at a site and measures what is drawn against the rule: inside
 //! the render distance every ground column is full-res, and beyond it each far tile is the
-//! detail its distance gives. They fail on the selection the rule replaces and are run by hand:
+//! detail its distance gives, measured from the eye's cell as the rule measures. They failed on
+//! the selection the rule replaced and are run by hand:
 //! `cargo test --release --lib lod_rule_symptom -- --ignored --nocapture --test-threads 1`
 
 use voxel_engine::DVec3;
 
-use super::select::Surface;
 use super::*;
 use crate::coord::{ChunkCoord as Coord, Face};
 use crate::render_config::{LOD_COARSEST_DETAIL, RenderConfig, lod_for};
@@ -31,12 +31,12 @@ fn owner_view(seed: i64) -> World {
 
 /// The rule for `world`'s view, on body `body`: a chart stops at its chord rule.
 fn rule_of(world: &World, body: u16) -> Rule {
-    let rule = Rule::new(f64::from(world.view.horizontal * CHUNK_SIZE as i32), LOD_COARSEST_DETAIL as i8);
-    let Some(atlas) = body.checked_sub(crate::world::section::CHART_BODY_BASE).and_then(|i| world.seams.atlases().get(usize::from(i))) else {
-        return rule;
+    let ground = match body.checked_sub(crate::world::section::CHART_BODY_BASE) {
+        Some(i) => Ground::Chart { index: usize::from(i) },
+        None if world.generator.cosmos().is_none() => Ground::Flat,
+        None => Ground::Cube { body },
     };
-    let cap = (rule.finest..=rule.coarsest).take_while(|&d| crate::world::section::section_fits(crate::world::section::section_span(crate::ident::Detail(d)), atlas.radius)).last();
-    rule.capped(cap.unwrap_or(rule.finest))
+    world.rule_on(ground)
 }
 
 /// Stream at `eye` until the whole view is loaded and drawn. Returns the passes taken.
@@ -56,6 +56,14 @@ fn drawn(world: &World) -> Vec<SectionPos> {
     world.section_visible.iter().filter(|(_, m)| !m.is_empty()).map(|&(s, _)| s).collect()
 }
 
+/// The columns tile `s`'s drawn mesh leaves to the full-res chunks.
+fn drawn_clip(world: &World, s: SectionPos) -> crate::world::section::ColumnClip {
+    match world.sections.get(&s) {
+        Some(crate::world::resident::SectionState::Ready { clip, .. }) => clip.drawn,
+        _ => crate::world::section::ColumnClip::NONE,
+    }
+}
+
 /// The drawn far field against the rule.
 #[derive(Debug, Default)]
 struct CutAudit {
@@ -73,7 +81,8 @@ struct CutAudit {
 }
 
 fn audit_cut(world: &World, eye: DVec3) -> CutAudit {
-    let mut tiles: Vec<(SectionPos, f64)> = drawn(world).into_iter().filter_map(|s| Some((s, world.node_box(s)?.dist(eye)))).collect();
+    let cell = PhysBox::eye_cell(eye);
+    let mut tiles: Vec<(SectionPos, f64)> = drawn(world).into_iter().filter_map(|s| Some((s, world.node_box(s)?.dist_box(&cell)))).collect();
     let mut audit = CutAudit { tiles: tiles.len(), ..CutAudit::default() };
     for &(s, d) in &tiles {
         let rule = rule_of(world, s.body);
@@ -84,7 +93,7 @@ fn audit_cut(world: &World, eye: DVec3) -> CutAudit {
         let finer = if s.detail.0 < rule.finest {
             d >= rule.r
         } else if s.detail.0 < rule.coarsest {
-            world.node_box(s.parent()).is_some_and(|p| !rule.splits(s.detail.0 + 1, p.dist(eye)))
+            world.node_box(s.parent()).is_some_and(|p| !rule.splits(s.detail.0 + 1, p.dist_box(&cell)))
         } else {
             false
         };
@@ -107,16 +116,24 @@ fn audit_cut(world: &World, eye: DVec3) -> CutAudit {
 
 /// Ground columns whose top lies inside the render distance (half a chunk of margin) and are not
 /// drawn by settled full-res chunks alone: no settled chunk holds the top, or a far tile draws
-/// over it. Columns are chunk centres of the near square: charts read storage through the net,
-/// a cube face its reference frame.
+/// over it (a tile whose drawn mesh leaves the column out does not). Columns are chunk centres of
+/// the near square: charts read storage through the net, a cube face its reference frame.
 fn not_full_res(world: &World, eye: DVec3) -> (usize, usize) {
     let cs = CHUNK_SIZE as i32;
     let center = world.center.expect("a centre");
     let h = world.view.horizontal;
     let reach = f64::from(h * cs) - f64::from(cs) * 0.75;
-    let tiles: Vec<SectionPos> = drawn(world).into_iter().map(|s| world.storage_tile(s)).collect();
-    let covers = |body: u16, face: Face, u: i32, v: i32| {
-        tiles.iter().any(|s| s.body == body && s.face == face && (s.min_x()..s.min_x() + s.span()).contains(&u) && (s.min_z()..s.min_z() + s.span()).contains(&v))
+    let tiles: Vec<(SectionPos, [i64; 4], crate::world::section::ColumnClip)> = drawn(world).into_iter().map(|s| (s, world.tile_rect(s), drawn_clip(world, s))).collect();
+    // A chart's tiles are read in storage, whatever patch they count from.
+    let covers = |body: u16, face: Option<Face>, u: i32, v: i32| {
+        let (u, v) = (i64::from(u), i64::from(v));
+        tiles.iter().any(|&(s, [x0, z0, x1, z1], clip)| {
+            s.body == body
+                && face.is_none_or(|f| s.face == f)
+                && (x0..x1).contains(&u)
+                && (z0..z1).contains(&v)
+                && !clip.masks(((u - x0) / 16) as i32, ((v - z0) / 16) as i32)
+        })
     };
     let settled = |c: Coord| world.chunks.get(&c).is_some_and(|l| l.state.settled());
     let (mut inside, mut bad) = (0, 0);
@@ -144,7 +161,7 @@ fn not_full_res(world: &World, eye: DVec3) -> (usize, usize) {
                 inside += 1;
                 let rc = World::chunk_of(x, y, z);
                 let c = Coord::new(rc.x - d[0], rc.y - d[1], rc.z - d[2]);
-                bad += usize::from(!settled(c) || covers(body, face, u, v));
+                bad += usize::from(!settled(c) || covers(body, Some(face), u, v));
             }
         }
         return (inside, bad);
@@ -165,7 +182,7 @@ fn not_full_res(world: &World, eye: DVec3) -> (usize, usize) {
             }
             inside += 1;
             let top_chunk = Coord::new(c.x, top.div_euclid(cs), c.z);
-            bad += usize::from(!settled(top_chunk) || covers(body, Face::PosY, x, z));
+            bad += usize::from(!settled(top_chunk) || covers(body, None, x, z));
         }
     }
     (inside, bad)
@@ -329,93 +346,7 @@ fn lod_rule_symptom_c_far_tiles_are_never_finer() {
     assert!(failures.is_empty(), "far tiles finer than their distance: {failures:?}");
 }
 
-/// The start world's band-0 charts as the rule's trees, measured where the rule would draw them:
-/// every chart's tiles of its chord-rule detail near the eye, a tile across a chart's edge cut to
-/// the part on the chart.
-struct Charts<'a> {
-    world: &'a World,
-    index: usize,
-    /// Each chart's patch, storage box and the eye's local position on it.
-    seats: Vec<(crate::space::atlas::Patch, [i64; 3], [i64; 3], (f64, f64))>,
-}
-
-impl<'a> Charts<'a> {
-    fn new(world: &'a World, eye: DVec3) -> Self {
-        use crate::space::atlas::Patch;
-        use crate::space::chart::{Map, basis};
-        let storage = world.chart_eye(eye).expect("a chart eye");
-        let seat = world.seams.chart_seat(World::chunk_of(storage.x.floor() as i32, storage.y.floor() as i32, storage.z.floor() as i32)).expect("a seat");
-        let atlas = &world.seams.atlases()[seat.index];
-        let n = atlas.bands[0].n;
-        let dir = (eye - atlas.centre).normalize();
-        let seats = Face::ALL
-            .into_iter()
-            .filter_map(|face| {
-                let (tu, nn, tv) = basis(face);
-                let d = DVec3::new(dir.dot(tu), dir.dot(nn), dir.dot(tv));
-                if d.y <= 0.05 {
-                    return None;
-                }
-                let (xi, eta) = Map::Equiangular.inverse(d);
-                let patch = Patch::Shell { band: 0, face };
-                let (o, size) = atlas.storage_box(patch);
-                let local = ((xi + 1.0) * 0.5 * n as f64, (eta + 1.0) * 0.5 * n as f64);
-                Some((patch, o, [o[0] + size[0], o[1] + size[1], o[2] + size[2]], local))
-            })
-            .collect();
-        Charts { world, index: seat.index, seats }
-    }
-
-    fn seat_of(&self, s: SectionPos) -> Option<&(crate::space::atlas::Patch, [i64; 3], [i64; 3], (f64, f64))> {
-        let (x, z, w) = (i64::from(s.min_x()), i64::from(s.min_z()), i64::from(s.span()));
-        self.seats.iter().find(|(_, lo, hi, _)| x < hi[0] && x + w > lo[0] && z < hi[2] && z + w > lo[2])
-    }
-}
-
-impl Surface for Charts<'_> {
-    fn roots(&self, rule: &Rule, _eye: DVec3, out: &mut Vec<SectionPos>) {
-        let body = crate::world::section::CHART_BODY_BASE + self.index as u16;
-        let span = i64::from(crate::world::section::section_span(crate::ident::Detail(rule.coarsest)));
-        let reach = (rule.horizon() * 1.5) as i64;
-        for (_, lo, hi, (lx, lz)) in &self.seats {
-            let (ex, ez) = (lo[0] + *lx as i64, lo[2] + *lz as i64);
-            let (x0, x1) = ((ex - reach).max(lo[0]), (ex + reach).min(hi[0]));
-            let (z0, z1) = ((ez - reach).max(lo[2]), (ez + reach).min(hi[2]));
-            if x0 >= x1 || z0 >= z1 {
-                continue;
-            }
-            for z in z0.div_euclid(span)..=(z1 - 1).div_euclid(span) {
-                for x in x0.div_euclid(span)..=(x1 - 1).div_euclid(span) {
-                    out.push(SectionPos { detail: crate::ident::Detail(rule.coarsest), body, face: Face::PosY, x: x as i32, z: z as i32 });
-                }
-            }
-        }
-    }
-
-    fn node_box(&self, s: SectionPos) -> Option<PhysBox> {
-        let (patch, lo, hi, _) = self.seat_of(s)?;
-        let w = i64::from(s.span());
-        let (x0, z0) = (i64::from(s.min_x()).max(lo[0]), i64::from(s.min_z()).max(lo[2]));
-        let (x1, z1) = ((i64::from(s.min_x()) + w).min(hi[0]), (i64::from(s.min_z()) + w).min(hi[2]));
-        let (a, b) = if (x1 - x0, z1 - z0) == (w, w) {
-            self.world.storage_bounds(s.body, x0 as i32, z0 as i32, w as i32)?
-        } else {
-            self.world.storage_rect(s.body, x0 as i32, z0 as i32, x1 as i32, z1 as i32)?
-        };
-        let atlas = &self.world.seams.atlases()[self.index];
-        let pts = (0..8).map(|c| {
-            DVec3::new(
-                if c & 1 == 0 { x0 } else { x1 } as f64,
-                f64::from(if c & 2 == 0 { a } else { b }),
-                if c & 4 == 0 { z0 } else { z1 } as f64,
-            )
-        });
-        let span = w as f64;
-        PhysBox::around(pts.map(|p| atlas.embed_storage(*patch, p)), span * span / (8.0 * atlas.radius as f64) + 1.0 + DRESS)
-    }
-}
-
-/// The rule's cut at the owner's site, in counts per detail, next to main's drawn cut there.
+/// The rule's cut at the owner's site, in counts per detail, next to the cut drawn once settled.
 #[test]
 #[ignore]
 fn lod_rule_cut_at_the_owner_site() {
@@ -424,30 +355,26 @@ fn lod_rule_cut_at_the_owner_site() {
         world.prepare_around(OWNER_EYE);
         world.drive_spawn_ready();
         settle(&mut world, OWNER_EYE);
-        let mut main_per = [0usize; 10];
+        let mut drawn_per = [0usize; 10];
         for s in drawn(&world) {
-            main_per[s.detail.0 as usize] += 1;
+            drawn_per[s.detail.0 as usize] += 1;
         }
-        let charts = Charts::new(&world, OWNER_EYE);
-        let rule = rule_of(&world, crate::world::section::CHART_BODY_BASE + charts.index as u16);
-        let (mut stack, mut leaves) = (Vec::new(), Vec::new());
+        let storage = world.chart_eye(OWNER_EYE).expect("a chart eye");
+        let seat = world.seams.chart_seat(World::chunk_of(storage.x.floor() as i32, storage.y.floor() as i32, storage.z.floor() as i32)).expect("a seat");
+        let ground = Ground::Chart { index: seat.index };
+        let (mut memo, mut leaves) = (RuleMemo::default(), Vec::new());
         let t = std::time::Instant::now();
-        rule.select(OWNER_EYE, &charts, &mut stack, &mut leaves);
+        let rule = world.rule_cut(ground, OWNER_EYE, &mut memo, &mut leaves);
         let us = t.elapsed().as_micros();
         let mut per = [0usize; 10];
         for l in &leaves {
             per[l.pos.detail.0 as usize] += 1;
         }
         let near = leaves.iter().filter(|l| l.dist < rule.r).count();
-        let cut = leaves.iter().filter(|l| charts.seat_of(l.pos).is_some_and(|(_, lo, hi, _)| {
-            let (x, z, w) = (i64::from(l.pos.min_x()), i64::from(l.pos.min_z()), i64::from(l.pos.span()));
-            x < lo[0] || z < lo[2] || x + w > hi[0] || z + w > hi[2]
-        })).count();
         println!(
-            "seed {seed}: main draws {} tiles {main_per:?}; the rule {} tiles {per:?} ({near} within R, {cut} cut by a chart edge, {} charts) in {us} µs; horizon {} finest d{} coarsest d{}",
-            main_per.iter().sum::<usize>(),
+            "seed {seed}: drawn {} tiles {drawn_per:?}; the rule {} tiles {per:?} ({near} within R) in {us} µs; horizon {} finest d{} coarsest d{}",
+            drawn_per.iter().sum::<usize>(),
             leaves.len(),
-            charts.seats.len(),
             rule.horizon(),
             rule.finest,
             rule.coarsest

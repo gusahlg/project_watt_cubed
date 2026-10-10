@@ -1,6 +1,7 @@
 //! The rule's cut: a top-down traversal of every root near the eye that splits a node while the
 //! eye is within its level's range. Its leaves partition the roots, each is the detail its distance
-//! gives, and nothing past the horizon is drawn.
+//! gives, and nothing past the horizon is drawn. The eye is a box (the cell holding it); a point is
+//! the box holding only itself.
 
 use voxel_engine::DVec3;
 
@@ -12,7 +13,7 @@ pub(in crate::world) trait Surface {
     /// Every root (a tile of `rule.coarsest`) whose box may come within the rule's horizon of `eye`.
     fn roots(&self, rule: &Rule, eye: DVec3, out: &mut Vec<SectionPos>);
     /// The node's physical box; `None` where it holds no surface (the subtree is skipped).
-    fn node_box(&self, s: SectionPos) -> Option<PhysBox>;
+    fn node_box(&mut self, s: SectionPos) -> Option<PhysBox>;
 }
 
 /// One tile of the cut and its distance from the eye.
@@ -24,14 +25,14 @@ pub(in crate::world) struct Leaf {
 
 impl Rule {
     /// The cut around `eye` on `surface`, into `out` (cleared first). `stack` is reused scratch.
-    pub fn select(&self, eye: DVec3, surface: &impl Surface, stack: &mut Vec<SectionPos>, out: &mut Vec<Leaf>) {
+    pub fn select(&self, eye: &PhysBox, surface: &mut impl Surface, stack: &mut Vec<SectionPos>, out: &mut Vec<Leaf>) {
         out.clear();
         stack.clear();
-        surface.roots(self, eye, stack);
+        surface.roots(self, eye.centre(), stack);
         let horizon = self.horizon();
         while let Some(s) = stack.pop() {
             let Some(b) = surface.node_box(s) else { continue };
-            let dist = b.dist(eye);
+            let dist = b.dist_box(eye);
             if dist >= horizon {
                 continue;
             }
@@ -91,7 +92,7 @@ mod tests {
             }
         }
 
-        fn node_box(&self, s: SectionPos) -> Option<PhysBox> {
+        fn node_box(&mut self, s: SectionPos) -> Option<PhysBox> {
             let (x0, z0, span) = (f64::from(s.min_x()), f64::from(s.min_z()), f64::from(s.span()));
             let (lo, hi) = bounds(&self.h, x0, z0, span);
             Some(PhysBox { lo: DVec3::new(x0, lo, z0), hi: DVec3::new(x0 + span, hi, z0 + span) })
@@ -132,7 +133,7 @@ mod tests {
                 for z in 0..self.n / span {
                     for x in 0..self.n / span {
                         let s = SectionPos { detail: Detail(rule.coarsest), body: 0, face, x, z };
-                        if self.node_box(s).is_some_and(|b| b.dist(eye) < rule.horizon()) {
+                        if self.box_of(s).is_some_and(|b| b.dist(eye) < rule.horizon()) {
                             out.push(s);
                         }
                     }
@@ -140,7 +141,13 @@ mod tests {
             }
         }
 
-        fn node_box(&self, s: SectionPos) -> Option<PhysBox> {
+        fn node_box(&mut self, s: SectionPos) -> Option<PhysBox> {
+            self.box_of(s)
+        }
+    }
+
+    impl Ball {
+        fn box_of(&self, s: SectionPos) -> Option<PhysBox> {
             let (x0, z0, span) = (f64::from(s.min_x()), f64::from(s.min_z()), f64::from(s.span()));
             let (lo, hi) = bounds(&self.h, x0, z0, span);
             let mut pts = Vec::with_capacity(18);
@@ -171,7 +178,7 @@ mod tests {
 
     /// P1: each leaf is the detail its distance gives (no split it should take, and its parent
     /// would split). P4: no leaf is two levels coarser than a farther one.
-    fn assert_rule(name: &str, rule: &Rule, surface: &impl Surface, eye: DVec3, leaves: &[Leaf]) {
+    fn assert_rule(name: &str, rule: &Rule, surface: &mut impl Surface, eye: DVec3, leaves: &[Leaf]) {
         assert!(!leaves.is_empty(), "{name}: empty cut");
         for l in leaves {
             let d = l.pos.detail.0;
@@ -209,9 +216,9 @@ mod tests {
         }
     }
 
-    fn cut_of(rule: &Rule, surface: &impl Surface, eye: DVec3) -> Vec<Leaf> {
+    fn cut_of(rule: &Rule, surface: &mut impl Surface, eye: DVec3) -> Vec<Leaf> {
         let (mut stack, mut out) = (Vec::new(), Vec::new());
-        rule.select(eye, surface, &mut stack, &mut out);
+        rule.select(&PhysBox::point(eye), surface, &mut stack, &mut out);
         out
     }
 
@@ -220,15 +227,15 @@ mod tests {
     /// within one level, and the leaves tile the ground under the horizon exactly once.
     #[test]
     fn plane_cut_follows_the_rule() {
-        let plane = Plane { h: hills };
+        let mut plane = Plane { h: hills };
         for rd in [6, 8, 12, 16, 24, 32] {
             let rule = Rule::new(f64::from(rd * 16), 9);
             for (i, up) in [2.0, 300.0, 2_000.0].into_iter().enumerate() {
                 let (x, z) = (37.0 + 1_011.0 * i as f64, -12.0 - 517.0 * i as f64);
                 let eye = DVec3::new(x, hills(x, z) + up, z);
                 let name = format!("render distance {rd}, {up} up");
-                let leaves = cut_of(&rule, &plane, eye);
-                assert_rule(&name, &rule, &plane, eye, &leaves);
+                let leaves = cut_of(&rule, &mut plane, eye);
+                assert_rule(&name, &rule, &mut plane, eye, &leaves);
                 let cut = leaf_map(&leaves);
                 let disc = rule.horizon() * 0.5;
                 assert_balance(&name, &rule, &cut, Face::PosY, |px, pz| (px - x).hypot(pz - z) < disc);
@@ -250,14 +257,14 @@ mod tests {
     /// never falls inward, and neighbours (across a seam too) stay within one level.
     #[test]
     fn ball_cut_follows_the_rule_across_seams() {
-        let ball = Ball { radius: 150_000.0, n: 1 << 18, h: hills };
+        let mut ball = Ball { radius: 150_000.0, n: 1 << 18, h: hills };
         let rule = Rule::new(256.0, 9);
         let n = f64::from(ball.n);
         for (face, x, z, up) in [(Face::PosY, n / 2.0, n / 2.0, 2.0), (Face::PosY, n - 40.0, n / 3.0, 2.0), (Face::PosX, n - 3.0, n - 5.0, 250.0)] {
             let eye = ball.point(face, x, z, hills(x, z) + up);
             let name = format!("{face:?} ({x}, {z}) {up} up");
-            let leaves = cut_of(&rule, &ball, eye);
-            assert_rule(&name, &rule, &ball, eye, &leaves);
+            let leaves = cut_of(&rule, &mut ball, eye);
+            assert_rule(&name, &rule, &mut ball, eye, &leaves);
             let cut = leaf_map(&leaves);
             for f in Face::ALL {
                 assert_balance(&name, &rule, &cut, f, |px, pz| px >= 0.0 && pz >= 0.0 && px < n && pz < n);
@@ -288,10 +295,10 @@ mod tests {
     /// quarter turn about a grid corner under it turns the cut with them.
     #[test]
     fn flat_cut_is_rotation_invariant() {
-        let flat = Plane { h: |_, _| 0.0 };
+        let mut flat = Plane { h: |_, _| 0.0 };
         let rule = Rule::new(256.0, 9);
         let eye = DVec3::new(0.0, 40.0, 0.0);
-        let cut = leaf_map(&cut_of(&rule, &flat, eye));
+        let cut = leaf_map(&cut_of(&rule, &mut flat, eye));
         for (&s, _) in &cut {
             let turned = SectionPos { x: -s.z - 1, z: s.x, ..s };
             assert!(cut.contains_key(&turned), "{s:?} has no quarter-turned twin");
@@ -302,11 +309,11 @@ mod tests {
     /// render distance.
     #[test]
     fn cut_size_is_bounded_at_every_render_distance() {
-        let plane = Plane { h: hills };
+        let mut plane = Plane { h: hills };
         for rd in [2, 4, 6, 8, 12, 16, 20, 24, 31, 32] {
             let rule = Rule::new(f64::from(rd * 16), 9);
             let eye = DVec3::new(5.0, hills(5.0, 7.0) + 2.0, 7.0);
-            let leaves = cut_of(&rule, &plane, eye);
+            let leaves = cut_of(&rule, &mut plane, eye);
             let mut per = [0usize; 10];
             for l in &leaves {
                 per[l.pos.detail.0 as usize] += 1;
@@ -318,4 +325,56 @@ mod tests {
 
     /// Most tiles a cut holds on open ground, at any render distance.
     const CUT_BOUND: usize = 640;
+
+    /// Where 2:1 balance breaks. It holds while a finest far tile's 3D extent stays under its
+    /// parent's range, so ordinary relief keeps neighbours within one level (the tests above). A
+    /// tower that rises most of the way to an eye 1000 blocks up pulls the tiles holding it two
+    /// levels finer than the open ground beside them; the skirt walls seal that step. A tower of
+    /// ordinary height does not.
+    #[test]
+    fn balance_breaks_only_beside_towering_relief() {
+        fn step(tower: f64) -> Option<(SectionPos, SectionPos)> {
+            let h = move |x: f64, z: f64| if (400.0..416.0).contains(&x) && (100.0..116.0).contains(&z) { tower } else { 0.0 };
+            struct Tower<F: Fn(f64, f64) -> f64>(F);
+            impl<F: Fn(f64, f64) -> f64> Surface for Tower<F> {
+                fn roots(&self, rule: &Rule, eye: DVec3, out: &mut Vec<SectionPos>) {
+                    Plane { h: |_, _| 0.0 }.roots(rule, eye, out);
+                }
+                fn node_box(&mut self, s: SectionPos) -> Option<PhysBox> {
+                    let (x0, z0, span) = (f64::from(s.min_x()), f64::from(s.min_z()), f64::from(s.span()));
+                    let n = 32;
+                    let (mut lo, mut hi) = (f64::MAX, f64::MIN);
+                    for i in 0..=n {
+                        for j in 0..=n {
+                            let (x, z) = (x0 + span * f64::from(i) / f64::from(n), z0 + span * f64::from(j) / f64::from(n));
+                            let y = (self.0)(x.min(x0 + span - 0.5), z.min(z0 + span - 0.5));
+                            lo = lo.min(y);
+                            hi = hi.max(y);
+                        }
+                    }
+                    Some(PhysBox { lo: DVec3::new(x0, lo, z0), hi: DVec3::new(x0 + span, hi, z0 + span) })
+                }
+            }
+            let rule = Rule::new(256.0, 9);
+            let cut = leaf_map(&cut_of(&rule, &mut Tower(h), DVec3::new(0.0, 1_000.0, 0.0)));
+            let mut found = None;
+            for &s in cut.keys() {
+                let (x0, z0, w) = (f64::from(s.min_x()), f64::from(s.min_z()), f64::from(s.span()));
+                for (x, z) in [(x0 - 0.5, z0 + w / 2.0), (x0 + w + 0.5, z0 + w / 2.0), (x0 + w / 2.0, z0 - 0.5), (x0 + w / 2.0, z0 + w + 0.5)] {
+                    if let Some(n) = leaf_at(&cut, &rule, Face::PosY, x, z)
+                        && n.detail.0 >= s.detail.0 + 2
+                    {
+                        found = Some((s, n));
+                    }
+                }
+            }
+            found
+        }
+        let (fine, coarse) = step(950.0).expect("a 950-block tower 400 blocks out gives a two-level step");
+        let p = fine.parent();
+        let holds = |a: i32, at: i32| a <= at && at < a + p.span();
+        assert!(holds(p.min_x(), 400) && holds(p.min_z(), 100), "the fine side {fine:?} is a child of the tile holding the tower");
+        assert_eq!(coarse.detail.0 - fine.detail.0, 2, "{fine:?} beside {coarse:?}");
+        assert_eq!(step(150.0), None, "a 150-block tower keeps neighbours within one level");
+    }
 }

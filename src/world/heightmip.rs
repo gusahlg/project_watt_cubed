@@ -284,9 +284,23 @@ fn sample_section<G: TerrainGenerator + ?Sized>(
     body: u16,
     datum: i32,
 ) -> MipCell {
-    let cell = lod::cell(detail);
     let span = section_span(detail);
-    let (min_x, min_z) = (ax * span, az * span);
+    sample_section_at(terra, colors, detail, ax * span, az * span, face, body, datum)
+}
+
+/// [`sample_section`] of the square whose min corner is `(min_x, min_z)`.
+#[allow(clippy::too_many_arguments)]
+fn sample_section_at<G: TerrainGenerator + ?Sized>(
+    terra: &G,
+    colors: &[Color],
+    detail: Detail,
+    min_x: i32,
+    min_z: i32,
+    face: Face,
+    body: u16,
+    datum: i32,
+) -> MipCell {
+    let cell = lod::cell(detail);
     let mut fold = MipFold::new();
     let mut below = [AIR; 1];
     for iz in 0..SECTION_N as i32 {
@@ -839,19 +853,13 @@ mod tests {
             .expect("spawn is charted");
         let body = super::super::section::CHART_BODY_BASE + index as u16;
         for detail in [FINEST_DETAIL, Detail(FINEST_DETAIL.0 + 4)] {
-            let span = section_span(detail);
-            let stored = SectionPos {
-                body,
-                face: Face::PosY,
-                detail,
-                x: (eye.x as i32).div_euclid(span),
-                z: (eye.z as i32).div_euclid(span),
-            };
-            // The overlay reads the tile counted from its patch; the bake reads storage.
-            let pos = world.patch_tile(stored);
+            // The overlay reads the tile counted from its patch; the bake reads its storage square.
+            let pos = world.tile_at(body, detail, eye.x as i64, eye.z as i64).expect("a chart tile");
+            let [x0, z0, ..] = world.tile_rect(pos);
+            let (x0, z0) = (x0 as i32, z0 as i32);
             let datum = terra.face_datum(body, pos.face);
             assert!(datum > 1_000_000, "the chart datum sits far up storage +Y: {datum}");
-            let bake = sample_section(terra, &colors, detail, stored.x, stored.z, Face::PosY, body, datum);
+            let bake = sample_section_at(terra, &colors, detail, x0, z0, Face::PosY, body, datum);
             let got = resample_cell(pos, terra, &[], &colors).expect("the chart has a surface here");
             let cell = pos.cell_size() as f32;
             assert!(
@@ -872,7 +880,7 @@ mod tests {
             let c = pos.cell_size();
             let (lo, hi) = terra.surface_bounds(body, pos.face, pos.min_x(), pos.min_z(), pos.span()).unwrap();
             let (_, ahi) = super::super::section::sample_window(lo, hi, c);
-            let (wx, wz) = (stored.min_x() + c / 2, stored.min_z() + c / 2);
+            let (wx, wz) = (x0 + c / 2, z0 + c / 2);
             let edits: Vec<_> = (ahi - c..ahi)
                 .map(|y| {
                     let (coord, local) = BlockCoord::new(wx, y, wz).split();

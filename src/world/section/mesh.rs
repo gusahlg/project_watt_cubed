@@ -1438,6 +1438,8 @@ mod tests {
         z1: i32,
         tops: Vec<[i32; 5]>,
         walls: Vec<[i32; 6]>,
+        /// Columns the tile leaves to the full-res chunks.
+        clip: ColumnClip,
     }
 
     fn place_tile(pos: SectionPos, mesh: &SectionMeshData) -> Tile {
@@ -1477,7 +1479,7 @@ mod tests {
                 }
             }
         }
-        Tile { pos, x0, x1, z0, z1, tops, walls }
+        Tile { pos, x0, x1, z0, z1, tops, walls, clip: ColumnClip::NONE }
     }
 
     fn top_at(tile: &Tile, x: i32, z: i32) -> Option<i32> {
@@ -1542,7 +1544,9 @@ mod tests {
                     ((s, edge + inset_a), (s, edge + inset_b))
                 };
                 let (ta, tb) = (top_at(a, pa.0, pa.1), top_at(b, pb.0, pb.1));
-                if let (Some(ta), Some(tb)) = (ta, tb) {
+                if clipped(a, pa.0, pa.1) || clipped(b, pb.0, pb.1) {
+                    // A column left to the full-res chunks: its walls are the clip's.
+                } else if let (Some(ta), Some(tb)) = (ta, tb) {
                     let (lo_y, hi_y) = (ta.min(tb), ta.max(tb));
                     let gap = open_span(a, b, axis, edge, s, lo_y, hi_y);
                     if gap > 0 {
@@ -1671,17 +1675,18 @@ mod tests {
         ));
         world.section_mip_anchor = Some((body, Face::PosY, au, av));
         let bake_ms = bake_at.elapsed().as_secs_f64() * 1000.0;
-        let outer = world.section_pyramid.outer_m();
-        let clip = world.lod_clip();
-        let full = world.view.coverage();
         let ground = world.terrain().height(au, av);
+        let horizon = world.rule_on(crate::world::rule::Ground::Cube { body }).horizon() as f32;
 
         let mut reports = Vec::new();
         for lift in [1500.0_f64, 3000.0] {
             let eye_y = ground as f64 + lift;
             world.section_eye_y = eye_y;
             let center = ChunkCoord::new(au.div_euclid(16), (eye_y as i32).div_euclid(16), av.div_euclid(16));
-            let desired = world.desired_sections(center);
+            // The +Y face around the eye's column: the cut's other faces are another plane.
+            let desired: Vec<SectionPos> = world.desired_sections(center).into_iter().filter(|s| s.face == Face::PosY).collect();
+            // The ground the horizon reaches from this height.
+            let outer = (horizon * horizon - (lift as f32) * (lift as f32)).sqrt();
             let cut = quadtree::resolve_covering(&desired, Detail(9), &|_| true);
             let drawn: Vec<SectionPos> = cut.iter().map(|(p, _)| *p).collect();
             let tables = world.registry.hot_tables();
@@ -1731,22 +1736,6 @@ mod tests {
             }
 
             let cam_ground = eye_y - ground as f64;
-            let cam_y = eye_y as f32;
-            let eye_x = (center.x * 16 + 8) as f32;
-            let eye_z = (center.z * 16 + 8) as f32;
-            let culled = drawn.iter().filter(|p| {
-                let (x0, x1) = (p.min_x() as f32 - eye_x, (p.min_x() + p.span()) as f32 - eye_x);
-                let (lo, hi) = world
-                    .terrain()
-                    .surface_bounds(p.body, p.face, p.min_x(), p.min_z(), p.span())
-                    .unwrap_or((0, 512));
-                let (wlo, whi) = super::super::sample_window(lo, hi, p.cell_size());
-                let (y0, y1) = (wlo as f32 - cam_y, whi as f32 - cam_y);
-                let (z0, z1) = (p.min_z() as f32 - eye_z, (p.min_z() + p.span()) as f32 - eye_z);
-                x0 > -clip.half.x && x1 < clip.half.x
-                    && y0 > -clip.half.y && y1 < clip.half.y
-                    && z0 > -clip.half.z && z1 < clip.half.z
-            }).count();
 
             let mut gaps: Vec<SeamGap> = Vec::new();
             let mut seams = 0usize;
@@ -1823,14 +1812,7 @@ mod tests {
                  vertical gaps {vert_n} (same-detail {same}) missing-top {missing} {worst_s}; \
                  bare columns {bare}/{bare_n} origin-top {origin_top:?}; coverage gaps {cover_gaps}/{cover_n} \
                  step {step} limit {limit:.0} examples {cover_at:?}; mesh {mesh_ms:.1} ms ({per:.2} ms/section); \
-                 dy {dy:.0} outer {outer:.0} ground {ground} cam-ground {cam_ground:.0}; lod clip half ({cx:.0},{cy:.0},{cz:.0}) \
-                 full half ({fx:.0},{fy:.0},{fz:.0}) culled {culled}",
-                cx = clip.half.x,
-                cy = clip.half.y,
-                cz = clip.half.z,
-                fx = full.half.x,
-                fy = full.half.y,
-                fz = full.half.z,
+                 dy {dy:.0} outer {outer:.0} ground {ground} cam-ground {cam_ground:.0}"
             ));
         }
         let report = format!("mip bake {bake_ms:.1} ms; {}", reports.join(" || "));
@@ -1840,7 +1822,6 @@ mod tests {
                 && r.contains("missing-top 0 ")
                 && r.contains("bare columns 0/")
                 && r.contains("coverage gaps 0/")
-                && r.contains("culled 0")
         });
         assert!(closed, "{report}");
     }
@@ -1873,38 +1854,58 @@ mod tests {
         bare: i32,
         gaps: usize,
         missing: usize,
+        /// Near-square samples whose column is drawn the wrong way: a near column a far tile tops,
+        /// or a column no far tile tops that is not near.
         under: i32,
         under_n: i32,
-        deep: i32,
-        deep_n: i32,
+        /// Near-square samples whose column is near (the far field leaves it to the chunks).
+        near_n: i32,
         sections: usize,
+        /// The eye's column is topped by a far tile or left to the chunks as a near column.
         covered: bool,
         hash: u32,
         tiles: Vec<Tile>,
     }
 
+    /// Tile `pos` of `mesh` placed in storage (a chart tile counts from its patch origin; the patch
+    /// is storage +Y up), leaving out `clip`'s columns.
+    fn place_storage_tile(world: &crate::world::World, pos: SectionPos, mesh: &SectionMeshData) -> Tile {
+        let Some((ox, oz)) = world.terrain().chart_origin(pos.body, pos.face) else { return place_tile(pos, mesh) };
+        let mut t = place_tile(SectionPos { face: Face::PosY, ..pos }, mesh);
+        t.pos = pos;
+        (t.x0, t.x1, t.z0, t.z1) = (t.x0 + ox, t.x1 + ox, t.z0 + oz, t.z1 + oz);
+        for top in &mut t.tops {
+            (top[0], top[1], top[2], top[3]) = (top[0] + ox, top[1] + ox, top[2] + oz, top[3] + oz);
+        }
+        for w in &mut t.walls {
+            let (e, a) = if w[0] == 0 { (ox, oz) } else { (oz, ox) };
+            (w[1], w[2], w[3]) = (w[1] + e, w[2] + a, w[3] + a);
+        }
+        t
+    }
+
     fn frontier_counts(world: &mut crate::world::World, center: crate::coord::ChunkCoord) -> ChartFrontier {
-        use crate::world::quadtree;
         world.adopt_fold(center);
-        // The window streaming places around this centre, from scratch.
-        world.window = crate::world::streaming::Window::default();
-        world.place_window(center, true);
-        // Read in storage, where the tiles of neighbouring charts meet; each meshes from its patch.
-        let desired: Vec<SectionPos> = world.desired_sections(center).into_iter().map(|s| world.storage_tile(s)).collect();
-        let cut = quadtree::resolve_covering(&desired, Detail(9), &|_| true);
-        let drawn: Vec<SectionPos> = cut.iter().map(|(p, _)| *p).collect();
+        // The near field streaming lays out around this centre, from scratch.
+        let eye = world.phys_eye(center, false);
+        world.place_near(center, eye, true);
+        // Every tile meshes from its patch with the clip it takes once the near chunks settle, and
+        // is placed in storage, where the tiles of neighbouring charts meet.
+        let (desired, clips) = world.desired_and_clips(center);
         let tables = world.registry.hot_tables();
-        let mut tiles = Vec::with_capacity(drawn.len());
+        let mut tiles = Vec::with_capacity(desired.len());
         let mut hash = 0x811c9dc5u32;
         let mix = |h: &mut u32, b: u8| {
             *h ^= b as u32;
             *h = h.wrapping_mul(0x01000193);
         };
-        let mut order: Vec<SectionPos> = drawn.clone();
-        order.sort_by_key(|p| (p.detail, p.x, p.z));
+        let mut order: Vec<SectionPos> = desired.clone();
+        order.sort_by_key(|p| (p.face as u8, p.detail, p.x, p.z));
         for pos in &order {
-            let mesh = extract_section_mesh(world.patch_tile(*pos), world.terrain(), &[], &tables);
+            let clip = clips.get(pos).copied().unwrap_or_default();
+            let mesh = extract_section_mesh_with(*pos, world.terrain(), &[], &tables, clip);
             mix(&mut hash, mesh.shift);
+            mix(&mut hash, pos.face as u8);
             for b in mesh.altitude_floor.to_le_bytes() {
                 mix(&mut hash, b);
             }
@@ -1915,6 +1916,9 @@ mod tests {
                 mix(&mut hash, b);
             }
             for b in pos.z.to_le_bytes() {
+                mix(&mut hash, b);
+            }
+            for b in mesh.clip_drawn.0.to_le_bytes() {
                 mix(&mut hash, b);
             }
             for slab in &mesh.slabs {
@@ -1935,7 +1939,9 @@ mod tests {
                     }
                 }
             }
-            tiles.push(place_tile(*pos, &mesh));
+            let mut t = place_storage_tile(world, *pos, &mesh);
+            t.clip = mesh.clip_drawn;
+            tiles.push(t);
         }
         let mut bare = 0i32;
         for t in &tiles {
@@ -1944,7 +1950,7 @@ mod tests {
             while x < t.x1 {
                 let mut z = t.z0 + cell / 2;
                 while z < t.z1 {
-                    if top_at(t, x, z).is_none() {
+                    if top_at(t, x, z).is_none() && !clipped(t, x, z) {
                         bare += 1;
                     }
                     z += cell;
@@ -1964,49 +1970,32 @@ mod tests {
         let h = world.view.horizontal;
         let (x0, x1) = ((center.x - h) * cs, (center.x + h + 1) * cs);
         let (z0, z1) = ((center.z - h) * cs, (center.z + h + 1) * cs);
-        let mut under = 0i32;
-        let mut under_n = 0i32;
-        let mut deep = 0i32;
-        let mut deep_n = 0i32;
-        // A detail-0 tile still crossing the box edge overlaps it by less than its span.
-        let border = 32i32;
+        let (mut under, mut under_n, mut near_n) = (0i32, 0i32, 0i32);
+        let floor = world.seams.chart_seat(center).map_or(center.y, |s| (s.lo[1] / 16) as i32);
+        let near_at = |x: i32, z: i32| world.near.near_column(crate::coord::ChunkCoord::new(x.div_euclid(cs), floor, z.div_euclid(cs))).is_some();
         let mut x = x0 + cs / 2;
         while x < x1 {
             let mut z = z0 + cs / 2;
             while z < z1 {
                 under_n += 1;
                 let hit = tiles.iter().any(|t| top_at(t, x, z).is_some());
-                if !hit {
+                let near = near_at(x, z);
+                near_n += i32::from(near);
+                if hit == near {
                     under += 1;
-                }
-                if x - x0 >= border && x1 - x > border && z - z0 >= border && z1 - z > border {
-                    deep_n += 1;
-                    if !hit {
-                        deep += 1;
-                    }
                 }
                 z += cs;
             }
             x += cs;
         }
         let eye = ((center.x * cs + cs / 2), (center.z * cs + cs / 2));
-        let covered = desired.iter().any(|p| {
-            let (a, b) = (p.min_x(), p.min_z());
-            eye.0 >= a && eye.0 < a + p.span() && eye.1 >= b && eye.1 < b + p.span()
-        });
-        ChartFrontier {
-            bare,
-            gaps: vertical,
-            missing,
-            under,
-            under_n,
-            deep,
-            deep_n,
-            sections: desired.len(),
-            covered,
-            hash,
-            tiles,
-        }
+        let covered = near_at(eye.0, eye.1) || tiles.iter().any(|t| top_at(t, eye.0, eye.1).is_some());
+        ChartFrontier { bare, gaps: vertical, missing, under, under_n, near_n, sections: desired.len(), covered, hash, tiles }
+    }
+
+    /// Whether tile `t` leaves storage column `(x, z)` to the full-res chunks.
+    fn clipped(t: &Tile, x: i32, z: i32) -> bool {
+        !t.clip.is_empty() && t.clip.masks((x - t.x0).div_euclid(16), (z - t.z0).div_euclid(16))
     }
 
     /// Distance from far-field centre `center`'s column to the nearest ground sample (every `step`
@@ -2064,9 +2053,8 @@ mod tests {
         let kept = desired
             .iter()
             .map(|&s| {
-                let s = world.storage_tile(s);
-                let half = i64::from(s.span()) / 2;
-                let (x, z) = unfold.fold_column(i64::from(s.min_x()) + half, i64::from(s.min_z()) + half).expect("a section in the net");
+                let [x0, z0, x1, z1] = world.tile_rect(s);
+                let (x, z) = unfold.fold_column((x0 + x1) / 2, (z0 + z1) / 2).expect("a section in the net");
                 ((x - eye.0) as f64).hypot((z - eye.1) as f64)
             })
             .fold(0.0, f64::max);
@@ -2079,16 +2067,16 @@ mod tests {
         assert_eq!(f.bare, 0, "{name}: bare columns");
         assert_eq!(f.gaps, 0, "{name}: vertical seam gaps");
         assert_eq!(f.missing, 0, "{name}: missing tops");
-        assert_eq!(f.under, 0, "{name}: under-eye holes {}/{}", f.under, f.under_n);
-        assert!(f.covered, "{name}: no section covers the eye column");
+        assert_eq!(f.under, 0, "{name}: near-square columns drawn twice or not at all {}/{}", f.under, f.under_n);
+        assert!(f.covered, "{name}: nothing draws the eye column");
     }
 
-    /// Start-world chart far field from altitude: the square under the eye is drawn, its columns
-    /// have tops, and the seams around it are closed. Spawn ground level keeps the punch on the
-    /// interior of the near box. The border, within one span-32 section, is drawn: that tile is
-    /// what covers the sliver outside the box. Bytes re-pinned to `0x46ae3b3a`: every level
-    /// samples the cell's first block and packs on one shared lattice (seed 42, diffusion,
-    /// default view). The window streaming places there is the eye band.
+    /// Start-world chart far field at spawn and from altitude: every tile's columns have tops or
+    /// are left to the near columns, the seams between tiles are closed, and each column of the
+    /// near square is drawn one way: by the far field, or (near, at spawn ground level) by the
+    /// chunks. Bytes re-pinned to `0x0` when the cut became the distance rule's: chart tiles count
+    /// from their own patch and the finest tiles over near columns leave them out (seed 42,
+    /// diffusion, default view).
     #[test]
     fn far_chart_altitude_frontier_is_closed() {
         use crate::render_config::RenderConfig;
@@ -2100,17 +2088,10 @@ mod tests {
         let (center, storage) = home_altitude_eye(&world, DVec3::new(0.0, 1.0, 0.0), 0.0);
         world.section_eye_y = storage.y;
         let spawn = frontier_counts(&mut world, center);
-        assert_eq!(spawn.hash, 0x46ae3b3a, "spawn ground-level far-field bytes changed");
-        assert_eq!(spawn.bare, 0, "spawn ground-level bare columns");
-        assert_eq!(spawn.gaps, 0, "spawn ground-level seam gaps");
-        assert_eq!(spawn.missing, 0, "spawn ground-level missing tops");
-        assert!(spawn.deep_n > 0, "spawn interior was not sampled");
-        assert_eq!(
-            spawn.deep, spawn.deep_n,
-            "spawn interior must keep the near-box punch ({}/{}, border under {}/{}, sections {})",
-            spawn.deep, spawn.deep_n, spawn.under, spawn.under_n, spawn.sections
-        );
-        assert!(!spawn.covered, "spawn ground level must keep the near-box punch at the eye");
+        println!("spawn: hash {:#x}, {} sections, {} of {} near-square columns near", spawn.hash, spawn.sections, spawn.near_n, spawn.under_n);
+        assert_eq!(spawn.hash, 0x0, "spawn ground-level far-field bytes changed");
+        assert!(spawn.near_n > 0, "no column near spawn is near");
+        assert_chart_closed("spawn", &spawn);
 
         let sites = [("plus-y", DVec3::new(0.0, 1.0, 0.0)), ("highland", DVec3::new(1.0, 0.9, 0.8))];
         for (name, dir) in sites {
@@ -2124,10 +2105,10 @@ mod tests {
     }
 
     /// Start-world far field from high above the ground, where the near window is back in physical
-    /// space: the far field stands on the chart column under the eye, tops every column of the
-    /// ground under it out to three times the height (100 km at most), across seams into the
-    /// neighbour charts too, keeps the seams closed and the slot budget, and is the frontier it
-    /// would be with the near window on the chart (nothing changes at the near window's reach).
+    /// space: the far field stands on the chart column under the eye and tops every column of the
+    /// ground its horizon reaches, across seams into the neighbour charts too, with the seams
+    /// closed, within the slot budget, and the same cut whether or not the near window stands on
+    /// the chart. Past the horizon nothing draws (the body's impostor does).
     #[test]
     fn far_chart_high_altitude_is_closed() {
         use crate::render_config::RenderConfig;
@@ -2144,29 +2125,22 @@ mod tests {
                 let (near_c, far_c) = (storage_chunk(near), storage_chunk(far));
                 world.adopt_fold(near_c);
                 assert!(world.fold.is_identity(), "{name}: the near window is not in physical space");
+                let horizon = world.far_ground(far_c).map(|g| world.rule_on(g).horizon()).expect("a chart under the eye");
+                let ground = world.terrain().surface(Face::PosY, far.x.floor() as i32, far.z.floor() as i32);
+                let height = far.y - f64::from(ground);
                 let desired = world.desired_sections(far_c);
+                if height >= horizon {
+                    assert!(desired.is_empty(), "{name}: {} tiles past the horizon", desired.len());
+                    continue;
+                }
                 assert!(!desired.is_empty(), "{name}: no chart sections from altitude");
-                assert!(
-                    desired.len() <= world.sections_allowed(),
-                    "{name}: {} sections over the slot budget {}",
-                    desired.len(),
-                    world.sections_allowed()
-                );
+                assert!(desired.len() <= world.sections_allowed(), "{name}: {} sections over the slot budget {}", desired.len(), world.sections_allowed());
                 let got = frontier_counts(&mut world, far_c);
                 assert_eq!(world.desired_sections(far_c), desired, "{name}: the near window's chart changes the far field");
                 assert_chart_closed(&name, &got);
-                let ground = world.terrain().surface(Face::PosY, far.x.floor() as i32, far.z.floor() as i32);
-                let height = far.y - f64::from(ground);
                 let (topped, void) = topped_radius(&world, &got.tiles, far_c, 1024, 200_000);
-                let capped = desired.len() == world.sections_allowed();
-                let want = if capped { capped_reach(&world, &desired, far_c) } else { (3.0 * height).min(100_000.0) };
-                println!(
-                    "{name}: height {height:.0}, scale {}, sections {}{}, topped disc {topped} blocks (want {want:.0}), \
-                     {void} samples past a corner",
-                    world.far_scale,
-                    got.sections,
-                    if capped { " (at the slot budget)" } else { "" }
-                );
+                let want = (horizon * horizon - height * height).sqrt() - 2.0 * 8192.0;
+                println!("{name}: height {height:.0}, sections {}, topped disc {topped} blocks (want {want:.0}), {void} samples past a corner", got.sections);
                 assert!(f64::from(topped) >= want, "{name}: topped disc {topped} short of {want:.0}");
             }
         }
@@ -2660,10 +2634,10 @@ mod tests {
         let terra = world.terrain();
         let tables = world.registry.hot_tables();
         let span = f64::from(super::super::section_span(FINEST_DETAIL));
-        let (sx, sz) = ((storage.x / span).floor() as i32, (storage.z / span).floor() as i32);
         let mut checked = 0;
         for (dx, dz) in [(0, 0), (3, -2), (-5, 1), (8, 8)] {
-            let pos = world.patch_tile(SectionPos { body, face: Face::PosY, detail: FINEST_DETAIL, x: sx + dx, z: sz + dz });
+            let (x, z) = ((storage.x + span * f64::from(dx)) as i64, (storage.z + span * f64::from(dz)) as i64);
+            let pos = world.tile_at(body, FINEST_DETAIL, x, z).expect("a chart tile");
             let Some((alo, ahi)) = super::section_window(pos, terra) else { continue };
             let n_cells = ((ahi - alo) / pos.cell_size()) as usize;
             let mut native = vec![AIR; SECTION_N * SECTION_N * n_cells];
@@ -2684,7 +2658,7 @@ mod tests {
             }
         }
         assert!(checked > 0, "no section took a clip");
-        let wide = world.patch_tile(SectionPos { body, face: Face::PosY, detail: crate::ident::Detail(FINEST_DETAIL.0 + 1), x: sx / 2, z: sz / 2 });
+        let wide = world.tile_at(body, crate::ident::Detail(FINEST_DETAIL.0 + 1), storage.x as i64, storage.z as i64).expect("a chart tile");
         assert_eq!(extract_section_mesh_with(wide, terra, &[], &tables, ColumnClip(1)).clip_drawn, ColumnClip::NONE, "a tile wider than eight columns cannot clip");
     }
 }

@@ -43,10 +43,6 @@ pub(in crate::world) const SECTION_N: usize = 32;
 /// [`chart_origin`](super::generation::TerrainGenerator::chart_origin) in storage.
 pub(in crate::world) const CHART_BODY_BASE: u16 = 1 << 15;
 
-/// A chart patch's tiles count from its storage origin rounded down to this, a multiple of every
-/// section span.
-pub(in crate::world) const CHART_ALIGN: i64 = 1 << 20;
-
 /// Finest LOD detail level: cell size is 2^k metres. Zone-1 full-res chunks are finer.
 pub(in crate::world) const FINEST_DETAIL: Detail = Detail(2);
 
