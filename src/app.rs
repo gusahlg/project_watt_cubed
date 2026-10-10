@@ -116,6 +116,8 @@ pub struct App {
     enter_pending: bool,
     /// Set when the app should save and quit at the end of this frame.
     quit: bool,
+    /// The pause screen closed this frame: the game gets input back after this frame's update.
+    resuming: bool,
     /// This frame's menu input, refilled in place.
     menu_input: MenuInput,
     /// This frame's screen picture, cleared in place.
@@ -351,6 +353,7 @@ impl App {
             has_root: false,
             enter_pending: false,
             quit: false,
+            resuming: false,
             menu_input: MenuInput::new(),
             ui: Vec::new(),
             loading: None,
@@ -682,6 +685,7 @@ impl App {
         self.audio.enter_world();
         self.active = None;
         self.pause = None;
+        self.resuming = false;
         self.saves = save::list();
         self.screen = Screen::Menus;
         if !self.has_root {
@@ -874,6 +878,7 @@ impl App {
         self.fan_world_edge(GameEvent::EnterWorld);
         self.menus = None;
         self.pause = None;
+        self.resuming = false;
         self.screen = Screen::Playing(Box::new(game));
     }
 
@@ -916,13 +921,12 @@ impl App {
         }
     }
 
-    /// Close the pause screen and hand input back to the game.
-    fn resume(&mut self, eng: &mut Engine) {
+    /// Close the pause screen. The game stays held for the rest of this frame, so the Esc that
+    /// closed the screen does not reach it too (and open the screen again); input returns after
+    /// this frame's update.
+    fn resume(&mut self) {
         self.pause = None;
-        if let Screen::Playing(game) = &mut self.screen {
-            game.hold_input(false);
-            game.on_enter(eng, &mut self.router);
-        }
+        self.resuming = true;
     }
 
     /// Save and leave the world: back to the root screen, or quit without one.
@@ -980,7 +984,7 @@ impl App {
         let now_ms = self.now_ms();
         // The pause screen takes input first; what it asks is done before the world moves on.
         match self.update_pause(eng) {
-            Some(StackEvent::BackAtRoot | StackEvent::Request(AppRequest::Resume)) => self.resume(eng),
+            Some(StackEvent::BackAtRoot | StackEvent::Request(AppRequest::Resume)) => self.resume(),
             Some(StackEvent::Request(AppRequest::LeaveWorld)) => {
                 self.leave_world(eng);
                 return;
@@ -1004,6 +1008,10 @@ impl App {
             &mut self.audio,
             &self.cues,
         );
+        if std::mem::take(&mut self.resuming) {
+            game.hold_input(false);
+            game.on_enter(eng, &mut self.router);
+        }
         if settings_write_due(&mut self.settings_flush, game.take_settings_dirty(), now_ms) && self.bench.is_none() {
             self.settings.save(self.mods.options());
         }

@@ -22,10 +22,6 @@ impl Mod for HelloHud {
         "hello_hud"
     }
 
-    fn description(&self) -> &str {
-        "Counts the blocks you broke (an example mod)."
-    }
-
     fn reset(&mut self) {
         self.broken = 0;
     }
@@ -34,7 +30,11 @@ impl Mod for HelloHud {
         self.broken += 1;
     }
 
-    fn hud(&self, _world: &World, _player: &Player, _screen: (i32, i32), out: &mut Vec<HudElement>) {
+    fn hud(&self, facts: &HudFacts, _world: &World, _player: &Player, out: &mut Vec<HudElement>) {
+        // The core asks in every HUD mode; this line shows in Full and Minimal.
+        if !facts.hud_mode.shows_mod_hud() {
+            return;
+        }
         out.push(HudElement::Label {
             at: Anchor::TopRight,
             off: (-12, 96),
@@ -51,7 +51,7 @@ mod tests {
     use pwc_mod_api::{GameBuild, ModDescriptor};
 
     #[test]
-    fn registers_one_enabled_mod() {
+    fn registers_one_mod() {
         let build = GameBuild::new().with_mod(ModDescriptor {
             id: "example.hello-hud",
             name: "Hello HUD",
@@ -62,6 +62,6 @@ mod tests {
         assert_eq!(mods.len(), 1);
         assert_eq!(mods.id(0), "hello_hud");
         assert_eq!(mods.package(0), Some("example.hello-hud"));
-        assert!(mods.is_enabled(0));
+        assert!(mods.is_active(0));
     }
 }

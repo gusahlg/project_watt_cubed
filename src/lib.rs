@@ -17,7 +17,6 @@ pub(crate) mod avatar;
 pub(crate) mod benchmark;
 pub mod block;
 pub(crate) mod camera;
-pub(crate) mod console;
 pub(crate) mod coord;
 pub mod derived;
 pub mod gravity;

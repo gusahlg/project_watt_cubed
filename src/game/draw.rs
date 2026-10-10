@@ -4,15 +4,14 @@ use voxel_engine::{Camera3D, Color, DVec3, Engine, Vec2};
 use super::Game;
 use crate::avatar::Pose;
 use crate::camera::ViewPose;
-use crate::console;
 use crate::derived::Memo;
 use super::{DebugView, SKY_KEY, TERRAIN_KEY};
 use crate::interact;
-use crate::modding::Mods;
+use crate::modding::{HudFacts, Mods};
 use crate::presence::{self, Eye, Feet, Gait, RenderPose, Stance, TagVisibility};
 use crate::sched::RateGate;
 use crate::sky::SkyFrame;
-use crate::ui::{self, Anchor, HudMode};
+use crate::ui;
 
 /// Retained presentation state; gameplay only initializes it.
 pub(super) struct DrawState {
@@ -22,10 +21,9 @@ pub(super) struct DrawState {
     /// Frozen lighting by day, content revision, space factor, and body up.
     static_frame_cache: Memo<(u64, u64, u32, [u32; 3]), StaticFrame>,
     anim_uv_cache: Memo<[u64; 2], [f32; 2]>,
-    coord_cache: Memo<[i64; 4], String>,
-    fps_cache: Memo<i32, String>,
+    /// The frame rate the HUD shows, resampled at `fps_refresh`; `None` when pinned (scripted).
+    fps_shown: Option<u32>,
     fps_refresh: RateGate,
-    online_cache: Memo<(usize, Option<u32>), String>,
     peer_scratch: Vec<PeerDraw>,
     /// Last composed frame uniforms handed to `begin_3d`.
     last_uniforms: Option<voxel_engine::skeleton::FrameUniformsGpu>,
@@ -38,10 +36,8 @@ impl DrawState {
             sky_frame_cache: Memo::new(),
             static_frame_cache: Memo::new(),
             anim_uv_cache: Memo::new(),
-            coord_cache: Memo::new(),
-            fps_cache: Memo::new(),
+            fps_shown: None,
             fps_refresh: RateGate::from_hz(4),
-            online_cache: Memo::new(),
             peer_scratch: Vec::new(),
             last_uniforms: None,
         }
@@ -50,8 +46,7 @@ impl DrawState {
 
 /// Everything [`Game::compose_phase`] decides before frame recording starts:
 /// the camera pose, the composed per-frame lighting truth, and peer render
-/// poses — handed read-only to the scene and HUD phases. HUD strings stay in
-/// their `Game`-side caches (no per-frame `String` clones into the scene).
+/// poses — handed read-only to the scene and HUD phases.
 struct Scene {
     pose: ViewPose,
     camera: Camera3D,
@@ -128,7 +123,7 @@ impl Game {
 
     /// Everything a frame needs decided BEFORE recording starts: the camera
     /// pose, the per-frame lighting truth (the engine UBO's single source),
-    /// peer render poses, and the refreshed HUD string caches.
+    /// peer render poses, and the HUD's frame-rate sample.
     fn compose_phase(&mut self, eng: &mut Engine, fov: f32, shake: f32) -> Scene {
         let dt = eng.frame_time();
         // The one pose this frame renders from: mode observation plus effects.
@@ -150,7 +145,7 @@ impl Game {
             .camera_cache
             .get_or(camera_key, || pose.camera3d());
 
-        self.refresh_hud_text(eng.fps(), dt);
+        self.sample_fps(eng.fps(), dt);
         let screen = (eng.screen_width(), eng.screen_height());
 
         // `dt` steps each peer's animator (body-yaw follow, stance blend, swing).
@@ -290,47 +285,34 @@ impl Game {
         }
     }
 
-    /// Refresh the cached HUD strings (coordinates, FPS, players-online) only
-    /// when their displayed value changes — and not at all below Full HUD.
-    fn refresh_hud_text(&mut self, fps: i32, dt: f32) {
-        if !self.theme.hud.shows_info() {
-            return;
-        }
-        let p = self.player.position;
-        // 0.1-block display resolution: only re-format when a shown digit moves.
-        let cruise = self.player.cruise.map(|c| c.speed * crate::math::BLOCK_METERS / 1000.0);
-        let key = [
-            (p.x * 10.0) as i64,
-            (p.y * 10.0) as i64,
-            (p.z * 10.0) as i64,
-            cruise.map_or(-1, |km_s| km_s as i64),
-        ];
-        self.drawing.coord_cache.get_or(key, || match cruise {
-            Some(km_s) => format!("X: {:.1}    Y: {:.1}    Z: {:.1}    CRUISE {km_s:.0} km/s", p.x, p.y, p.z),
-            None => format!("X: {:.1}    Y: {:.1}    Z: {:.1}", p.x, p.y, p.z),
-        });
-        // Scripted (harness) frames pin the readout: a live FPS number is the
-        // one nondeterministic pixel region in an otherwise reproducible shot,
-        // and golden diffs must only ever see real rendering drift. Live FPS is
-        // sampled at human display cadence and re-formatted only when the
-        // displayed integer changes.
+    /// Sample the frame rate the HUD shows at human display cadence (4 Hz), so a HUD mod
+    /// re-formats only when the shown number changes. Scripted (harness) frames pin it: a live
+    /// FPS number is the one nondeterministic pixel region in an otherwise reproducible shot.
+    fn sample_fps(&mut self, fps: i32, dt: f32) {
         if self.scripted {
-            self.drawing.fps_cache.get_or(-1, || "-- FPS".to_string());
-        } else if self.drawing.fps_refresh.steps(dt) != 0 || self.drawing.fps_cache.get().is_none()
-        {
-            self.drawing
-                .fps_cache
-                .get_or(fps, || format!("{fps:2} FPS"));
+            self.drawing.fps_shown = None;
+        } else if self.drawing.fps_refresh.steps(dt) != 0 || self.drawing.fps_shown.is_none() {
+            self.drawing.fps_shown = Some(fps.max(0) as u32);
         }
-        if let Some(net) = &self.net {
-            let count = net.peer_count() + 1;
-            let ping = net.ping_ms();
-            self.drawing
-                .online_cache
-                .get_or((count, ping), || match ping {
-                    Some(ms) => format!("players online: {count}   {ms} ms"),
-                    None => format!("players online: {count}"),
-                });
+    }
+
+    /// This frame's facts for the HUD mods: the frame rate, the link, loading, the HUD mode and
+    /// scale, and the corner the minimap takes.
+    pub(super) fn hud_facts(&self, screen: (i32, i32)) -> HudFacts {
+        let net = self.net.as_ref();
+        let minimap = self.minimap.as_ref().filter(|_| self.theme.hud.shows_minimap());
+        HudFacts {
+            screen,
+            fps: self.drawing.fps_shown,
+            ping_ms: net.and_then(|net| net.ping_ms()),
+            players_online: net.map(|net| net.peer_count() + 1),
+            snapshot_ready: net.is_none_or(|net| net.snapshot_ready()),
+            spawn_ready: self.world.spawn_ready(),
+            link_interrupted: net.is_some_and(|net| net.link_interrupted()),
+            hud_mode: self.theme.hud,
+            ui_scale: self.theme.scale,
+            cruise: self.player.cruise.map(|c| c.speed * crate::math::BLOCK_METERS / 1000.0),
+            minimap_corner: minimap.map_or((0, 0), |m| (m.reserved_width(), m.reserved_height())),
         }
     }
 
@@ -404,41 +386,33 @@ impl Game {
         }
     }
 
-    /// Everything over the world: minimap, reticle, name tags, info text, the
-    /// mods' HUD data (rendered by the core — mods never touch the frame), and
-    /// the console on top.
+    /// Everything over the world: the minimap and name tags, then the mods' HUD data on top
+    /// (rendered by the core — mods never touch the frame). The core draws no HUD text of its
+    /// own: the reticle, coordinates, frame rate, player count, loading and link notices are a
+    /// mod's, from [`HudFacts`].
     fn hud_phase(&mut self, f: &mut voxel_engine::Frame, mods: &mut Mods, scene: &Scene) {
         let map_sample = self.map_sample.take();
-        // HUD Off records nothing at all — unless the console is open, which
-        // must stay reachable in every mode.
-        if matches!(self.theme.hud, HudMode::Off) && !self.console.is_open() {
-            return;
-        }
         let screen = scene.screen;
         let _hud = voxel_engine::profile::scope(voxel_engine::profile::Meter::ListHud);
-        let theme = &self.theme;
 
         // Minimap: informational, so Full mode only (HUD Off must blank it too).
-        if theme.hud.shows_minimap()
+        if self.theme.hud.shows_minimap()
             && let Some(minimap) = &self.minimap
         {
             let sample = map_sample.unwrap_or_else(|| crate::minimap::MapSample::of(&self.world, &self.player));
             minimap.draw(f, screen, sample);
         }
 
-        // Reticle and world-space name tags: shown in every mode but fully-off.
-        if theme.hud.shows_world_ui() {
-            theme.crosshair.draw(f, screen);
-
-            // Floating name tags over each visible player, in the peer's own
-            // tint, fading with distance and dimming when terrain occludes the
-            // head (instead of drawing full-strength through walls).
+        // World-space name tags over each visible player: every mode but fully-off, in the
+        // peer's own tint, fading with distance and dimming when terrain occludes the head
+        // (instead of drawing full-strength through walls).
+        if self.theme.hud.shows_world_ui() {
             for peer in &scene.peers {
                 if let Some(tag) = &peer.tag {
-                    let fs = theme.fs(18);
+                    let fs = self.theme.fs(18);
                     let tw = f.measure_text(&tag.name, fs);
                     let c = peer.color;
-                    console::shadowed(
+                    ui::shadowed(
                         f,
                         &tag.name,
                         tag.screen.x as i32 - tw / 2,
@@ -450,96 +424,24 @@ impl Game {
             }
         }
 
-        // Informational HUD text: coords, help, FPS, player count. Full mode
-        // only — read from the `Game`-side caches `refresh_hud_text` maintains.
-        // Loading covers Full and Minimal (not Off) until the spawn slab lands.
-        // A network join holds "Loading world…" until the edit overlay arrives.
-        let overlay_hold = self.net.as_ref().is_some_and(|net| !net.snapshot_ready());
-        if overlay_hold && theme.hud.shows_world_ui() {
-            ui::label(
-                f,
-                theme,
-                screen,
-                Anchor::Top,
-                (0, 12),
-                26,
-                ui::Role::Primary.color(),
-                "Loading world…",
-            );
-        } else if !self.world.spawn_ready() && theme.hud.shows_world_ui() {
-            ui::label(
-                f,
-                theme,
-                screen,
-                Anchor::Top,
-                (0, 12),
-                26,
-                ui::Role::Primary.color(),
-                "Loading terrain…",
-            );
-        } else if theme.hud.shows_info() {
-            // The centred coordinates shrink to fit between the FPS readout and the minimap.
-            let fps_w = self.drawing.fps_cache.get().map_or(0, |t| 10 + f.measure_text(t, theme.fs(20)));
-            let map_w = self.minimap.as_ref().filter(|_| theme.hud.shows_minimap()).map_or(0, |m| m.reserved_width());
-            let side = fps_w.max(map_w) + 12;
-            if let Some(coord_text) = self.drawing.coord_cache.get() {
-                let color = ui::Role::Primary.color();
-                ui::label_fit(f, theme, screen, Anchor::Top, (0, 12), 26, screen.0 - 2 * side, color, coord_text);
-            }
-            if let Some(fps_text) = self.drawing.fps_cache.get() {
-                ui::label(f, theme, screen, Anchor::TopLeft, (10, 12), 20, ui::Role::Positive.color(), fps_text);
-            }
-            if self.net.is_some()
-                && let Some(online_text) = self.drawing.online_cache.get()
-            {
-                ui::label(f, theme, screen, Anchor::TopRight, (-12, 180), 20, ui::Role::Positive.color(), online_text);
-            }
-        }
-
-        if self.net.as_ref().is_some_and(|net| net.link_interrupted()) && theme.hud.shows_world_ui() {
-            ui::label(
-                f,
-                theme,
-                screen,
-                Anchor::Top,
-                (0, 44),
-                22,
-                ui::Role::Warning.color(),
-                crate::net::client::INTERRUPTED,
-            );
-        }
-
-        // Enabled mods contribute their HUD as data; the core renders it over the
-        // world, under the console. Mods never touch the frame themselves.
-        // Gameplay UI, so it follows the reticle: hidden only when HUD is Off
-        // or the mod-HUD lane itself is disabled.
-        if self.mod_hud && theme.hud.shows_mod_hud() {
-            self.hud_scratch.clear();
-            mods.hud(&self.world, &self.player, screen, &mut self.hud_scratch);
-            ui::render_hud(f, theme, screen, &self.hud_scratch);
-        }
-        // Minimal keeps the world readable: no closed-console scrollback.
-        if matches!(theme.hud, HudMode::Full) || self.console.is_open() {
-            self.console.draw(f, screen.0, screen.1);
-        }
+        // The mods' HUD, in every mode: each mod reads `hud_mode` and decides (an open chat
+        // stays reachable with the HUD off). An empty contribution records nothing.
+        self.hud_scratch.clear();
+        let facts = self.hud_facts(screen);
+        mods.hud(&facts, &self.world, &self.player, &mut self.hud_scratch);
+        ui::render_hud(f, &self.theme, screen, &self.hud_scratch);
     }
 
-    /// Lighting + HUD string caches for a headless quiet frame (no Engine).
+    /// Lighting + the mods' HUD data for a headless quiet frame (no Engine).
     #[cfg(test)]
     pub(super) fn compose_quiet(&mut self, mods: &mut Mods) {
         const DT: f32 = 1.0 / 60.0;
-        self.refresh_hud_text(0, DT);
+        self.sample_fps(0, DT);
         let pose = self.camera.pose(&self.player, &self.world, 90.0, 0.0);
         self.compose_lighting(&pose, voxel_engine::skeleton::Exposure::DEFAULT);
-        if self.mod_hud && self.theme.hud.shows_mod_hud() {
-            self.hud_scratch.clear();
-            mods.hud(
-                &self.world,
-                &self.player,
-                (1280, 720),
-                &mut self.hud_scratch,
-            );
-        }
+        self.hud_scratch.clear();
+        let facts = self.hud_facts((1280, 720));
+        mods.hud(&facts, &self.world, &self.player, &mut self.hud_scratch);
     }
 
     /// Build the per-frame draw data for other players. `&mut self` because
@@ -693,6 +595,66 @@ fn tag_visibility(
 mod tests {
     use super::*;
 
+    /// A HUD mod that shows which HUD mode it was told, in every mode.
+    struct ModeLabel;
+
+    impl crate::modding::Mod for ModeLabel {
+        fn name(&self) -> &str {
+            "mode"
+        }
+        fn id(&self) -> &'static str {
+            "mode"
+        }
+        fn hud(&self, facts: &HudFacts, _: &crate::world::World, _: &crate::player::Player, out: &mut Vec<ui::HudElement>) {
+            out.push(ui::HudElement::Label {
+                at: ui::Anchor::Top,
+                off: (0, 0),
+                base_fs: 20,
+                role: ui::Role::Primary,
+                text: facts.hud_mode.label().into(),
+            });
+        }
+    }
+
+    /// The core draws no HUD text: the mods get the facts in every HUD mode, Off included, and
+    /// decide what to show.
+    #[test]
+    fn the_mods_hud_runs_in_every_mode_with_the_facts() {
+        let mut game = crate::game::tests::game();
+        let mut mods = Mods::empty();
+        mods.install(Box::new(ModeLabel));
+        for mode in [ui::HudMode::Full, ui::HudMode::Minimal, ui::HudMode::Off] {
+            game.theme.hud = mode;
+            game.compose_quiet(&mut mods);
+            assert_eq!(ui::hud_text(&game.hud_scratch), format!("{}\n", mode.label()));
+        }
+    }
+
+    #[test]
+    fn hud_facts_report_the_frame_rate_loading_scale_and_minimap_corner() {
+        let mut game = crate::game::tests::game();
+        let facts = game.hud_facts((1280, 720));
+        assert_eq!(facts.screen, (1280, 720));
+        assert_eq!((facts.fps, facts.ping_ms, facts.players_online), (None, None, None), "single player, unsampled");
+        assert!(facts.snapshot_ready && !facts.link_interrupted, "single player has no join snapshot or link");
+        assert_eq!(facts.spawn_ready, game.world.spawn_ready());
+        assert_eq!((facts.hud_mode, facts.ui_scale, facts.cruise), (ui::HudMode::Full, 1.0, None));
+        assert_eq!(facts.minimap_corner, (172, 172), "the default minimap: 160 px plus its 12 px margin");
+        game.sample_fps(59, 1.0 / 60.0);
+        game.sample_fps(144, 1.0 / 60.0);
+        assert_eq!(game.hud_facts((1280, 720)).fps, Some(59), "resampled at 4 Hz, not every frame");
+        game.sample_fps(144, 0.3);
+        assert_eq!(game.hud_facts((1280, 720)).fps, Some(144));
+        game.theme.hud = ui::HudMode::Minimal;
+        game.theme.scale = 1.5;
+        let minimal = game.hud_facts((1280, 720));
+        assert_eq!((minimal.minimap_corner, minimal.ui_scale), ((0, 0), 1.5), "no minimap below Full");
+        assert_eq!(minimal.font_px(20), 30);
+        game.scripted = true;
+        game.sample_fps(144, 1.0);
+        assert_eq!(game.hud_facts((1280, 720)).fps, None, "the harness pins the readout");
+    }
+
     /// A steady multiplayer frame with a visible peer: the one pose sampled per peer feeds both
     /// the audio and the draw records, and the frame allocates nothing.
     #[test]
@@ -718,7 +680,7 @@ mod tests {
         }
         assert!(conn.peers().any(|peer| peer.visible()), "the peer is in range");
 
-        let (game, settings) = crate::game::tests::quiet_minimum_game();
+        let (game, mut settings) = crate::game::tests::quiet_minimum_game();
         let mut game = game.with_net(conn);
         let (mut sound, symbols) = SoundSystem::mute();
         let mut audio = AudioService::new();
@@ -727,7 +689,7 @@ mod tests {
         const DT: f32 = 1.0 / 60.0;
         for i in 0..10 {
             alloc_count::reset();
-            game.tick_quiet(DT, &mut router, &mut sound, &mut audio, &symbols, &settings, &mut mods);
+            game.tick_quiet(DT, &mut router, &mut sound, &mut audio, &symbols, &mut settings, &mut mods);
             let pose = game.camera.pose(&game.player, &game.world, 90.0, 0.0);
             let draws = game.peer_draws((1280, 720), &pose.camera3d(), &pose, DT, true, true);
             assert_eq!(draws.len(), 1, "the visible peer is drawn");

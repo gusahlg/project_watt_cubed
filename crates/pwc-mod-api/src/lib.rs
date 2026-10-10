@@ -70,8 +70,13 @@
 //! granularity, never per voxel.
 
 pub use project_watt_cubed::modding::{
-    Action, ActionSet, BuildInfo, Command, CommandContext, GameBuild, Mod, ModContext, ModDescriptor, ModRegistrar,
-    Mods, PackageInfo, PackageKind, ToolUse, VisualMask,
+    Action, ActionSet, BuildInfo, GameBuild, Mod, ModContext, ModDescriptor, ModRegistrar, Mods, PackageInfo,
+    PackageKind, ToolUse, VisualMask,
+};
+/// The frame hook, text capture, the chat send queue, the message stream and the HUD facts
+/// (track B of 3.0).
+pub use project_watt_cubed::modding::{
+    Channel, FrameContext, GameContext, HudFacts, Message, Notice, NoticeLevel, Notices, TextFrame,
 };
 
 /// Every bundle in `packages` that includes the package `id`, in the order `packages` lists them
@@ -140,7 +145,7 @@ pub mod prelude {
     pub use crate::settings::{Category, OptionId, OptionSpec, Options};
     pub use crate::ui::{Anchor, HudElement, Line, Panel, Role, Row};
     pub use crate::world::World;
-    pub use crate::{Command, CommandContext, Mod, ModContext, ModRegistrar};
+    pub use crate::{FrameContext, GameContext, HudFacts, Mod, ModContext, ModRegistrar};
 }
 
 #[cfg(test)]
