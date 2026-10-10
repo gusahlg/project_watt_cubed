@@ -4,7 +4,6 @@ use voxel_engine::{Camera3D, Color, DVec3, Engine, Vec2};
 use super::Game;
 use crate::avatar::Pose;
 use crate::camera::ViewPose;
-use crate::console;
 use crate::derived::Memo;
 use super::{DebugView, SKY_KEY, TERRAIN_KEY};
 use crate::interact;
@@ -404,14 +403,12 @@ impl Game {
         }
     }
 
-    /// Everything over the world: minimap, reticle, name tags, info text, the
-    /// mods' HUD data (rendered by the core — mods never touch the frame), and
-    /// the console on top.
+    /// Everything over the world: minimap, reticle, name tags, info text, and the
+    /// mods' HUD data on top (rendered by the core — mods never touch the frame).
     fn hud_phase(&mut self, f: &mut voxel_engine::Frame, mods: &mut Mods, scene: &Scene) {
         let map_sample = self.map_sample.take();
-        // HUD Off records nothing at all — unless the console is open, which
-        // must stay reachable in every mode.
-        if matches!(self.theme.hud, HudMode::Off) && !self.console.is_open() {
+        // HUD Off records nothing at all.
+        if matches!(self.theme.hud, HudMode::Off) {
             return;
         }
         let screen = scene.screen;
@@ -438,7 +435,7 @@ impl Game {
                     let fs = theme.fs(18);
                     let tw = f.measure_text(&tag.name, fs);
                     let c = peer.color;
-                    console::shadowed(
+                    ui::shadowed(
                         f,
                         &tag.name,
                         tag.screen.x as i32 - tw / 2,
@@ -510,17 +507,13 @@ impl Game {
         }
 
         // Enabled mods contribute their HUD as data; the core renders it over the
-        // world, under the console. Mods never touch the frame themselves.
+        // world. Mods never touch the frame themselves.
         // Gameplay UI, so it follows the reticle: hidden only when HUD is Off
         // or the mod-HUD lane itself is disabled.
         if self.mod_hud && theme.hud.shows_mod_hud() {
             self.hud_scratch.clear();
             mods.hud(&self.world, &self.player, screen, &mut self.hud_scratch);
             ui::render_hud(f, theme, screen, &self.hud_scratch);
-        }
-        // Minimal keeps the world readable: no closed-console scrollback.
-        if matches!(theme.hud, HudMode::Full) || self.console.is_open() {
-            self.console.draw(f, screen.0, screen.1);
         }
     }
 
@@ -718,7 +711,7 @@ mod tests {
         }
         assert!(conn.peers().any(|peer| peer.visible()), "the peer is in range");
 
-        let (game, settings) = crate::game::tests::quiet_minimum_game();
+        let (game, mut settings) = crate::game::tests::quiet_minimum_game();
         let mut game = game.with_net(conn);
         let (mut sound, symbols) = SoundSystem::mute();
         let mut audio = AudioService::new();
@@ -727,7 +720,7 @@ mod tests {
         const DT: f32 = 1.0 / 60.0;
         for i in 0..10 {
             alloc_count::reset();
-            game.tick_quiet(DT, &mut router, &mut sound, &mut audio, &symbols, &settings, &mut mods);
+            game.tick_quiet(DT, &mut router, &mut sound, &mut audio, &symbols, &mut settings, &mut mods);
             let pose = game.camera.pose(&game.player, &game.world, 90.0, 0.0);
             let draws = game.peer_draws((1280, 720), &pose.camera3d(), &pose, DT, true, true);
             assert_eq!(draws.len(), 1, "the visible peer is drawn");

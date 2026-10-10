@@ -15,10 +15,14 @@
 //! disabled mods are skipped entirely. A mod therefore costs nothing where it would
 //! matter and only what it draws where it wouldn't.
 mod build;
+mod frame;
+mod message;
 #[cfg(test)]
 pub(crate) mod testing;
 
 pub use build::{BuildInfo, GameBuild, ModDescriptor, ModRegistrar, PackageInfo, PackageKind};
+pub use frame::{Channel, FrameContext, GameContext, TextFrame};
+pub use message::{Message, Notice, NoticeLevel, Notices};
 
 use std::fs;
 use std::io;
@@ -32,8 +36,7 @@ use crate::menu::theme::MenuTheme;
 use crate::player::Player;
 use crate::render_config::{RenderConfig, VisualGroup};
 use crate::settings::Settings;
-use crate::sky::Sky;
-use crate::ui::{HudElement, Line};
+use crate::ui::HudElement;
 use crate::world::generation::WorldgenKind;
 use crate::world::World;
 
@@ -164,6 +167,10 @@ pub struct Action {
     pub repeat: bool,
     /// When true, the action is on for every frame the chord is down, not only the press.
     pub held: bool,
+    /// When true, the action is sampled every frame, even with the mod-logic lane off, and
+    /// reaches only [`Mod::on_frame`] ([`FrameContext::action`]), never [`Mod::update`]. For keys
+    /// that must always work, such as opening the chat.
+    pub immediate: bool,
 }
 
 /// Which declared actions fired this frame. At most [`ActionSet::CAP`] actions;
@@ -305,65 +312,19 @@ impl<'a> ModContext<'a> {
     }
 }
 
-/// One console command a mod handles: what `/help` lists and Tab completes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Command {
-    /// The name typed after the `/` (aliases are the handling mod's own business).
-    pub name: &'static str,
-    /// The arguments as `/help` shows them (`<x y z|name>`), or `""`.
-    pub args: &'static str,
-    /// What the command does, in a few words.
-    pub help: &'static str,
-}
-
-/// What a console command may read and change: the whole-game state the core owns. A command only
-/// edits it; the core follows up on what changed (applies and saves changed settings, re-mixes the
-/// audio, shares a changed clock with the server, streams a moved player's surroundings at once
-/// and reports the move as a teleport). Build one with [`CommandContext::new`].
-#[non_exhaustive]
-pub struct CommandContext<'a> {
-    pub player: &'a mut Player,
-    pub world: &'a mut World,
-    pub settings: &'a mut Settings,
-    pub sky: &'a mut Sky,
-    /// Which visual groups the enabled mods provide (`/gfx` names the mod a lane waits on).
-    pub visuals: VisualMask,
-    /// True when a server owns the session: it sets the day length and may refuse a teleport.
-    pub networked: bool,
-    /// Every enabled mod's commands, in install order (for `/help`).
-    pub commands: &'a [Command],
-    /// Set to play the local voice test cue (the core owns the audio).
-    pub voice_test: bool,
-}
-
-impl<'a> CommandContext<'a> {
-    /// A singleplayer context over these handles, with every visual group on and no command list.
-    pub fn new(player: &'a mut Player, world: &'a mut World, settings: &'a mut Settings, sky: &'a mut Sky) -> Self {
-        Self {
-            player,
-            world,
-            settings,
-            sky,
-            visuals: VisualMask::default(),
-            networked: false,
-            commands: &[],
-            voice_test: false,
-        }
-    }
-}
-
 /// A unit of layered-on functionality. Every method has a default, so a mod
 /// implements only the hooks it cares about. This is the public surface mod authors
 /// write against — kept small on purpose.
 ///
 /// Arbitration when more than one enabled mod implements a hook:
-/// - **Fan-out**, install order: `update`, `on_block_break`, `on_break_rejected`,
-///   `on_place_rejected`, `on_tool_changed`, `on_tool_used`. `hud` uses the same order as z-order
-///   (later draws on top). `commands` lists concatenate in the same order. `actions` are collected,
-///   not arbitrated: each enabled mod's list is its own.
-/// - **First enabled wins**: `menu_theme`, `start_screen`, `close_overlay` and `on_toggle_fly`
-///   (first `true`),
-///   `worldgen`, `worldgen_config`, `appearance`, `namer`, `tool`, `run_command` (first `Some`).
+/// - **Fan-out**, install order: `update`, `on_frame`, `on_message`, `on_block_break`,
+///   `on_break_rejected`, `on_place_rejected`, `on_tool_changed`, `on_tool_used`. `hud` uses the
+///   same order as z-order (later draws on top). `actions` are collected, not arbitrated: each
+///   enabled mod's list is its own.
+/// - **First enabled wins**: `menu_theme`, `start_screen` and `close_overlay` (first `true`),
+///   `worldgen`, `worldgen_config`, `appearance`, `namer`, `tool` (first `Some`). The keyboard
+///   capture ([`FrameContext::capture_text`]) belongs to the first mod that asks until it gives it
+///   back or Escape ends it.
 /// - **Compose**: `visual_group` bits OR into the render mask.
 ///
 /// `knobs` / `step_knob` and save hooks are per-mod. `worldgen_config` is an
@@ -404,12 +365,18 @@ pub trait Mod {
         let _ = ctx;
     }
 
-    /// The flight key (`F`) was pressed. The core has no flight toggle of its own: a mod that
-    /// offers flight switches it here and returns `true`; the first enabled mod that does wins.
-    /// Delivered on the frame of the press (whatever the mod cadence), never while a detached
-    /// camera holds the player.
-    fn on_toggle_fly(&mut self, player: &mut Player, world: &World) -> bool {
-        let _ = (player, world);
+    /// Every in-world frame, after input and before movement, whatever the mod cadence and even
+    /// with the mod-logic lane off. `ctx` has this frame's immediate actions, the keyboard capture
+    /// (and the typing, while this mod holds it), and the game state; the core follows up on what
+    /// the hook changed (see [`GameContext`]). Keep it cheap: it runs at frame rate.
+    fn on_frame(&mut self, ctx: &mut FrameContext) {
+        let _ = ctx;
+    }
+
+    /// A chat line, a join or leave, or a core notice (see [`Message`]). Return `true` when this
+    /// mod showed it to the player; a notice no mod showed goes to stderr.
+    fn on_message(&mut self, msg: &Message) -> bool {
+        let _ = msg;
         false
     }
 
@@ -476,25 +443,6 @@ pub trait Mod {
     /// configuration; without one the core describes materials by their readings.
     fn namer(&self) -> Option<&dyn MaterialNamer> {
         None
-    }
-
-    /// A console command without access to the game state; the default
-    /// [`run_command`](Self::run_command) asks this.
-    fn command(&mut self, cmd: &str, args: &[&str]) -> Option<Vec<Line>> {
-        let _ = (cmd, args);
-        None
-    }
-
-    /// Handle the console command `cmd` (the leading `/` stripped) with `args`. The first enabled
-    /// mod that returns `Some` handles it; its lines go to the console.
-    fn run_command(&mut self, ctx: &mut CommandContext<'_>, cmd: &str, args: &[&str]) -> Option<Vec<Line>> {
-        let _ = ctx;
-        self.command(cmd, args)
-    }
-
-    /// The commands this mod handles, for `/help` and Tab completion.
-    fn commands(&self) -> &[Command] {
-        &[]
     }
 
     /// This mod's HUD contribution while enabled, as data — [`HudElement`]s
@@ -609,6 +557,8 @@ pub struct Mods {
     revision: u64,
     /// Package ids the current server refused. Not written to `mods.cfg`.
     server_packages: Vec<String>,
+    /// Install index of the mod holding the keyboard (see [`FrameContext::capture_text`]).
+    capture: Option<usize>,
     /// Module ids that were on when the server refused their package. Restored
     /// on leave. The session disable itself is not saved.
     server_held: Vec<String>,
@@ -640,6 +590,7 @@ impl Mods {
             revision: 0,
             server_packages: Vec::new(),
             server_held: Vec::new(),
+            capture: None,
         }
     }
 
@@ -707,6 +658,7 @@ impl Mods {
     /// Reset every mod's per-world state (entering a new/loaded/networked
     /// world) while keeping the player's enable/disable choices.
     pub fn reset_state(&mut self) {
+        self.capture = None;
         for entry in &mut self.entries {
             entry.module.reset();
         }
@@ -725,9 +677,44 @@ impl Mods {
         self.each_enabled(|m| m.update(ctx));
     }
 
-    /// The flight key: the first enabled mod that handles it wins. False when none does.
-    pub fn on_toggle_fly(&mut self, player: &mut Player, world: &World) -> bool {
-        self.entries.iter_mut().filter(|e| e.enabled).any(|e| e.module.on_toggle_fly(player, world))
+    /// Run every enabled mod's frame hook, in install order. Only the keyboard holder sees the
+    /// typing; Escape ends its capture after its hook. A holder that was switched off loses the
+    /// keyboard first.
+    pub fn on_frame(&mut self, ctx: &mut FrameContext) {
+        if let Some(holder) = self.capture
+            && !self.entries.get(holder).is_some_and(|e| e.enabled)
+        {
+            self.capture = None;
+        }
+        let held = self.capture;
+        ctx.set_holder(held);
+        for (index, entry) in self.entries.iter_mut().enumerate() {
+            if entry.enabled {
+                ctx.enter(index);
+                entry.module.on_frame(ctx);
+            }
+        }
+        if held.is_some() && ctx.escaped() && ctx.holder() == held {
+            ctx.set_holder(None);
+        }
+        self.capture = ctx.holder();
+    }
+
+    /// Whether a mod holds the keyboard. While it does the router reads typing, the world takes
+    /// no input, and Escape goes to that mod (and ends the capture) before anything else sees it.
+    pub fn text_captured(&self) -> bool {
+        self.capture.is_some()
+    }
+
+    /// Hand one message to every enabled mod. True when any of them showed it.
+    pub fn on_message(&mut self, msg: &Message) -> bool {
+        let mut shown = false;
+        for entry in &mut self.entries {
+            if entry.enabled {
+                shown |= entry.module.on_message(msg);
+            }
+        }
+        shown
     }
 
     /// Fan a block-break event out to every enabled mod.
@@ -778,34 +765,6 @@ impl Mods {
     /// The first enabled namer, if any.
     pub fn namer(&self) -> Option<&dyn MaterialNamer> {
         self.entries.iter().filter(|e| e.enabled).find_map(|e| e.module.namer())
-    }
-
-    /// First enabled mod that handles `cmd` with its context-free [`Mod::command`] wins.
-    pub fn command(&mut self, cmd: &str, args: &[&str]) -> Option<Vec<Line>> {
-        for entry in &mut self.entries {
-            if !entry.enabled {
-                continue;
-            }
-            if let Some(out) = entry.module.command(cmd, args) {
-                return Some(out);
-            }
-        }
-        None
-    }
-
-    /// First enabled mod that handles `cmd` wins.
-    pub fn run_command(&mut self, ctx: &mut CommandContext<'_>, cmd: &str, args: &[&str]) -> Option<Vec<Line>> {
-        self.entries
-            .iter_mut()
-            .filter(|e| e.enabled)
-            .find_map(|e| e.module.run_command(ctx, cmd, args))
-    }
-
-    /// Every enabled mod's commands, in install order; a name a mod earlier in that order already
-    /// lists is left out (that mod handles it: `run_command` is first-wins).
-    pub fn commands(&self) -> impl Iterator<Item = &Command> {
-        let all = || self.entries.iter().filter(|e| e.enabled).flat_map(|e| e.module.commands());
-        all().enumerate().filter(move |&(i, c)| !all().take(i).any(|d| d.name == c.name)).map(|(_, c)| c)
     }
 
     /// Push every enabled mod's HUD contribution into `out`, in install order
@@ -1657,47 +1616,117 @@ mod tests {
         assert_ne!(cursor.index, 0, "cursor must skip the group header");
     }
 
-    /// A mod written against the context-free hook only.
-    struct Legacy;
+    /// A mod that asks for the keyboard on its action and logs what it types and is told.
+    struct Typist {
+        id: &'static str,
+        log: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+        shows: bool,
+    }
 
-    impl Mod for Legacy {
+    impl Mod for Typist {
         fn name(&self) -> &str {
-            "Legacy"
+            self.id
         }
         fn id(&self) -> &'static str {
-            "legacy"
+            self.id
         }
-        fn command(&mut self, cmd: &str, args: &[&str]) -> Option<Vec<Line>> {
-            (cmd == "old").then(|| vec![Line::of(crate::ui::Role::Dim, args.join(" "))])
+        fn on_frame(&mut self, ctx: &mut FrameContext) {
+            if ctx.action("open") {
+                let got = ctx.capture_text(true);
+                self.log.borrow_mut().push(format!("{} open {got}", self.id));
+            }
+            if let Some(text) = ctx.text() {
+                let typed: String = text.chars.iter().collect();
+                self.log.borrow_mut().push(format!("{} typed {typed} esc={}", self.id, text.escape));
+            }
+        }
+        fn on_message(&mut self, msg: &Message) -> bool {
+            if let Message::Notice(notice) = msg {
+                self.log.borrow_mut().push(format!("{} notice {}", self.id, notice.text));
+            }
+            self.shows
         }
     }
 
-    const A: &[Command] = &[Command { name: "tp", args: "<x y z>", help: "teleport" }];
-    const B: &[Command] = &[
-        Command { name: "tp", args: "", help: "shadowed" },
-        Command { name: "time", args: "", help: "clock" },
-    ];
-
-    #[test]
-    fn the_first_enabled_mod_that_knows_a_command_runs_it() {
+    fn typists(shows: bool) -> (Mods, std::rc::Rc<std::cell::RefCell<Vec<String>>>) {
+        let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let mut mods = Mods::empty();
-        mods.install(Box::new(Stub::new("a").commands(A)), true);
-        mods.install(Box::new(Stub::new("b").commands(B)), true);
-        mods.install(Box::new(Legacy), true);
-        mods.install(Box::new(Stub::new("off").commands(&[Command { name: "hidden", args: "", help: "" }])), false);
-        let names: Vec<&str> = mods.commands().map(|c| c.name).collect();
-        assert_eq!(names, ["tp", "time"], "enabled mods only, in install order, a shadowed name once");
+        for id in ["a", "b"] {
+            mods.install(Box::new(Typist { id, log: log.clone(), shows }), true);
+        }
+        (mods, log)
+    }
 
+    /// Run one frame of `mods` with `action` fired and `text` typed (as the core would pass it:
+    /// only while a capture was held when the input was read).
+    fn frame(mods: &mut Mods, action: bool, text: Option<TextFrame<'_>>) {
         let mut world = World::new(1);
         let mut player = Player::new(glam::DVec3::ZERO);
         let (mut settings, mut sky) = (Settings::default(), crate::sky::Sky::new());
-        let mut ctx = CommandContext::new(&mut player, &mut world, &mut settings, &mut sky);
-        let first = |out: Option<Vec<Line>>| out.map(|lines| lines[0].text().to_string());
-        assert_eq!(first(mods.run_command(&mut ctx, "tp", &[])).as_deref(), Some("a"));
-        assert_eq!(first(mods.run_command(&mut ctx, "time", &[])).as_deref(), Some("b"));
-        assert_eq!(first(mods.run_command(&mut ctx, "old", &["still", "works"])).as_deref(), Some("still works"));
-        assert!(mods.run_command(&mut ctx, "hidden", &[]).is_none(), "a disabled mod runs nothing");
-        assert_eq!(ctx.player.position.y, 2.0, "the handlers reached the player through the context");
+        let game = GameContext::new(&mut player, &mut world, &mut settings, &mut sky);
+        let mut ctx = FrameContext::frame(game, (800, 600), ActionSet::NONE, &[], text);
+        if action {
+            ctx.set_action("open");
+        }
+        mods.on_frame(&mut ctx);
+    }
+
+    #[test]
+    fn the_keyboard_belongs_to_the_first_mod_that_asks_until_escape() {
+        let (mut mods, log) = typists(false);
+        assert!(!mods.text_captured());
+        frame(&mut mods, true, None);
+        assert!(mods.text_captured());
+        assert_eq!(log.take(), ["a open true", "b open false"], "the first asker holds it; the second is refused");
+
+        let typed = ['h', 'i'];
+        frame(&mut mods, false, Some(TextFrame { chars: &typed, edit: None, escape: false }));
+        assert_eq!(log.take(), ["a typed hi esc=false"], "only the holder sees the typing");
+
+        frame(&mut mods, false, Some(TextFrame { chars: &[], edit: None, escape: true }));
+        assert_eq!(log.take(), ["a typed  esc=true"], "the holder sees Escape once");
+        assert!(!mods.text_captured(), "Escape ends the capture");
+
+        frame(&mut mods, true, None);
+        assert!(mods.text_captured());
+        mods.reset_state();
+        assert!(!mods.text_captured(), "a new world starts with the keyboard free");
+        frame(&mut mods, true, None);
+        mods.toggle(0);
+        frame(&mut mods, false, None);
+        assert!(!mods.text_captured(), "a holder that was switched off loses the keyboard");
+    }
+
+    #[test]
+    fn messages_reach_every_enabled_mod_and_say_whether_one_showed_them() {
+        let notice = Notice { level: NoticeLevel::Info, text: "saved".into() };
+        let (mut quiet, log) = typists(false);
+        assert!(!quiet.on_message(&Message::Notice(&notice)), "nobody showed it: the core logs it");
+        assert_eq!(log.take(), ["a notice saved", "b notice saved"]);
+        let (mut shown, _) = typists(true);
+        shown.toggle(1);
+        assert!(shown.on_message(&Message::Notice(&notice)));
+        assert!(!Mods::empty().on_message(&Message::Joined { name: "x" }));
+    }
+
+    /// The settings count as changed only when a hook changed a value, not when it looked.
+    #[test]
+    fn a_game_context_reports_changed_settings_and_queues_chat_and_notices() {
+        let mut world = World::new(1);
+        let mut player = Player::new(glam::DVec3::ZERO);
+        let (mut settings, mut sky) = (Settings::default(), crate::sky::Sky::new());
+        let mut game = GameContext::new(&mut player, &mut world, &mut settings, &mut sky);
+        let fov = game.settings().fov;
+        assert!(!game.settings_changed());
+        game.settings_mut().fov = fov;
+        assert!(!game.settings_changed(), "writing the same value changes nothing");
+        game.settings_mut().fov = fov + 5.0;
+        assert!(game.settings_changed());
+        game.send_chat(Channel::Global, "/op hunter2");
+        game.notice(NoticeLevel::Warning, "careful");
+        assert_eq!(game.chat_out(), [(Channel::Global, "/op hunter2".to_string())]);
+        assert_eq!(game.notices().iter().map(|n| n.text.as_str()).collect::<Vec<_>>(), ["careful"]);
+        assert_eq!((Channel::Global.wire(), Channel::from_wire(Channel::Local.wire())), (crate::net::chat::GLOBAL, Channel::Local));
     }
 
     #[test]

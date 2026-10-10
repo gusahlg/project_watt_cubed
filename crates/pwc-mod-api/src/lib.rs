@@ -70,9 +70,13 @@
 //! granularity, never per voxel.
 
 pub use project_watt_cubed::modding::{
-    annotate_setting, forced_off_marker, Action, ActionSet, BuildInfo, ChoicesFlush, Command, CommandContext,
-    GameBuild, Group, Knob, Mod, ModContext, ModDescriptor, ModRegistrar, Mods, PackageInfo, PackageKind, ToolUse,
-    VisualMask, ESSENTIALS, ESSENTIALS_GROUP,
+    annotate_setting, forced_off_marker, Action, ActionSet, BuildInfo, ChoicesFlush, GameBuild, Group, Knob, Mod,
+    ModContext, ModDescriptor, ModRegistrar, Mods, PackageInfo, PackageKind, ToolUse, VisualMask, ESSENTIALS,
+    ESSENTIALS_GROUP,
+};
+/// The frame hook, text capture, the chat send queue and the message stream (track B of 3.0).
+pub use project_watt_cubed::modding::{
+    Channel, FrameContext, GameContext, Message, Notice, NoticeLevel, Notices, TextFrame,
 };
 
 /// Every bundle in `packages` that includes the package `id`, in the order `packages` lists them
@@ -140,7 +144,7 @@ pub mod prelude {
     pub use crate::player::Player;
     pub use crate::ui::{Anchor, HudElement, Line, Panel, Role, Row};
     pub use crate::world::World;
-    pub use crate::{Command, CommandContext, Group, Knob, Mod, ModContext, ModRegistrar, ESSENTIALS};
+    pub use crate::{FrameContext, GameContext, Group, Knob, Mod, ModContext, ModRegistrar, ESSENTIALS};
 }
 
 #[cfg(test)]

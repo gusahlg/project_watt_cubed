@@ -52,6 +52,8 @@ struct ModBinding {
     chords: Vec<Chord>,
     repeat: bool,
     held: bool,
+    /// Sampled with the mod-logic lane off too, and reported apart (see `Action::immediate`).
+    immediate: bool,
 }
 
 /// Device edges the router samples. The engine is one; tests inject a bitset.
@@ -184,6 +186,8 @@ pub(crate) struct Sample {
     pub gameplay: [bool; GameplayEvent::COUNT],
     pub menu: [bool; MenuEvent::COUNT],
     pub actions: ActionSet,
+    /// Immediate actions that fired: sampled whatever the mod-logic lane says.
+    pub immediate: ActionSet,
     pub wheel: i8,
 }
 
@@ -262,7 +266,12 @@ impl Router {
             }
             let chords = action.default.iter().copied().filter(|c| !core_claims(&self.bindings, *c)).collect();
             self.mod_ids.push(action.id);
-            self.mod_bindings.push(ModBinding { chords, repeat: action.repeat, held: action.held });
+            self.mod_bindings.push(ModBinding {
+                chords,
+                repeat: action.repeat,
+                held: action.held,
+                immediate: action.immediate,
+            });
             self.mod_timers.push(-1.0);
         }
     }
@@ -312,12 +321,14 @@ impl Router {
             gameplay_fired: sample.gameplay,
             menu_fired: sample.menu,
             actions: sample.actions,
+            immediate: sample.immediate,
             wheel: sample.wheel,
         }
     }
 
-    /// Evaluate the active context. `mod_logic` false unprimes mod-action timers
-    /// and reports no actions and no wheel.
+    /// Evaluate the active context. `mod_logic` false unprimes the timers of the
+    /// cadence actions and reports none of them and no wheel; immediate actions
+    /// are sampled either way.
     pub(crate) fn sample(&mut self, probe: &impl Probe, dt: f32, mod_logic: bool, minimap: bool) -> Sample {
         let mut global_fired = [false; GlobalEvent::COUNT];
         for e in GlobalEvent::ALL {
@@ -331,6 +342,7 @@ impl Router {
         let mut gameplay_fired = [false; GameplayEvent::COUNT];
         let mut menu_fired = [false; MenuEvent::COUNT];
         let mut actions = ActionSet::NONE;
+        let mut immediate = ActionSet::NONE;
         let mut wheel = 0i8;
         match self.context {
             Context::Gameplay => {
@@ -349,26 +361,24 @@ impl Router {
                 }
                 if mod_logic {
                     wheel = scroll_steps(probe.wheel());
-                    let n = self.mod_bindings.len();
-                    for i in 0..n {
-                        let hit = if self.mod_bindings[i].held {
-                            self.mod_bindings[i].chords.iter().any(|chord| probe.held(*chord))
-                        } else {
-                            let repeat = self.mod_bindings[i].repeat.then_some(MOD_REPEAT);
-                            eval_event(
-                                &self.mod_bindings[i].chords,
-                                repeat,
-                                &mut self.mod_timers[i],
-                                probe,
-                                dt,
-                            )
-                        };
-                        if hit {
-                            actions.insert(i);
-                        }
+                }
+                for i in 0..self.mod_bindings.len() {
+                    let binding = &self.mod_bindings[i];
+                    if !binding.immediate && !mod_logic {
+                        self.mod_timers[i] = -1.0;
+                        continue;
                     }
-                } else {
-                    self.reset_mod_timers();
+                    let hit = if binding.held {
+                        binding.chords.iter().any(|chord| probe.held(*chord))
+                    } else {
+                        let repeat = binding.repeat.then_some(MOD_REPEAT);
+                        eval_event(&binding.chords, repeat, &mut self.mod_timers[i], probe, dt)
+                    };
+                    match (hit, binding.immediate) {
+                        (true, true) => immediate.insert(i),
+                        (true, false) => actions.insert(i),
+                        (false, _) => {}
+                    }
                 }
             }
             Context::Menu => {
@@ -385,7 +395,7 @@ impl Router {
             Context::Text => {}
         }
 
-        Sample { global: global_fired, gameplay: gameplay_fired, menu: menu_fired, actions, wheel }
+        Sample { global: global_fired, gameplay: gameplay_fired, menu: menu_fired, actions, immediate, wheel }
     }
 }
 
@@ -407,6 +417,7 @@ pub struct FrameInput<'e> {
     gameplay_fired: [bool; GameplayEvent::COUNT],
     menu_fired: [bool; MenuEvent::COUNT],
     actions: ActionSet,
+    immediate: ActionSet,
     wheel: i8,
 }
 
@@ -456,6 +467,11 @@ impl Gameplay<'_> {
     /// Mod actions that fired this frame. Empty when mod logic is off.
     pub fn actions(&self) -> ActionSet {
         self.fi.actions
+    }
+
+    /// Immediate mod actions that fired this frame, mod logic on or off.
+    pub fn immediate_actions(&self) -> ActionSet {
+        self.fi.immediate
     }
 
     /// Signed scroll steps this frame. Zero when mod logic is off.
@@ -581,8 +597,10 @@ mod tests {
     use crate::modding::{Action, Mods as Host};
 
     const SLOT3: &[Action] = &[action("bar.slot3", &[Chord::key(Key::Num3)])];
-    /// F is the core flight key.
-    const CLASH: &[Action] = &[action("clash.fire", &[Chord::key(Key::F), Chord::key(Key::Num3)])];
+    /// Tab is the core capture key.
+    const CLASH: &[Action] = &[action("clash.fire", &[Chord::key(Key::Tab), Chord::key(Key::Num3)])];
+    /// The chat key: the physical key left of 1 (§ on a Swedish layout).
+    const CHAT: &[Action] = &[Action { immediate: true, ..action("chat.open", &[Chord::key(Key::Backquote)]) }];
     const WHEEL: &[Action] = &[action("wheel.down", &[Chord::bare(Source::WheelDown)])];
     const HOLD: &[Action] = &[Action { held: true, ..action("voice.talk", &[Chord::key(Key::V)]) }];
 
@@ -616,7 +634,28 @@ mod tests {
         router.sync_actions(&mods);
         let sample = router.sample(&Press::key(Key::Num3), 1.0 / 60.0, true, true);
         assert!(fired(&router, "bar.slot3", sample.actions));
-        assert!(!sample.gameplay[GameplayEvent::ToggleFly as usize]);
+        assert!(sample.immediate.is_empty());
+        assert!(!sample.gameplay[GameplayEvent::ToggleCapture as usize]);
+    }
+
+    /// An immediate action fires with the mod-logic lane off, on its own set, and not while
+    /// text is captured; a cadence action does not fire with the lane off.
+    #[test]
+    fn an_immediate_action_fires_with_mod_logic_off() {
+        let mut router = Router::new();
+        let mut mods = host(CHAT);
+        mods.install(Box::new(Stub::new("bar").actions(SLOT3)), true);
+        router.sync_actions(&mods);
+        let chat = router.sample(&Press::key(Key::Backquote), 1.0 / 60.0, false, true);
+        assert!(fired(&router, "chat.open", chat.immediate), "the chat key works under the Minimum preset");
+        assert!(chat.actions.is_empty(), "an immediate action is not a cadence action");
+        let slot = router.sample(&Press::key(Key::Num3), 1.0 / 60.0, false, true);
+        assert!(slot.actions.is_empty() && slot.immediate.is_empty(), "mod logic off silences cadence actions");
+        let on = router.sample(&Press::key(Key::Backquote), 1.0 / 60.0, true, true);
+        assert!(fired(&router, "chat.open", on.immediate));
+        router.set_context(Context::Text);
+        let typing = router.sample(&Press::key(Key::Backquote), 1.0 / 60.0, true, true);
+        assert!(typing.immediate.is_empty(), "while typing, the key types");
     }
 
     #[test]
@@ -624,12 +663,12 @@ mod tests {
         let mut router = Router::new();
         let mods = host(CLASH);
         router.sync_actions(&mods);
-        let fly = router.sample(&Press::key(Key::F), 1.0 / 60.0, true, true);
-        assert!(fly.gameplay[GameplayEvent::ToggleFly as usize], "F stays the flight key");
-        assert!(!fired(&router, "clash.fire", fly.actions), "the core chord is not also a mod action");
+        let tab = router.sample(&Press::key(Key::Tab), 1.0 / 60.0, true, true);
+        assert!(tab.gameplay[GameplayEvent::ToggleCapture as usize], "Tab stays the capture key");
+        assert!(!fired(&router, "clash.fire", tab.actions), "the core chord is not also a mod action");
         let slot = router.sample(&Press::key(Key::Num3), 1.0 / 60.0, true, true);
         assert!(fired(&router, "clash.fire", slot.actions), "the other default chord still fires");
-        assert!(!slot.gameplay[GameplayEvent::ToggleFly as usize]);
+        assert!(!slot.gameplay[GameplayEvent::ToggleCapture as usize]);
     }
 
     #[test]

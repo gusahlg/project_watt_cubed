@@ -1502,13 +1502,13 @@ mod seam_tests {
     #[test]
     fn live_sources_block_the_service_skip() {
         use crate::audio::AudioService;
-        use crate::console::Console;
+        use crate::modding::Notices;
         use crate::world::World;
 
         let (mut sound, syms, _rec) = system(32);
         let mut svc = AudioService::new();
         let world = World::generate();
-        let mut console = Console::new();
+        let mut notices = Notices::default();
         let pos = DVec3::ZERO;
         let listener = crate::audio::Listener {
             pos,
@@ -1516,7 +1516,7 @@ mod seam_tests {
             pitch: 0.0,
             frame: glam::DQuat::IDENTITY,
         };
-        svc.finish(&mut sound, &world, listener, 0.1, &mut console);
+        svc.finish(&mut sound, &world, listener, 0.1, &mut notices);
         assert!(svc.can_skip(&sound, true, pos), "a silent still frame arms the skip");
 
         let cue = sound.catalog().typed::<OneShot>(&syms, "oneshot").unwrap();

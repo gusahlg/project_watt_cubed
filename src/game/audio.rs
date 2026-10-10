@@ -81,7 +81,7 @@ impl Game {
                 });
                 ups.push(r.up);
             }
-            // A console-owned frame does not step the player, so a stale walk speed
+            // A frame a mod's text capture owns does not step the player, so a stale walk speed
             // must not fire a footstep.
             let velocity = if active { self.player.velocity() } else { DVec3::ZERO };
             audio.footsteps(
@@ -131,7 +131,7 @@ impl Game {
             ids,
         };
         let mut link = ModLink::new(self.net.as_mut());
-        let mut api = audio.api(sound, cues, Some(&self.world), Some(&mut self.console));
+        let mut api = audio.api(sound, cues, Some(&self.world), Some(&mut self.notices));
         for event in events {
             mods.on_game_event(event, &mut api);
         }
@@ -145,6 +145,6 @@ impl Game {
             pitch: self.player.orientation.pitch,
             frame: self.player.orientation.frame,
         };
-        audio.finish(sound, &self.world, listener, dt, &mut self.console);
+        audio.finish(sound, &self.world, listener, dt, &mut self.notices);
     }
 }

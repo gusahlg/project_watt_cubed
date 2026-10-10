@@ -9,12 +9,10 @@ use crate::audio::GameEvent;
 use crate::block::{AIR, BlockId};
 use crate::interact;
 use crate::math::{Aabb, Bounded};
-use crate::modding::{Mods, ToolUse};
-use crate::net::chat;
+use crate::modding::{Channel, Message, Mods, Notice, NoticeLevel, ToolUse};
 use crate::net::client::Incoming;
 use crate::presence::{Stance, WireAction};
 use crate::save;
-use crate::ui;
 use crate::world::World;
 
 /// One optimistic edit awaiting the server's verdict: everything needed to
@@ -37,7 +35,7 @@ enum PendingKind {
 impl Game {
     /// Drain server events and send our heartbeat. `Some(ExitToMenu)` when the
     /// server dropped us. Runs before input so edits and chat keep flowing even
-    /// while the console is open or the player stands still — and the move
+    /// while a mod is typing or the player stands still — and the move
     /// report doubles as the keepalive, so it too runs unconditionally.
     pub(super) fn net_phase(&mut self, mods: &mut Mods, events: &mut Vec<GameEvent>) -> Option<Signal> {
         // The overwhelmingly common singleplayer path should not even enter a
@@ -58,7 +56,7 @@ impl Game {
             } else {
                 format!("* disconnected: {reason}")
             };
-            self.console.print(line.clone());
+            post(mods, Notice { level: NoticeLevel::Warning, text: line.clone() });
             self.leave_notice = Some(line);
             return Some(Signal::ExitToMenu);
         }
@@ -78,7 +76,7 @@ impl Game {
     }
 
     /// Drain queued server messages: apply world edits, resolve our own edit
-    /// verdicts (rolling back rejected predictions), surface chat, and report
+    /// verdicts (rolling back rejected predictions), hand chat to the mods, and report
     /// a lost connection. `Some(reason)` if the server dropped us.
     fn apply_net_events(&mut self, mods: &mut Mods, events: &mut Vec<GameEvent>) -> Option<String> {
         let incoming = match &mut self.net {
@@ -153,30 +151,19 @@ impl Game {
                     self.player.cancel_fall();
                     self.force_stream = true;
                 }
+                // Chat and the roster are messages for the mods: the core shows none of them.
                 Incoming::Chat {
                     from_name,
                     channel,
                     text,
                 } => {
-                    // Colour the scope tag and name so chat scans at a glance: a gold
-                    // [global] tag, a blue <name>, and the message body white.
-                    let name = ui::Line::of(ui::Role::Accent, format!("<{from_name}> "));
-                    let line = if channel == chat::GLOBAL {
-                        ui::Line::of(ui::Role::Warning, "[global] ")
-                            .then(ui::Role::Accent, format!("<{from_name}> "))
-                    } else {
-                        name
-                    };
-                    self.console
-                        .push(line.then(ui::Role::Muted, text.to_string()));
+                    mods.on_message(&Message::Chat { from: &from_name, channel: Channel::from_wire(channel), text: &text });
                 }
                 Incoming::Joined { name } => {
-                    self.console
-                        .push(ui::Line::of(ui::Role::Positive, format!("* {name} joined")));
+                    mods.on_message(&Message::Joined { name: &name });
                 }
                 Incoming::Left { name } => {
-                    self.console
-                        .push(ui::Line::of(ui::Role::Muted, format!("* {name} left")));
+                    mods.on_message(&Message::Left { name: &name });
                 }
                 Incoming::Time { day, day_secs } => {
                     // The server owns the shared clock: phase AND cycle length.
@@ -185,8 +172,8 @@ impl Game {
                 }
                 Incoming::Disconnected { reason } => disconnected = Some(reason),
                 Incoming::Interrupted => {
-                    self.console
-                        .push(ui::Line::of(ui::Role::Warning, crate::net::client::INTERRUPTED));
+                    let text = crate::net::client::INTERRUPTED.to_string();
+                    post(mods, Notice { level: NoticeLevel::Warning, text });
                 }
                 Incoming::ToolResult { req, reacted, cell, cell_spec, tool_spec } => {
                     let Some(tool) = self.pending_tools.remove(&req) else { continue };
@@ -389,6 +376,13 @@ impl Game {
 }
 
 /// The world-space centre of a voxel cell (occurrence position).
+/// Hand a session notice to the mods now; with no mod showing it, stderr.
+fn post(mods: &mut Mods, notice: Notice) {
+    if !mods.on_message(&Message::Notice(&notice)) {
+        eprintln!("{}", notice.text);
+    }
+}
+
 fn cell_center(x: i32, y: i32, z: i32) -> DVec3 {
     DVec3::new(x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5)
 }
@@ -449,6 +443,33 @@ mod tests {
 
         game.apply_incoming(incoming, &mut crate::modding::testing::standard(), &mut Vec::new());
         game.world.assert_same_edits(&reference);
+    }
+
+    /// A chat line a mod queues goes to the server, which relays it back as a message for the
+    /// mods; the core shows nothing itself.
+    #[test]
+    fn queued_chat_goes_to_the_server_and_returns_as_a_message() {
+        use crate::game::tests::{probe_mods, type_word};
+        use crate::net::client::Connection;
+        use crate::net::server::{self, Config};
+        use std::time::{Duration, Instant};
+
+        let server = server::spawn(0, Config { seed: 1, ..Config::default() }).expect("loopback server");
+        let conn = Connection::connect("127.0.0.1", server.addr().port(), "ada", "").expect("connect");
+        let mut game = game().with_net(conn);
+        let (mut mods, log) = probe_mods();
+        let mut settings = crate::settings::Settings::default();
+        type_word(&mut game, &mut mods, &mut settings, "chat");
+        assert!(game.chat_out.is_empty(), "sent, not kept");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut events = Vec::new();
+        while !log.borrow().iter().any(|l| l.starts_with("chat")) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+            assert!(game.apply_net_events(&mut mods, &mut events).is_none(), "still connected");
+        }
+        let chats: Vec<String> = log.borrow().iter().filter(|l| l.starts_with("chat")).cloned().collect();
+        assert_eq!(chats, ["chat ada Local hello"]);
+        server.stop();
     }
 
     #[test]
