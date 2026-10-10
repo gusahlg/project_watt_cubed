@@ -11,7 +11,7 @@ pub(super) fn reject_edit(shared: &Arc<Mutex<State>>, id: u32, req: u32, x: i32,
 
 /// The one rejection an edit gets: `accepted: false` with the cell's current revision.
 pub(super) fn ack_reject(state: &State, out: &Outbox, req: u32, at: Pos) {
-    let _ = out.try_send(ServerMessage::EditAck { req, accepted: false, rev: state.rev(at) }.encode().into());
+    let _ = out.try_send(ServerMessage::EditAck { req, accepted: false, rev: state.rev(at) }.frame());
 }
 
 /// Novel specs intern only while `block_count()` is below `limit`. A known spec resolves
@@ -172,8 +172,8 @@ pub(super) fn on_edit(
         // Reconcile even when a peer or tool result overwrote the prediction, or the request
         // expired locally. Send content before the verdict: if the verdict cannot be queued,
         // the confirmed revision still prevents timeout from undoing authoritative content.
-        if out.try_send(ServerMessage::Snapshot { edits: vec![(x, y, z, rev, spec.clone())] }.encode().into()).is_ok() {
-            let _ = out.try_send(ServerMessage::EditAck { req, accepted: true, rev }.encode().into());
+        if out.try_send(ServerMessage::Snapshot { edits: vec![(x, y, z, rev, spec.clone())] }.frame()).is_ok() {
+            let _ = out.try_send(ServerMessage::EditAck { req, accepted: true, rev }.frame());
         } else {
             // An essential confirmation cannot be silently lost: a fresh join will replay it.
             kick_slow(&state, &[id]);
@@ -211,7 +211,7 @@ pub(super) fn refuse_tool<'a>(
         None => Arc::clone(state.registry.spec_ref(server_block(&state, generator, at))),
     };
     let msg = ServerMessage::ToolResult { req, reacted: false, rev: state.rev(at), cell_spec, tool_spec: Arc::clone(tool) };
-    let _ = h.out.try_send(msg.encode().into());
+    let _ = h.out.try_send(msg.frame());
 }
 
 /// A player uses a held configuration as a tool on a cell. Gates: ready, reach, the tool spec
@@ -262,7 +262,7 @@ pub(super) fn on_tool_use(
     let tool_out = Arc::clone(state.registry.spec_ref(new_tool));
     if let Some(h) = state.players.get(&id) {
         let msg = ServerMessage::ToolResult { req, reacted: true, rev, cell_spec: Arc::clone(&spec), tool_spec: tool_out };
-        let _ = h.out.try_send(msg.encode().into());
+        let _ = h.out.try_send(msg.frame());
     }
     let wake = broadcast(&mut state, &ServerMessage::Edit { x, y, z, rev, spec }, |pid, _| pid != id);
     drop(state);

@@ -320,8 +320,6 @@ const SEND_DEADLINE: Duration = Duration::from_secs(8);
 const TIME_BROADCAST: Duration = Duration::from_secs(60);
 /// Body cells tested for a solid overlap. A larger box fails closed.
 const BODY_CELL_CAP: usize = 64;
-/// Bytes of queued frames a writer sends in one write.
-const WRITE_BATCH: usize = 64 * 1024;
 
 /// A running server. [`stop`](ServerHandle::stop) closes every connection, saves
 /// the world, and joins the server threads so the port can be bound again.

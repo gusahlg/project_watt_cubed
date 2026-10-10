@@ -96,25 +96,30 @@ impl Drop for Wake {
 }
 
 impl Outgoing {
-    /// Frame what is queued into `batch`, up to [`WRITE_BATCH`] bytes, parking while
+    /// Frame what is queued into `batch`, up to [`protocol::WRITE_BATCH`] bytes, parking while
     /// nothing is. `Ok(false)` once every sender is gone and the queue is empty; an
     /// error for a frame past the cap.
     pub(super) fn take(&self, batch: &mut Vec<u8>) -> io::Result<bool> {
         batch.clear();
         loop {
-            while batch.len() < WRITE_BATCH {
-                match self.rx.try_recv() {
-                    Ok(frame) => {
-                        #[cfg(test)]
-                        self.writer.depth.fetch_sub(1, Ordering::Relaxed);
-                        protocol::put_frame(batch, &frame)?;
-                    }
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => return Ok(!batch.is_empty()),
+            let mut gone = false;
+            protocol::pump(batch, || match self.rx.try_recv() {
+                Ok(frame) => {
+                    #[cfg(test)]
+                    self.writer.depth.fetch_sub(1, Ordering::Relaxed);
+                    Some(frame)
                 }
-            }
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => {
+                    gone = true;
+                    None
+                }
+            })?;
             if !batch.is_empty() {
                 return Ok(true);
+            }
+            if gone {
+                return Ok(false);
             }
             thread::park();
         }
@@ -179,8 +184,7 @@ pub(super) fn tell(h: &PlayerHandle, id: u32, text: &str, sends: &mut Vec<Pendin
         channel: chat::GLOBAL,
         text: text.into(),
     }
-    .encode()
-    .into();
+    .frame();
     sends.push((id, frame));
 }
 
@@ -217,7 +221,7 @@ pub(super) fn on_mod_data(
     seq: u32,
     bytes: protocol::ModBytes,
 ) {
-    relay(shared, id, ServerMessage::PeerModData { channel, sender: id, seq, bytes }.encode().into());
+    relay(shared, id, ServerMessage::PeerModData { channel, sender: id, seq, bytes }.frame());
 }
 
 /// Loss-tolerant: `frame` reaches `from`'s visible, ready peers, and a full queue drops
@@ -249,7 +253,7 @@ pub(super) fn broadcast(state: &mut State, msg: &ServerMessage, want: impl Fn(u3
         ServerMessage::PeerJoined { id, .. } => Some(*id),
         _ => None,
     };
-    broadcast_frame(state, msg.encode().into(), joined, want)
+    broadcast_frame(state, msg.frame(), joined, want)
 }
 
 /// [`broadcast`] of an encoded frame. `joined` is the peer a `PeerJoined` frame
@@ -357,5 +361,5 @@ pub(super) fn drop_oldest_cosmetic(h: &mut PlayerHandle) -> bool {
 /// Swing relay: the swinger's visible set, same as voice. A full queue drops
 /// the frame; a swing is cosmetic and never a kick.
 pub(super) fn relay_swing(shared: &Arc<Mutex<State>>, id: u32) {
-    relay(shared, id, ServerMessage::PeerSwing { id }.encode().into());
+    relay(shared, id, ServerMessage::PeerSwing { id }.frame());
 }

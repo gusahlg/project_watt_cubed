@@ -10,6 +10,7 @@
 //! Positions travel as 3x f64 (24 bytes): the game plays out to ±1e9 blocks,
 //! where f32 cannot even represent adjacent positions. Peer poses are the
 //! exception: i16 offsets from the recipient's own position.
+use std::cell::RefCell;
 use std::io;
 #[cfg(test)]
 use std::io::{Read, Write};
@@ -746,11 +747,21 @@ pub(crate) struct SnapshotWriter {
     cells: Vec<u8>,
     count: u64,
     last: (i32, i32, i32),
+    /// The frame being handed out, reused from frame to frame.
+    frame: Vec<u8>,
 }
 
 impl SnapshotWriter {
     pub(crate) fn new() -> Self {
-        Self { slots: Vec::new(), used: Vec::new(), palette: Vec::new(), cells: Vec::new(), count: 0, last: (0, 0, 0) }
+        Self {
+            slots: Vec::new(),
+            used: Vec::new(),
+            palette: Vec::new(),
+            cells: Vec::new(),
+            count: 0,
+            last: (0, 0, 0),
+            frame: Vec::new(),
+        }
     }
 
     /// Add one cell, first handing `emit` the frame so far when this cell would not fit.
@@ -780,13 +791,14 @@ impl SnapshotWriter {
         if self.count == 0 {
             return;
         }
-        let mut frame = Vec::with_capacity(SNAPSHOT_HEAD + self.palette.len() + self.cells.len());
+        let frame = &mut self.frame;
+        frame.clear();
         frame.push(tag::SNAPSHOT);
-        var_into(&mut frame, self.used.len() as u64);
+        var_into(frame, self.used.len() as u64);
         frame.extend_from_slice(&self.palette);
-        var_into(&mut frame, self.count);
+        var_into(frame, self.count);
         frame.extend_from_slice(&self.cells);
-        emit(frame.into());
+        emit(Arc::from(frame.as_slice()));
         for key in self.used.drain(..) {
             self.slots[usize::from(key)] = u32::MAX;
         }
@@ -795,6 +807,28 @@ impl SnapshotWriter {
         self.count = 0;
         self.last = (0, 0, 0);
     }
+}
+
+thread_local! {
+    /// The buffer [`ClientMessage::frame`] and [`ServerMessage::frame`] encode into.
+    static FRAME: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Encode with `write` into this thread's reused buffer and copy the bytes into one shared
+/// frame. A buffer grown past [`MAX_FRAME`] is let go rather than kept.
+fn framed(write: impl FnOnce(&mut codec::Writer)) -> Arc<[u8]> {
+    FRAME.with(|cell| {
+        let mut buf = cell.take();
+        buf.clear();
+        let mut w = codec::Writer::from_vec(buf);
+        write(&mut w);
+        let buf = w.into_inner();
+        let frame = Arc::from(buf.as_slice());
+        if buf.capacity() <= MAX_FRAME {
+            cell.replace(buf);
+        }
+        frame
+    })
 }
 
 /// Define one direction's message enum AND its codec from a single table:
@@ -821,14 +855,27 @@ macro_rules! messages {
         impl $name {
             /// Serialise to a frame payload (tag byte + fields, in declared order).
             pub fn encode(&self) -> Vec<u8> {
-                let mut w = codec::Writer::new();
+                // Most messages fit, so one allocation instead of a run of growths.
+                let mut w = codec::Writer::with_capacity(64);
+                self.write(&mut w);
+                w.into_inner()
+            }
+
+            /// [`encode`](Self::encode) straight into a shared frame: the bytes are built in
+            /// this thread's reused buffer, so the frame's own allocation is the only one.
+            // The client's send path (`Connection::dispatch`) has not adopted it yet.
+            #[allow(dead_code)]
+            pub fn frame(&self) -> Arc<[u8]> {
+                framed(|w| self.write(w))
+            }
+
+            fn write(&self, w: &mut codec::Writer) {
                 match self {
                     $( $name::$variant $( { $( $field ),+ } )? => {
                         w.u8($tag);
-                        $( $( Wire::put($field, &mut w); )+ )?
+                        $( $( Wire::put($field, w); )+ )?
                     } )*
                 }
-                w.into_inner()
             }
 
             /// Parse a frame payload. `None` on any malformed or truncated input.
@@ -1034,10 +1081,24 @@ fn frame_len(header: [u8; 4]) -> io::Result<usize> {
     Ok(len)
 }
 
+/// Bytes of queued frames a writer sends in one write.
+pub(crate) const WRITE_BATCH: usize = 64 * 1024;
+
 /// Append `payload` with its length header, so many frames go out in one write.
 pub(crate) fn put_frame(buf: &mut Vec<u8>, payload: &[u8]) -> io::Result<()> {
     buf.extend_from_slice(&frame_header(payload)?);
     buf.extend_from_slice(payload);
+    Ok(())
+}
+
+/// Append every frame `ready` hands over without waiting, each with its length header, until
+/// it has none or `batch` holds [`WRITE_BATCH`] bytes: the batch then goes out in one write.
+/// An error for a frame past the cap.
+pub(crate) fn pump<F: AsRef<[u8]>>(batch: &mut Vec<u8>, mut ready: impl FnMut() -> Option<F>) -> io::Result<()> {
+    while batch.len() < WRITE_BATCH {
+        let Some(frame) = ready() else { break };
+        put_frame(batch, frame.as_ref())?;
+    }
     Ok(())
 }
 
@@ -1593,6 +1654,32 @@ mod tests {
         assert_eq!(ServerMessage::decode(&read), Some(ServerMessage::PeerLeft { id: 7 }));
     }
 
+    /// A pumped batch is the frames written one after another, it stops at the batch size,
+    /// and a frame past the cap is an error.
+    #[test]
+    fn pump_batches_the_bytes_frame_by_frame_writes_would_send() {
+        let frames: Vec<Vec<u8>> = (0..40u32).map(|i| ServerMessage::Pong { nonce: i }.encode()).collect();
+        let mut one_by_one = Vec::new();
+        for f in &frames {
+            write_frame(&mut one_by_one, f).unwrap();
+        }
+        let mut queue = frames.iter();
+        let mut batch = Vec::new();
+        pump(&mut batch, || queue.next()).unwrap();
+        assert_eq!(batch, one_by_one);
+
+        let big = vec![7u8; MAX_FRAME];
+        let mut queue = std::iter::repeat_n(&big, 3);
+        let mut batch = Vec::new();
+        pump(&mut batch, || queue.next()).unwrap();
+        assert_eq!(batch.len(), 4 + MAX_FRAME, "a full batch waits for the next write");
+        assert_eq!(queue.count(), 2);
+
+        let over = vec![0u8; MAX_FRAME + 1];
+        let mut once = Some(&over);
+        assert!(pump(&mut Vec::new(), || once.take()).is_err());
+    }
+
     #[test]
     fn oversize_frame_is_refused() {
         let big = vec![0u8; MAX_FRAME + 1];
@@ -2040,6 +2127,20 @@ mod golden {
         sw.finish(&mut emit);
         assert_eq!(frames.len(), 1);
         assert_eq!(hex(&frames[0]), SNAPSHOT);
+    }
+
+    /// A frame built in the reused buffer is the encoding, whatever the buffer held before.
+    #[test]
+    fn frames_match_their_encoding() {
+        let big = ServerMessage::Snapshot { edits: (0..20_000).map(|i| (i, 0, 0, 1, Arc::from("air"))).collect() };
+        for m in client_cases() {
+            assert_eq!(&*m.frame(), m.encode().as_slice());
+        }
+        for m in server_cases().into_iter().chain([big]) {
+            assert_eq!(&*m.frame(), m.encode().as_slice());
+        }
+        let m = ServerMessage::Pong { nonce: 9 };
+        assert_eq!(&*m.frame(), m.encode().as_slice(), "after a frame larger than the kept buffer");
     }
 
     #[test]

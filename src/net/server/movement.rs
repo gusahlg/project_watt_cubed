@@ -4,7 +4,7 @@ use super::*;
 impl PlayerHandle {
     pub(super) fn correct_position(&self, id: u32, sends: &mut Vec<PendingSend>) {
         if self.ready {
-            let frame = ServerMessage::Position { pos: self.pos, frame: self.frame, up: self.up }.encode().into();
+            let frame = ServerMessage::Position { pos: self.pos, frame: self.frame, up: self.up }.frame();
             sends.push((id, frame));
         }
     }
@@ -396,8 +396,8 @@ pub(super) fn commit_pose(
         for &pid in &gone {
             let Some(other) = state.players.get_mut(&pid) else { continue };
             other.visible.remove(&id);
-            sends.push((pid, ServerMessage::PeerExited { id }.encode().into()));
-            sends.push((id, ServerMessage::PeerExited { id: pid }.encode().into()));
+            sends.push((pid, ServerMessage::PeerExited { id }.frame()));
+            sends.push((id, ServerMessage::PeerExited { id: pid }.frame()));
         }
         // An arriving peer needs the mover's pose AND the mover needs theirs, or
         // the mover keeps hiding them until they next move.

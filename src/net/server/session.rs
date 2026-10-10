@@ -79,7 +79,7 @@ pub(super) fn client_loop(
                 if let Some(h) = state.players.get(&id) {
                     // Best-effort: a full queue drops the probe, and the
                     // client simply re-sends on its interval.
-                    let _ = h.out.try_send(ServerMessage::Pong { nonce }.encode().into());
+                    let _ = h.out.try_send(ServerMessage::Pong { nonce }.frame());
                 }
             }
             ClientMessage::Hello { .. } => {} // Already authenticated; ignore repeats.
@@ -129,8 +129,7 @@ pub(super) fn on_chat(
                         channel,
                         text: reason,
                     }
-                    .encode()
-                    .into(),
+                    .frame(),
                 );
             }
             return;
@@ -189,7 +188,7 @@ pub(super) fn on_set_time(shared: &Arc<Mutex<State>>, ctx: &Ctx, id: u32, day: f
         let Some(h) = state.players.get(&id) else { return };
         if !h.op {
             tell(h, id, "only an operator can set the time", sends);
-            sends.push((id, ServerMessage::Time { day: state.day_now(ctx.day_secs), day_secs: ctx.day_secs }.encode().into()));
+            sends.push((id, ServerMessage::Time { day: state.day_now(ctx.day_secs), day_secs: ctx.day_secs }.frame()));
             let wake = queue(&state, sends);
             drop(state);
             drop(wake);
@@ -207,7 +206,7 @@ pub(super) fn on_set_time(shared: &Arc<Mutex<State>>, ctx: &Ctx, id: u32, day: f
 pub(super) fn answer_time(shared: &Arc<Mutex<State>>, ctx: &Ctx, id: u32) {
     let state = shared.lock_recover();
     if let Some(h) = state.players.get(&id) {
-        let _ = h.out.try_send(ServerMessage::Time { day: state.day_now(ctx.day_secs), day_secs: ctx.day_secs }.encode().into());
+        let _ = h.out.try_send(ServerMessage::Time { day: state.day_now(ctx.day_secs), day_secs: ctx.day_secs }.frame());
     }
 }
 

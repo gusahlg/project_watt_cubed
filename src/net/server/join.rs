@@ -419,7 +419,7 @@ pub(super) fn send_join(
 /// bootstrap, which must not drop frames). Returns false when `kicked` is set,
 /// the queue is gone, or [`SEND_DEADLINE`] passes.
 pub(super) fn send_blocking(out: &Outbox, kicked: &AtomicBool, msg: &ServerMessage) -> bool {
-    send_until(out, kicked, msg.encode().into(), Instant::now() + SEND_DEADLINE)
+    send_until(out, kicked, msg.frame(), Instant::now() + SEND_DEADLINE)
 }
 
 pub(super) fn send_until(out: &Outbox, kicked: &AtomicBool, frame: Arc<[u8]>, deadline: Instant) -> bool {

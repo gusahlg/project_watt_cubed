@@ -588,9 +588,16 @@ fn connect_one(
 
         let (writer_tx, writer_rx) = mpsc::sync_channel::<Arc<[u8]>>(OUT_QUEUE);
         let writer_rt = Arc::clone(rt);
+        // Waits for a frame, then sends it with every other frame already queued in one write.
         let writer = thread::spawn(move || {
-            while let Ok(frame) = writer_rx.recv() {
-                if writer_rt.block_on(protocol::write_frame_async(&mut send, &frame)).is_err() {
+            let mut batch = Vec::new();
+            while let Ok(first) = writer_rx.recv() {
+                batch.clear();
+                let mut first = Some(first);
+                if protocol::pump(&mut batch, || first.take().or_else(|| writer_rx.try_recv().ok())).is_err() {
+                    break;
+                }
+                if writer_rt.block_on(send.write_all(&batch)).is_err() {
                     break;
                 }
             }
