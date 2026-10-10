@@ -1082,7 +1082,7 @@ pub async fn read_frame_async(r: &mut RecvStream, buf: &mut Vec<u8>) -> io::Resu
 mod tests {
     use super::*;
 
-    fn client_cases() -> Vec<ClientMessage> {
+    pub(super) fn client_cases() -> Vec<ClientMessage> {
         vec![
             ClientMessage::Hello {
                 protocol: 1,
@@ -1132,7 +1132,7 @@ mod tests {
         ]
     }
 
-    fn server_cases() -> Vec<ServerMessage> {
+    pub(super) fn server_cases() -> Vec<ServerMessage> {
         vec![
             ServerMessage::Welcome {
                 player_id: 42,
@@ -1965,5 +1965,92 @@ mod tests {
         assert_eq!(offers[0].id.len(), MAX_MOD_ID, "an id and version at the limit are kept");
         let sent = hello(offers);
         assert_eq!(ClientMessage::decode(&sent.encode()), Some(sent));
+    }
+}
+
+/// Protocol 17 on the wire, byte for byte: encoder changes must not move a byte.
+#[cfg(test)]
+mod golden {
+    use super::*;
+    use super::tests::{client_cases, server_cases};
+
+    const MOVE: &str = "0100000000404a93c000000000009058400000800184d7974100002040000040bf0000000000000000f304353ff304353f0000604000001cc10000003e0201";
+    const POSES: &str = "050000000000407f4000000000008034c00000000080842e41030007055f14300aa0018000c0feac0238c585e3c20108208000490038fffb00b500140064f0a20423be280000000011800000000000000100";
+    const SNAPSHOT: &str = "020203006169720c00633a30313238353038636130042080011f01000200000301a1897a8901a0d0acf30effffffff0f00a2897a8c019fd0acf30e0201";
+    /// FNV-64 over every encoding in the round-trip cases, client then server.
+    const DIGEST: u64 = 0x4935_facd_0ee5_2bd8;
+
+    fn golden_move() -> ClientMessage {
+        ClientMessage::Move {
+            pos: DVec3::new(-1234.5625, 98.25, 1.0e8 + 0.375),
+            yaw: 2.5,
+            pitch: -0.75,
+            frame: DQuat::from_xyzw(0.0, 0.0, 0.707_106_77, 0.707_106_77),
+            velocity: Vec3::new(3.5, -9.75, 0.125),
+            up: Face::NegZ,
+            stance: Stance::Sneaking,
+        }
+    }
+
+    fn golden_poses() -> (DVec3, Vec<(u32, PoseBody, DVec3)>) {
+        let origin = DVec3::new(500.0, -20.5, 1.0e6);
+        let list = vec![
+            (7, PoseBody::new(0.5, 0.25, DQuat::IDENTITY, Vec3::ZERO, Face::PosY, Stance::Standing), origin + DVec3::new(3.25, 1.0, -2.5)),
+            (
+                300,
+                PoseBody::new(-3.0, -1.5, DQuat::from_xyzw(0.0, 1.0, 0.0, 0.0), Vec3::new(10.0, 0.5, -70_000.0), Face::NegX, Stance::Sneaking),
+                origin + DVec3::new(-150.0, 40.0, 200.0),
+            ),
+            (70_000, PoseBody::new(1.0, 0.0, DQuat::IDENTITY, Vec3::new(0.0, -1.0e-6, 0.0), Face::PosZ, Stance::Standing), origin + DVec3::new(0.0, 0.0, 0.0078125)),
+        ];
+        (origin, list)
+    }
+
+    fn golden_snapshot() -> Vec<(i32, i32, i32, u32, Arc<str>)> {
+        vec![
+            (16, 64, -16, 1, "air".into()),
+            (17, 64, -16, 3, "c:0128508ca0".into()),
+            (-1_000_000, -5, 2_000_000_000, u32::MAX, "air".into()),
+            (17, 65, -16, 2, "c:0128508ca0".into()),
+        ]
+    }
+
+    fn hex(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    #[test]
+    fn move_peer_poses_and_snapshot_frames_keep_their_bytes() {
+        assert_eq!(hex(&golden_move().encode()), MOVE);
+        let (origin, list) = golden_poses();
+        let mut w = PosesWriter::new();
+        w.begin(origin);
+        for (id, body, pos) in &list {
+            w.push(*id, body, *pos);
+        }
+        assert_eq!(hex(&w.frame()), POSES);
+        assert_eq!(hex(&ServerMessage::Snapshot { edits: golden_snapshot() }.encode()), SNAPSHOT);
+        let mut frames = Vec::new();
+        let mut sw = SnapshotWriter::new();
+        let mut emit = |f: Arc<[u8]>| frames.push(f);
+        for (x, y, z, rev, spec) in &golden_snapshot() {
+            let key = if spec.as_ref() == "air" { 0 } else { 9 };
+            sw.push((*x, *y, *z), *rev, key, spec, &mut emit);
+        }
+        sw.finish(&mut emit);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(hex(&frames[0]), SNAPSHOT);
+    }
+
+    #[test]
+    fn every_message_keeps_its_bytes() {
+        let mut h = crate::hash::Fnv64::new();
+        for m in client_cases() {
+            h.bytes(&m.encode());
+        }
+        for m in server_cases() {
+            h.bytes(&m.encode());
+        }
+        assert_eq!(h.finish(), DIGEST);
     }
 }
