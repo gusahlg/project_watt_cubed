@@ -37,10 +37,15 @@ use crate::ui::{HudElement, HudMode, Theme};
 use crate::world::World;
 
 /// What a game update wants the app to do next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Signal {
     /// Keep playing.
     Continue,
-    /// Leave to the start menu (the app saves on the way out).
+    /// Esc that nothing in the world took: text capture (the console's `Context::Text`) and every
+    /// mod overlay ([`Mods::close_overlay`]) come first. The app opens the pause screen a mod
+    /// gives, or leaves the world.
+    Escape,
+    /// Leave to the start menu (the app saves on the way out): the server ended the session.
     ExitToMenu,
 }
 
@@ -221,6 +226,9 @@ pub struct Game {
     scripted: bool,
     /// Benchmarks drive the camera themselves; stray keystrokes must not steer or stall the run.
     input_locked: bool,
+    /// A screen over the world (the pause screen) holds the input: the world runs without any,
+    /// and the router is left to the screen.
+    input_held: bool,
     /// Visual groups enabled by mods; fancy lanes strip when a group is off.
     visual_mask: crate::modding::VisualMask,
     /// The typed look/lane config this game draws with (was the `WATT_CLOUDS`/
@@ -374,6 +382,7 @@ impl Game {
             debug_view: DebugView::Normal,
             scripted: false,
             input_locked: false,
+            input_held: false,
             visual_mask: crate::modding::VisualMask::default(),
             render: crate::render_config::RenderConfig::default(),
             sched,
@@ -590,6 +599,21 @@ impl Game {
         std::mem::take(&mut self.settings_changed)
     }
 
+    /// Something outside the game (the pause screen) changed the settings: apply them as a
+    /// console change is applied, after the app's engine push.
+    pub fn mark_settings_changed(&mut self) {
+        self.settings_changed = true;
+    }
+
+    /// While `held`, a screen over the world takes every input: the game reads none and leaves
+    /// the router alone, and the world keeps running (streaming, the network, physics).
+    pub fn hold_input(&mut self, held: bool) {
+        self.input_held = held;
+        if held {
+            self.drop_pending_edges();
+        }
+    }
+
     /// Why a network session left, for the menu. Cleared by the take.
     pub fn take_leave_notice(&mut self) -> Option<String> {
         self.leave_notice.take()
@@ -628,7 +652,8 @@ impl Game {
         self.world.free_meshes(eng);
     }
 
-    /// Advance one frame. Returns Signal::ExitToMenu when the player leaves.
+    /// Advance one frame. Returns [`Signal::Escape`] for an Esc nothing in the world took, and
+    /// [`Signal::ExitToMenu`] when the network session ends.
     /// One frame of in-world logic, as a sequence of named phases. Each phase
     /// is a plain method — the flow reads top to bottom and any early Signal
     /// short-circuits the rest of the frame, exactly as before the split.
@@ -677,7 +702,7 @@ impl Game {
         }
         t.stop(&mut self.phases.net);
         let t = Lap::start(watch);
-        let input = self.input_phase(eng, router, mods, dt);
+        let input = if self.input_held { FrameInput::default() } else { self.input_phase(eng, router, mods, dt) };
         t.stop(&mut self.phases.input);
         // The overlay may consume the frame (console typing, opening chat): movement
         // and interaction run only on an unconsumed frame. Streaming still runs
@@ -696,7 +721,7 @@ impl Game {
         });
         t.stop(&mut self.phases.overlay);
         let consumed = match overlay {
-            Some(Signal::ExitToMenu) => return Signal::ExitToMenu,
+            Some(signal @ (Signal::ExitToMenu | Signal::Escape)) => return signal,
             Some(Signal::Continue) => true,
             None => false,
         };
@@ -855,13 +880,8 @@ impl Game {
             return Some(Signal::Continue);
         }
 
-        // Esc closes an in-world mod overlay before leaving the world.
         if input.g_escape {
-            self.drop_pending_edges();
-            if self.mod_ui_active() && mods.close_overlay() {
-                return Some(Signal::Continue);
-            }
-            return Some(Signal::ExitToMenu);
+            return Some(self.escape(mods));
         }
 
         // Open the console: `/` (OpenConsole) pre-fills a slash, `T` (OpenChat)
@@ -922,6 +942,18 @@ impl Game {
             self.force_stream = true;
         }
         None
+    }
+
+    /// Esc outside text capture (the text branch of `overlay_phase` takes it first): an open mod
+    /// overlay closes and keeps the frame; otherwise Esc is the app's, which opens the pause
+    /// screen or leaves.
+    fn escape(&mut self, mods: &mut Mods) -> Signal {
+        self.drop_pending_edges();
+        if self.mod_ui_active() && mods.close_overlay() {
+            Signal::Continue
+        } else {
+            Signal::Escape
+        }
     }
 
     /// Drop every latched input edge — called when a modal (console, menu
@@ -1411,6 +1443,36 @@ mod tests {
         assert!(game.player.flying(), "the first flight mod toggles, on this frame, mod logic off");
         game.fly_key(&FrameInput::default(), false, &mut two);
         assert!(game.player.flying(), "no key, no toggle");
+    }
+
+    /// A mod overlay that is open until Esc closes it.
+    struct Overlay(bool);
+
+    impl Mod for Overlay {
+        fn id(&self) -> &'static str {
+            "overlay"
+        }
+        fn close_overlay(&mut self) -> bool {
+            std::mem::take(&mut self.0)
+        }
+    }
+
+    /// Esc goes to an open overlay first; only then is it the app's (pause screen or leave). A
+    /// held game reads no input at all.
+    #[test]
+    fn esc_closes_an_overlay_before_it_reaches_the_app() {
+        let mut game = game();
+        let mut mods = Mods::empty();
+        mods.install(Box::new(Overlay(true)));
+        assert_eq!(game.escape(&mut mods), super::Signal::Continue, "the overlay takes the first Esc");
+        assert_eq!(game.escape(&mut mods), super::Signal::Escape, "then Esc is the app's");
+        game.hold_input(true);
+        assert!(game.input_held);
+        game.hold_input(false);
+        assert!(!game.input_held);
+        assert!(!game.take_settings_changed());
+        game.mark_settings_changed();
+        assert!(game.take_settings_changed(), "a pause-screen change is applied like a console change");
     }
 
     #[test]

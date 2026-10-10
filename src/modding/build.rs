@@ -233,6 +233,13 @@ impl<'a> ModRegistrar<'a> {
         self.mods.options.declare(self.package.id, spec)
     }
 
+    /// Offer a screen (a settings menu, a package list) on the screen out of a world and/or the
+    /// pause screen: a root or pause screen lists the entries for its place without knowing this
+    /// package. See [`crate::screen`].
+    pub fn screen_entry(&mut self, entry: crate::screen::ScreenEntry) {
+        self.mods.add_entry_from(Some(self.package.id), entry);
+    }
+
     /// Share a value with the packages registered after this one (handles are usually `Rc`s).
     /// A second value of the same type replaces the first.
     pub fn provide<T: Any>(&mut self, value: T) {

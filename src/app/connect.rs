@@ -6,7 +6,7 @@ use voxel_engine::Engine;
 
 use super::{App, Screen, fresh_seed, terrain_cfg_from_mods};
 use super::entry::Loading;
-use crate::menu::{HostInfo, JoinInfo};
+use crate::screen::{HostInfo, JoinInfo};
 use crate::modding::{Mods, PackageInfo};
 use crate::net::client::{Connection, PendingConnect};
 use crate::net::server::{Config, NoclipPolicy, TeleportPolicy};
@@ -158,7 +158,9 @@ impl App {
         }
         let Screen::Connecting(job) = &mut self.screen else { return };
         let Some(landed) = job.poll(&mut self.mods, self.build.packages()) else { return };
-        self.screen = Screen::Menus(self.standby_menu());
+        // A fresh root screen stands by under the world being built.
+        self.screen = Screen::Menus;
+        self.menus = self.root_stack(None);
         match landed {
             Landed::Joined { conn, notice, hosted } => {
                 let render = self.mods.effective_render(&self.settings);
@@ -191,8 +193,6 @@ mod tests {
     use crate::modding::testing::Stub;
     use crate::modding::{GameBuild, PackageKind};
     use crate::net::server;
-    use crate::session::Session;
-    use crate::settings::Settings;
     use crate::world::generation::WorldgenKind;
 
     fn register_toolkit(reg: &mut crate::modding::ModRegistrar) {
@@ -265,12 +265,10 @@ mod tests {
         }
     }
 
-    /// The server refuses the toolkit, the job suspends it and joins once, the Mods menu shows
-    /// it off on this server, and leaving resumes it.
+    /// The server refuses the toolkit, the job suspends it and joins once, screens see it
+    /// suspended, and leaving resumes it.
     #[test]
     fn a_denied_mod_is_suspended_for_the_session_and_shown_as_such() {
-        use crate::menu::menus::ModsMenu;
-        use crate::menu::Menu;
         let packages = sample_packages();
         let (mut mods, index) = sample_mods(&packages);
         let config = Config { seed: 1, worldgen: WorldgenKind::Flat, mods_deny: vec!["pwc.dev-toolkit".into()], ..Config::default() };
@@ -284,14 +282,8 @@ mod tests {
         assert_eq!(mods.active_package_reports(&packages), [("pwc.hotbar".to_string(), "0.1.0".to_string())]);
         let hotbar = (0..mods.len()).find(|&i| mods.id(i) == "hotbar").expect("hotbar");
         assert!(mods.is_active(hotbar));
-        let build = GameBuild::new().with_package(packages[0]).with_package(packages[1]);
-        let mut settings = Settings::default();
-        let session = Session::default();
-        let mut options = crate::settings::Options::new();
-        let ctx = crate::menu::Ctx { build: build.info(), suspended: mods.suspended(), ..crate::menu::Ctx::bare(&mut settings, &mut options, &session) };
-        let view = ModsMenu.view(&ctx);
-        let row = view.rows.iter().find(|row| row.label.contains("Developer Toolkit")).expect("row");
-        assert_eq!(row.label, "Developer Toolkit 1.0.0 (off on this server)");
+        let (suspended, _, _) = mods.screen_view();
+        assert_eq!(suspended, ["pwc.dev-toolkit"], "what a mods screen reads as off on this server");
         drop(conn);
         mods.resume_packages();
         assert!(mods.is_active(index));

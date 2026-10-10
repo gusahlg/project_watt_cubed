@@ -26,10 +26,9 @@ pub use build::{BuildInfo, GameBuild, ModDescriptor, ModRegistrar, PackageInfo, 
 use crate::block::appearance::{BlockAppearance, FLAT};
 use crate::block::naming::MaterialNamer;
 use crate::block::BlockId;
-use crate::menu::start::{StartFacts, StartScreen};
-use crate::menu::theme::MenuTheme;
 use crate::player::Player;
 use crate::render_config::{RenderConfig, VisualGroup};
+use crate::screen::{Screen, ScreenEntry, ScreenFacts};
 use crate::settings::{Options, Settings};
 use crate::sky::Sky;
 use crate::ui::{HudElement, Line};
@@ -325,9 +324,9 @@ impl<'a> CommandContext<'a> {
 ///   `on_place_rejected`, `on_tool_changed`, `on_tool_used`. `hud` uses the same order as z-order
 ///   (later draws on top). `commands` lists concatenate in the same order. `actions` are collected,
 ///   not arbitrated: each active mod's list is its own.
-/// - **First active wins**: `menu_theme`, `start_screen`, `close_overlay` and `on_toggle_fly`
-///   (first `true`),
-///   `worldgen`, `worldgen_config`, `appearance`, `namer`, `tool`, `run_command` (first `Some`).
+/// - **First active wins**: `close_overlay` and `on_toggle_fly` (first `true`), `root_screen`,
+///   `pause_screen`, `worldgen`, `worldgen_config`, `appearance`, `namer`, `tool`, `run_command`
+///   (first `Some`).
 /// - **Compose**: `visual_group` bits OR into the render mask.
 ///
 /// Save hooks are per-mod. `worldgen_config` is an opaque string; the winning worldgen kind
@@ -472,15 +471,19 @@ pub trait Mod {
         false
     }
 
-    /// Optional theme override; fallback prevents breaking nav.
-    fn menu_theme(&self) -> Option<&dyn MenuTheme> {
+    /// The screen out of a world (a start screen), built each time the player returns to it;
+    /// `facts.notice` says why when the core has a reason. The first active mod that returns
+    /// `Some` wins. With none, the core enters the most recent world (or a new one) and Esc saves
+    /// and quits. See [`crate::screen`].
+    fn root_screen(&self, facts: &ScreenFacts) -> Option<Box<dyn Screen>> {
+        let _ = facts;
         None
     }
 
-    /// Optional start screen. First active mod that returns `Some` wins;
-    /// the core fallback (New world / Load / Settings / Mods / Quit) is used
-    /// when every active mod returns `None`. Plain-data signatures only.
-    fn start_screen(&self, facts: &StartFacts) -> Option<Box<dyn StartScreen>> {
+    /// The screen Esc opens in a world, once text capture and every overlay declined the key. The
+    /// first active mod that returns `Some` wins. With none, Esc leaves the world as it always
+    /// did. The world keeps running underneath; only input goes to the screen.
+    fn pause_screen(&self, facts: &ScreenFacts) -> Option<Box<dyn Screen>> {
         let _ = facts;
         None
     }
@@ -554,6 +557,10 @@ pub struct Mods {
     suspended: Vec<String>,
     /// The options the packages declared, and their values.
     options: Options,
+    /// Every registered screen entry, with its package.
+    registered_screens: Vec<(Option<&'static str>, ScreenEntry)>,
+    /// The screen entries of active packages, by order (ties in registration order).
+    screens: Vec<ScreenEntry>,
 }
 
 impl Mods {
@@ -583,7 +590,61 @@ impl Mods {
             pinned: Vec::new(),
             suspended: Vec::new(),
             options: Options::new(),
+            registered_screens: Vec::new(),
+            screens: Vec::new(),
         }
+    }
+
+    /// Offer a screen entry (see [`ModRegistrar::screen_entry`]).
+    pub fn add_screen_entry(&mut self, entry: ScreenEntry) {
+        self.add_entry_from(None, entry);
+    }
+
+    pub(crate) fn add_entry_from(&mut self, package: Option<&'static str>, entry: ScreenEntry) {
+        self.registered_screens.push((package, entry));
+        self.rebuild_screens();
+        self.revise();
+    }
+
+    fn rebuild_screens(&mut self) {
+        self.screens.clear();
+        for (package, entry) in &self.registered_screens {
+            if !package.is_some_and(|pkg| self.suspended.iter().any(|id| id == pkg)) {
+                self.screens.push(*entry);
+            }
+        }
+        // Stable: equal orders keep registration order.
+        self.screens.sort_by_key(|e| e.order);
+    }
+
+    /// The screen entries of the active packages, by order.
+    pub fn screen_entries(&self) -> &[ScreenEntry] {
+        &self.screens
+    }
+
+    /// What a screen reads: the suspended packages, the screen entries and the visual mask.
+    pub fn screen_view(&self) -> (&[String], &[ScreenEntry], VisualMask) {
+        (&self.suspended, &self.screens, self.visuals)
+    }
+
+    /// What a screen reads beside the options it changes: the suspended packages, the screen
+    /// entries and the visual mask, borrowed alongside the options.
+    pub fn screen_parts(&mut self) -> (&[String], &[ScreenEntry], VisualMask, &mut Options) {
+        (&self.suspended, &self.screens, self.visuals, &mut self.options)
+    }
+
+    /// The first active mod's root screen, if any (see [`Mod::root_screen`]).
+    pub fn root_screen(&self, facts: &ScreenFacts) -> Option<Box<dyn Screen>> {
+        self.active_mods().find_map(|m| m.root_screen(facts))
+    }
+
+    /// The first active mod's pause screen, if any (see [`Mod::pause_screen`]).
+    pub fn pause_screen(&self, facts: &ScreenFacts) -> Option<Box<dyn Screen>> {
+        self.active_mods().find_map(|m| m.pause_screen(facts))
+    }
+
+    fn active_mods(&self) -> impl Iterator<Item = &dyn Mod> + '_ {
+        self.entries.iter().filter(|e| e.active).map(|e| &*e.module)
     }
 
     /// The options the packages declared.
@@ -603,11 +664,7 @@ impl Mods {
         }
     }
 
-    /// What a menu reads beside the options it changes: the suspended packages and the visual
-    /// mask, borrowed alongside the options.
-    pub fn menu_parts(&mut self) -> (&[String], VisualMask, &mut Options) {
-        (&self.suspended, self.visuals, &mut self.options)
-    }
+
 
     /// Install a mod directly (tests, the vanilla harness). Packages install through
     /// [`ModRegistrar::add`].
@@ -767,17 +824,6 @@ impl Mods {
         self.entries.iter_mut().filter(|e| e.active).any(|e| e.module.close_overlay())
     }
 
-    /// The first active mod's menu theme, if any.
-    pub fn menu_theme(&self) -> Option<&dyn MenuTheme> {
-        self.entries.iter().filter(|e| e.active).find_map(|e| e.module.menu_theme())
-    }
-
-    /// First active mod that returns a start screen wins. `None` means the
-    /// core fallback should be used.
-    pub fn start_screen(&self, facts: &StartFacts) -> Option<Box<dyn StartScreen>> {
-        self.entries.iter().filter(|e| e.active).find_map(|e| e.module.start_screen(facts))
-    }
-
     /// Number of installed mods.
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -877,6 +923,7 @@ impl Mods {
         for entry in &mut self.entries {
             entry.active = !entry.package.is_some_and(|pkg| self.suspended.iter().any(|id| id == pkg));
         }
+        self.rebuild_screens();
         self.active_changed();
     }
 

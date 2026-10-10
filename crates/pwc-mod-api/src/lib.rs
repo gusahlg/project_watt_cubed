@@ -126,8 +126,8 @@ pub mod audio {
 
 /// The game's subsystems, as far as mods may use them.
 pub use project_watt_cubed::{
-    block, derived, engine, gravity, input, material, math, menu, net, player, render_config, session, settings, sim,
-    inventory, sky, ui, world,
+    block, derived, engine, gravity, input, inventory, material, math, net, player, render_config, screen, session,
+    settings, sim, sky, ui, world,
 };
 
 /// The mod API version this crate provides (`pwc-api` requirements are checked against it).

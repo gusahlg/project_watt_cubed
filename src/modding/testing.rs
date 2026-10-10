@@ -6,7 +6,6 @@
 
 use super::{Action, Command, CommandContext, Mod, Mods};
 use crate::input::intent::Chord;
-use crate::menu::theme::{DefaultTheme, MenuTheme};
 use crate::render_config::VisualGroup;
 use crate::ui::{Line, Role};
 use crate::world::generation::WorldgenKind;
@@ -64,7 +63,6 @@ pub(crate) struct Stand {
     id: &'static str,
     name: &'static str,
     visual: Option<VisualGroup>,
-    theme: Option<DefaultTheme>,
     /// Persisted per-world state (echoed back verbatim), like a mod's own save line.
     state: Option<String>,
     persists: bool,
@@ -72,7 +70,7 @@ pub(crate) struct Stand {
 
 impl Stand {
     pub(crate) fn new(id: &'static str, name: &'static str) -> Self {
-        Self { id, name, visual: None, theme: None, state: None, persists: false }
+        Self { id, name, visual: None, state: None, persists: false }
     }
 }
 
@@ -85,9 +83,6 @@ impl Mod for Stand {
     }
     fn visual_group(&self) -> Option<VisualGroup> {
         self.visual
-    }
-    fn menu_theme(&self) -> Option<&dyn MenuTheme> {
-        self.theme.as_ref().map(|t| t as &dyn MenuTheme)
     }
     fn reset(&mut self) {
         if self.persists {
@@ -128,9 +123,6 @@ impl Mod for Worldgen {
 /// Stand-ins for the essentials, in the old built-in order, each under its package id.
 pub(crate) fn standard() -> Mods {
     let mut mods = Mods::empty();
-    let mut menus = Stand::new("menus", "Menus");
-    menus.theme = Some(DefaultTheme);
-    mods.install_from(Some("pwc.menus"), Box::new(menus));
     mods.install_from(Some("pwc.start-screen"), Box::new(Stand::new("start", "Start")));
     mods.install_from(Some("pwc.inventory"), Box::new(Stand::new("inventory", "Inventory")));
     let mut hotbar = Stand::new("hotbar", "Hotbar");

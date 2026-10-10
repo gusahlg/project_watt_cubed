@@ -33,7 +33,7 @@ pub(crate) mod interact;
 pub(crate) mod macros;
 pub mod math;
 pub mod mechanics;
-pub mod menu;
+pub mod screen;
 pub(crate) mod minimap;
 pub mod modding;
 pub mod net;
