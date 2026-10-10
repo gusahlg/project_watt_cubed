@@ -357,7 +357,8 @@ impl Stats {
         self.start_fallback += u.start_fallback as usize;
         // The radius is snapped to 16 blocks: the contract holds to half a snap.
         let contract = (start.density * start.radius as f64 - project_watt_cubed::world::terrain::emergent::RHO_R).abs() <= 8.0 * start.density;
-        let valid = start.traits.rank == Rank::Start && start.traits.form == Form::Round && contract;
+        let pull = (start.traits.gravity as f64 / project_watt_cubed::world::terrain::emergent::start_pull() - 1.0).abs() < 1e-3;
+        let valid = start.traits.rank == Rank::Start && start.traits.form == Form::Round && contract && pull;
         self.start_valid += valid as usize;
         self.resalts.push(u.resalts as f64);
         self.debris.push(u.debris);
@@ -421,7 +422,7 @@ impl Stats {
         );
         let _ = writeln!(
             s,
-            "GATE start world: valid (start rank, round, ρ·R pinned) in {valid:.1}% of seeds, {:.1}% through the `rock` fallback; need 100% -> {}",
+            "GATE start world: valid (start rank, round, ρ·R pinned, spawn pull within 0.1%) in {valid:.1}% of seeds, {:.1}% through the `rock` fallback; need 100% -> {}",
             pct(self.start_fallback, self.seeds),
             verdict(self.start_valid == self.seeds)
         );

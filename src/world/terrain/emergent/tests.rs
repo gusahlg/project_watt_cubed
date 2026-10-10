@@ -12,9 +12,9 @@ const SEEDS: [u64; 3] = [0xC0FFEE, 42, 1_791_184_794_939_118_871];
 
 /// `(nebula, catalog, suites, start globe at G=32)` per seed.
 const PINS: [[u64; 4]; 3] = [
-    [0xc9eb33927aa562fa, 0x06841ffe54f7bfae, 0xf02949df449ea31b, 0x78d5dea9c373a504],
-    [0x14276b40ffcd9ae0, 0x3e1f91ec5e582658, 0x8d1e4c780a06985c, 0xc0777c8deca31ed6],
-    [0xdcdcba074d536dbe, 0x7a4702cb079c0af8, 0x89ba8e8f7a7c92a0, 0xbd95e746bde93ca5],
+    [0xc9eb33927aa562fa, 0x6b1c643a854df8f1, 0x6935160005a0a303, 0xb35ca704b2e41828],
+    [0x14276b40ffcd9ae0, 0xdcd25efe3aa85d89, 0x5b4086c57a5864d2, 0xc0777c8deca31ed6],
+    [0xdcdcba074d536dbe, 0x8d4c630a32d91943, 0x570c969d06a6fc4e, 0xbd95e746bde93ca5],
 ];
 
 /// Calls whose results may differ between math libraries.
@@ -168,6 +168,7 @@ fn a_universe_is_the_same_twice_and_sane() {
         assert_eq!((start.traits.rank, start.traits.form), (Rank::Start, Form::Round));
         assert!(start.traits.air_top.is_some());
         assert!((start.density * start.radius as f64 - RHO_R).abs() <= 8.0 * start.density, "the spawn contract (to half a snap)");
+        assert!((start.traits.gravity as f64 / start_pull() - 1.0).abs() < 1e-3, "the spawn pull: {}", start.traits.gravity);
         assert!(u.bodies.len() > OTHERS_MIN || u.resalts == INTEREST_TRIES);
         for (i, a) in u.bodies.iter().enumerate() {
             for b in &u.bodies[i + 1..] {

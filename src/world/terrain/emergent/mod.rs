@@ -35,6 +35,12 @@ pub const M_HOME: f64 = 5.0 * 5.0e7 * 5.0e7 * 5.0e7;
 pub const RHO_R: f64 = 5.0 * HOME_RADIUS as f64;
 /// Cube half-size over datum radius of the start world (25e6 over 31,017,520).
 const HALF_PER_RADIUS: f64 = HOME_CUBE_HALF as f64 / HOME_RADIUS as f64;
+/// The start world's surface pull fixed by the spawn contract: `G·M/R²` with `M = ρ(2·half)³`,
+/// `half = HALF_PER_RADIUS·R` and `ρR = RHO_R`, whatever its density.
+pub fn start_pull() -> f64 {
+    G * 8.0 * HALF_PER_RADIUS * HALF_PER_RADIUS * HALF_PER_RADIUS * RHO_R
+}
+
 /// Face-centre pull of a uniform cube over `G·ρ·half`.
 pub const KAPPA_FACE: f64 = 5.193_793_156_516_389;
 const SQRT3: f64 = 1.732_050_807_568_877_2;
@@ -675,8 +681,9 @@ fn expand(ws: &mut Vec<Work>, suites: &mut Suites, law: &Law, p: &Params) {
             let side = (if k == 0 { -pair.masses[1] } else { pair.masses[0] }) / total;
             parts[k].b.pos[pair.axis] = com[pair.axis] + pair.sign * sep * side;
         }
+        // The heavier part keeps the index (a start world split from a pair is its heavier part).
         let j = ws.len();
-        let [a, mut b] = parts;
+        let [a, mut b] = if pair.masses[0] >= pair.masses[1] { parts } else { let [x, y] = parts; [y, x] };
         b.partner = Some(i);
         ws[i] = a;
         ws[i].partner = Some(j);
@@ -973,6 +980,16 @@ fn settle(
             ws[root].suite = k;
             ws[root].shape(&suites.list[k]);
         }
+    }
+    // The spawn contract holds the start world's mass: a last fall onto it rescales the universe.
+    if ws[start].b.mass != m_s {
+        let f = m_s / ws[start].b.mass;
+        calibration *= f;
+        for w in ws.iter_mut() {
+            w.b.mass *= f;
+        }
+        ws[start].b.mass = m_s;
+        assign(&mut ws, suites, law, p, start, s_suite, &grounds);
     }
     let traits = lite(&ws, start, r_s, suites, p);
     let settled_grounds = grounds_of(&ws, start, &traits);

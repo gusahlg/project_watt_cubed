@@ -16,6 +16,8 @@ pub const PROVISIONAL_DENSITY: f64 = 5.0;
 pub const IMPACTS: usize = 16;
 /// Bodies smaller than this half-size are debris (the largest rock class's radius).
 pub const DEBRIS_HALF: f64 = 3_000.0;
+/// Impactors lighter than this share of a binary's lighter part leave the binary standing.
+const PAIR_HIT: f64 = 0.125;
 /// Composition jitter of a parcel around its cell, per axis.
 const JITTER: f64 = 8.0;
 
@@ -131,8 +133,9 @@ pub fn keep_impacts(list: &mut Vec<Impact>) {
 }
 
 /// Fuse `from` into `into`: masses add, composition and heat are mass-weighted, the collision
-/// heats the result and is remembered as an impact in `into`'s frame. `into` keeps its place when
-/// `keep_place`, else the pair moves to its centre of mass.
+/// heats the result and is remembered as an impact in `into`'s frame; a binary hit by anything but a
+/// small impactor becomes one body. `into` keeps its place when `keep_place`, else the pair moves to
+/// its centre of mass.
 pub fn fuse(into: &mut Proto, from: &Proto, keep_place: bool) {
     let m = into.mass + from.mass;
     let r = half_of(into.mass, PROVISIONAL_DENSITY) + half_of(from.mass, PROVISIONAL_DENSITY);
@@ -146,12 +149,17 @@ pub fn fuse(into: &mut Proto, from: &Proto, keep_place: bool) {
     }
     into.comp = std::array::from_fn(|a| into.comp[a] + (from.comp[a] - into.comp[a]) * w);
     into.heat_in = into.heat_in + (from.heat_in - into.heat_in) * w + energy / m;
+    // A binary survives an impactor lighter than PAIR_HIT of its lighter part (on its heavier part);
+    // anything heavier fuses it into one body. A modelling choice.
     if let Some(pair) = &mut into.pair {
-        // A binary takes the hit on its heavier part.
         let k = if pair.masses[0] >= pair.masses[1] { 0 } else { 1 };
-        let wk = from.mass / (pair.masses[k] + from.mass);
-        pair.comps[k] = std::array::from_fn(|a| pair.comps[k][a] + (from.comp[a] - pair.comps[k][a]) * wk);
-        pair.masses[k] += from.mass;
+        if from.mass < PAIR_HIT * pair.masses[1 - k] && from.pair.is_none() {
+            let wk = from.mass / (pair.masses[k] + from.mass);
+            pair.comps[k] = std::array::from_fn(|a| pair.comps[k][a] + (from.comp[a] - pair.comps[k][a]) * wk);
+            pair.masses[k] += from.mass;
+        } else {
+            into.pair = None;
+        }
     }
     into.mass = m;
     into.impacts.push(Impact { dir, energy });
