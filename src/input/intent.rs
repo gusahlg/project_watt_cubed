@@ -267,27 +267,19 @@ impl GameplayState {
     ];
 }
 
-/// A gameplay edge event (bound to modifier-exact chords).
+/// A gameplay edge event (bound to modifier-exact chords). Chat, commands and flight are not
+/// here: the mods that offer them declare their own [`Action`](crate::modding::Action)s.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum GameplayEvent {
-    ToggleFly,
     Break,
     Place,
-    OpenConsole,
-    OpenChat,
     ToggleCapture,
 }
 
 impl GameplayEvent {
-    pub const COUNT: usize = 6;
-    pub const ALL: [GameplayEvent; Self::COUNT] = [
-        GameplayEvent::ToggleFly,
-        GameplayEvent::Break,
-        GameplayEvent::Place,
-        GameplayEvent::OpenConsole,
-        GameplayEvent::OpenChat,
-        GameplayEvent::ToggleCapture,
-    ];
+    pub const COUNT: usize = 3;
+    pub const ALL: [GameplayEvent; Self::COUNT] =
+        [GameplayEvent::Break, GameplayEvent::Place, GameplayEvent::ToggleCapture];
 
     /// Break and Place autofire; others don't.
     pub const fn repeat(self) -> Option<Repeat> {

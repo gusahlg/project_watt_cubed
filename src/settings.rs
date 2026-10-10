@@ -1,7 +1,8 @@
-//! Persistent graphics settings.
+//! Persistent graphics settings, and the options registry they share `settings.cfg` with.
 //!
 //! Stored as plain `key=value` lines in `settings.cfg` under the config root
-//! (std-only, no dependencies). The settings menu and the `/gfx` console command both edit
+//! (std-only, no dependencies): the core's keys, then each package option as
+//! `<package-id>.<key>=` ([`options`]). A settings screen and the `/gfx` console command both edit
 //! a [`Settings`] value; [`Settings::apply`] pushes it to the engine, which
 //! no-ops for values that didn't change.
 //!
@@ -20,6 +21,10 @@ use std::ops::RangeInclusive;
 use std::path::PathBuf;
 
 use voxel_engine::{Engine, GpuCaps, RenderFlags};
+
+pub mod options;
+
+pub use options::{Applies, OptionId, OptionInfo, OptionKind, OptionSpec, OptionValue, Options, OptionsRef, OptionsView};
 
 use crate::render_config::{
     DeviceCaps, RenderConfig, SessionGraphics, VRS_AUTO_MIN_PIXELS, VrsChoice,
@@ -194,12 +199,10 @@ settings_fields! {
     physics_hz: u32 = 0,
     sky_hz: u32 = 0,
     mod_hz: u32 = 0,
-    simulation: bool = true,
     mod_logic: bool = true,
     autosave: bool = true,
     hud_mode: HudMode = HudMode::Full,
     minimap: bool = true,
-    mod_hud: bool = true,
     player_models: bool = true,
     name_tags: bool = true,
 
@@ -228,7 +231,6 @@ settings_fields! {
     master_volume: u8 = 80,
     effects_volume: u8 = 100,
     voice_volume: u8 = 100,
-    voice_enabled: bool = true,
     voice_incoming: bool = true,
     /// Runtime-only `/mute` state; absent from [`SETTINGS`].
     muted: bool = false,
@@ -645,7 +647,7 @@ const PHYSICS_RATES: &[i32] = &[0, 30, 60, 120, 240, 500, 1000];
 
 /// Every setting, in menu/persistence order. The single source of the field set;
 /// persistence, `/gfx`, the menu, and [`Settings::clamp`] all fold over it.
-pub const SETTINGS: [Setting; 49] = [
+pub const SETTINGS: [Setting; 46] = [
     enum_setting!(
         apply, Profile::Personal, Category::Performance, preset, Preset, "Performance Preset",
         "preset custom|minimum|fast|default", &["profile"], "performance preset",
@@ -706,14 +708,6 @@ pub const SETTINGS: [Setting; 49] = [
     toggle_setting!(
         Profile::Owned,
         Category::Performance,
-        simulation,
-        "simulation",
-        "Simulation",
-        &["sim"]
-    ),
-    toggle_setting!(
-        Profile::Owned,
-        Category::Performance,
         mod_logic,
         "mod_logic",
         "Mod Updates",
@@ -727,14 +721,6 @@ pub const SETTINGS: [Setting; 49] = [
         "minimap",
         "Minimap",
         &["map"]
-    ),
-    toggle_setting!(
-        Profile::Owned,
-        Category::Performance,
-        mod_hud,
-        "mod_hud",
-        "Mod HUD",
-        &["modhud"]
     ),
     toggle_setting!(
         Profile::Owned,
@@ -943,14 +929,6 @@ pub const SETTINGS: [Setting; 49] = [
     toggle_setting!(
         Profile::Personal,
         Category::Audio,
-        voice_enabled,
-        "voice_enabled",
-        "Voice Chat",
-        &["voice", "mic"]
-    ),
-    toggle_setting!(
-        Profile::Personal,
-        Category::Audio,
         voice_incoming,
         "voice_incoming",
         "Hear Voice",
@@ -1007,12 +985,10 @@ impl Settings {
                 physics_hz: 30,
                 sky_hz: 15,
                 mod_hz: 15,
-                simulation: false,
                 mod_logic: false,
                 autosave: false,
                 hud_mode: HudMode::Off,
                 minimap: false,
-                mod_hud: false,
                 player_models: false,
                 name_tags: false,
                 lod2: false,
@@ -1029,11 +1005,9 @@ impl Settings {
                 physics_hz: 60,
                 sky_hz: 60,
                 mod_hz: 60,
-                simulation: true,
                 autosave: true,
                 hud_mode: HudMode::Minimal,
                 minimap: false,
-                mod_hud: false,
                 player_models: true,
                 name_tags: false,
                 lod2: true,
@@ -1058,12 +1032,14 @@ impl Settings {
         s
     }
 
-    /// Load from disk, falling back to defaults for missing/invalid entries.
-    pub fn load() -> Self {
-        let mut settings = Self::default();
-        if let Ok(text) = fs::read_to_string(settings_path()) {
-            settings.parse_from(&text);
-        }
+    /// Load from disk, falling back to defaults for missing/invalid entries. The packages'
+    /// option lines in the same file go to `options` (declare the options first). Until
+    /// `settings.cfg` records the options format, an old `mods.cfg` is read once for the knob
+    /// values packages name as legacy keys; the file itself is left alone.
+    pub fn load(options: &mut Options) -> Self {
+        let text = fs::read_to_string(settings_path()).ok();
+        let legacy_mods_cfg = || fs::read_to_string(crate::paths::Paths::get().legacy_mods_file()).ok();
+        let mut settings = Self::from_text(text.as_deref(), legacy_mods_cfg, options);
         // The engine picks the six-way cull itself; `WATT_CULL=0|1` forces it (env-only, not in the
         // persisted table). Read after the file parse so it can't be overwritten.
         settings.cull_faces = match std::env::var("WATT_CULL").as_deref() {
@@ -1075,6 +1051,19 @@ impl Settings {
         settings
     }
 
+    /// The settings and options in a `settings.cfg` text (`None`: no file). `mods_cfg` is asked
+    /// for an old `mods.cfg` only when the text does not record the options format yet.
+    fn from_text(text: Option<&str>, mods_cfg: impl FnOnce() -> Option<String>, options: &mut Options) -> Self {
+        let mut settings = Self::default();
+        let text = text.unwrap_or("");
+        settings.parse_from(text);
+        let mut migrated = false;
+        each_kv_line(text, |key, _| migrated |= key == options::FORMAT_KEY);
+        let legacy = if migrated { String::new() } else { mods_cfg().map(|t| options::flatten_mods_cfg(&t)).unwrap_or_default() };
+        options.read_text(text, &legacy, |key| SETTINGS.iter().any(|f| f.matches(key)));
+        settings
+    }
+
     fn parse_from(&mut self, text: &str) {
         each_kv_line(text, |key, value| {
             if let Some(field) = SETTINGS.iter().find(|f| f.matches(key)) {
@@ -1083,10 +1072,11 @@ impl Settings {
         });
     }
 
-    /// Serialize every field to `key=value` lines — the exact text [`save`] writes.
+    /// Serialize every field to `key=value` lines, then the options' lines — the exact text
+    /// [`save`] writes.
     ///
     /// [`save`]: Settings::save
-    fn to_text(&self) -> String {
+    fn to_text(&self, options: &Options) -> String {
         let mut text = String::new();
         for field in &SETTINGS {
             text.push_str(field.key);
@@ -1094,13 +1084,17 @@ impl Settings {
             (field.write)(self, &mut text);
             text.push('\n');
         }
+        text.push_str(options::FORMAT_KEY);
+        text.push_str("=1\n");
+        options.write_text(&mut text);
         text
     }
 
-    /// Best-effort save (a failed write shouldn't crash the game).
-    pub fn save(&self) {
+    /// Best-effort save of the settings and the packages' options (a failed write shouldn't
+    /// crash the game).
+    pub fn save(&self, options: &Options) {
         let path = settings_path();
-        if let Err(e) = crate::save::write_atomic_file(&path, self.to_text().as_bytes()) {
+        if let Err(e) = crate::save::write_atomic_file(&path, self.to_text(options).as_bytes()) {
             crate::save::log_fs_err("write", &path, &e);
         }
     }
@@ -1412,6 +1406,14 @@ impl Settings {
 
 // Shared value helpers — the single definition each surface reuses.
 
+/// Whether the material law's reaction scheduler runs in single player: always, unless the
+/// process starts with `WATT_SIMULATION=0` (a bench and dev override). The law is environment,
+/// not a player preference, so there is no setting for it.
+pub fn simulation_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !matches!(std::env::var("WATT_SIMULATION").as_deref(), Ok("0" | "off" | "false")))
+}
+
 /// Default Auto scale for a window pixel count. One comparison so the menu,
 /// session apply, and tests cannot disagree.
 pub fn auto_render_scale(window_w: u32, window_h: u32) -> f32 {
@@ -1474,7 +1476,7 @@ fn vertical_distance_clamp(s: &mut Settings) {
 }
 
 /// Walk `key=value` lines, skipping malformed ones. Shared by settings.cfg,
-/// session.cfg, and mods.cfg.
+/// session.cfg and the options' lines.
 pub(crate) fn each_kv_line(text: &str, mut visit: impl FnMut(&str, &str)) {
     for line in text.lines() {
         let Some((key, value)) = line.split_once('=') else {
@@ -1643,11 +1645,56 @@ mod tests {
         };
         // Same table-driven serialization as `save`, so this can't drift from
         // what `parse_from` reads.
-        let text = s.to_text();
+        let text = s.to_text(&Options::new());
         let mut loaded = Settings::default();
         loaded.parse_from(&text);
         loaded.clamp();
         assert_eq!(loaded, s);
+    }
+
+    /// The knob values an old game kept in `mods.cfg` reach the package options that name them,
+    /// once: a `settings.cfg` written since records the format, and `mods.cfg` is not read again.
+    #[test]
+    fn old_knob_values_migrate_from_mods_cfg_once() {
+        fn options() -> (Options, [OptionId; 3]) {
+            let mut o = Options::new();
+            let relief = o.declare(
+                "pwc.infinite-diffusion",
+                OptionSpec::percent("relief", "Relief", Category::World, (25, 200, 25), 100).legacy_key("diffusion.state.relief"),
+            );
+            let detail = o.declare(
+                "pwc.neural-textures",
+                OptionSpec::float("detail", "Detail", Category::Video, (0.1, 2.0, 0.1), 1.0).legacy_key("neural_textures.state.detail"),
+            );
+            let style = o.declare(
+                "pwc.material-names",
+                OptionSpec::choice("style", "Style", Category::Interface, &["Mineral", "Arcane"], 0).legacy_key("material_names.state.style"),
+            );
+            (o, [relief, detail, style])
+        }
+        let mods_cfg = "version=2\ndiffusion=on\ndiffusion.state=relief=150,caves=75\nneural_textures.state=detail=1.3,contrast=0.5\nmaterial_names.state=style=arcane\n";
+        let (mut o, [relief, detail, style]) = options();
+        let settings = Settings::from_text(Some("fov=100\n"), || Some(mods_cfg.to_string()), &mut o);
+        assert_eq!(settings.fov, 100.0);
+        assert_eq!((o.int(relief), o.float(detail), o.choice(style)), (150, 1.3, 1), "the old knobs carry over");
+        let written = settings.to_text(&o);
+        assert!(written.contains("options_format=1\n") && written.contains("pwc.infinite-diffusion.relief=150\n"), "{written}");
+
+        // From now on the file is not read: a later change in it is ignored.
+        let (mut again, [relief, ..]) = options();
+        let asked = std::cell::Cell::new(false);
+        Settings::from_text(Some(&written), || { asked.set(true); Some("diffusion.state=relief=25\n".to_string()) }, &mut again);
+        assert!(!asked.get(), "mods.cfg is not read once settings.cfg records the format");
+        assert_eq!(again.int(relief), 150);
+
+        // An option's own line wins over the old file, and no files mean defaults.
+        let (mut own, [relief, ..]) = options();
+        Settings::from_text(Some("pwc.infinite-diffusion.relief=50\n"), || Some(mods_cfg.to_string()), &mut own);
+        assert_eq!(own.int(relief), 50);
+        let (mut none, [relief, detail, style]) = options();
+        Settings::from_text(None, || None, &mut none);
+        assert_eq!((none.int(relief), none.float(detail), none.choice(style)), (100, 1.0, 0));
+        assert_eq!(options::flatten_mods_cfg("a.state=x=1, y = 2\nb=on\njunk\n"), "a.state.x=1\na.state.y=2\n");
     }
 
     #[test]
@@ -1656,10 +1703,18 @@ mod tests {
         assert!(path.starts_with(&crate::paths::Paths::get().config));
         assert_ne!(path, PathBuf::from("saves/settings.cfg"));
         let s = Settings { fov: 110.0, ..Default::default() };
-        s.save();
+        let mut options = Options::new();
+        let relief = options.declare("test.worldgen", OptionSpec::percent("relief", "Relief", Category::World, (25, 300, 25), 100));
+        options.set(relief, OptionValue::Int(150));
+        s.save(&options);
         assert!(path.exists());
-        let loaded = Settings::load();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\nfov=110\n") && text.ends_with("options_format=1\ntest.worldgen.relief=150\n"), "{text}");
+        let mut fresh = Options::new();
+        let relief = fresh.declare("test.worldgen", OptionSpec::percent("relief", "Relief", Category::World, (25, 300, 25), 100));
+        let loaded = Settings::load(&mut fresh);
         assert_eq!(loaded.fov, 110.0);
+        assert_eq!(fresh.int(relief), 150, "a package option shares the file");
         let _ = fs::remove_file(path);
     }
 
@@ -1831,7 +1886,7 @@ mod tests {
         }
         // The composed roundtrip lands the exact struct.
         let mut back = Settings::default();
-        back.parse_from(&samples.to_text());
+        back.parse_from(&samples.to_text(&Options::new()));
         back.clamp();
         assert_eq!(back, samples);
     }
@@ -1844,12 +1899,11 @@ mod tests {
             master_volume: 45,
             effects_volume: 0,
             voice_volume: 75,
-            voice_enabled: false,
             voice_incoming: false,
             ..Settings::default()
         };
         let mut back = Settings::default();
-        back.parse_from(&s.to_text());
+        back.parse_from(&s.to_text(&Options::new()));
         back.clamp();
         assert_eq!(back, s);
 
@@ -1912,8 +1966,8 @@ mod tests {
             (15, 30, 15, 15)
         );
         assert_eq!(s.hud_mode, HudMode::Off);
-        assert!(!s.simulation && !s.mod_logic && !s.autosave);
-        assert!(!s.minimap && !s.mod_hud && !s.player_models && !s.name_tags);
+        assert!(!s.mod_logic && !s.autosave);
+        assert!(!s.minimap && !s.player_models && !s.name_tags);
         assert!(!s.lighting && !s.occlusion && !s.ao);
         assert_eq!(s.vrs, VrsChoice::Off);
         assert!(!s.sky && !s.bloom && !s.clouds);
@@ -1935,8 +1989,8 @@ mod tests {
             (60, 60, 60, 60)
         );
         assert_eq!(s.hud_mode, HudMode::Minimal);
-        assert!(s.simulation && s.mod_logic && s.autosave && s.player_models);
-        assert!(!s.minimap && !s.mod_hud && !s.name_tags);
+        assert!(s.mod_logic && s.autosave && s.player_models);
+        assert!(!s.minimap && !s.name_tags);
         assert_eq!(s.vrs, VrsChoice::Off);
 
         assert!(preset.parse_human(&mut s, "default"));
@@ -2018,7 +2072,7 @@ mod tests {
             (8, 2),
             "stored ladder keys do not override the render distance"
         );
-        let text = loaded.to_text();
+        let text = loaded.to_text(&Options::new());
         assert!(text.lines().any(|line| line == "render_distance=16"));
         assert!(text.lines().any(|line| line == "lod2=true"));
         assert!(text.lines().all(|line| {
@@ -2133,12 +2187,12 @@ mod tests {
         loaded.parse_from("vrs=auto\n");
         assert_eq!(loaded.vrs, VrsChoice::Auto);
         assert!(
-            loaded.to_text().lines().any(|line| line == "vrs=auto"),
+            loaded.to_text(&Options::new()).lines().any(|line| line == "vrs=auto"),
             "new files persist the word form"
         );
 
         let mut round = Settings::default();
-        round.parse_from(&loaded.to_text());
+        round.parse_from(&loaded.to_text(&Options::new()));
         assert_eq!(round.vrs, VrsChoice::Auto);
     }
 

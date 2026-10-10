@@ -147,7 +147,7 @@ fn write_synced(path: &Path, bytes: &[u8]) -> io::Result<()> {
     f.sync_all()
 }
 
-/// [`write_rotating`] without a backup. Settings, session, and mods.cfg persist through this.
+/// [`write_rotating`] without a backup. Settings and session persist through this.
 pub fn write_atomic_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
     write_rotating(path, bytes, false)
 }

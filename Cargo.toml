@@ -28,7 +28,7 @@ required-features = ["dev-tools"]
 [dependencies]
 # Our own Vulkan renderer (ash + winit under the hood). It re-exports the math
 # types (glam Vec2/Vec3) and Color the game uses
-voxel_engine = { version = "0.2.8", path = "../voxel-engine" }
+voxel_engine = { version = "0.2.10", path = "../voxel-engine" }
 material = { version = "0.1.0", path = "crates/material" }
 field = { version = "0.1.0", path = "crates/field", optional = true }
 

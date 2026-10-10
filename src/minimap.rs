@@ -388,6 +388,11 @@ impl Minimap {
         i32::from(self.cfg.screen_px) + self.cfg.margin.0
     }
 
+    /// Height of the top-right corner the map takes, its margin included.
+    pub fn reserved_height(&self) -> i32 {
+        i32::from(self.cfg.screen_px) + self.cfg.margin.1
+    }
+
     pub fn draw(&self, f: &mut Frame, screen: (i32, i32), sample: MapSample) {
         let player_col = sample.col;
         let half = self.cfg.screen_px as f32 / 2.0;

@@ -1,8 +1,7 @@
-//! app.rs owns the top-level state machine: the start menu, an in-world
-//! [`Game`], the mod menu, the host/join forms, and the graphics settings
-//! screen. It routes each engine frame to the active screen, creates and
-//! loads worlds (off the render thread, in `entry`), and autosaves when
-//! leaving one.
+//! app.rs owns the top-level state machine: the screens out of a world (hosted for the menu mods,
+//! see [`crate::screen`]), connecting to a server, building or loading a world, and the
+//! [`Game`] in it with its pause screen. It routes each engine frame to the active state,
+//! creates and loads worlds (off the render thread, in `entry`), and autosaves when leaving one.
 //!
 //! The window itself belongs to the engine: [`App::run`] hands a per-frame
 //! closure to [`voxel_engine::run`], which is the moral equivalent of the old
@@ -19,17 +18,17 @@ use voxel_engine::{Color, DVec3, Engine};
 use crate::audio::{AudioService, AudioView, CueSymbols, GameEvent, ModLink, PeerAudio, SoundConfig, SoundSystem};
 use crate::benchmark::Benchmark;
 use crate::game::{Game, Signal};
+use crate::input::intent::MenuEvent;
 use crate::input::router::{Context, Router, View};
-use crate::menu::menus::{ModsMenu, SettingsHub};
-use crate::menu::start::{StartFacts, StartRoot, VERSION};
-use crate::menu::theme::{DefaultTheme, MenuTheme};
-use crate::menu::{AppEffect, Ctx, Framed, MenuStack, ModRow};
-use crate::modding::{ActionSet, ChoicesFlush, Debounce, GameBuild, ModDescriptor, Mods, VisualMask};
-use crate::ui::{self, Anchor};
+use crate::modding::{ActionSet, BuildInfo, Debounce, GameBuild, Mods, VisualMask};
 use crate::player::Player;
 use crate::save::{self, Autosaver, SaveMeta, Slot, SlotId, Tick};
+use crate::screen::{
+    AppRequest, MenuInput, Phase, ScreenContext, ScreenFacts, ScreenStack, StackEvent, UiElement, VERSION,
+};
 use crate::session::Session;
-use crate::settings::{GfxEngine, Settings};
+use crate::settings::{GfxEngine, Options, Settings};
+use crate::world::generation::WorldgenKind;
 use crate::world::terrain::TerrainCfg;
 use crate::world::World;
 use connect::ConnectJob;
@@ -38,7 +37,7 @@ use host::Host;
 
 const STARTING_WINDOW_WIDTH: u32 = 1280;
 const STARTING_WINDOW_HEIGHT: u32 = 720;
-/// Background for every non-world screen.
+/// Background for every non-world screen (and the whole frame of a build with no screens).
 const MENU_CLEAR: Color = Color::new(18, 20, 28, 255);
 /// Menu frame cap. The engine sleeps until the deadline (`WaitUntil`), so
 /// 120 Hz is ~8 ms worst-case input-to-photon; a busy-wait cap would want 240.
@@ -57,14 +56,63 @@ fn pacing(in_world: bool, bench: bool, settings: &Settings) -> (bool, u32) {
 }
 
 enum Screen {
-    Menus(MenuStack),
+    /// Out of a world: the root screen stack (if a mod gives one), maybe over a world being built.
+    Menus,
     /// DNS, handshake, and Welcome, off the render thread.
     Connecting(ConnectJob),
     Playing(Box<Game>),
 }
 
+/// What Esc in a world does once text capture and every overlay declined it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EscapeAction {
+    /// Open the pause screen a mod gave.
+    Pause,
+    /// Save and return to the root screen.
+    Leave,
+    /// Save and quit: there is no screen to return to.
+    Quit,
+}
+
+/// Set by SIGTERM or SIGINT: the next frame saves and quits, as the window's close button does.
+static QUIT_SIGNAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// SIGTERM (a logout, `kill`) and SIGINT (Ctrl+C in a terminal) save and quit at the next frame
+/// instead of killing the game with its settings and world unsaved. A second signal exits at once,
+/// so a game that stopped running frames can still be stopped.
+fn install_quit_signals() {
+    extern "C" fn on_signal(_: libc::c_int) {
+        if QUIT_SIGNAL.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            // Async-signal-safe: a second request leaves without unwinding.
+            unsafe { libc::_exit(130) };
+        }
+    }
+    let handler = on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
+    // SAFETY: the handler only touches an atomic and calls `_exit`, both async-signal-safe.
+    unsafe {
+        libc::signal(libc::SIGTERM, handler);
+        libc::signal(libc::SIGINT, handler);
+    }
+}
+
+/// Esc's meaning in a world: the pause screen if a mod gives one, else leave to the root screen,
+/// else quit.
+fn escape_action(pause_screen: bool, root_screen: bool) -> EscapeAction {
+    match (pause_screen, root_screen) {
+        (true, _) => EscapeAction::Pause,
+        (false, true) => EscapeAction::Leave,
+        (false, false) => EscapeAction::Quit,
+    }
+}
+
+/// The world a build with no root screen enters: the most recently played save it can read, or
+/// a new one. `saves` is most recent first, as `save::list` gives it.
+fn default_entry(saves: &[Slot]) -> Option<&SlotId> {
+    saves.iter().find(|slot| slot.meta.is_ok()).map(|slot| &slot.id)
+}
+
 /// The whole program: the installed mods (persist across worlds), the graphics
-/// settings, and either the menu stack or the current world.
+/// settings, the screens and the current world.
 pub struct App {
     /// Available save slots, refreshed on menu return.
     saves: Vec<Slot>,
@@ -73,11 +121,28 @@ pub struct App {
     active: Option<ActiveSlot>,
     /// Shared router for menus and in-game input.
     router: Router,
-    /// Installed mods and their on/off state; shared with the game while playing.
+    /// Installed mods and what the core suspended; shared with the game while playing.
     mods: Mods,
-    /// Packages compiled into this executable. `Hello` reports the enabled ones.
-    packages: Vec<ModDescriptor>,
+    /// Packages compiled into this executable, of every kind. `Hello` reports the unsuspended mods.
+    build: BuildInfo,
     screen: Screen,
+    /// The screens out of a world: the root screen a mod gave, and what it opened. `None` in a
+    /// world, and always in a build without a root screen.
+    menus: Option<ScreenStack>,
+    /// The pause screen and what it opened, while it is up in a world.
+    pause: Option<ScreenStack>,
+    /// False when no mod gives a root screen: the app enters a world itself and quits on leaving.
+    has_root: bool,
+    /// A build without a root screen enters its world on the first frame.
+    enter_pending: bool,
+    /// Set when the app should save and quit at the end of this frame.
+    quit: bool,
+    /// The pause screen closed this frame: the game gets input back after this frame's update.
+    resuming: bool,
+    /// This frame's menu input, refilled in place.
+    menu_input: MenuInput,
+    /// This frame's screen picture, cleared in place.
+    ui: Vec<UiElement>,
     /// A world building off the render thread. The menu under it stays as it was; Esc drops it.
     loading: Option<Loading>,
     /// Said in the next world (or on the menu, if it fails or is cancelled): the host stopped for it.
@@ -87,6 +152,8 @@ pub struct App {
     host: Host,
     /// Graphics settings, persisted as `settings.cfg` under the config root.
     settings: Settings,
+    /// The packages' options, persisted after the settings in the same file.
+    options: Options,
     /// Last-used connection details, persisted as `session.cfg` under the config root.
     session: Session,
     /// Self-describing benchmark mode (`WATT_BENCH=<seconds>`).
@@ -99,15 +166,14 @@ pub struct App {
     audio: AudioService,
     /// Last stall-detector log, so a hung frame names itself once per window.
     last_stall_log: Option<Instant>,
-    /// Debounces `mods.cfg` writes (held Left/Right would otherwise rewrite ~22×/s).
-    choices_flush: ChoicesFlush,
     /// Settings changes (menu steps, the HUD hotkey, the console) wait here and save once they
     /// go quiet, or on leaving a world and on quit.
     settings_flush: Debounce,
     clock: Instant,
-    /// True while the Mods screen is on the menu stack.
-    mods_open: bool,
-    mods_save_error: Option<String>,
+    /// `WATT_BENCH_WORLDGEN`: the generator new worlds use, whatever the mods say.
+    worldgen_pin: Option<WorldgenKind>,
+    /// The options revision the mods last heard about ([`Mod::on_options`](crate::modding::Mod::on_options)).
+    options_seen: u64,
     /// Last graphics stamp pushed to the engine; `apply` runs only on change.
     gfx_applied: Option<GfxKey>,
 }
@@ -176,6 +242,49 @@ fn settings_write_due(flush: &mut Debounce, changed: bool, now_ms: u64) -> bool 
     flush.poll(now_ms)
 }
 
+/// The confirm-or-navigate click a menu frame makes, if any. Confirm wins when both landed.
+fn menu_click(input: &MenuInput) -> Option<GameEvent> {
+    if input.event(MenuEvent::Confirm) || input.event(MenuEvent::Toggle) {
+        Some(GameEvent::UiConfirm)
+    } else if input.event(MenuEvent::Up) || input.event(MenuEvent::Down) || input.event(MenuEvent::NextTab) {
+        Some(GameEvent::UiNavigate)
+    } else {
+        None
+    }
+}
+
+/// The facts a screen sees and the context it changes tunables through, borrowed from the app's
+/// fields one by one so the stacks (other fields) can run against it.
+struct ScreenParts<'a> {
+    saves: &'a [Slot],
+    session: &'a Session,
+    build: &'a BuildInfo,
+    hosting: bool,
+    mods: &'a Mods,
+    settings: &'a mut Settings,
+    options: &'a mut Options,
+}
+
+impl<'a> ScreenParts<'a> {
+    fn ctx(self, phase: Phase, in_world: bool, notice: Option<&'a str>) -> ScreenContext<'a> {
+        let (suspended, entries, visuals) = self.mods.screen_view();
+        let facts = ScreenFacts {
+            saves: self.saves,
+            session: self.session,
+            version: VERSION,
+            hosting: self.hosting,
+            notice,
+            phase,
+            in_world,
+            build: self.build,
+            suspended,
+            entries,
+            visuals,
+        };
+        ScreenContext::new(facts, self.settings, self.options)
+    }
+}
+
 /// The save slot behind the open singleplayer world: identity, header
 /// metadata carried across writes, accumulated playtime, and the autosaver.
 struct ActiveSlot {
@@ -204,19 +313,31 @@ impl App {
     pub fn new(build: &GameBuild) -> Self {
         crate::paths::Paths::init(None);
         match build.environment() {
-            Some(env) => eprintln!("PWC: {} mod packages, environment {env}", build.packages().len()),
-            None if build.packages().is_empty() => eprintln!("PWC: vanilla build (no mod packages)"),
-            None => eprintln!("PWC: {} mod packages", build.packages().len()),
+            Some(env) => eprintln!("PWC: {} packages, environment {env}", build.packages().len()),
+            None if build.packages().is_empty() => eprintln!("PWC: vanilla build (no packages)"),
+            None => eprintln!("PWC: {} packages", build.packages().len()),
         }
         // While the menu is up, so the first world's frame does not pay for it.
         crate::world::terrain::prewarm();
-        let packages = build.packages().to_vec();
-        let mut mods = Mods::from_build(build);
-        mods.load_choices();
+        let mut options = Options::new();
+        let mut mods = Mods::from_build(build, &mut options);
         let pins = Benchmark::mod_pins_from_env();
-        mods.apply_bench_env(pins.worldgen_diffusion, pins.visuals_core);
+        let mut pinned = pins.suspend;
+        if pins.visuals_core == Some(true) {
+            for id in mods.visual_packages() {
+                if !pinned.contains(&id) {
+                    pinned.push(id);
+                }
+            }
+        }
+        if !pinned.is_empty() {
+            eprintln!("PWC: suspended for this run: {}", pinned.join(", "));
+            mods.pin_suspended(&pinned);
+        }
         let saves = save::list();
-        let mut settings = Settings::load();
+        let mut settings = Settings::load(&mut options);
+        mods.options_changed(&options);
+        let options_seen = options.revision();
         let (caps, display) = crate::benchmark::graphics_caps();
         settings.set_device_caps(caps, display);
         let session = Session::load();
@@ -245,53 +366,76 @@ impl App {
         let (mut sound, cues) = SoundSystem::with_graceful_degradation(SoundConfig::default());
         sound.set_mix(settings.mix_change());
         let audio = AudioService::new();
-        let screen = Screen::Menus(Self::start_stack(&mods, &saves, &session, None, false));
-        Self {
+        let mut app = Self {
             saves,
             active: None,
             router: Router::new(),
             mods,
-            packages,
-            screen,
+            build: build.info().clone(),
+            screen: Screen::Menus,
+            menus: None,
+            pause: None,
+            has_root: false,
+            enter_pending: false,
+            quit: false,
+            resuming: false,
+            menu_input: MenuInput::new(),
+            ui: Vec::new(),
             loading: None,
             entry_notice: None,
             host: Host::default(),
             settings,
+            options,
             session,
             bench,
             sound,
             cues,
             audio,
             last_stall_log: None,
-            choices_flush: ChoicesFlush::new(),
             settings_flush: Debounce::new(),
             clock: Instant::now(),
-            mods_open: false,
-            mods_save_error: None,
+            worldgen_pin: pins.worldgen,
+            options_seen,
             gfx_applied: None,
+        };
+        app.menus = app.root_stack(None);
+        app.has_root = app.menus.is_some();
+        if !app.has_root {
+            eprintln!("PWC: no root screen in this build; entering a world (Esc saves and quits)");
+            app.enter_pending = app.bench.is_none();
         }
+        app
     }
 
     fn now_ms(&self) -> u64 {
         self.clock.elapsed().as_millis() as u64
     }
 
-    fn persist_mod_choices(&mut self) {
-        match self.mods.save_choices() {
-            Ok(()) => self.mods_save_error = None,
-            Err(e) => self.mods_save_error = Some(e.to_string()),
-        }
-    }
-
-    fn flush_mod_choices_if_dirty(&mut self) {
-        if self.choices_flush.take() {
-            self.persist_mod_choices();
+    /// Tell the mods once the options moved since they last heard.
+    fn tell_options(&mut self) {
+        let revision = self.options.revision();
+        if revision != self.options_seen {
+            self.options_seen = revision;
+            self.mods.options_changed(&self.options);
         }
     }
 
     fn flush_settings_if_dirty(&mut self) {
         if self.settings_flush.take() && self.bench.is_none() {
-            self.settings.save();
+            self.settings.save(&self.options);
+        }
+    }
+
+    /// The parts of the app a screen context borrows.
+    fn screen_parts(&mut self) -> ScreenParts<'_> {
+        ScreenParts {
+            saves: &self.saves,
+            session: &self.session,
+            build: &self.build,
+            hosting: self.host.running(),
+            mods: &self.mods,
+            settings: &mut self.settings,
+            options: &mut self.options,
         }
     }
 
@@ -325,19 +469,24 @@ impl App {
             // Engine-side render lanes from the effective (mod-masked) config.
             flags: app.mods.effective_render(&app.settings).engine_flags(),
         };
+        install_quit_signals();
         voxel_engine::run(config, move |eng| app.frame(eng));
+    }
+
+    /// Save everything that waits on quitting.
+    fn save_on_quit(&mut self) {
+        if self.bench.is_none() {
+            self.settings.save(&self.options);
+        }
+        self.flush_save();
     }
 
     /// One engine frame: update and draw the active screen.
     fn frame(&mut self, eng: &mut Engine) -> bool {
-        // OS close button: save and go. Settings save too — the player may be
+        // OS close button (or SIGTERM/SIGINT): save and go. Settings save too — the player may be
         // mid-edit on the Settings screen.
-        if eng.should_close() {
-            if self.bench.is_none() {
-                self.settings.save();
-            }
-            self.flush_mod_choices_if_dirty();
-            self.flush_save();
+        if eng.should_close() || QUIT_SIGNAL.load(std::sync::atomic::Ordering::Relaxed) {
+            self.save_on_quit();
             return false;
         }
 
@@ -351,34 +500,25 @@ impl App {
             return false;
         }
 
+        if std::mem::take(&mut self.enter_pending) {
+            self.enter_default(eng);
+        }
+
         let t_update = watch.then(Instant::now);
-        let quit = match self.screen {
-            Screen::Menus(_) if self.loading.is_some() => {
-                self.update_loading(eng);
-                false
-            }
-            Screen::Menus(_) => self.update_menus(eng),
-            Screen::Connecting(_) => {
-                self.update_connecting(eng);
-                false
-            }
-            Screen::Playing(_) => {
-                self.update_playing(eng);
-                false
-            }
-        };
+        match self.screen {
+            Screen::Menus if self.loading.is_some() => self.update_loading(eng),
+            Screen::Menus => self.update_menus(eng),
+            Screen::Connecting(_) => self.update_connecting(eng),
+            Screen::Playing(_) => self.update_playing(eng),
+        }
         let update_dt = t_update.map(|t| t.elapsed()).unwrap_or_default();
-        if quit {
-            if self.bench.is_none() {
-                self.settings.save();
-            }
-            self.flush_mod_choices_if_dirty();
-            self.flush_save();
+        if self.quit {
+            self.save_on_quit();
             self.note_frame_stall(t0, update_dt);
             return false;
         }
-        // VRAM guard + live settings, then the game's half of a console change, which reads
-        // the render extent the push noted.
+        // VRAM guard + live settings, then the game's half of a console or pause-screen change,
+        // which reads the render extent the push noted.
         self.push_gfx(eng);
         if let Screen::Playing(game) = &mut self.screen
             && game.take_settings_changed()
@@ -427,8 +567,8 @@ impl App {
                 eprintln!("{head}\n  {}\n  {}", game.world().entry_debug(), game.phase_debug());
                 return;
             }
-            Screen::Menus(_) if self.loading.is_some() => "loading",
-            Screen::Menus(_) => "menus",
+            Screen::Menus if self.loading.is_some() => "loading",
+            Screen::Menus => "menus",
             Screen::Connecting(_) => "connecting",
         };
         eprintln!("{head} ({screen})");
@@ -438,77 +578,62 @@ impl App {
         push_gfx(eng, &mut self.settings, self.mods.visual_mask(), &mut self.gfx_applied);
     }
 
-    /// Update the menu stack and apply settings live each frame.
-    fn update_menus(&mut self, eng: &mut Engine) -> bool {
+    /// Refill this frame's menu input from the router (in the menu context).
+    fn read_menu_input(&mut self, eng: &Engine) {
         let dt = eng.frame_time();
         self.router.set_context(Context::Menu);
-        let intents = match self.router.frame(eng, dt).view() {
-            View::Menu(m) => crate::menu::gather(&m),
-            _ => Vec::new(),
-        };
-        // One click: confirm wins when both a confirm and a navigation landed together.
-        let click = if intents.iter().any(|intent| matches!(intent, crate::menu::Intent::Confirm)) {
-            Some(GameEvent::UiConfirm)
-        } else if intents.iter().any(|intent| matches!(intent, crate::menu::Intent::Nav(_))) {
-            Some(GameEvent::UiNavigate)
-        } else {
-            None
-        };
-        self.fan_audio(dt, false, click);
-        // A per-frame snapshot so a menu never holds a live `&Mods`.
-        let mods = ModRow::snapshot(&self.mods);
-        let mods_save_error = self.mods_save_error.clone();
-        let before = self.settings.clone();
-        let depth_before = match &self.screen {
-            Screen::Menus(stack) => stack.depth(),
-            _ => 0,
-        };
-        let now_ms = self.now_ms();
-        let mut effect = None;
-        if let Screen::Menus(stack) = &mut self.screen {
-            let mut ctx = Ctx {
-                settings: &mut self.settings,
-                saves: &self.saves,
-                mods: &mods,
-                session: &self.session,
-                mods_save_error: mods_save_error.as_deref(),
-            };
-            effect = stack.update(&intents, &mut ctx);
+        let frame = self.router.frame(eng, dt);
+        match frame.view() {
+            View::Menu(menu) => self.menu_input.read(&menu),
+            _ => self.menu_input.clear(),
         }
-        // Persist whenever a step (or a hardware clamp) moved a value, once the steps go quiet.
-        let changed = self.settings != before;
+    }
+
+    /// After a frame of screens: a moved options revision tells the mods, re-mixes the audio,
+    /// and saves once the steps go quiet. True when it moved.
+    fn after_screens(&mut self, revision_before: u64, now_ms: u64) -> bool {
+        let changed = self.options.revision() != revision_before;
         if changed {
             self.sound.set_mix(self.settings.mix_change());
         }
-        if settings_write_due(&mut self.settings_flush, changed, now_ms) {
-            self.settings.save();
+        self.tell_options();
+        if settings_write_due(&mut self.settings_flush, changed, now_ms) && self.bench.is_none() {
+            self.settings.save(&self.options);
         }
-        if self.mods_open {
-            let depth_after = match &self.screen {
-                Screen::Menus(stack) => stack.depth(),
-                _ => 0,
-            };
-            if depth_after < depth_before {
-                self.mods_open = false;
-                self.flush_mod_choices_if_dirty();
-            }
-        }
-        let quit = match effect {
-            Some(effect) => self.handle_effect(eng, effect),
-            None => false,
-        };
-        if self.choices_flush.poll(now_ms) {
-            self.persist_mod_choices();
-        }
-        quit
+        changed
     }
 
-    /// Interpret one menu effect. Returns `true` only for Quit.
-    fn handle_effect(&mut self, eng: &mut Engine, effect: AppEffect) -> bool {
-        match effect {
-            AppEffect::NewWorld => self.start_new_world(eng),
-            AppEffect::Load(id) => self.load_world(eng, &id),
-            AppEffect::DeleteWorld(id) => {
+    /// One frame of the screens out of a world.
+    fn update_menus(&mut self, eng: &mut Engine) {
+        let dt = eng.frame_time();
+        self.read_menu_input(eng);
+        let click = menu_click(&self.menu_input);
+        self.fan_audio(dt, false, click);
+        let before = self.options.revision();
+        let now_ms = self.now_ms();
+        let event = match self.menus.take() {
+            Some(mut stack) => {
+                let input = std::mem::take(&mut self.menu_input);
+                let mut ctx = self.screen_parts().ctx(Phase::Idle, false, None);
+                let event = stack.update(&input, &mut ctx);
+                self.menu_input = input;
+                self.menus = Some(stack);
+                event
+            }
+            None => StackEvent::None,
+        };
+        self.after_screens(before, now_ms);
+        if let StackEvent::Request(request) = event {
+            self.handle_request(eng, request);
+        }
+    }
+
+    /// Carry out what a screen asked of the core.
+    fn handle_request(&mut self, eng: &mut Engine, request: AppRequest) {
+        match request {
+            AppRequest::NewWorld => self.start_new_world(eng),
+            AppRequest::Load(id) => self.load_world(eng, &id),
+            AppRequest::Delete(id) => {
                 // Stopping saves, so the trashed copy keeps the friends' last edits.
                 let stopped = if self.host.serves(&id) { self.host.stop() } else { None };
                 if let Err(e) = save::delete(&id) {
@@ -516,78 +641,34 @@ impl App {
                 }
                 self.saves = save::list();
                 if stopped.is_some() {
-                    self.screen = Screen::Menus(Self::start_stack(&self.mods, &self.saves, &self.session, stopped, false));
+                    self.menus = self.root_stack(stopped);
                 }
             }
-            AppEffect::Host(info) => {
+            AppRequest::Host(info) => {
                 self.session.port = info.port.to_string();
                 self.session.name = info.name.clone();
                 self.session.save();
                 self.start_host(info);
             }
-            AppEffect::Join(info) => {
+            AppRequest::Join(info) => {
                 self.session.address = info.host.clone();
                 self.session.port = info.port.to_string();
                 self.session.name = info.name.clone();
                 self.session.save();
                 self.start_join(info);
             }
-            AppEffect::Settings => {
-                if let Screen::Menus(stack) = &mut self.screen {
-                    stack.push(Framed::boxed(SettingsHub));
-                }
-            }
-            AppEffect::Mods => {
-                if let Screen::Menus(stack) = &mut self.screen {
-                    stack.push(Framed::boxed(ModsMenu));
-                    self.mods_open = true;
-                }
-            }
-            AppEffect::ToggleMod(index) => {
-                if self.mods.toggle(index) {
-                    self.choices_flush.mark(self.now_ms());
-                }
-            }
-            AppEffect::StepModKnob {
-                mod_index,
-                knob,
-                delta,
-            } => {
-                self.mods.step_knob(mod_index, knob, delta);
-                self.choices_flush.mark(self.now_ms());
-            }
-            AppEffect::SetGroup { id, on } => {
-                if self.mods.set_group_enabled(id, on) {
-                    self.choices_flush.mark(self.now_ms());
-                }
-            }
-            AppEffect::Quit => {
-                self.flush_mod_choices_if_dirty();
-                return true;
-            }
+            AppRequest::Quit => self.quit = true,
+            // Out of a world there is nothing to resume or leave, and Esc already cancels.
+            AppRequest::Cancel | AppRequest::Resume | AppRequest::LeaveWorld => {}
         }
-        false
     }
 
-    /// Open the start screen: first enabled start-screen mod, else the core fallback.
-    fn start_stack(
-        mods: &Mods,
-        saves: &[Slot],
-        session: &Session,
-        notice: Option<&str>,
-        hosting: bool,
-    ) -> MenuStack {
-        let facts = StartFacts {
-            saves,
-            session,
-            version: VERSION,
-            hosting,
-            notice,
-        };
-        let inner = mods
-            .start_screen(&facts)
-            .unwrap_or_else(|| crate::menu::start::fallback(&facts));
-        MenuStack::new(StartRoot::wrap(inner, hosting))
+    /// A new root screen stack from the first active root-screen mod, telling it `notice`.
+    /// `None` in a build without one.
+    fn root_stack(&mut self, notice: Option<&str>) -> Option<ScreenStack> {
+        let parts = self.screen_parts();
+        let (facts, mods) = Self::slot_facts(&parts, false, notice);
+        mods.root_screen(&facts).map(ScreenStack::new)
     }
 
     /// Run the mods' audio hooks with no world under them: each menu frame (`dt`, and maybe a UI
@@ -601,7 +682,6 @@ impl App {
             pos: DVec3::ZERO,
             peers: EMPTY,
             in_world,
-            voice_enabled: self.settings.voice_enabled,
             hear_voice: self.settings.voice_incoming,
             actions: ActionSet::NONE,
             ids: NO_IDS,
@@ -623,37 +703,47 @@ impl App {
         self.fan_audio(0.0, in_world, Some(event));
     }
 
-    /// Return to the start menu with an optional notice (e.g. a failed connect).
+    /// Return to the root screen with an optional notice (e.g. a failed connect). A build without
+    /// a root screen has nothing to return to: it prints the notice and quits.
     fn return_to_menu(&mut self, notice: Option<String>) {
-        // Mods a server turned off for the session come back on leave.
-        // The hold was never written to mods.cfg.
-        self.mods.release_server();
+        // Packages a server suspended for the session come back on leave. Nothing was saved.
+        self.mods.resume_packages();
         self.fan_world_edge(GameEvent::LeaveWorld);
         self.sound.leave_world();
         self.audio.enter_world();
         self.active = None;
+        self.pause = None;
+        self.resuming = false;
         self.saves = save::list();
-        self.screen = Screen::Menus(Self::start_stack(
-            &self.mods,
-            &self.saves,
-            &self.session,
-            notice.as_deref(),
-            self.host.running(),
-        ));
+        self.screen = Screen::Menus;
+        if !self.has_root {
+            if let Some(notice) = notice {
+                eprintln!("{notice}");
+            }
+            self.quit = true;
+            return;
+        }
+        self.menus = self.root_stack(notice.as_deref());
     }
 
-    fn standby_menu(&self) -> MenuStack {
-        Self::start_stack(&self.mods, &self.saves, &self.session, None, self.host.running())
+    /// A build without a root screen: enter the most recent save, else a new world.
+    fn enter_default(&mut self, eng: &mut Engine) {
+        match default_entry(&self.saves).cloned() {
+            Some(id) => {
+                eprintln!("PWC: loading the newest world, {id}");
+                self.load_world(eng, &id);
+            }
+            None => {
+                eprintln!("PWC: no saved world; making a new one");
+                self.start_new_world(eng);
+            }
+        }
     }
 
     /// Esc on a waiting screen (connecting, loading).
     fn cancel_pressed(&mut self, eng: &mut Engine) -> bool {
-        let dt = eng.frame_time();
-        self.router.set_context(Context::Menu);
-        match self.router.frame(eng, dt).view() {
-            View::Menu(menu) => crate::menu::gather(&menu).iter().any(|intent| matches!(intent, crate::menu::Intent::Cancel)),
-            _ => false,
-        }
+        self.read_menu_input(eng);
+        self.menu_input.event(MenuEvent::Back)
     }
 
     /// Report a connection/host failure and return to the menu.
@@ -677,7 +767,7 @@ impl App {
         let recipe = Recipe {
             seed,
             render: self.mods.effective_render(&self.settings),
-            kind: self.mods.worldgen_kind(),
+            kind: self.worldgen_pin.unwrap_or_else(|| self.mods.worldgen_kind()),
             cfg: terrain_cfg_from_mods(&self.mods),
         };
         self.entry_notice = stopped;
@@ -687,7 +777,7 @@ impl App {
     /// Start loading a save. A save that fails to load returns to the menu.
     fn load_world(&mut self, eng: &mut Engine, id: &SlotId) {
         // Stopping saves first, so the world loads with the friends' last edits. The save header
-        // names the generator; the InfiniteDiffusion mod's enabled flag only chooses the next *new* world.
+        // names the generator; the installed worldgen mod only chooses the next *new* world.
         self.entry_notice = self.host.stop();
         let render = self.mods.effective_render(&self.settings);
         self.begin_loading(eng, Loading::load(id.clone(), render));
@@ -714,10 +804,12 @@ impl App {
                     self.return_to_menu(None);
                 }
                 // The menu under a new world or a load was never replaced. Only a stopped host
-                // changes it (its status line), and the notice says why.
+                // changes it (its status line), and the notice says why. A build with no menu
+                // has nothing under it: cancelling quits.
                 Some(_) => {
-                    if let Some(notice) = self.entry_notice.take() {
-                        self.return_to_menu(Some(notice.to_string()));
+                    let notice = self.entry_notice.take();
+                    if notice.is_some() || !self.has_root {
+                        self.return_to_menu(notice.map(str::to_string));
                     }
                 }
                 None => {}
@@ -732,8 +824,7 @@ impl App {
 
     /// Swap a built world in: fresh mod state, the save's mod state for a load, then the game.
     fn arrive(&mut self, eng: &mut Engine, loading: Loading) {
-        // Every world starts from a clean default mod set (empty inventory, etc.);
-        // the mod menu's enable/disable choices persist.
+        // Every world starts from a clean default mod state (empty inventory, etc.).
         self.mods.reset_state();
         match loading {
             Loading::New(job) => {
@@ -773,7 +864,13 @@ impl App {
                         Some(notice) => format!("{notice}; could not load {id}: {e}"),
                         None => format!("could not load {id}: {e}"),
                     };
-                    self.fail_to_menu(message);
+                    if self.has_root {
+                        self.fail_to_menu(message);
+                    } else {
+                        // Nothing to show the failure on: say it and make a new world instead.
+                        eprintln!("{message}; making a new world");
+                        self.start_new_world(eng);
+                    }
                 }
             },
             Loading::Join { job, conn, notice, .. } => {
@@ -813,13 +910,127 @@ impl App {
         self.sound.enter_world();
         self.audio.enter_world();
         self.fan_world_edge(GameEvent::EnterWorld);
+        self.menus = None;
+        self.pause = None;
+        self.resuming = false;
+        eprintln!("PWC: in world {}", game.save_name());
         self.screen = Screen::Playing(Box::new(game));
+    }
+
+    /// The facts a slot screen is created with: idle, in or out of a world, with `notice`.
+    fn slot_facts<'a>(parts: &'a ScreenParts<'_>, in_world: bool, notice: Option<&'a str>) -> (ScreenFacts<'a>, &'a Mods) {
+        let (suspended, entries, visuals) = parts.mods.screen_view();
+        let facts = ScreenFacts {
+            saves: parts.saves,
+            session: parts.session,
+            version: VERSION,
+            hosting: parts.hosting,
+            notice,
+            phase: Phase::Idle,
+            in_world,
+            build: parts.build,
+            suspended,
+            entries,
+            visuals,
+        };
+        (facts, &*parts.mods)
+    }
+
+    /// Esc in a world that text capture and every overlay declined: the pause screen, or leave.
+    fn on_escape(&mut self, eng: &mut Engine) {
+        let screen = {
+            let parts = self.screen_parts();
+            let (facts, mods) = Self::slot_facts(&parts, true, None);
+            mods.pause_screen(&facts)
+        };
+        match escape_action(screen.is_some(), self.has_root) {
+            EscapeAction::Pause => {
+                self.pause = screen.map(ScreenStack::new);
+                if let Screen::Playing(game) = &mut self.screen {
+                    game.hold_input(true);
+                }
+                self.router.set_captured(false);
+                eng.enable_cursor();
+            }
+            EscapeAction::Leave | EscapeAction::Quit => self.leave_world(eng),
+        }
+    }
+
+    /// Close the pause screen. The game stays held for the rest of this frame, so the Esc that
+    /// closed the screen does not reach it too (and open the screen again); input returns after
+    /// this frame's update.
+    fn resume(&mut self) {
+        self.pause = None;
+        self.resuming = true;
+    }
+
+    /// Save and leave the world: back to the root screen, or quit without one.
+    fn leave_world(&mut self, eng: &mut Engine) {
+        self.flush_settings_if_dirty();
+        self.flush_save();
+        let notice = if let Screen::Playing(game) = &mut self.screen {
+            let notice = game.take_leave_notice();
+            // Return the world's GPU meshes to the engine before dropping it.
+            game.free_gpu(eng);
+            notice
+        } else {
+            None
+        };
+        eng.enable_cursor();
+        self.return_to_menu(notice); // drops the Box<Game>
+    }
+
+    /// One frame of the pause screen over a running world. The world keeps running; only input
+    /// goes to the screen. Its settings changes apply to the world at once.
+    fn update_pause(&mut self, eng: &mut Engine) -> Option<StackEvent> {
+        let mut stack = self.pause.take()?;
+        self.read_menu_input(eng);
+        if let Some(click) = menu_click(&self.menu_input) {
+            let mut api = self.audio.api(&mut self.sound, &self.cues, None, None);
+            self.mods.on_game_event(&click, &mut api);
+        }
+        let before = self.options.revision();
+        let now_ms = self.now_ms();
+        let input = std::mem::take(&mut self.menu_input);
+        let event = {
+            let mut ctx = self.screen_parts().ctx(Phase::Idle, true, None);
+            stack.update(&input, &mut ctx)
+        };
+        self.menu_input = input;
+        self.pause = Some(stack);
+        // A change made here is the same as a console change: the game applies it after the push.
+        let changed = self.options.revision() != before;
+        if changed {
+            self.sound.set_mix(self.settings.mix_change());
+            if let Screen::Playing(game) = &mut self.screen {
+                game.mark_settings_changed();
+            }
+        }
+        self.tell_options();
+        if settings_write_due(&mut self.settings_flush, changed, now_ms) && self.bench.is_none() {
+            self.settings.save(&self.options);
+        }
+        Some(event)
     }
 
     /// In-world update: run the game and handle autosave.
     fn update_playing(&mut self, eng: &mut Engine) {
         let dt = eng.frame_time() as f64;
         let now_ms = self.now_ms();
+        // The pause screen takes input first; what it asks is done before the world moves on.
+        match self.update_pause(eng) {
+            Some(StackEvent::BackAtRoot | StackEvent::Request(AppRequest::Resume)) => self.resume(),
+            Some(StackEvent::Request(AppRequest::LeaveWorld)) => {
+                self.leave_world(eng);
+                return;
+            }
+            Some(StackEvent::Request(AppRequest::Quit)) => {
+                self.quit = true;
+                return;
+            }
+            // A pause screen cannot start another world from inside this one.
+            Some(StackEvent::Request(_) | StackEvent::None) | None => {}
+        }
         let Screen::Playing(game) = &mut self.screen else {
             return;
         };
@@ -828,32 +1039,39 @@ impl App {
             &mut self.router,
             &mut self.mods,
             &mut self.settings,
+            &mut self.options,
             &mut self.sound,
             &mut self.audio,
             &self.cues,
         );
-        if settings_write_due(&mut self.settings_flush, game.take_settings_dirty(), now_ms) && self.bench.is_none() {
-            self.settings.save();
+        if std::mem::take(&mut self.resuming) {
+            game.hold_input(false);
+            game.on_enter(eng, &mut self.router);
         }
-        if let Signal::ExitToMenu = signal {
-            self.flush_settings_if_dirty();
-            self.flush_save();
-            let notice = if let Screen::Playing(game) = &mut self.screen {
-                let notice = game.take_leave_notice();
-                // Return the world's GPU meshes to the engine before dropping it.
-                game.free_gpu(eng);
-                notice
-            } else {
-                None
-            };
-            eng.enable_cursor();
-            self.return_to_menu(notice); // drops the Box<Game>
-            return;
+        let dirty = game.take_settings_dirty();
+        // A frame hook may have changed an option (`/set`): the mods hear it now.
+        self.tell_options();
+        if settings_write_due(&mut self.settings_flush, dirty, now_ms) && self.bench.is_none() {
+            self.settings.save(&self.options);
+        }
+        match signal {
+            Signal::Continue => {}
+            Signal::Escape => {
+                self.on_escape(eng);
+                return;
+            }
+            Signal::ExitToMenu => {
+                self.leave_world(eng);
+                return;
+            }
         }
         // Periodic autosave on edits; bench/multiplayer never save.
         if self.bench.is_some() {
             return;
         }
+        let Screen::Playing(game) = &mut self.screen else {
+            return;
+        };
         let Some(active) = &mut self.active else {
             return;
         };
@@ -914,60 +1132,48 @@ impl App {
         }
     }
 
-    /// Draw the active screen (game or menu).
+    /// Draw the active screen: the world, the pause screen over it, or the screens out of a world
+    /// (the root's waiting page while connecting or loading).
     fn draw(&mut self, eng: &mut Engine) {
-        let (w, h) = (eng.screen_width(), eng.screen_height());
-        if let Screen::Playing(game) = &mut self.screen {
-            let fov = self.settings.fov;
-            let shake = self.settings.shake;
-            game.draw(eng, &mut self.mods, fov, shake);
-            return;
-        }
-        let waiting = match &self.screen {
-            Screen::Connecting(_) => Some("Connecting…"),
-            _ if self.loading.is_some() => Some("Loading…"),
-            _ => None,
+        let size = (eng.screen_width(), eng.screen_height());
+        let (stack, phase, in_world, root) = match &self.screen {
+            Screen::Playing(_) if self.pause.is_none() => {
+                if let Screen::Playing(game) = &mut self.screen {
+                    let fov = self.settings.fov;
+                    let shake = self.settings.shake;
+                    game.draw(eng, &mut self.mods, fov, shake, &[]);
+                }
+                return;
+            }
+            Screen::Playing(_) => (self.pause.take(), Phase::Idle, true, false),
+            Screen::Connecting(_) => (self.menus.take(), Phase::Connecting, false, true),
+            Screen::Menus if self.loading.is_some() => (self.menus.take(), Phase::Loading, false, true),
+            Screen::Menus => (self.menus.take(), Phase::Idle, false, false),
         };
-        if let Some(title) = waiting {
-            let mut f = eng.begin_frame(MENU_CLEAR.to_linear());
-            let theme = ui::Theme::new();
-            let screen = (w as i32, h as i32);
-            ui::label(
-                &mut f,
-                &theme,
-                screen,
-                Anchor::Center,
-                (0, -16),
-                28,
-                ui::Role::Primary.color(),
-                title,
-            );
-            ui::label(
-                &mut f,
-                &theme,
-                screen,
-                Anchor::Center,
-                (0, 24),
-                20,
-                ui::Role::Muted.color(),
-                "Cancel",
-            );
-            return;
+        let mut ui = std::mem::take(&mut self.ui);
+        ui.clear();
+        if let Some(stack) = &stack {
+            let ctx = self.screen_parts().ctx(phase, in_world, None);
+            if root {
+                stack.draw_root(&ctx, &mut ui, size);
+            } else {
+                stack.draw(&ctx, &mut ui, size);
+            }
         }
-        // Mods snapshot avoids borrow conflict between theme and view.
-        let mods = ModRow::snapshot(&self.mods);
-        let fallback = DefaultTheme;
-        let theme: &dyn MenuTheme = self.mods.menu_theme().unwrap_or(&fallback);
-        let mut f = eng.begin_frame(MENU_CLEAR.to_linear());
-        if let Screen::Menus(stack) = &self.screen {
-            let ctx = Ctx {
-                settings: &mut self.settings,
-                saves: &self.saves,
-                mods: &mods,
-                session: &self.session,
-                mods_save_error: self.mods_save_error.as_deref(),
-            };
-            stack.draw(&ctx, theme, &mut f, w, h);
+        // The pause screen draws over the running world (the screen dims it); every other screen
+        // has the frame to itself.
+        if let Screen::Playing(game) = &mut self.screen {
+            let (fov, shake) = (self.settings.fov, self.settings.shake);
+            game.draw(eng, &mut self.mods, fov, shake, &ui);
+        } else {
+            let mut f = eng.begin_frame(MENU_CLEAR.to_linear());
+            crate::screen::render(&mut f, &ui);
+        }
+        self.ui = ui;
+        if in_world {
+            self.pause = stack;
+        } else {
+            self.menus = stack;
         }
     }
 }
@@ -1363,26 +1569,42 @@ mod tests {
         }
     }
 
-    /// Left held on a Video row at key-repeat rate for two seconds, frames 8 ms apart, the way
-    /// the menu screen runs them: nothing is written while the value moves, and one write lands
+    /// A settings row as a screen: Left steps the render distance through the options view.
+    struct DistanceRow;
+
+    impl crate::screen::Screen for DistanceRow {
+        fn update(&mut self, input: &MenuInput, ctx: &mut ScreenContext) -> crate::screen::ScreenOutcome {
+            if input.event(MenuEvent::Left) {
+                let row = ctx.options().find("render_distance").expect("a core setting");
+                ctx.options_mut().step(row, -1);
+            }
+            crate::screen::ScreenOutcome::Stay
+        }
+        fn draw(&self, _ctx: &ScreenContext, _out: &mut Vec<UiElement>, _size: (i32, i32)) {}
+    }
+
+    /// Left held on a settings row at key-repeat rate for two seconds, frames 8 ms apart, the way
+    /// the screen host runs them: nothing is written while the value moves, and one write lands
     /// once it has been still for the debounce window.
     #[test]
     fn holding_left_writes_settings_at_most_once_per_debounce_window() {
-        use crate::menu::menus::SettingsPage;
-        use crate::menu::{Dir, Intent};
         let mut settings = Settings::default();
+        let mut options = Options::new();
+        let mods = Mods::empty();
         let session = Session::default();
-        let mut stack = MenuStack::new(Framed::boxed(SettingsPage::new(crate::settings::Category::Video)));
+        let build = BuildInfo::EMPTY;
+        let mut stack = ScreenStack::new(Box::new(DistanceRow));
         let mut flush = Debounce::new();
         let (mut writes, mut steps) = (Vec::new(), 0);
         for frame in 0..400u64 {
             let now_ms = frame * 8;
             let held = now_ms < 2000 && frame % 4 == 0;
-            let intents = if held { vec![Intent::Adjust(Dir::Prev)] } else { Vec::new() };
-            let before = settings.clone();
-            let mut ctx = Ctx { settings: &mut settings, saves: &[], mods: &[], session: &session, mods_save_error: None };
-            stack.update(&intents, &mut ctx);
-            let changed = settings != before;
+            let input = if held { MenuInput::new().with(MenuEvent::Left) } else { MenuInput::new() };
+            let before = options.revision();
+            let parts = ScreenParts { saves: &[], session: &session, build: &build, hosting: false, mods: &mods, settings: &mut settings, options: &mut options };
+            let mut ctx = parts.ctx(Phase::Idle, false, None);
+            stack.update(&input, &mut ctx);
+            let changed = options.revision() != before;
             steps += changed as u32;
             if settings_write_due(&mut flush, changed, now_ms) {
                 writes.push(now_ms);
@@ -1392,6 +1614,35 @@ mod tests {
         assert_eq!(writes.len(), 1, "one write, after the release: {writes:?}");
         assert!((2000..2000 + Debounce::IDLE_MS + 16).contains(&writes[0]), "written {}ms in", writes[0]);
         assert!(!flush.take(), "nothing left pending");
+    }
+
+    /// Esc in a world: the pause screen when a mod gives one, else back to the root screen, else
+    /// (a build without screens) save and quit.
+    #[test]
+    fn escape_opens_the_pause_screen_or_leaves_or_quits() {
+        assert_eq!(escape_action(true, true), EscapeAction::Pause);
+        assert_eq!(escape_action(true, false), EscapeAction::Pause);
+        assert_eq!(escape_action(false, true), EscapeAction::Leave);
+        assert_eq!(escape_action(false, false), EscapeAction::Quit);
+    }
+
+    /// A build without a root screen enters the most recent readable save, or a new world.
+    #[test]
+    fn a_build_without_screens_enters_the_latest_world_or_a_new_one() {
+        assert_eq!(default_entry(&[]), None, "no save: a new world");
+        let broken = Slot { id: SlotId::new("broken").unwrap(), meta: Err(crate::save::SaveError::Corrupt("x")) };
+        let saves = [broken, Slot::for_test("alpha", 90, 3), Slot::for_test("beta", 10, 1)];
+        assert_eq!(default_entry(&saves).map(SlotId::as_str), Some("alpha"), "the newest readable save");
+    }
+
+    /// The menu click cue: confirm wins over navigation, and a quiet frame clicks nothing.
+    #[test]
+    fn a_menu_frame_clicks_once() {
+        assert!(menu_click(&MenuInput::new()).is_none());
+        let both = MenuInput::new().with(MenuEvent::Down).with(MenuEvent::Confirm);
+        assert!(matches!(menu_click(&both), Some(GameEvent::UiConfirm)));
+        assert!(matches!(menu_click(&MenuInput::new().with(MenuEvent::NextTab)), Some(GameEvent::UiNavigate)));
+        assert!(menu_click(&MenuInput::new().with(MenuEvent::Back)).is_none());
     }
 
     #[test]

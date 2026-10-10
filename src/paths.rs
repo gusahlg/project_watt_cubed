@@ -13,7 +13,7 @@ const APP: &str = "project_watt_cubed";
 const ENV_DATA_DIR: &str = "WATT_DATA_DIR";
 const ENV_CHECKOUT_DIR: &str = "WATT_CHECKOUT_DIR";
 
-/// Worlds under `data`; `settings.cfg` / `session.cfg` / `mods.cfg` under `config`.
+/// Worlds under `data`; `settings.cfg` / `session.cfg` under `config`.
 /// Optional source checkout when `WATT_CHECKOUT_DIR` points at a `Cargo.toml`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Paths {
@@ -72,7 +72,8 @@ impl Paths {
         self.config.join("session.cfg")
     }
 
-    pub(crate) fn mods_file(&self) -> PathBuf {
+    /// The mod choices file older games wrote. Read once for knob values, never written.
+    pub(crate) fn legacy_mods_file(&self) -> PathBuf {
         self.config.join("mods.cfg")
     }
 
@@ -284,7 +285,6 @@ mod tests {
         };
         assert_eq!(p.settings_file(), PathBuf::from("/config/settings.cfg"));
         assert_eq!(p.session_file(), PathBuf::from("/config/session.cfg"));
-        assert_eq!(p.mods_file(), PathBuf::from("/config/mods.cfg"));
         assert_eq!(p.mods_selection_file(), None);
     }
 
