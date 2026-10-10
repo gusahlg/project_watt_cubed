@@ -71,11 +71,7 @@ pub(super) fn on_move(shared: &Arc<Mutex<State>>, ctx: &Ctx, id: u32, pose: Pose
 }
 
 pub(super) fn noclip_allowed(ctx: &Ctx, h: &PlayerHandle) -> bool {
-    match ctx.noclip {
-        NoclipPolicy::All => true,
-        NoclipPolicy::Ops => h.op,
-        NoclipPolicy::Off => false,
-    }
+    ctx.noclip.allows(h.op)
 }
 
 pub(super) fn body_stance(stance: Stance) -> player::Stance {
@@ -268,15 +264,11 @@ pub(super) fn on_teleport(shared: &Arc<Mutex<State>>, ctx: &Ctx, id: u32, pos: D
     let wake = {
         let mut state = shared.lock_recover();
         let Some(h) = state.players.get(&id) else { return };
-        let allowed = match ctx.teleport {
-            TeleportPolicy::All => true,
-            TeleportPolicy::Ops => h.op,
-            TeleportPolicy::Off => false,
-        };
+        let allowed = ctx.teleport.allows(h.op);
         if outside_world(pos) || !allowed {
             h.correct_position(id, sends);
             if !outside_world(pos) {
-                let reason = if ctx.teleport == TeleportPolicy::Off {
+                let reason = if ctx.teleport == Policy::Off {
                     "teleport is not permitted"
                 } else {
                     "only an operator can teleport"

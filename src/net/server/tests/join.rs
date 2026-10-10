@@ -615,3 +615,13 @@ fn names_that_spell_server_are_reserved() {
         assert!(!reserved_name(name), "{name}");
     }
 }
+
+/// The flags' spellings round-trip, and only `ops` asks whether the player is an operator.
+#[test]
+fn a_policy_reads_its_flag_and_decides_by_operator() {
+    for policy in [Policy::Off, Policy::Ops, Policy::All] {
+        assert_eq!(Policy::parse(policy.name()), Some(policy));
+    }
+    assert_eq!(Policy::parse("OPS"), None);
+    assert_eq!([Policy::Off.allows(true), Policy::Ops.allows(true), Policy::Ops.allows(false), Policy::All.allows(false)], [false, true, false, true]);
+}

@@ -174,18 +174,17 @@ pub(super) fn drain_writer(
     }
 }
 
+/// Queue a private line from "server" for a ready player.
 pub(super) fn tell(h: &PlayerHandle, id: u32, text: &str, sends: &mut Vec<PendingSend>) {
-    if !h.ready {
-        return;
+    if h.ready {
+        sends.push((id, server_says(chat::GLOBAL, text.into())));
     }
-    let frame = ServerMessage::Chat {
-        from_id: WORLD_PLAYER,
-        from_name: Arc::from("server"),
-        channel: chat::GLOBAL,
-        text: text.into(),
-    }
-    .frame();
-    sends.push((id, frame));
+}
+
+/// A chat line from the server itself: player id [`WORLD_PLAYER`], named "server".
+pub(super) fn server_says(channel: u8, text: Arc<str>) -> Arc<[u8]> {
+    static NAME: LazyLock<Arc<str>> = LazyLock::new(|| Arc::from("server"));
+    ServerMessage::Chat { from_id: WORLD_PLAYER, from_name: Arc::clone(&NAME), channel, text }.frame()
 }
 
 /// Queue `sends` in order under the state lock, so no frame overtakes a state change

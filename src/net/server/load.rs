@@ -17,7 +17,7 @@ use quinn::{Endpoint, RecvStream, SendStream};
 use tokio::runtime::Runtime;
 use voxel_engine::{DVec3, Vec3};
 
-use super::{Config, LockRecover, NoclipPolicy, ServerHandle, State, TeleportPolicy, install_edits, spawn};
+use super::{Config, LockRecover, Policy, ServerHandle, State, install_edits, spawn};
 use crate::block::registry::BlockId;
 use crate::coord::Face;
 use crate::net::protocol::{self, ClientMessage, ServerMessage};
@@ -466,7 +466,7 @@ fn cpu() -> (u64, u64) {
 fn dedicated() -> ServerHandle {
     spawn(
         0,
-        Config { seed: 4242, teleport: TeleportPolicy::Ops, noclip: NoclipPolicy::Ops, ..Config::default() },
+        Config { seed: 4242, teleport: Policy::Ops, noclip: Policy::Ops, ..Config::default() },
     )
     .unwrap()
 }

@@ -309,13 +309,7 @@ pub(super) fn admit_player(
         (existing, snapshot) = state.admit(id, PlayerHandle::new(name.clone(), spawn, frame, up, op, out.clone(), kick.clone()));
     }
     if let Some(hooks) = ctx.hooks.as_ref() {
-        hooks.lock_recover().on_join(&JoinFacts {
-            player: id,
-            name: name.clone(),
-            x: block_coord(spawn.x),
-            y: block_coord(spawn.y),
-            z: block_coord(spawn.z),
-        });
+        hooks.lock_recover().on_join(&JoinFacts::at(id, name.clone(), spawn));
     }
     Some((id, spawn, existing, snapshot, out, rx, kick))
 }
@@ -333,13 +327,7 @@ pub(super) fn depart(
     {
         let mut state = shared.lock_recover();
         if let Some(h) = state.remove_player(id) {
-            left = Some(JoinFacts {
-                player: id,
-                name: h.name.clone(),
-                x: block_coord(h.pose.pos.x),
-                y: block_coord(h.pose.pos.y),
-                z: block_coord(h.pose.pos.z),
-            });
+            left = Some(JoinFacts::at(id, h.name.clone(), h.pose.pos));
         }
     }
     if let (Some(hooks), Some(facts)) = (ctx.hooks.as_ref(), left) {
@@ -441,28 +429,26 @@ pub(super) fn send_until(out: &Outbox, kicked: &AtomicBool, frame: Arc<[u8]>, de
     }
 }
 
-/// QUIC (unlike TCP) can discard buffered stream data when a connection closes,
-/// so we wait (bounded) for the peer to close after reading — otherwise a
-/// rejected client would see "no reply" instead of the reason.
 pub(super) fn reject(rt: &Runtime, send: &mut SendStream, conn: &quinn::Connection, reason: &str) {
-    rt.block_on(async {
-        let _ =
-            protocol::write_frame_async(send, &ServerMessage::Reject { reason: reason.into() }.encode())
-                .await;
-        let _ = send.finish();
-        let _ = tokio::time::timeout(REJECT_DRAIN, conn.closed()).await;
-    });
+    refuse(rt, send, conn, &ServerMessage::Reject { reason: reason.into() });
     println!("[x] rejected a connection: {}", console_text(reason));
 }
 
 pub(super) fn deny_mods(rt: &Runtime, send: &mut SendStream, conn: &quinn::Connection, ids: Vec<ModId>) {
     let listed = ids.iter().map(|id| console_text(id)).collect::<Vec<_>>().join(", ");
+    refuse(rt, send, conn, &ServerMessage::ModsDenied { ids });
+    println!("[x] refused mods: {listed}");
+}
+
+/// Send the last word of a refused connection and close the stream. QUIC (unlike TCP) can
+/// discard buffered stream data when a connection closes, so we wait (bounded) for the peer
+/// to close after reading — otherwise a refused client would see "no reply" instead of why.
+fn refuse(rt: &Runtime, send: &mut SendStream, conn: &quinn::Connection, last: &ServerMessage) {
     rt.block_on(async {
-        let _ = protocol::write_frame_async(send, &ServerMessage::ModsDenied { ids }.encode()).await;
+        let _ = protocol::write_frame_async(send, &last.encode()).await;
         let _ = send.finish();
         let _ = tokio::time::timeout(REJECT_DRAIN, conn.closed()).await;
     });
-    println!("[x] refused mods: {listed}");
 }
 
 /// Scattered a little per id so players don't stack on the exact same block; scans outward for

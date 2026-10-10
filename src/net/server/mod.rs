@@ -40,7 +40,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
 #[cfg(not(test))]
 use std::sync::MutexGuard;
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, PoisonError};
 use std::thread::{self, JoinHandle, Thread};
 use std::time::{Duration, Instant};
 
@@ -197,24 +197,51 @@ const NOVEL_SPEC_QUOTA: u32 = 64;
 /// Matches the client palette cap ([`format::MAX_SPECS`](crate::save::format));
 /// a hostile client can exhaust neither server memory nor peers' palettes.
 const MAX_SPEC_POOL: usize = 16_384;
-/// Who may teleport. `All` is the integrated host and [`Config::default`], so
-/// existing sessions keep today's behaviour. A dedicated server passes [`Ops`](Self::Ops).
+/// Who may do something only some players should: nobody, operators, or everyone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TeleportPolicy {
+pub enum Policy {
     Off,
     Ops,
     All,
 }
 
-/// Who may pass through solid ground. Same three settings as [`TeleportPolicy`].
-/// [`Config::default`] is [`All`](Self::All) so existing sessions are not suddenly
-/// collision-checked. A dedicated server passes [`Ops`](Self::Ops).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NoclipPolicy {
-    Off,
-    Ops,
-    All,
+impl Policy {
+    /// `off`, `ops` or `all`, as the dedicated server's flags spell them.
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "off" => Some(Self::Off),
+            "ops" => Some(Self::Ops),
+            "all" => Some(Self::All),
+            _ => None,
+        }
+    }
+
+    /// The spelling [`parse`](Self::parse) reads.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Ops => "ops",
+            Self::All => "all",
+        }
+    }
+
+    /// Whether a player, an operator or not, may.
+    pub fn allows(self, operator: bool) -> bool {
+        match self {
+            Self::Off => false,
+            Self::Ops => operator,
+            Self::All => true,
+        }
+    }
 }
+
+/// Who may teleport. `All` is the integrated host and [`Config::default`], so
+/// existing sessions keep today's behaviour. A dedicated server passes [`Ops`](Policy::Ops).
+pub type TeleportPolicy = Policy;
+
+/// Who may pass through solid ground. [`Config::default`] is [`All`](Policy::All) so existing
+/// sessions are not suddenly collision-checked. A dedicated server passes [`Ops`](Policy::Ops).
+pub type NoclipPolicy = Policy;
 
 /// Matches the client's [`World`](crate::world::World::new) so server spawn
 /// heights land on real ground.

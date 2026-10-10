@@ -120,15 +120,7 @@ pub(super) fn on_chat(
         let verdict = hooks.lock_recover().on_chat(&facts);
         if let Verdict::Deny { reason } = verdict {
             if let Some(out) = out {
-                let _ = out.try_send(
-                    ServerMessage::Chat {
-                        from_id: 0,
-                        from_name: Arc::from("server"),
-                        channel,
-                        text: reason,
-                    }
-                    .frame(),
-                );
+                let _ = out.try_send(server_says(channel, reason));
             }
             return;
         }
@@ -137,13 +129,13 @@ pub(super) fn on_chat(
             return;
         }
     }
-    println!("<{from_name}> {text}");
-    let msg = ServerMessage::Chat { from_id: id, from_name, channel, text };
+    let msg = ServerMessage::Chat { from_id: id, from_name: from_name.clone(), channel, text: text.clone() };
     let wake = broadcast(&mut state, &msg, |_, h| {
         channel == chat::GLOBAL || h.pose.pos.distance(origin) <= chat::RADIUS
     });
     drop(state);
     drop(wake);
+    println!("<{from_name}> {text}");
 }
 
 /// The secret of a `/op <secret>` chat line. Such a line is never relayed, logged, or shown to hooks.
@@ -155,7 +147,7 @@ pub(super) fn op_secret(text: &str) -> Option<Arc<str>> {
 
 /// An operator listed with a secret proves it. Either way only the sender hears the answer.
 pub(super) fn on_op_login(shared: &Arc<Mutex<State>>, ctx: &Ctx, id: u32, secret: &str, sends: &mut Vec<PendingSend>) {
-    let wake = {
+    let (name, log, wake) = {
         let mut state = shared.lock_recover();
         let Some(h) = state.players.get_mut(&id) else { return };
         let proved = !secret.is_empty()
@@ -166,11 +158,12 @@ pub(super) fn on_op_login(shared: &Arc<Mutex<State>>, ctx: &Ctx, id: u32, secret
         } else {
             ("operator secret refused", "sent a wrong operator secret")
         };
-        println!("[op] {} (#{id}) {log}", h.name);
         tell(h, id, reply, sends);
-        queue(&state, sends)
+        let name = h.name.clone();
+        (name, log, queue(&state, sends))
     };
     drop(wake);
+    println!("[op] {name} (#{id}) {log}");
 }
 
 /// Anchors the shared clock so joiners inherit the CURRENT time. A non-finite

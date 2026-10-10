@@ -70,6 +70,14 @@ pub struct JoinFacts {
     pub z: i32,
 }
 
+impl JoinFacts {
+    /// `player` called `name`, standing in the block that holds `pos`.
+    pub(crate) fn at(player: u32, name: Arc<str>, pos: voxel_engine::DVec3) -> Self {
+        use crate::math::block_coord;
+        Self { player, name, x: block_coord(pos.x), y: block_coord(pos.y), z: block_coord(pos.z) }
+    }
+}
+
 /// A chat line after the server has sanitised it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatFacts {
@@ -91,45 +99,43 @@ impl Table {
     }
 
     pub(crate) fn validate_edit(&mut self, intent: &EditIntent) -> Verdict {
-        for m in &mut self.mods {
-            let id = m.id();
-            match catch_unwind(AssertUnwindSafe(|| m.validate_edit(intent))) {
-                Ok(Verdict::Deny { reason }) => return Verdict::Deny { reason },
-                Ok(Verdict::Allow) => {}
-                Err(_) => note_panic(&mut self.panicked, id),
-            }
-        }
-        Verdict::Allow
+        self.gate(|m| m.validate_edit(intent))
     }
 
     pub(crate) fn on_join(&mut self, player: &JoinFacts) {
-        for m in &mut self.mods {
-            let id = m.id();
-            if catch_unwind(AssertUnwindSafe(|| m.on_join(player))).is_err() {
-                note_panic(&mut self.panicked, id);
-            }
-        }
+        self.each(|m| m.on_join(player));
     }
 
     pub(crate) fn on_leave(&mut self, player: &JoinFacts) {
-        for m in &mut self.mods {
-            let id = m.id();
-            if catch_unwind(AssertUnwindSafe(|| m.on_leave(player))).is_err() {
-                note_panic(&mut self.panicked, id);
-            }
-        }
+        self.each(|m| m.on_leave(player));
     }
 
     pub(crate) fn on_chat(&mut self, msg: &ChatFacts) -> Verdict {
+        self.gate(|m| m.on_chat(msg))
+    }
+
+    /// Ask each mod in order; the first Deny wins and the rest are not asked. A mod that
+    /// panics allows.
+    fn gate(&mut self, mut ask: impl FnMut(&mut dyn ServerMod) -> Verdict) -> Verdict {
         for m in &mut self.mods {
             let id = m.id();
-            match catch_unwind(AssertUnwindSafe(|| m.on_chat(msg))) {
+            match catch_unwind(AssertUnwindSafe(|| ask(m.as_mut()))) {
                 Ok(Verdict::Deny { reason }) => return Verdict::Deny { reason },
                 Ok(Verdict::Allow) => {}
                 Err(_) => note_panic(&mut self.panicked, id),
             }
         }
         Verdict::Allow
+    }
+
+    /// Tell each mod in order; a mod that panics is logged and skipped.
+    fn each(&mut self, mut tell: impl FnMut(&mut dyn ServerMod)) {
+        for m in &mut self.mods {
+            let id = m.id();
+            if catch_unwind(AssertUnwindSafe(|| tell(m.as_mut()))).is_err() {
+                note_panic(&mut self.panicked, id);
+            }
+        }
     }
 }
 
