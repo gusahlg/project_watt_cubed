@@ -2224,9 +2224,9 @@ mod tests {
         let mut order: Vec<SectionPos> = drawn.clone();
         order.sort_by_key(|p| (p.detail, p.x, p.z));
         for pos in &order {
-            // As the worker meshes it: the clip the window takes.
+            // As the worker meshes it: the clip the window takes, `dy` where the level morphs.
             let clip = clips.get(pos).copied().unwrap_or_default();
-            let mesh = extract_section_mesh_with(*pos, world.terrain(), &[], &tables, clip, true);
+            let mesh = extract_section_mesh_with(*pos, world.terrain(), &[], &tables, clip, world.section_morphs(*pos));
             mix(&mut hash, mesh.shift);
             for b in mesh.altitude_floor.to_le_bytes() {
                 mix(&mut hash, b);
@@ -2410,11 +2410,12 @@ mod tests {
     /// Start-world chart far field from altitude: the square under the eye is drawn, its columns
     /// have tops, and the seams around it are closed. Spawn ground level keeps the punch on the
     /// interior of the near box. The border, within one span-32 section, is drawn: that tile is
-    /// what covers the sliver outside the box. Bytes re-pinned to `0x0a2c44d4`: the window clips
+    /// what covers the sliver outside the box. Bytes re-pinned to `0xbb07d8f0`: the window clips
     /// the finest ring's straddlers (meshed without their clipped columns) instead of splitting
-    /// them, chart rings 0 and 1 shift out, and ring parents split into their children. The hash
-    /// covers positions, normals and layers, not morph bits (seed 42, diffusion, default view), of
-    /// each tile as the worker meshes it. The window streaming places there is the eye band.
+    /// them, chart rings 0 and 1 shift out, ring parents split into their children, and the
+    /// coarsest ring meshes without `dy`. The hash covers positions, normals and layers, not morph
+    /// bits (seed 42, diffusion, default view), of each tile as the worker meshes it. The window
+    /// streaming places there is the eye band.
     #[test]
     fn far_chart_altitude_frontier_is_closed() {
         use crate::render_config::RenderConfig;
@@ -2426,7 +2427,7 @@ mod tests {
         let (center, storage) = home_altitude_eye(&world, DVec3::new(0.0, 1.0, 0.0), 0.0);
         world.section_eye_y = storage.y;
         let spawn = frontier_counts(&mut world, center);
-        assert_eq!(spawn.hash, 0x0a2c44d4, "spawn ground-level far-field bytes changed");
+        assert_eq!(spawn.hash, 0xbb07d8f0, "spawn ground-level far-field bytes changed");
         assert_eq!(spawn.bare, 0, "spawn ground-level bare columns");
         assert_eq!(spawn.gaps, 0, "spawn ground-level seam gaps");
         assert_eq!(spawn.missing, 0, "spawn ground-level missing tops");

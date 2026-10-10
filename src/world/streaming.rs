@@ -4075,7 +4075,7 @@ impl World {
 
     /// Pyramid stopped at the largest detail whose span still satisfies `L² ≤ 8R`, on the
     /// altitude-scaled unit, with the window clip's ring shift.
-    fn chart_pyramid(&self, radius: i64) -> Option<(pyramid::PyramidCfg, i8)> {
+    pub(in crate::world) fn chart_pyramid(&self, radius: i64) -> Option<(pyramid::PyramidCfg, i8)> {
         let src = self.far_pyramid();
         let mut levels = 0u8;
         let mut max_d = src.finest.0;

@@ -25,12 +25,14 @@ const MARGIN: f32 = 0.01;
 /// shader measures from the camera, which can stand anywhere in that chunk: half its diagonal.
 const EYE_SLACK: f32 = CHUNK_SIZE as f32 * 0.5 * std::f32::consts::SQRT_2;
 
-/// One drawn detail's nearest and farthest camera distance, in blocks.
+/// One drawn detail's nearest and farthest camera distance, in blocks. `flat`: some section of it
+/// was meshed without `dy` ([`World::section_morphs`]), so the level never moves.
 #[derive(Clone, Copy)]
 struct LevelReach {
     near: f32,
     far: f32,
     on: bool,
+    flat: bool,
 }
 
 /// Column tops sampled for one section. `stamp` is the edit overlay; `pass` is the
@@ -44,7 +46,7 @@ pub(in crate::world) struct CachedTops {
 }
 
 impl LevelReach {
-    const OFF: Self = Self { near: f32::MAX, far: 0.0, on: false };
+    const OFF: Self = Self { near: f32::MAX, far: 0.0, on: false, flat: false };
 }
 
 /// One edge of a drawn tile where its level meets a coarser drawn level (`coarse`), or the
@@ -142,7 +144,7 @@ fn aabb_reach(ex: f64, ey: f64, ez: f64, x0: f64, x1: f64, y0: f64, y1: f64, z0:
 /// shrunk nearest point where detail `d` meets a coarser level, `start_d` the grown farthest point
 /// where a finer level or the full-res window meets `d`. With no finer neighbour a level starts at
 /// its own nearest point (`full_res_far` adds the full-res window where its contact is not traced);
-/// with no coarser neighbour it stays unmorphed.
+/// with no coarser neighbour, or meshed without `dy`, it stays unmorphed.
 fn bands_from_meets(levels: &[LevelReach; 16], meets: &[Meets; 16], full_res_far: Option<f32>) -> [LodMorph; 16] {
     let mut out = [LodMorph::default(); 16];
     let finest = (0..16).find(|&d| levels[d].on);
@@ -157,7 +159,10 @@ fn bands_from_meets(levels: &[LevelReach; 16], meets: &[Meets; 16], full_res_far
         {
             start = start.max(grow_start(full, cell));
         }
-        let end = meets[d].coarser_near.map_or(start, |near| shrink_end(near, cell));
+        let end = match meets[d].coarser_near {
+            Some(near) if !levels[d].flat => shrink_end(near, cell),
+            _ => start,
+        };
         let k = d + MESH_SHIFT;
         if k < 16 {
             out[k] = LodMorph { start, end };
@@ -456,6 +461,7 @@ impl World {
         self.lod_relief_gen = self.lod_relief_gen.wrapping_add(1);
         let pass = self.lod_relief_gen;
         let mut levels = [LevelReach::OFF; 16];
+        let mut morphs = (u16::MAX, 0..0);
         let n = self.section_visible.len();
         for i in 0..n {
             let (s, mask) = self.section_visible[i];
@@ -467,10 +473,15 @@ impl World {
                 continue;
             }
             let (near, far) = self.section_reach_cached(center, s, chart, in_cube, pass);
+            if morphs.0 != s.body {
+                morphs = (s.body, self.morph_levels(s.body));
+            }
+            let flat = !morphs.1.contains(&d);
             let slot = &mut levels[d as usize];
             slot.near = slot.near.min(near);
             slot.far = slot.far.max(far);
             slot.on = true;
+            slot.flat |= flat;
         }
         let mut meets = [Meets::NONE; 16];
         let frontier = std::mem::take(&mut self.lod_frontier);
@@ -509,6 +520,27 @@ impl World {
         };
         let far = aabb_reach(ex, ey, ez, f.x0, f.x1, b0, b1, f.z0, f.z1).1;
         (near, far)
+    }
+
+    /// Whether `s`'s level can morph (see [`morph_levels`](Self::morph_levels)).
+    pub(in crate::world) fn section_morphs(&self, s: SectionPos) -> bool {
+        self.morph_levels(s.body).contains(&s.detail.0)
+    }
+
+    /// The details of `body` that can morph: the selection's rings with a coarser ring beyond
+    /// them. The coarsest ring and the slivers finer than the finest are meshed without `dy`, and
+    /// their bands stay empty.
+    fn morph_levels(&self, body: u16) -> std::ops::Range<i8> {
+        let coarsest = if body >= CHART_BODY_BASE {
+            let atlas = self.seams.atlases().get(usize::from(body - CHART_BODY_BASE));
+            match atlas.and_then(|a| self.chart_pyramid(a.radius)) {
+                Some((_, max_d)) => max_d,
+                None => return 0..0,
+            }
+        } else {
+            self.section_pyramid.coarsest().0
+        };
+        self.section_pyramid.finest.0..coarsest
     }
 
     fn chart_eyes(&self, center: Coord) -> Option<ChartEyes> {
@@ -693,8 +725,8 @@ impl World {
 #[test]
 fn lod_morph_bands_follow_synthetic_frontiers() {
     let mut levels = [LevelReach::OFF; 16];
-    levels[2] = LevelReach { near: 400.0, far: 900.0, on: true };
-    levels[3] = LevelReach { near: 800.0, far: 1800.0, on: true };
+    levels[2] = LevelReach { near: 400.0, far: 900.0, on: true, flat: false };
+    levels[3] = LevelReach { near: 800.0, far: 1800.0, on: true, flat: false };
     let mut meets = [Meets::NONE; 16];
     meets[2] = Meets { finer_far: Some(420.0), coarser_near: Some(800.0) };
     meets[3] = Meets { finer_far: Some(870.0), coarser_near: None };
@@ -714,6 +746,12 @@ fn lod_morph_bands_follow_synthetic_frontiers() {
     assert_eq!(bands_from_meets(&levels, &meets, None)[2 + MESH_SHIFT].start, grow_start(400.0, 4.0));
     // An untraced full-res window still bounds the finest level.
     assert_eq!(bands_from_meets(&levels, &meets, Some(600.0))[2 + MESH_SHIFT].start, grow_start(600.0, 4.0));
+
+    // A level meshed without `dy` cannot move, coarser neighbour or not.
+    levels[2].flat = true;
+    let flat = bands_from_meets(&levels, &meets, None)[2 + MESH_SHIFT];
+    assert_eq!(flat.end, flat.start, "a flat level stays put: {flat:?}");
+    levels[2].flat = false;
 
     // Crossed limits: the level pops.
     meets[2] = Meets { finer_far: Some(900.0), coarser_near: Some(700.0) };
@@ -783,7 +821,7 @@ fn arm_drawn(world: &mut World, eye: DVec3) -> usize {
     let tables = world.tables.get();
     for s in world.section_desired.clone() {
         let asked = world.clip_target(s);
-        let mesh = super::section::extract_section_mesh_with(s, world.generator.as_ref(), &[], &tables, asked, true);
+        let mesh = super::section::extract_section_mesh_with(s, world.generator.as_ref(), &[], &tables, asked, world.section_morphs(s));
         let detail = crate::ident::Detail(s.detail.0.saturating_add(mesh.shift as i8));
         let alt = super::SectionState::slab_span(s, detail, mesh.altitude_floor, mesh.slabs.iter().map(|slab| slab.origin_y));
         let clip = super::SectionClip { asked, drawn: mesh.clip_drawn };
@@ -885,7 +923,8 @@ fn assert_lod_bands(world: &mut World, label: &str) {
     println!("{label}: empty {empty} of {shown}, {drawn} sections {per:?}, {} frontier edges, {partial} partial parents drawn whole", frontier.len());
 }
 
-/// Probe: how many quads the morph's dy splits add, per detail, over the drawn cut at the owner site.
+/// Probe: how many quads the morph's dy splits add, per detail, over the drawn cut at the owner
+/// site: with `dy` everywhere, and gated to the levels that can morph (what the workers mesh).
 #[test]
 #[ignore]
 fn morph_quad_overhead_probe() {
@@ -897,7 +936,7 @@ fn morph_quad_overhead_probe() {
         m.slabs.iter().map(|slab| slab.data.iter().map(|(_, d)| d.quad_counts().iter().map(|&q| u64::from(q)).sum::<u64>()).sum::<u64>()).sum()
     };
     let pct = |a: u64, b: u64| (a as f64 / b.max(1) as f64 - 1.0) * 100.0;
-    let mut per = [(0u64, 0u64, 0usize); 16];
+    let mut per = [(0u64, 0u64, 0u64, 0usize); 16];
     for &(s, mask) in &world.section_visible {
         if mask.is_empty() {
             continue;
@@ -907,18 +946,24 @@ fn morph_quad_overhead_probe() {
         let e = &mut per[s.detail.0 as usize];
         e.0 += off;
         e.1 += on;
-        e.2 += 1;
+        e.2 += if world.section_morphs(s) { on } else { off };
+        e.3 += 1;
     }
-    let (mut t0, mut t1) = (0u64, 0u64);
-    for (d, &(off, on, n)) in per.iter().enumerate() {
+    let (mut t0, mut t1, mut t2) = (0u64, 0u64, 0u64);
+    for (d, &(off, on, gated, n)) in per.iter().enumerate() {
         if n == 0 {
             continue;
         }
         let band = world.lod_morph[d + MESH_SHIFT];
-        (t0, t1) = (t0 + off, t1 + on);
-        println!("detail {d}: {n} sections, quads {off} -> {on} (+{:.1}%), band morphs {}", pct(on, off), band.end > band.start);
+        (t0, t1, t2) = (t0 + off, t1 + on, t2 + gated);
+        println!(
+            "detail {d}: {n} sections, quads {off} plain, {on} with dy (+{:.1}%), {gated} gated (+{:.1}%), band morphs {}",
+            pct(on, off),
+            pct(gated, off),
+            band.end > band.start
+        );
     }
-    println!("total quads {t0} -> {t1} (+{:.1}%)", pct(t1, t0));
+    println!("total quads {t0} plain, {t1} with dy (+{:.1}%), {t2} gated (+{:.1}%)", pct(t1, t0), pct(t2, t0));
 }
 
 /// Chart, RD16/V5, the drawn far field after the near window has taken its columns.
@@ -1001,7 +1046,7 @@ fn lod_morph_walk_and_climb_probe() {
         let above = world.section_eye_y - ground(&world);
         let coarsest = (0..16).rev().find(|&d| levels[d].on).expect("a drawn level");
         let mut line = format!("above {above:.0}:");
-        for d in (0..coarsest).filter(|&d| levels[d].on) {
+        for d in (0..coarsest).filter(|&d| levels[d].on && !levels[d].flat) {
             let b = world.lod_morph[d + MESH_SHIFT];
             line.push_str(&format!(" d{d} {:.0}..{:.0}", b.start, b.end));
             if b.end <= b.start {

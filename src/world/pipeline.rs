@@ -139,6 +139,8 @@ pub(in crate::world) enum Job {
         tables: Arc<HotTables>,
         /// Chunk columns the full-res window draws instead.
         clip: section::ColumnClip,
+        /// The level can morph: faces carry their parent `dy`.
+        morph: bool,
     },
     /// Test-only: panics inside `run`, reporting the given claim — the injector
     /// for the worker-panic → `Done::Failed` → claim-release path.
@@ -1951,13 +1953,14 @@ fn run(job: Job, stager: Option<&MeshStager>, stats: &StagingStats) -> Done {
             edits,
             tables,
             clip,
+            morph,
         } => {
             // Fused extract+mesh on owned data: the generator samples straight
             // into the dense section grid — no RLE brick storage is built for
             // a result whose Section would be dropped after meshing anyway.
             // Pinned byte-identical to the storage path by the parity test in
             // `section::mesh`.
-            let meshes = section::extract_section_mesh_with(pos, &*generator, &edits, &tables, clip, true);
+            let meshes = section::extract_section_mesh_with(pos, &*generator, &edits, &tables, clip, morph);
             Done::Section {
                 pos,
                 epoch,
@@ -1998,6 +2001,7 @@ mod tests {
             edits: Vec::new(),
             tables: Arc::new(BlockRegistry::with_builtins().hot_tables()),
             clip: section::ColumnClip::NONE,
+            morph: true,
         }
     }
     /// The `x` id a `section_job` was tagged with.
