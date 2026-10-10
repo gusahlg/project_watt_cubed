@@ -17,6 +17,21 @@
 //! requires a major version bump. The [`prelude`] covers what most mods need; the module
 //! re-exports give access to the game's subsystems a mod may read or drive.
 //!
+//! # 2.2.0
+//!
+//! Additive on 2.1.0 (`^2.0` still matches):
+//!
+//! - The build lists every package compiled in, of every kind: one [`PackageInfo`] each (id,
+//!   name, version, description, [`PackageKind`], direct dependencies, and the entry point for
+//!   mods). [`ModRegistrar::build`] gives the whole list to any package as a [`BuildInfo`], so a
+//!   package can show what is installed without the core naming anything.
+//! - [`bundles_of`] works out which bundles include a package, from the bundles' own dependency
+//!   lists.
+//! - Generated builds use [`GameBuild::from_static`]. [`ModDescriptor`] and
+//!   [`GameBuild::with_mod`] still work and make a mod package with no description and no
+//!   dependencies. [`ModRegistrar::package`] returns the [`PackageInfo`], which has the same `id`,
+//!   `name` and `version` fields.
+//!
 //! # 2.1.0
 //!
 //! Additive on 2.0.0 (`^2.0` still matches):
@@ -55,9 +70,53 @@
 //! granularity, never per voxel.
 
 pub use project_watt_cubed::modding::{
-    annotate_setting, forced_off_marker, Action, ActionSet, ChoicesFlush, Command, CommandContext, GameBuild, Group,
-    Knob, Mod, ModContext, ModDescriptor, ModRegistrar, Mods, ToolUse, VisualMask, ESSENTIALS, ESSENTIALS_GROUP,
+    annotate_setting, forced_off_marker, Action, ActionSet, BuildInfo, ChoicesFlush, Command, CommandContext,
+    GameBuild, Group, Knob, Mod, ModContext, ModDescriptor, ModRegistrar, Mods, PackageInfo, PackageKind, ToolUse,
+    VisualMask, ESSENTIALS, ESSENTIALS_GROUP,
 };
+
+/// Every bundle in `packages` that includes the package `id`, in the order `packages` lists them
+/// (for a build: registration order). A bundle includes its own dependencies, and everything a
+/// bundle among them includes. A mod's dependencies are not members of the bundles that list the
+/// mod, and a bundle is not its own member.
+///
+/// ```
+/// use pwc_mod_api::{bundles_of, PackageInfo, PackageKind};
+/// const fn package(id: &'static str, kind: PackageKind, dependencies: &'static [&'static str]) -> PackageInfo {
+///     PackageInfo { id, name: id, version: "1.0.0", description: "", kind, dependencies, register: None }
+/// }
+/// let packages = [
+///     package("a.chat", PackageKind::Library, &[]),
+///     package("a.talk", PackageKind::Bundle, &["a.chat"]),
+///     package("a.all", PackageKind::Bundle, &["a.talk"]),
+/// ];
+/// let ids: Vec<&str> = bundles_of(&packages, "a.chat").iter().map(|b| b.id).collect();
+/// assert_eq!(ids, ["a.talk", "a.all"]);
+/// ```
+pub fn bundles_of<'p>(packages: &'p [PackageInfo], id: &str) -> Vec<&'p PackageInfo> {
+    let bundles: Vec<&PackageInfo> = packages.iter().filter(|p| p.kind == PackageKind::Bundle).collect();
+    let mut member_of = vec![false; bundles.len()];
+    // A bundle joins once it lists `id` or a bundle already found; repeat until nothing joins.
+    // Builds have a few dozen packages, and a lock has no cycles (a cycle would only stop early).
+    let mut grew = true;
+    while grew {
+        grew = false;
+        for (i, bundle) in bundles.iter().enumerate() {
+            if member_of[i] || bundle.id == id {
+                continue;
+            }
+            let includes = bundle
+                .dependencies
+                .iter()
+                .any(|dep| *dep == id || bundles.iter().zip(&member_of).any(|(b, &m)| m && b.id == *dep));
+            if includes {
+                member_of[i] = true;
+                grew = true;
+            }
+        }
+    }
+    bundles.into_iter().zip(member_of).filter_map(|(b, m)| m.then_some(b)).collect()
+}
 
 /// Catalog cues, the mix, voice sessions and the microphone. No device, codec or mixer type.
 pub mod audio {
@@ -82,4 +141,57 @@ pub mod prelude {
     pub use crate::ui::{Anchor, HudElement, Line, Panel, Role, Row};
     pub use crate::world::World;
     pub use crate::{Command, CommandContext, Group, Knob, Mod, ModContext, ModRegistrar, ESSENTIALS};
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const fn package(id: &'static str, kind: PackageKind, dependencies: &'static [&'static str]) -> PackageInfo {
+        PackageInfo { id, name: id, version: "1.0.0", description: "", kind, dependencies, register: None }
+    }
+
+    /// Registration order: a library, mods, nested bundles, a mod outside every bundle.
+    const PACKAGES: &[PackageInfo] = &[
+        package("t.kit", PackageKind::Library, &[]),
+        package("t.chat", PackageKind::Mod, &["t.kit"]),
+        package("t.commands", PackageKind::Mod, &["t.chat"]),
+        package("t.chat-commands", PackageKind::Bundle, &["t.chat", "t.commands"]),
+        package("t.hotbar", PackageKind::Mod, &[]),
+        package("t.essentials", PackageKind::Bundle, &["t.chat-commands", "t.hotbar"]),
+        package("t.extra", PackageKind::Bundle, &["t.hotbar"]),
+        package("t.toolkit", PackageKind::Mod, &["t.commands"]),
+    ];
+
+    fn ids(id: &str) -> Vec<&'static str> {
+        bundles_of(PACKAGES, id).iter().map(|b| b.id).collect()
+    }
+
+    #[test]
+    fn bundles_include_their_members_and_the_members_of_nested_bundles() {
+        assert_eq!(ids("t.chat"), ["t.chat-commands", "t.essentials"]);
+        assert_eq!(ids("t.hotbar"), ["t.essentials", "t.extra"], "in list order");
+        assert_eq!(ids("t.chat-commands"), ["t.essentials"]);
+    }
+
+    #[test]
+    fn dependencies_of_members_and_unbundled_packages_belong_to_no_bundle() {
+        assert!(ids("t.kit").is_empty(), "a member's dependency is not a member");
+        assert!(ids("t.toolkit").is_empty());
+        assert!(ids("t.essentials").is_empty(), "a top-level bundle");
+        assert!(ids("t.gone").is_empty());
+        assert!(bundles_of(&[], "t.chat").is_empty());
+    }
+
+    #[test]
+    fn a_cycle_ends() {
+        let cycle = [
+            package("c.a", PackageKind::Bundle, &["c.b", "c.x"]),
+            package("c.b", PackageKind::Bundle, &["c.a"]),
+        ];
+        let found: Vec<&str> = bundles_of(&cycle, "c.x").iter().map(|b| b.id).collect();
+        assert_eq!(found, ["c.a", "c.b"]);
+        let found: Vec<&str> = bundles_of(&cycle, "c.a").iter().map(|b| b.id).collect();
+        assert_eq!(found, ["c.b"], "a bundle is never its own member");
+    }
 }
