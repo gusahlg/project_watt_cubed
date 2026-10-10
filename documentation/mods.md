@@ -35,10 +35,16 @@ mod's own source keeps its licence.
 
 `src/modding/build.rs`:
 
-- `ModDescriptor { id, name, version, register }` — one compiled-in package: its `mod.toml`
-  identity and its entry point `fn register(&mut ModRegistrar)`.
+- `PackageInfo { id, name, version, description, kind, dependencies, register }` — one
+  compiled-in package of any `PackageKind` (`Mod`, `Library`, `Bundle`): its `mod.toml` identity,
+  its direct dependencies from the lock (a bundle's are its members), and for a mod its entry
+  point `fn register(&mut ModRegistrar)`. Libraries and bundles have `register: None`.
 - `GameBuild` — the packages of one build in registration (dependency) order, plus the
-  environment hash of the `pwc.lock` it came from. `GameBuild::vanilla()` has no packages.
+  environment hash of the `pwc.lock` it came from. Generated builds use
+  `GameBuild::from_static(ENVIRONMENT, PACKAGES)`; `GameBuild::vanilla()` has no packages.
+  `GameBuild::info()` is the read-only `BuildInfo` (`packages()`, `package(id)`, `environment()`).
+- `ModDescriptor { id, name, version, register }` with `GameBuild::with_mod` is the 2.x shorthand
+  for a mod package with no description and no dependencies; tests still use it.
 - `project_watt_cubed::run(build)` starts the game; `harness::golden_main(build)` runs the
   golden-shot harness for that build (blessed images in `WATT_GOLDEN_DIR`, default
   `tests/golden`).
@@ -52,18 +58,23 @@ fn main() {
 }
 ```
 
-where `game_build()` lists every package of the lock. Nothing scans directories or loads code at
-run time; disabled mods cost nothing.
+where `game_build()` lists every package of the lock, of every kind. Nothing scans directories or
+loads code at run time; disabled mods cost nothing.
 
 ## Registration
 
-`Mods::from_build(&build)` calls each package's `register` in order. The `ModRegistrar` it gets:
+`Mods::from_build(&build)` calls the `register` of each package that has one, in order. The
+`ModRegistrar` it gets:
 
 - `add(m)` / `add_disabled(m)` install a value implementing `Mod` (the player's `mods.cfg` choice
   still wins at load);
 - `declare_group(group)` adds a section to the Mods screen (`ESSENTIALS` is well known);
 - `provide(handle)` / `get::<T>()` share values between packages during registration — a package
-  reads what its dependencies provided (the inventory reads the hotbar's shared state this way).
+  reads what its dependencies provided (the inventory reads the hotbar's shared state this way);
+- `package()` is the package being registered, and `build()` the whole build as a `BuildInfo`:
+  every package of every kind, including those registered later. A package that shows what is
+  installed copies what it needs here (`PackageInfo` is `Copy`); `pwc_mod_api::bundles_of`
+  works out bundle membership from the bundles' dependency lists. The core names no package.
 
 ## The `Mod` trait
 
@@ -117,12 +128,13 @@ proximity-chat mod the microphone stays closed and voice is neither sent nor pla
 ## The mod API crate
 
 `crates/pwc-mod-api` is the one crate mods depend on. It re-exports the host types
-(`Mod`, `ModContext`, `ModRegistrar`, `GameBuild`, `ModDescriptor`, `Knob`, `Group`, …), the game
+(`Mod`, `ModContext`, `ModRegistrar`, `GameBuild`, `BuildInfo`, `PackageInfo`, `Knob`, `Group`, …), the game
 modules mods may use (`block`, `world`, `player`, `ui`, `menu`, `settings`, `inventory`, `render_config`,
 `net`, `session`, `sim`, `input`, `derived`, `engine`, `material`, `audio`) and a `prelude`. Its version is
 the **mod API version** a package's `mod.toml` requires (`pwc-api = "^2.0"`); a breaking change to
-what it re-exports needs a major version bump. The 2.1.0 additions and the 2.0.0 breaks are listed at the top of
-`crates/pwc-mod-api/src/lib.rs`. `audio` plays cues and voice; it does not expose the device.
+what it re-exports needs a major version bump. The 2.2.0 and 2.1.0 additions and the 2.0.0 breaks
+are listed at the top of `crates/pwc-mod-api/src/lib.rs`. `audio` plays cues and voice; it does not
+expose the device. Besides re-exports it has one function of its own, `bundles_of`.
 
 ## First-party mods
 
