@@ -589,7 +589,7 @@ mod tests {
     /// One enabled mod declaring `actions`.
     fn host(actions: &'static [Action]) -> Host {
         let mut mods = Host::empty();
-        mods.install(Box::new(Stub::new("stub").actions(actions)), true);
+        mods.install(Box::new(Stub::new("stub").actions(actions)));
         mods
     }
 

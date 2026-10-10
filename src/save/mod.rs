@@ -700,16 +700,17 @@ mod tests {
         assert!(before.iter().any(|c| c.iter().any(|&id| id != AIR)), "the spawn chart chunk must contain terrain");
 
         let player = Player::new(DVec3::new(0.0, 40.0, 0.0));
-        // The diffusion mod OFF: the save header, not the mod flag, decides the generator on load.
+        // The worldgen mod suspended: the save header, not the installed mods, decides the
+        // generator on load.
         let mut mods = crate::modding::testing::standard();
-        mods.set_enabled("diffusion", false);
+        mods.suspend_packages(&["pwc.infinite-diffusion".to_string()]);
         assert_eq!(mods.worldgen_kind(), WorldgenKind::Flat);
         save(&id, &world, &player, &mods, meta("diffusion")).unwrap();
 
         let (loaded, _, _, _) = load(&id, &mut mods, make_world).unwrap();
         assert_eq!(loaded.worldgen(), WorldgenKind::Diffusion);
         assert_eq!(loaded.terrain_cfg(), cfg.clamp());
-        assert_eq!(mods.worldgen_kind(), WorldgenKind::Flat, "loading must not flip the mod's enabled flag");
+        assert_eq!(mods.worldgen_kind(), WorldgenKind::Flat, "loading must not end the suspension");
         for (i, &(cx, cy, cz)) in chunks.iter().enumerate() {
             assert_eq!(dump_chunk(&loaded, cx, cy, cz), before[i], "chunk {cx},{cy},{cz} must regenerate identically");
         }

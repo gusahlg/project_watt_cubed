@@ -23,13 +23,14 @@ use crate::input::router::{Context, Router, View};
 use crate::menu::menus::{ModsMenu, SettingsHub};
 use crate::menu::start::{StartFacts, StartRoot, VERSION};
 use crate::menu::theme::{DefaultTheme, MenuTheme};
-use crate::menu::{AppEffect, Ctx, Framed, MenuStack, ModRow};
-use crate::modding::{ActionSet, BuildInfo, ChoicesFlush, Debounce, GameBuild, Mods, VisualMask};
+use crate::menu::{AppEffect, Ctx, Framed, MenuStack};
+use crate::modding::{ActionSet, BuildInfo, Debounce, GameBuild, Mods, VisualMask};
 use crate::ui::{self, Anchor};
 use crate::player::Player;
 use crate::save::{self, Autosaver, SaveMeta, Slot, SlotId, Tick};
 use crate::session::Session;
 use crate::settings::{GfxEngine, Settings};
+use crate::world::generation::WorldgenKind;
 use crate::world::terrain::TerrainCfg;
 use crate::world::World;
 use connect::ConnectJob;
@@ -73,9 +74,9 @@ pub struct App {
     active: Option<ActiveSlot>,
     /// Shared router for menus and in-game input.
     router: Router,
-    /// Installed mods and their on/off state; shared with the game while playing.
+    /// Installed mods and what the core suspended; shared with the game while playing.
     mods: Mods,
-    /// Packages compiled into this executable, of every kind. `Hello` reports the enabled mods.
+    /// Packages compiled into this executable, of every kind. `Hello` reports the unsuspended mods.
     build: BuildInfo,
     screen: Screen,
     /// A world building off the render thread. The menu under it stays as it was; Esc drops it.
@@ -99,15 +100,12 @@ pub struct App {
     audio: AudioService,
     /// Last stall-detector log, so a hung frame names itself once per window.
     last_stall_log: Option<Instant>,
-    /// Debounces `mods.cfg` writes (held Left/Right would otherwise rewrite ~22×/s).
-    choices_flush: ChoicesFlush,
     /// Settings changes (menu steps, the HUD hotkey, the console) wait here and save once they
     /// go quiet, or on leaving a world and on quit.
     settings_flush: Debounce,
     clock: Instant,
-    /// True while the Mods screen is on the menu stack.
-    mods_open: bool,
-    mods_save_error: Option<String>,
+    /// `WATT_BENCH_WORLDGEN`: the generator new worlds use, whatever the mods say.
+    worldgen_pin: Option<WorldgenKind>,
     /// Last graphics stamp pushed to the engine; `apply` runs only on change.
     gfx_applied: Option<GfxKey>,
 }
@@ -211,9 +209,19 @@ impl App {
         // While the menu is up, so the first world's frame does not pay for it.
         crate::world::terrain::prewarm();
         let mut mods = Mods::from_build(build);
-        mods.load_choices();
         let pins = Benchmark::mod_pins_from_env();
-        mods.apply_bench_env(pins.worldgen_diffusion, pins.visuals_core);
+        let mut pinned = pins.suspend;
+        if pins.visuals_core == Some(true) {
+            for id in mods.visual_packages() {
+                if !pinned.contains(&id) {
+                    pinned.push(id);
+                }
+            }
+        }
+        if !pinned.is_empty() {
+            eprintln!("PWC: suspended for this run: {}", pinned.join(", "));
+            mods.pin_suspended(&pinned);
+        }
         let saves = save::list();
         let mut settings = Settings::load();
         let (caps, display) = crate::benchmark::graphics_caps();
@@ -262,30 +270,15 @@ impl App {
             cues,
             audio,
             last_stall_log: None,
-            choices_flush: ChoicesFlush::new(),
             settings_flush: Debounce::new(),
             clock: Instant::now(),
-            mods_open: false,
-            mods_save_error: None,
+            worldgen_pin: pins.worldgen,
             gfx_applied: None,
         }
     }
 
     fn now_ms(&self) -> u64 {
         self.clock.elapsed().as_millis() as u64
-    }
-
-    fn persist_mod_choices(&mut self) {
-        match self.mods.save_choices() {
-            Ok(()) => self.mods_save_error = None,
-            Err(e) => self.mods_save_error = Some(e.to_string()),
-        }
-    }
-
-    fn flush_mod_choices_if_dirty(&mut self) {
-        if self.choices_flush.take() {
-            self.persist_mod_choices();
-        }
     }
 
     fn flush_settings_if_dirty(&mut self) {
@@ -335,7 +328,6 @@ impl App {
             if self.bench.is_none() {
                 self.settings.save();
             }
-            self.flush_mod_choices_if_dirty();
             self.flush_save();
             return false;
         }
@@ -371,7 +363,6 @@ impl App {
             if self.bench.is_none() {
                 self.settings.save();
             }
-            self.flush_mod_choices_if_dirty();
             self.flush_save();
             self.note_frame_stall(t0, update_dt);
             return false;
@@ -454,23 +445,17 @@ impl App {
             None
         };
         self.fan_audio(dt, false, click);
-        // A per-frame snapshot so a menu never holds a live `&Mods`.
-        let mods = ModRow::snapshot(&self.mods);
-        let mods_save_error = self.mods_save_error.clone();
         let before = self.settings.clone();
-        let depth_before = match &self.screen {
-            Screen::Menus(stack) => stack.depth(),
-            _ => 0,
-        };
         let now_ms = self.now_ms();
         let mut effect = None;
         if let Screen::Menus(stack) = &mut self.screen {
             let mut ctx = Ctx {
                 settings: &mut self.settings,
                 saves: &self.saves,
-                mods: &mods,
                 session: &self.session,
-                mods_save_error: mods_save_error.as_deref(),
+                build: &self.build,
+                suspended: self.mods.suspended(),
+                visuals: self.mods.visual_mask(),
             };
             effect = stack.update(&intents, &mut ctx);
         }
@@ -482,24 +467,10 @@ impl App {
         if settings_write_due(&mut self.settings_flush, changed, now_ms) {
             self.settings.save();
         }
-        if self.mods_open {
-            let depth_after = match &self.screen {
-                Screen::Menus(stack) => stack.depth(),
-                _ => 0,
-            };
-            if depth_after < depth_before {
-                self.mods_open = false;
-                self.flush_mod_choices_if_dirty();
-            }
-        }
-        let quit = match effect {
+        match effect {
             Some(effect) => self.handle_effect(eng, effect),
             None => false,
-        };
-        if self.choices_flush.poll(now_ms) {
-            self.persist_mod_choices();
         }
-        quit
     }
 
     /// Interpret one menu effect. Returns `true` only for Quit.
@@ -539,36 +510,14 @@ impl App {
             AppEffect::Mods => {
                 if let Screen::Menus(stack) = &mut self.screen {
                     stack.push(Framed::boxed(ModsMenu));
-                    self.mods_open = true;
                 }
             }
-            AppEffect::ToggleMod(index) => {
-                if self.mods.toggle(index) {
-                    self.choices_flush.mark(self.now_ms());
-                }
-            }
-            AppEffect::StepModKnob {
-                mod_index,
-                knob,
-                delta,
-            } => {
-                self.mods.step_knob(mod_index, knob, delta);
-                self.choices_flush.mark(self.now_ms());
-            }
-            AppEffect::SetGroup { id, on } => {
-                if self.mods.set_group_enabled(id, on) {
-                    self.choices_flush.mark(self.now_ms());
-                }
-            }
-            AppEffect::Quit => {
-                self.flush_mod_choices_if_dirty();
-                return true;
-            }
+            AppEffect::Quit => return true,
         }
         false
     }
 
-    /// Open the start screen: first enabled start-screen mod, else the core fallback.
+    /// Open the start screen: first active start-screen mod, else the core fallback.
     fn start_stack(
         mods: &Mods,
         saves: &[Slot],
@@ -624,9 +573,8 @@ impl App {
 
     /// Return to the start menu with an optional notice (e.g. a failed connect).
     fn return_to_menu(&mut self, notice: Option<String>) {
-        // Mods a server turned off for the session come back on leave.
-        // The hold was never written to mods.cfg.
-        self.mods.release_server();
+        // Packages a server suspended for the session come back on leave. Nothing was saved.
+        self.mods.resume_packages();
         self.fan_world_edge(GameEvent::LeaveWorld);
         self.sound.leave_world();
         self.audio.enter_world();
@@ -676,7 +624,7 @@ impl App {
         let recipe = Recipe {
             seed,
             render: self.mods.effective_render(&self.settings),
-            kind: self.mods.worldgen_kind(),
+            kind: self.worldgen_pin.unwrap_or_else(|| self.mods.worldgen_kind()),
             cfg: terrain_cfg_from_mods(&self.mods),
         };
         self.entry_notice = stopped;
@@ -686,7 +634,7 @@ impl App {
     /// Start loading a save. A save that fails to load returns to the menu.
     fn load_world(&mut self, eng: &mut Engine, id: &SlotId) {
         // Stopping saves first, so the world loads with the friends' last edits. The save header
-        // names the generator; the InfiniteDiffusion mod's enabled flag only chooses the next *new* world.
+        // names the generator; the installed worldgen mod only chooses the next *new* world.
         self.entry_notice = self.host.stop();
         let render = self.mods.effective_render(&self.settings);
         self.begin_loading(eng, Loading::load(id.clone(), render));
@@ -731,8 +679,7 @@ impl App {
 
     /// Swap a built world in: fresh mod state, the save's mod state for a load, then the game.
     fn arrive(&mut self, eng: &mut Engine, loading: Loading) {
-        // Every world starts from a clean default mod set (empty inventory, etc.);
-        // the mod menu's enable/disable choices persist.
+        // Every world starts from a clean default mod state (empty inventory, etc.).
         self.mods.reset_state();
         match loading {
             Loading::New(job) => {
@@ -953,8 +900,6 @@ impl App {
             );
             return;
         }
-        // Mods snapshot avoids borrow conflict between theme and view.
-        let mods = ModRow::snapshot(&self.mods);
         let fallback = DefaultTheme;
         let theme: &dyn MenuTheme = self.mods.menu_theme().unwrap_or(&fallback);
         let mut f = eng.begin_frame(MENU_CLEAR.to_linear());
@@ -962,9 +907,10 @@ impl App {
             let ctx = Ctx {
                 settings: &mut self.settings,
                 saves: &self.saves,
-                mods: &mods,
                 session: &self.session,
-                mods_save_error: self.mods_save_error.as_deref(),
+                build: &self.build,
+                suspended: self.mods.suspended(),
+                visuals: self.mods.visual_mask(),
             };
             stack.draw(&ctx, theme, &mut f, w, h);
         }
@@ -1379,7 +1325,7 @@ mod tests {
             let held = now_ms < 2000 && frame % 4 == 0;
             let intents = if held { vec![Intent::Adjust(Dir::Prev)] } else { Vec::new() };
             let before = settings.clone();
-            let mut ctx = Ctx { settings: &mut settings, saves: &[], mods: &[], session: &session, mods_save_error: None };
+            let mut ctx = Ctx::bare(&mut settings, &session);
             stack.update(&intents, &mut ctx);
             let changed = settings != before;
             steps += changed as u32;

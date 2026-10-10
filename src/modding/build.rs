@@ -14,7 +14,7 @@ use std::any::{Any, TypeId};
 use std::borrow::Cow;
 use std::collections::HashMap;
 
-use super::{Group, Mod, Mods};
+use super::{Mod, Mods};
 
 /// What a package is: `kind` in its `mod.toml`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -97,6 +97,9 @@ pub struct BuildInfo {
 }
 
 impl BuildInfo {
+    /// A build with no package and no environment.
+    pub const EMPTY: BuildInfo = BuildInfo { packages: Cow::Borrowed(&[]), environment: None };
+
     /// Every package of every kind, dependencies before dependents (ties by id in generated
     /// builds).
     pub fn packages(&self) -> &[PackageInfo] {
@@ -184,8 +187,8 @@ pub(super) struct Resources {
     values: HashMap<TypeId, Box<dyn Any>>,
 }
 
-/// What a package's `register` function gets: the place to install its mods, declare groups,
-/// share handles with the packages that depend on it, and read what the build contains.
+/// What a package's `register` function gets: the place to install its mods, share handles with
+/// the packages that depend on it, and read what the build contains.
 pub struct ModRegistrar<'a> {
     package: &'a PackageInfo,
     build: &'a BuildInfo,
@@ -214,20 +217,10 @@ impl<'a> ModRegistrar<'a> {
         self.build
     }
 
-    /// Install a mod, enabled by default (the player's `mods.cfg` choice still wins).
+    /// Install a mod. It runs for as long as the build has it, unless the core suspends this
+    /// package for a session.
     pub fn add(&mut self, module: impl Mod + 'static) {
-        self.mods.install_from(Some(self.package.id), Box::new(module), true);
-    }
-
-    /// Install a mod that starts disabled.
-    pub fn add_disabled(&mut self, module: impl Mod + 'static) {
-        self.mods.install_from(Some(self.package.id), Box::new(module), false);
-    }
-
-    /// Declare a group for the mods screen (its members return `group.id` from [`Mod::group`]).
-    /// Declaring the same id twice keeps the first.
-    pub fn declare_group(&mut self, group: Group) {
-        self.mods.declare_group(group);
+        self.mods.install_from(Some(self.package.id), Box::new(module));
     }
 
     /// Share a value with the packages registered after this one (handles are usually `Rc`s).
@@ -260,8 +253,7 @@ mod tests {
     fn consumer(r: &mut ModRegistrar) {
         let shared = r.get::<Shared>().expect("the dependency provided it");
         assert_eq!(shared.0, 7);
-        r.add_disabled(Stub::new("second"));
-        r.declare_group(Group { id: "tools", name: "Tools", description: "" });
+        r.add(Stub::new("second"));
     }
 
     #[test]
@@ -273,8 +265,7 @@ mod tests {
         let mods = build.mods();
         assert_eq!(mods.len(), 2);
         assert_eq!((mods.id(0), mods.package(0)), ("first", Some("test.provider")));
-        assert_eq!((mods.id(1), mods.is_enabled(1)), ("second", false));
-        assert_eq!(mods.groups().map(|g| g.id).collect::<Vec<_>>(), ["essentials", "tools"]);
+        assert_eq!((mods.id(1), mods.package(1), mods.is_active(1)), ("second", Some("test.consumer"), true));
         assert_eq!(build.environment(), Some("sha256:00"));
         let kinds: Vec<PackageKind> = build.packages().iter().map(|p| p.kind).collect();
         assert_eq!(kinds, [PackageKind::Mod, PackageKind::Mod], "a 2.x descriptor is a mod package");

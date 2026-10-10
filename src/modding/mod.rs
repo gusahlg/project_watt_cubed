@@ -1,7 +1,10 @@
 //! The mod host: the game's "minimal core, layers on top" made real. Core
 //! gameplay owns the world, the law and physics; everything player-facing that
 //! isn't essential — the inventory panel, block looks and names, HUD
-//! widgets — is a [`Mod`] that can be toggled at runtime from the mod menu.
+//! widgets, menus — is a [`Mod`]. The build decides which mods are in: there is no
+//! runtime switch. The core can only *suspend* a package for one session, when the
+//! server it joins refuses it (or a benchmark pins it off); suspension has no UI and is
+//! never saved.
 //!
 //! Mods are **compiled in**. A mod package (`.pwcmod`, see the PWC package
 //! manager) is a Rust crate whose `register` function receives a
@@ -12,17 +15,13 @@
 //! **Performance:** mod hooks fire only at frame and event granularity —
 //! `update`/`draw` once per frame, `on_block_break` once per broken block. Nothing
 //! here is ever called from the voxel hot path (meshing, collision, streaming), and
-//! disabled mods are skipped entirely. A mod therefore costs nothing where it would
+//! suspended mods are skipped entirely. A mod therefore costs nothing where it would
 //! matter and only what it draws where it wouldn't.
 mod build;
 #[cfg(test)]
 pub(crate) mod testing;
 
 pub use build::{BuildInfo, GameBuild, ModDescriptor, ModRegistrar, PackageInfo, PackageKind};
-
-use std::fs;
-use std::io;
-use std::path::Path;
 
 use crate::block::appearance::{BlockAppearance, FLAT};
 use crate::block::naming::MaterialNamer;
@@ -37,36 +36,7 @@ use crate::ui::{HudElement, Line};
 use crate::world::generation::WorldgenKind;
 use crate::world::World;
 
-/// Group id of the first-party essentials (menus, inventory, looks, names, worldgen).
-pub const ESSENTIALS: &str = "essentials";
-
-/// The well-known essentials group. Mods returning [`ESSENTIALS`] from [`Mod::group`] are shown
-/// under it without declaring it themselves.
-pub const ESSENTIALS_GROUP: Group = Group {
-    id: ESSENTIALS,
-    name: "Essentials",
-    description: "Menus, inventory, looks, names and worldgen.",
-};
-
-/// Named group of related mods. The id is the stable key; the display name
-/// can change here without touching every member.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Group {
-    pub id: &'static str,
-    pub name: &'static str,
-    pub description: &'static str,
-}
-
-/// One tunable shown under a mod in the mods menu.
-#[derive(Clone, Debug)]
-pub struct Knob {
-    pub label: &'static str,
-    pub value: String,
-    /// Allowed range or choice list, shown as the row detail.
-    pub hint: String,
-}
-
-/// Which fancy visual groups are currently enabled.
+/// Which fancy visual groups the installed, unsuspended mods provide.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VisualMask {
     pub atmosphere: bool,
@@ -85,6 +55,13 @@ impl VisualMask {
         atmosphere: false,
         post: false,
         lighting: false,
+    };
+
+    /// Every group provided.
+    pub const ALL: Self = Self {
+        atmosphere: true,
+        post: true,
+        lighting: true,
     };
 
     /// The mask with exactly `groups` on: a group is on when any enabled mod owns it. The mods
@@ -127,24 +104,10 @@ impl VisualMask {
         self.apply(settings.render_config())
     }
 
-    /// Name of the visual mod forcing `key` off, if any.
-    pub fn forced_off(self, key: &str) -> Option<&'static str> {
-        let group = crate::render_config::lane_group(key)?;
-        (!self.get(group)).then(|| group.mod_name())
-    }
-}
-
-/// Marker appended when a visual group has stripped the lane. The settings
-/// menu, `/gfx`, and any HUD that prints lanes share this one string.
-pub fn forced_off_marker(mod_name: &str) -> String {
-    format!("(off: {mod_name} mod)")
-}
-
-/// Append [`forced_off_marker`] when a visual group has stripped the lane.
-pub fn annotate_setting(value: String, key: &str, mask: VisualMask) -> String {
-    match mask.forced_off(key) {
-        Some(name) => format!("{value} {}", forced_off_marker(name)),
-        None => value,
+    /// Whether this mask strips the settings lane `key`: no installed, unsuspended mod provides
+    /// its visual group. False for a lane outside every group.
+    pub fn strips(self, key: &str) -> bool {
+        crate::render_config::lane_group(key).is_some_and(|group| !self.get(group))
     }
 }
 
@@ -326,7 +289,7 @@ pub struct CommandContext<'a> {
     pub world: &'a mut World,
     pub settings: &'a mut Settings,
     pub sky: &'a mut Sky,
-    /// Which visual groups the enabled mods provide (`/gfx` names the mod a lane waits on).
+    /// Which visual groups the active mods provide (`/gfx` marks a lane no mod provides).
     pub visuals: VisualMask,
     /// True when a server owns the session: it sets the day length and may refuse a teleport.
     pub networked: bool,
@@ -352,52 +315,40 @@ impl<'a> CommandContext<'a> {
     }
 }
 
-/// A unit of layered-on functionality. Every method has a default, so a mod
-/// implements only the hooks it cares about. This is the public surface mod authors
-/// write against — kept small on purpose.
+/// A unit of layered-on functionality. Every method but [`id`](Self::id) has a default, so a mod
+/// implements only the hooks it cares about. This is the public surface mod authors write
+/// against — kept small on purpose.
 ///
-/// Arbitration when more than one enabled mod implements a hook:
+/// Arbitration when more than one active mod implements a hook (a mod is active unless the core
+/// suspended its package for the session):
 /// - **Fan-out**, install order: `update`, `on_block_break`, `on_break_rejected`,
 ///   `on_place_rejected`, `on_tool_changed`, `on_tool_used`. `hud` uses the same order as z-order
 ///   (later draws on top). `commands` lists concatenate in the same order. `actions` are collected,
-///   not arbitrated: each enabled mod's list is its own.
-/// - **First enabled wins**: `menu_theme`, `start_screen`, `close_overlay` and `on_toggle_fly`
+///   not arbitrated: each active mod's list is its own.
+/// - **First active wins**: `menu_theme`, `start_screen`, `close_overlay` and `on_toggle_fly`
 ///   (first `true`),
 ///   `worldgen`, `worldgen_config`, `appearance`, `namer`, `tool`, `run_command` (first `Some`).
 /// - **Compose**: `visual_group` bits OR into the render mask.
 ///
-/// `knobs` / `step_knob` and save hooks are per-mod. `worldgen_config` is an
-/// opaque string; the winning worldgen kind parses it.
+/// Save hooks are per-mod. `worldgen_config` is an opaque string; the winning worldgen kind
+/// parses it. What a package is called and what it does are its `mod.toml` (see
+/// [`ModRegistrar::package`]); a mod has no display text of its own.
 pub trait Mod {
-    /// Short name shown in the mod menu. Not a save key — see [`id`].
-    fn name(&self) -> &str;
+    /// Name for logs, and the key old saves used before mods had ids. Defaults to
+    /// [`id`](Self::id).
+    fn name(&self) -> &str {
+        self.id()
+    }
 
-    /// Stable lowercase code id. Persist, env pins, and lookups use this;
-    /// [`name`] is the display label and may change.
+    /// Stable lowercase code id. Per-world saves key on it; [`name`](Self::name) is only a
+    /// fallback for saves older than ids.
     fn id(&self) -> &'static str;
 
-    /// One-line description for the mod menu.
-    fn description(&self) -> &str {
-        ""
-    }
-
-    /// Group id ([`ESSENTIALS`] or one declared with [`ModRegistrar::declare_group`]), or `""`
-    /// if ungrouped.
-    fn group(&self) -> &'static str {
-        ""
-    }
-
-    /// Called when the mod is switched on (including at load if enabled).
-    fn on_enable(&mut self) {}
-    /// Called when the mod is switched off.
-    fn on_disable(&mut self) {}
-
     /// Clear per-world state (crafted blocks, open panels) when entering a
-    /// different world. Enable/disable choices are NOT touched — those persist
-    /// across worlds. The inventory lives on the player, not here.
+    /// different world. The inventory lives on the player, not here.
     fn reset(&mut self) {}
 
-    /// Cadence-controlled logic while enabled (the game's `mod_hz`). Runs
+    /// Cadence-controlled logic while active (the game's `mod_hz`). Runs
     /// after movement, before rendering; edge inputs accumulated between
     /// ticks are replayed in order without loss.
     fn update(&mut self, ctx: &mut ModContext) {
@@ -405,7 +356,7 @@ pub trait Mod {
     }
 
     /// The flight key (`F`) was pressed. The core has no flight toggle of its own: a mod that
-    /// offers flight switches it here and returns `true`; the first enabled mod that does wins.
+    /// offers flight switches it here and returns `true`; the first active mod that does wins.
     /// Delivered on the frame of the press (whatever the mod cadence), never while a detached
     /// camera holds the player.
     fn on_toggle_fly(&mut self, player: &mut Player, world: &World) -> bool {
@@ -433,13 +384,13 @@ pub trait Mod {
         let _ = (id, world);
     }
 
-    /// Controls this mod wants sampled while it is enabled. The core owns the chord
+    /// Controls this mod wants sampled while it is active. The core owns the chord
     /// table; a core binding wins any clash. Default is none.
     fn actions(&self) -> &[Action] {
         &[]
     }
 
-    /// The configuration a primary action applies, if any (first enabled mod that answers
+    /// The configuration a primary action applies, if any (first active mod that answers
     /// wins). `None` means no tool: the primary action breaks the block into the inventory.
     fn tool(&self, player: &Player) -> Option<BlockId> {
         let _ = player;
@@ -472,7 +423,7 @@ pub trait Mod {
         let _ = (view, audio, link);
     }
 
-    /// Optional material namer. First enabled mod that returns `Some` names every
+    /// Optional material namer. First active mod that returns `Some` names every
     /// configuration; without one the core describes materials by their readings.
     fn namer(&self) -> Option<&dyn MaterialNamer> {
         None
@@ -485,7 +436,7 @@ pub trait Mod {
         None
     }
 
-    /// Handle the console command `cmd` (the leading `/` stripped) with `args`. The first enabled
+    /// Handle the console command `cmd` (the leading `/` stripped) with `args`. The first active
     /// mod that returns `Some` handles it; its lines go to the console.
     fn run_command(&mut self, ctx: &mut CommandContext<'_>, cmd: &str, args: &[&str]) -> Option<Vec<Line>> {
         let _ = ctx;
@@ -497,7 +448,7 @@ pub trait Mod {
         &[]
     }
 
-    /// This mod's HUD contribution while enabled, as data — [`HudElement`]s
+    /// This mod's HUD contribution while active, as data — [`HudElement`]s
     /// pushed into a caller-owned buffer the core renders over the world and
     /// under the console. A mod describes *what* to show and never draws, so
     /// panel chrome and layout live in one place ([`crate::ui::render_hud`]).
@@ -518,9 +469,9 @@ pub trait Mod {
         None
     }
 
-    /// Optional start screen. First enabled mod that returns `Some` wins;
+    /// Optional start screen. First active mod that returns `Some` wins;
     /// the core fallback (New world / Load / Settings / Mods / Quit) is used
-    /// when every enabled mod returns `None`. Plain-data signatures only.
+    /// when every active mod returns `None`. Plain-data signatures only.
     fn start_screen(&self, facts: &StartFacts) -> Option<Box<dyn StartScreen>> {
         let _ = facts;
         None
@@ -543,75 +494,56 @@ pub trait Mod {
         0
     }
 
-    /// Which fancy render group this mod owns, if any. The host reads it when the mod is
-    /// installed or switched on or off.
+    /// Which fancy render group this mod provides, if any. The host reads it when the mod is
+    /// installed and when a suspension starts or ends.
     fn visual_group(&self) -> Option<VisualGroup> {
         None
     }
 
-    /// If this mod replaces worldgen, the kind to use when it is enabled.
+    /// If this mod replaces worldgen, the kind new worlds use while it is active.
     fn worldgen(&self) -> Option<WorldgenKind> {
         None
     }
 
-    fn knobs(&self) -> Vec<Knob> {
-        Vec::new()
-    }
-
-    fn step_knob(&mut self, index: usize, delta: i32) {
-        let _ = (index, delta);
-    }
-
-    /// Knob/config payload written as `id.state=` in `saves/mods.cfg`.
-    /// Per-world [`save_state`] is a different path and is not written here.
-    fn save_choice_state(&self) -> Option<String> {
-        None
-    }
-
-    fn load_choice_state(&mut self, data: &str) {
-        let _ = data;
-    }
-
-    /// Opaque payload for the winning [`worldgen`] kind. `None` if this mod
-    /// does not replace worldgen. InfiniteDiffusion parses it as its knobs.
+    /// Opaque payload for the winning [`worldgen`](Self::worldgen) kind. `None` if this mod
+    /// does not replace worldgen. InfiniteDiffusion builds it from its options.
     fn worldgen_config(&self) -> Option<String> {
         None
     }
 
-    /// Optional block appearance. First enabled mod that returns `Some` wins;
+    /// Optional block appearance. First active mod that returns `Some` wins;
     /// [`FlatAppearance`](crate::block::appearance::FlatAppearance) is used
-    /// when every enabled mod returns `None`.
+    /// when every active mod returns `None`.
     fn appearance(&self) -> Option<&dyn BlockAppearance> {
         None
     }
 }
 
-/// One installed mod and whether it is currently active.
+/// One installed mod and whether it runs this session.
 struct Entry {
     module: Box<dyn Mod>,
-    enabled: bool,
     /// Id of the package that registered it (`None` for mods installed directly).
     package: Option<&'static str>,
+    /// False while the core suspends its package (see [`Mods::suspend_packages`]).
+    active: bool,
 }
 
-/// The set of installed mods and their on/off state. Enable/disable choices persist
-/// in `mods.cfg`; per-world state is saved through each mod's `save_state`/`load_state`.
+/// The installed mods. Every mod the build installs runs, unless the core suspends its package
+/// for the session; per-world state is saved through each mod's `save_state`/`load_state`.
 pub struct Mods {
     entries: Vec<Entry>,
-    /// Groups declared by packages, after the well-known [`ESSENTIALS_GROUP`].
-    declared_groups: Vec<Group>,
-    /// Bumped when a mod is installed or enabled or disabled, so the input
+    /// Bumped when a mod is installed or a suspension starts or ends, so the input
     /// table can rebuild once instead of every frame.
     action_gen: u64,
-    /// The enabled mods' visual groups, rebuilt with `action_gen`.
+    /// The active mods' visual groups, rebuilt with `action_gen`.
     visuals: VisualMask,
-    /// Bumped whenever what the mods screen lists may have changed.
+    /// Bumped whenever what a mods screen lists may have changed.
     revision: u64,
-    /// Package ids the current server refused. Not written to `mods.cfg`.
-    server_packages: Vec<String>,
-    /// Module ids that were on when the server refused their package. Restored
-    /// on leave. The session disable itself is not saved.
-    server_held: Vec<String>,
+    /// Package ids suspended for the whole process (`WATT_BENCH_SUSPEND`). Never saved.
+    pinned: Vec<String>,
+    /// Package ids suspended now: the pinned ones plus what the current server refused. Never
+    /// saved.
+    suspended: Vec<String>,
 }
 
 impl Mods {
@@ -634,34 +566,31 @@ impl Mods {
     pub fn empty() -> Self {
         Self {
             entries: Vec::new(),
-            declared_groups: Vec::new(),
             action_gen: 0,
             visuals: VisualMask::NONE,
             revision: 0,
-            server_packages: Vec::new(),
-            server_held: Vec::new(),
+            pinned: Vec::new(),
+            suspended: Vec::new(),
         }
     }
 
-    /// Install a mod, running its enable hook if it starts on.
-    pub fn install(&mut self, module: Box<dyn Mod>, enabled: bool) {
-        self.install_from(None, module, enabled);
+    /// Install a mod directly (tests, the vanilla harness). Packages install through
+    /// [`ModRegistrar::add`].
+    pub fn install(&mut self, module: Box<dyn Mod>) {
+        self.install_from(None, module);
     }
 
-    fn install_from(&mut self, package: Option<&'static str>, module: Box<dyn Mod>, enabled: bool) {
-        let mut entry = Entry { module, enabled, package };
-        if enabled {
-            entry.module.on_enable();
-        }
-        self.entries.push(entry);
-        self.enabled_changed();
+    fn install_from(&mut self, package: Option<&'static str>, module: Box<dyn Mod>) {
+        let active = !package.is_some_and(|pkg| self.suspended.iter().any(|id| id == pkg));
+        self.entries.push(Entry { module, package, active });
+        self.active_changed();
     }
 
-    /// The enabled set changed: a new action generation and visual mask.
-    fn enabled_changed(&mut self) {
+    /// The active set changed: a new action generation and visual mask.
+    fn active_changed(&mut self) {
         self.action_gen = self.action_gen.wrapping_add(1);
-        let enabled = self.entries.iter().filter(|e| e.enabled);
-        self.visuals = VisualMask::of(enabled.filter_map(|e| e.module.visual_group()));
+        let active = self.entries.iter().filter(|e| e.active);
+        self.visuals = VisualMask::of(active.filter_map(|e| e.module.visual_group()));
         self.revise();
     }
 
@@ -669,34 +598,21 @@ impl Mods {
         self.revision = self.revision.wrapping_add(1);
     }
 
-    /// Generation of the enabled action lists. Changes when a mod is installed
-    /// or switched on or off.
+    /// Generation of the active action lists. Changes when a mod is installed or a suspension
+    /// starts or ends.
     pub fn action_generation(&self) -> u64 {
         self.action_gen
     }
 
-    /// Changes whenever what the mods screen lists may have changed: a mod installed or switched,
-    /// a knob stepped or loaded, a group declared, or a server hold set or released.
+    /// Changes whenever what a mods screen lists may have changed: a mod installed, or a
+    /// suspension started or ended.
     pub fn revision(&self) -> u64 {
         self.revision
     }
 
-    /// Actions of every enabled mod, in install order.
+    /// Actions of every active mod, in install order.
     pub fn enabled_actions(&self) -> impl Iterator<Item = &Action> + '_ {
-        self.entries.iter().filter(|e| e.enabled).flat_map(|e| e.module.actions())
-    }
-
-    /// Groups shown as sections on the mods screen, in this order: the well-known essentials,
-    /// then every group a package declared.
-    pub fn groups(&self) -> impl Iterator<Item = &Group> {
-        std::iter::once(&ESSENTIALS_GROUP).chain(self.declared_groups.iter())
-    }
-
-    fn declare_group(&mut self, group: Group) {
-        if group.id != ESSENTIALS && !self.declared_groups.iter().any(|g| g.id == group.id) {
-            self.declared_groups.push(group);
-            self.revise();
-        }
+        self.entries.iter().filter(|e| e.active).flat_map(|e| e.module.actions())
     }
 
     /// The package that registered the mod at `index`, if any.
@@ -704,60 +620,59 @@ impl Mods {
         self.entries[index].package
     }
 
-    /// Reset every mod's per-world state (entering a new/loaded/networked
-    /// world) while keeping the player's enable/disable choices.
+    /// Reset every mod's per-world state (entering a new/loaded/networked world).
     pub fn reset_state(&mut self) {
         for entry in &mut self.entries {
             entry.module.reset();
         }
     }
 
-    fn each_enabled(&mut self, mut f: impl FnMut(&mut dyn Mod)) {
+    fn each_active(&mut self, mut f: impl FnMut(&mut dyn Mod)) {
         for entry in &mut self.entries {
-            if entry.enabled {
+            if entry.active {
                 f(&mut *entry.module);
             }
         }
     }
 
-    /// Run every enabled mod's per-frame logic.
+    /// Run every active mod's per-frame logic.
     pub fn update(&mut self, ctx: &mut ModContext) {
-        self.each_enabled(|m| m.update(ctx));
+        self.each_active(|m| m.update(ctx));
     }
 
-    /// The flight key: the first enabled mod that handles it wins. False when none does.
+    /// The flight key: the first active mod that handles it wins. False when none does.
     pub fn on_toggle_fly(&mut self, player: &mut Player, world: &World) -> bool {
-        self.entries.iter_mut().filter(|e| e.enabled).any(|e| e.module.on_toggle_fly(player, world))
+        self.entries.iter_mut().filter(|e| e.active).any(|e| e.module.on_toggle_fly(player, world))
     }
 
-    /// Fan a block-break event out to every enabled mod.
+    /// Fan a block-break event out to every active mod.
     pub fn on_block_break(&mut self, id: BlockId, world: &World, overflow: bool) {
-        self.each_enabled(|m| m.on_block_break(id, world, overflow));
+        self.each_active(|m| m.on_block_break(id, world, overflow));
     }
 
-    /// Fan a rejected-break rollback out to every enabled mod.
+    /// Fan a rejected-break rollback out to every active mod.
     pub fn on_break_rejected(&mut self, id: BlockId) {
-        self.each_enabled(|m| m.on_break_rejected(id));
+        self.each_active(|m| m.on_break_rejected(id));
     }
 
-    /// Fan a rejected-placement refund out to every enabled mod.
+    /// Fan a rejected-placement refund out to every active mod.
     pub fn on_place_rejected(&mut self, id: crate::block::BlockId, world: &World) {
-        self.each_enabled(|m| m.on_place_rejected(id, world));
+        self.each_active(|m| m.on_place_rejected(id, world));
     }
 
-    /// Fan a held unit's change of configuration out to every enabled mod.
+    /// Fan a held unit's change of configuration out to every active mod.
     pub fn on_tool_changed(&mut self, old: BlockId, new: BlockId) {
-        self.each_enabled(|m| m.on_tool_changed(old, new));
+        self.each_active(|m| m.on_tool_changed(old, new));
     }
 
-    /// Fan a finished primary action out to every enabled mod.
+    /// Fan a finished primary action out to every active mod.
     pub fn on_tool_used(&mut self, outcome: ToolUse) {
-        self.each_enabled(|m| m.on_tool_used(outcome));
+        self.each_active(|m| m.on_tool_used(outcome));
     }
 
-    /// Fan one game fact out to every enabled mod.
+    /// Fan one game fact out to every active mod.
     pub fn on_game_event(&mut self, ev: &crate::audio::GameEvent, audio: &mut crate::audio::AudioApi) {
-        self.each_enabled(|m| m.on_game_event(ev, audio));
+        self.each_active(|m| m.on_game_event(ev, audio));
     }
 
     /// The per-frame audio hook. Runs even when the frame is otherwise idle.
@@ -767,85 +682,68 @@ impl Mods {
         audio: &mut crate::audio::AudioApi,
         link: &mut crate::audio::ModLink,
     ) {
-        self.each_enabled(|m| m.on_audio(view, audio, link));
+        self.each_active(|m| m.on_audio(view, audio, link));
     }
 
-    /// The configuration a primary action applies: the first enabled mod that answers.
+    /// The configuration a primary action applies: the first active mod that answers.
     pub fn tool(&self, player: &Player) -> Option<BlockId> {
-        self.entries.iter().filter(|e| e.enabled).find_map(|e| e.module.tool(player))
+        self.entries.iter().filter(|e| e.active).find_map(|e| e.module.tool(player))
     }
 
-    /// The first enabled namer, if any.
+    /// The first active namer, if any.
     pub fn namer(&self) -> Option<&dyn MaterialNamer> {
-        self.entries.iter().filter(|e| e.enabled).find_map(|e| e.module.namer())
+        self.entries.iter().filter(|e| e.active).find_map(|e| e.module.namer())
     }
 
-    /// First enabled mod that handles `cmd` with its context-free [`Mod::command`] wins.
+    /// First active mod that handles `cmd` with its context-free [`Mod::command`] wins.
     pub fn command(&mut self, cmd: &str, args: &[&str]) -> Option<Vec<Line>> {
-        for entry in &mut self.entries {
-            if !entry.enabled {
-                continue;
-            }
-            if let Some(out) = entry.module.command(cmd, args) {
-                return Some(out);
-            }
-        }
-        None
+        self.entries.iter_mut().filter(|e| e.active).find_map(|e| e.module.command(cmd, args))
     }
 
-    /// First enabled mod that handles `cmd` wins.
+    /// First active mod that handles `cmd` wins.
     pub fn run_command(&mut self, ctx: &mut CommandContext<'_>, cmd: &str, args: &[&str]) -> Option<Vec<Line>> {
         self.entries
             .iter_mut()
-            .filter(|e| e.enabled)
+            .filter(|e| e.active)
             .find_map(|e| e.module.run_command(ctx, cmd, args))
     }
 
-    /// Every enabled mod's commands, in install order; a name a mod earlier in that order already
+    /// Every active mod's commands, in install order; a name a mod earlier in that order already
     /// lists is left out (that mod handles it: `run_command` is first-wins).
     pub fn commands(&self) -> impl Iterator<Item = &Command> {
-        let all = || self.entries.iter().filter(|e| e.enabled).flat_map(|e| e.module.commands());
+        let all = || self.entries.iter().filter(|e| e.active).flat_map(|e| e.module.commands());
         all().enumerate().filter(move |&(i, c)| !all().take(i).any(|d| d.name == c.name)).map(|(_, c)| c)
     }
 
-    /// Push every enabled mod's HUD contribution into `out`, in install order
+    /// Push every active mod's HUD contribution into `out`, in install order
     /// (so a later mod draws over an earlier one). The caller owns `out` and
     /// clears it per frame so capacity is retained.
     pub fn hud(&self, world: &World, player: &Player, screen: (i32, i32), out: &mut Vec<HudElement>) {
         for entry in &self.entries {
-            if entry.enabled {
+            if entry.active {
                 entry.module.hud(world, player, screen, out);
             }
         }
     }
 
-    /// Give enabled mods first refusal on Escape. The first open overlay closes
+    /// Give active mods first refusal on Escape. The first open overlay closes
     /// and consumes it; otherwise the game can return to its main menu.
     pub fn close_overlay(&mut self) -> bool {
-        self.entries
-            .iter_mut()
-            .filter(|entry| entry.enabled)
-            .any(|entry| entry.module.close_overlay())
+        self.entries.iter_mut().filter(|e| e.active).any(|e| e.module.close_overlay())
     }
 
-    /// Fallback theme ensures disabling menu mod never breaks nav.
+    /// The first active mod's menu theme, if any.
     pub fn menu_theme(&self) -> Option<&dyn MenuTheme> {
-        self.entries
-            .iter()
-            .filter(|e| e.enabled)
-            .find_map(|e| e.module.menu_theme())
+        self.entries.iter().filter(|e| e.active).find_map(|e| e.module.menu_theme())
     }
 
-    /// First enabled mod that returns a start screen wins. `None` means the
+    /// First active mod that returns a start screen wins. `None` means the
     /// core fallback should be used.
     pub fn start_screen(&self, facts: &StartFacts) -> Option<Box<dyn StartScreen>> {
-        self.entries
-            .iter()
-            .filter(|e| e.enabled)
-            .find_map(|e| e.module.start_screen(facts))
+        self.entries.iter().filter(|e| e.active).find_map(|e| e.module.start_screen(facts))
     }
 
-    /// Number of installed mods (for the mod menu).
+    /// Number of installed mods.
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -855,7 +753,7 @@ impl Mods {
         self.entries.is_empty()
     }
 
-    /// The name of the mod at `index`.
+    /// The name of the mod at `index` (its id unless it says otherwise).
     pub fn name(&self, index: usize) -> &str {
         self.entries[index].module.name()
     }
@@ -865,74 +763,25 @@ impl Mods {
         self.entries[index].module.id()
     }
 
-    /// The description of the mod at `index`.
-    pub fn description(&self, index: usize) -> &str {
-        self.entries[index].module.description()
+    /// Whether the mod at `index` runs: false while its package is suspended.
+    pub fn is_active(&self, index: usize) -> bool {
+        self.entries[index].active
     }
 
-    /// The group id of the mod at `index` (`""` if ungrouped).
-    pub fn group(&self, index: usize) -> &str {
-        self.entries[index].module.group()
-    }
-
-    /// The declared group of the mod at `index`, if its group id names one.
-    pub fn group_of(&self, index: usize) -> Option<Group> {
-        let id = self.entries[index].module.group();
-        self.groups().find(|g| g.id == id).copied()
-    }
-
-    /// Whether the mod at `index` is enabled.
-    pub fn is_enabled(&self, index: usize) -> bool {
-        self.entries[index].enabled
-    }
-
-    /// Visual group owned by the mod at `index`, if it is a visual mod.
+    /// Visual group the mod at `index` provides, if it is a visual mod.
     pub fn visual_group(&self, index: usize) -> Option<VisualGroup> {
         self.entries[index].module.visual_group()
     }
 
-    /// Whether the mod at `index` replaces worldgen when enabled.
+    /// Whether the mod at `index` replaces worldgen.
     pub fn is_worldgen(&self, index: usize) -> bool {
         self.entries[index].module.worldgen().is_some()
     }
 
-    /// Flip the mod at `index` on or off, running the matching lifecycle hook.
-    /// False when the index is out of range or a server hold refuses the turn-on.
-    /// A refused turn-on does not change state and must not be written to `mods.cfg`.
-    pub fn toggle(&mut self, index: usize) -> bool {
-        if index >= self.entries.len() {
-            return false;
-        }
-        let turning_on = !self.entries[index].enabled;
-        if turning_on && self.server_off(index) {
-            return false;
-        }
-        let entry = &mut self.entries[index];
-        entry.enabled = !entry.enabled;
-        if entry.enabled {
-            entry.module.on_enable();
-        } else {
-            entry.module.on_disable();
-        }
-        self.enabled_changed();
-        true
-    }
-
-    pub fn knobs(&self, index: usize) -> Vec<Knob> {
-        self.entries[index].module.knobs()
-    }
-
-    pub fn step_knob(&mut self, index: usize, knob: usize, delta: i32) {
-        self.entries[index].module.step_knob(knob, delta);
-        self.revise();
-    }
-
-    /// Worldgen used for the next world: InfiniteDiffusion if that mod is on, else the flat
+    /// Worldgen used for the next world: the first active worldgen mod's kind, else the flat
     /// core fallback.
     pub fn worldgen_kind(&self) -> WorldgenKind {
-        self.first_worldgen()
-            .and_then(|m| m.worldgen())
-            .unwrap_or(WorldgenKind::Flat)
+        self.first_worldgen().and_then(|m| m.worldgen()).unwrap_or(WorldgenKind::Flat)
     }
 
     /// Opaque payload of the winning worldgen mod. The kind parses it
@@ -944,122 +793,89 @@ impl Mods {
     fn first_worldgen(&self) -> Option<&dyn Mod> {
         self.entries
             .iter()
-            .filter(|e| e.enabled)
+            .filter(|e| e.active)
             .find(|e| e.module.worldgen().is_some())
             .map(|e| &*e.module)
     }
 
-    /// First enabled appearance mod, or the core flat fallback.
+    /// First active appearance mod, or the core flat fallback.
     pub fn appearance(&self) -> &dyn BlockAppearance {
-        self.entries
-            .iter()
-            .filter(|e| e.enabled)
-            .find_map(|e| e.module.appearance())
-            .unwrap_or(&FLAT)
+        self.entries.iter().filter(|e| e.active).find_map(|e| e.module.appearance()).unwrap_or(&FLAT)
     }
 
-    /// The visual groups the enabled mods own (see [`VisualMask::of`]).
+    /// The visual groups the active mods provide (see [`VisualMask::of`]): installed and not
+    /// suspended.
     pub fn visual_mask(&self) -> VisualMask {
         self.visuals
     }
 
-    /// Enable or disable a mod by [`Mod::id`] (case-insensitive). No-op if
-    /// already in that state, the id is unknown, or a server hold refuses the turn-on.
-    pub fn set_enabled(&mut self, id: &str, on: bool) {
-        if let Some(i) = self
-            .entries
-            .iter()
-            .position(|e| e.module.id().eq_ignore_ascii_case(id))
-            && self.entries[i].enabled != on
-        {
-            let _ = self.toggle(i);
-        }
-    }
-
-    /// Enable or disable every installed member of `group_id`. Persists as
-    /// each member's `id=on|off` line — there is no group-level key. True when
-    /// at least one member changed. Members a server hold refuses stay off.
-    pub fn set_group_enabled(&mut self, group_id: &str, on: bool) -> bool {
-        let mut changed = false;
-        for i in 0..self.entries.len() {
-            let member = self.entries[i].module.group() == group_id;
-            let differs = self.entries[i].enabled != on;
-            if member && differs && self.toggle(i) {
-                changed = true;
+    /// Suspend every package in `package_ids` for the session, on top of the pinned ones
+    /// ([`pin_suspended`](Self::pin_suspended)): their mods stop running until
+    /// [`resume_packages`](Self::resume_packages). A server that refuses packages is the
+    /// authority for its session; this is how the client honours it. Nothing is saved, and
+    /// there is no way to undo it but leaving. The list is what the server said; it is not a
+    /// proof the client is unmodified.
+    pub fn suspend_packages(&mut self, package_ids: &[String]) {
+        let mut suspended = self.pinned.clone();
+        for id in package_ids {
+            if !suspended.contains(id) {
+                suspended.push(id.clone());
             }
         }
-        changed
+        self.set_suspended(suspended);
     }
 
-    /// Turn off every enabled module whose package is in `package_ids`, and
-    /// remember those module ids. Already-off siblings of a refused package
-    /// also show as server-off and cannot be enabled. This does not write
-    /// `mods.cfg`. The list is what the server said; it is not a proof the
-    /// client is unmodified.
-    pub fn hold_packages(&mut self, package_ids: &[String]) {
-        self.server_packages = package_ids.to_vec();
-        self.server_held.clear();
-        let mut turn_off = Vec::new();
-        for i in 0..self.entries.len() {
-            let Some(pkg) = self.entries[i].package else { continue };
-            if !package_ids.iter().any(|id| id == pkg) || !self.entries[i].enabled {
-                continue;
-            }
-            turn_off.push(self.entries[i].module.id().to_string());
+    /// End every session suspension. Pinned packages stay suspended.
+    pub fn resume_packages(&mut self) {
+        self.set_suspended(self.pinned.clone());
+    }
+
+    /// Suspend `package_ids` for the whole process (`WATT_BENCH_SUSPEND`): what
+    /// [`resume_packages`](Self::resume_packages) returns to.
+    pub fn pin_suspended(&mut self, package_ids: &[String]) {
+        self.pinned = package_ids.to_vec();
+        self.resume_packages();
+    }
+
+    fn set_suspended(&mut self, suspended: Vec<String>) {
+        self.suspended = suspended;
+        for entry in &mut self.entries {
+            entry.active = !entry.package.is_some_and(|pkg| self.suspended.iter().any(|id| id == pkg));
         }
-        for id in &turn_off {
-            self.set_enabled(id, false);
-        }
-        self.server_held = turn_off;
-        self.revise();
+        self.active_changed();
     }
 
-    /// True when the mod at `index` belongs to a package the server refused.
-    pub fn server_off(&self, index: usize) -> bool {
-        self.entries.get(index).and_then(|e| e.package).is_some_and(|pkg| {
-            self.server_packages.iter().any(|id| id == pkg)
-        })
+    /// The package ids suspended now, pinned ones first.
+    pub fn suspended(&self) -> &[String] {
+        &self.suspended
     }
 
-    /// Re-enable only the modules [`hold_packages`](Self::hold_packages) turned off.
-    pub fn release_server(&mut self) {
-        let held = std::mem::take(&mut self.server_held);
-        self.server_packages.clear();
-        self.revise();
-        for id in held {
-            self.set_enabled(&id, true);
-        }
-    }
-
-    /// Enabled mod packages, as `(id, version)`, in build order. A package is
-    /// included when it is of kind mod and any of its modules is enabled; libraries
-    /// and bundles are never reported. This is what an honest client puts on `Hello`.
-    pub fn enabled_package_reports(&self, packages: &[PackageInfo]) -> Vec<(String, String)> {
-        let mut out = Vec::new();
-        for desc in packages.iter().filter(|p| p.kind == PackageKind::Mod) {
-            let on = self.entries.iter().any(|e| e.enabled && e.package == Some(desc.id));
-            if on {
-                out.push((desc.id.to_string(), desc.version.to_string()));
+    /// Ids of the packages whose mods provide a visual group, in install order, each once.
+    pub fn visual_packages(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for entry in &self.entries {
+            if let Some(pkg) = entry.package
+                && entry.module.visual_group().is_some()
+                && !out.iter().any(|id| id == pkg)
+            {
+                out.push(pkg.to_string());
             }
         }
         out
     }
 
-    /// Apply pins parsed by [`crate::benchmark::Benchmark::mod_pins_from_env`].
-    pub fn apply_bench_env(&mut self, worldgen_diffusion: Option<bool>, visuals_core: Option<bool>) {
-        match worldgen_diffusion {
-            Some(true) => self.set_enabled(WorldgenKind::Diffusion.id(), true),
-            Some(false) => self.set_enabled(WorldgenKind::Diffusion.id(), false),
-            None => {}
-        }
-        if visuals_core == Some(true) {
-            self.set_enabled("atmosphere", false);
-            self.set_enabled("post", false);
-            self.set_enabled("lighting", false);
-        }
+    /// The mod packages this client runs, as `(id, version)`, in build order: every package of
+    /// kind mod that is not suspended. Libraries and bundles are never reported. This is what an
+    /// honest client puts on `Hello`.
+    pub fn active_package_reports(&self, packages: &[PackageInfo]) -> Vec<(String, String)> {
+        packages
+            .iter()
+            .filter(|p| p.kind == PackageKind::Mod && !self.suspended.iter().any(|id| id == p.id))
+            .map(|p| (p.id.to_string(), p.version.to_string()))
+            .collect()
     }
 
-    /// Settings lanes with disabled visual groups stripped. The one
+    /// Settings lanes with the visual groups no active mod provides stripped. The one
     /// composition world construction, `/gfx` apply, and the engine flags share.
     pub fn effective_render(&self, settings: &Settings) -> RenderConfig {
         self.visual_mask().effective_render(settings)
@@ -1088,98 +904,13 @@ impl Mods {
         }
         0
     }
-
-    /// `id=on|off` lines, plus `id.state=<payload>` for mods that persist knobs,
-    /// under a `version=` marker.
-    pub fn choices_text(&self) -> String {
-        let mut text = format!("version={CHOICES_VERSION}\n");
-        for entry in &self.entries {
-            // A server hold is in-memory only. The saved choice stays what it
-            // was, so a flush during the session does not record the hold.
-            let held = self.server_held.iter().any(|id| id == entry.module.id());
-            let on = entry.enabled || held;
-            text.push_str(entry.module.id());
-            text.push('=');
-            text.push_str(if on { "on" } else { "off" });
-            text.push('\n');
-            if let Some(payload) = entry.module.save_choice_state() {
-                text.push_str(entry.module.id());
-                text.push_str(".state=");
-                text.push_str(&payload);
-                text.push('\n');
-            }
-        }
-        text
-    }
-
-    /// Apply `id=on|off` and `id.state=` lines. Unknown ids and malformed lines
-    /// are ignored; missing keys keep the current defaults. A file from before
-    /// [`CHOICES_VERSION`] 2 recorded `diffusion=off` as the then-default of an
-    /// experiment; that mod is the world generator now, so those lines are dropped.
-    pub fn apply_choices_text(&mut self, text: &str) {
-        let mut version = 1;
-        crate::settings::each_kv_line(text, |key, value| {
-            if key == "version" {
-                version = value.trim().parse().unwrap_or(1);
-            }
-        });
-        crate::settings::each_kv_line(text, |key, value| {
-            if key == "version" || (version < 2 && key.starts_with("diffusion")) {
-                return;
-            }
-            if let Some(id) = key.strip_suffix(".state") {
-                self.apply_choice_state(id.trim(), value);
-                return;
-            }
-            let Some(on) = crate::settings::parse_toggle(value) else {
-                return;
-            };
-            self.set_enabled(key, on);
-        });
-    }
-
-    fn apply_choice_state(&mut self, id: &str, data: &str) {
-        let Some(entry) = self.entries.iter_mut().find(|e| e.module.id().eq_ignore_ascii_case(id)) else {
-            return;
-        };
-        entry.module.load_choice_state(data);
-        self.revise();
-    }
-
-    /// Restore enable/disable choices and knob payloads from `mods.cfg`.
-    /// Missing or unreadable file leaves the current defaults in place.
-    pub fn load_choices(&mut self) {
-        self.load_choices_from(&crate::paths::Paths::get().mods_file());
-    }
-
-    fn load_choices_from(&mut self, path: &Path) {
-        if let Ok(text) = fs::read_to_string(path) {
-            self.apply_choices_text(&text);
-        }
-    }
-
-    /// Write enable/disable choices and knob payloads. Bench-env pins are not
-    /// written from startup; only a later toggle or knob step persists.
-    pub fn save_choices(&self) -> io::Result<()> {
-        self.save_choices_to(&crate::paths::Paths::get().mods_file())
-    }
-
-    fn save_choices_to(&self, path: &Path) -> io::Result<()> {
-        crate::save::write_atomic_file(path, self.choices_text().as_bytes())
-    }
 }
-
-/// `mods.cfg` format: 2 since the diffusion mod became the default world generator.
-const CHOICES_VERSION: u32 = 2;
 
 /// Debounces file writes so a held Left/Right does not rewrite at key-repeat rate: a write is
 /// due once [`IDLE_MS`](Self::IDLE_MS) pass with no further mark.
 pub struct Debounce {
     last_ms: Option<u64>,
 }
-
-/// The `mods.cfg` debounce, by its mod API name.
-pub type ChoicesFlush = Debounce;
 
 impl Debounce {
     pub const IDLE_MS: u64 = 250;
@@ -1192,7 +923,7 @@ impl Debounce {
         self.last_ms = Some(now_ms);
     }
 
-    /// True (and clears) when [`IDLE_MS`] has passed with no further marks.
+    /// True (and clears) when [`IDLE_MS`](Self::IDLE_MS) has passed with no further marks.
     pub fn poll(&mut self, now_ms: u64) -> bool {
         match self.last_ms {
             Some(t) if now_ms.saturating_sub(t) >= Self::IDLE_MS => {
@@ -1203,7 +934,7 @@ impl Debounce {
         }
     }
 
-    /// True (and clears) if a write is pending — leave Mods / quit.
+    /// True (and clears) if a write is pending — leaving a world, quitting.
     pub fn take(&mut self) -> bool {
         self.last_ms.take().is_some()
     }
@@ -1232,90 +963,63 @@ pub(crate) fn split_mod_version(data: &str) -> (u16, &str) {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
     use super::*;
     use super::split_mod_version;
     use super::testing::Stub;
-    use crate::menu::Menu;
     use crate::world::terrain::TerrainCfg;
     use crate::world::World;
 
-    fn payload_cfg(mods: &Mods) -> TerrainCfg {
-        mods.worldgen_config()
-            .as_deref()
-            .map(TerrainCfg::from_text)
-            .unwrap_or_default()
-    }
-
-    /// Every stand-in, in install order.
-    const BUILTINS: [&str; 10] = super::testing::STANDARD_IDS;
-
-    #[test]
-    fn worldgen_kind_skips_non_worldgen_mods() {
-        let mods = crate::modding::testing::standard();
-        assert_eq!(mods.worldgen_kind(), WorldgenKind::Diffusion, "InfiniteDiffusion is on by default");
-        let mut off = crate::modding::testing::standard();
-        off.set_enabled("diffusion", false);
-        assert_eq!(off.worldgen_kind(), WorldgenKind::Flat, "the core fallback is the flat world");
+    fn suspend(mods: &mut Mods, ids: &[&str]) {
+        mods.suspend_packages(&ids.iter().map(|id| id.to_string()).collect::<Vec<_>>());
     }
 
     #[test]
-    fn effective_render_strips_disabled_visual_groups() {
+    fn worldgen_kind_follows_the_active_worldgen_mod() {
         let mut mods = crate::modding::testing::standard();
-        mods.set_enabled("Atmosphere", false);
-        mods.set_enabled("Post", false);
-        mods.set_enabled("Lighting", false);
+        assert_eq!(mods.worldgen_kind(), WorldgenKind::Diffusion, "the worldgen stand-in is installed");
+        suspend(&mut mods, &["pwc.infinite-diffusion"]);
+        assert_eq!(mods.worldgen_kind(), WorldgenKind::Flat, "the core fallback is the flat world");
+        assert_eq!(mods.worldgen_config(), None);
+        mods.resume_packages();
+        assert_eq!(mods.worldgen_kind(), WorldgenKind::Diffusion);
+        let text = mods.worldgen_config().expect("payload");
+        assert_eq!(TerrainCfg::from_text(&text), TerrainCfg::default());
+        assert_eq!(Mods::empty().worldgen_kind(), WorldgenKind::Flat);
+    }
+
+    #[test]
+    fn effective_render_strips_the_groups_no_active_mod_provides() {
+        let mut mods = crate::modding::testing::standard();
         let settings = Settings::default();
-        let stripped = mods.effective_render(&settings);
-        assert!(!stripped.clouds);
-        assert!(!stripped.bloom);
-        assert!(!stripped.shadows);
-        assert!(stripped.sunlight);
-        let full = crate::modding::testing::standard().effective_render(&settings);
+        let full = mods.effective_render(&settings);
         assert_eq!(full.clouds, settings.clouds);
         assert_eq!(full.bloom, settings.bloom);
         assert_eq!(full.shadows, settings.shadows);
-        let via_mask = mods.visual_mask().effective_render(&settings);
-        assert!(!via_mask.clouds && !via_mask.bloom && !via_mask.shadows);
-        assert_eq!(via_mask.sunlight, stripped.sunlight);
+        suspend(&mut mods, &["pwc.visuals"]);
+        let stripped = mods.effective_render(&settings);
+        assert!(!stripped.clouds && !stripped.bloom && !stripped.shadows);
+        assert!(stripped.sunlight, "a lane outside every group stays");
+        assert_eq!(mods.visual_mask(), VisualMask::NONE);
+        mods.resume_packages();
+        assert_eq!(mods.visual_mask(), VisualMask::default(), "installed and not suspended");
     }
 
+    /// `strips` marks exactly the lanes the renderer strips, and names no mod.
     #[test]
-    fn annotate_setting_names_the_mod_that_forced_the_lane_off() {
-        let mut mods = crate::modding::testing::standard();
-        mods.set_enabled("Post", false);
-        let mask = mods.visual_mask();
-        assert_eq!(forced_off_marker("Post"), "(off: Post mod)");
-        assert_eq!(
-            annotate_setting("On".to_string(), "bloom", mask),
-            format!("On {}", forced_off_marker("Post"))
-        );
-        assert_eq!(annotate_setting("On".to_string(), "shadows", mask), "On");
-        mods.set_enabled("Lighting", false);
-        let mask = mods.visual_mask();
-        assert_eq!(
-            annotate_setting("On".to_string(), "shadows", mask),
-            format!("On {}", forced_off_marker("Lighting"))
-        );
-    }
-
-    #[test]
-    fn set_enabled_keys_on_id_case_insensitively() {
-        let mut mods = crate::modding::testing::standard();
-        let i = (0..mods.len())
-            .find(|&i| mods.id(i) == WorldgenKind::Diffusion.id())
-            .expect("InfiniteDiffusion is installed");
-        assert_eq!(mods.name(i), "InfiniteDiffusion");
-        assert_ne!(mods.id(i), mods.name(i));
-        mods.set_enabled("diffusion", true);
-        assert_eq!(mods.worldgen_kind(), WorldgenKind::Diffusion);
-        mods.set_enabled("DIFFUSION", false);
-        assert_eq!(mods.worldgen_kind(), WorldgenKind::Flat);
-        mods.set_enabled("InfiniteDiffusion", true);
-        assert_eq!(
-            mods.worldgen_kind(),
-            WorldgenKind::Flat,
-            "display name is not a set_enabled key"
-        );
+    fn strips_marks_exactly_the_lanes_the_mask_strips() {
+        let mask = VisualMask::of([VisualGroup::Atmosphere, VisualGroup::Lighting]);
+        let mut settings = Settings::default();
+        settings.bloom = true;
+        settings.shadows = true;
+        let render = mask.effective_render(&settings);
+        assert!(mask.strips("bloom") && !render.bloom);
+        assert!(!mask.strips("shadows") && render.shadows);
+        assert!(!mask.strips("sunlight") && !mask.strips("not-a-lane"));
+        assert!(VisualMask::NONE.strips("clouds"));
+        assert!(!VisualMask::default().strips("clouds"));
     }
 
     #[test]
@@ -1367,219 +1071,63 @@ mod tests {
         assert_eq!(fresh.save_states(&world), saved);
     }
 
-    fn index_of(mods: &Mods, id: &str) -> usize {
-        (0..mods.len())
-            .find(|&i| mods.id(i) == id)
-            .unwrap_or_else(|| panic!("missing mod {id}"))
+    /// A mod that counts its `update` calls.
+    struct Counter {
+        id: &'static str,
+        calls: Rc<Cell<u32>>,
     }
 
-    fn temp_choices_path() -> std::path::PathBuf {
-        crate::save::store::test_temp_path("mods").with_extension("cfg")
-    }
-
-    #[test]
-    fn choices_text_round_trips_and_ignores_junk() {
-        let mut mods = crate::modding::testing::standard();
-        let defaults = mods.choices_text();
-        for id in BUILTINS {
-            assert!(defaults.contains(&format!("{id}=on")), "{id} is on by default:\n{defaults}");
+    impl Mod for Counter {
+        fn id(&self) -> &'static str {
+            self.id
         }
-        assert!(defaults.contains("neural_textures.state=detail=1.0,contrast=1.0"));
-        assert!(defaults.contains("material_names.state=style=mineral"));
-        assert!(defaults.contains("diffusion.state=relief=100,caves=100,mines=100,space=100"));
-        assert!(defaults.starts_with("version=2\n"));
-
-        mods.set_enabled("lighting", false);
-        let i = index_of(&mods, "diffusion");
-        mods.step_knob(i, 0, 1);
-        let cfg = payload_cfg(&mods);
-        assert_eq!(cfg.relief, 125);
-        let text = mods.choices_text();
-        assert!(text.contains("lighting=off"));
-        assert!(text.contains(&format!("diffusion.state={}", cfg.to_text())));
-
-        let mut fresh = crate::modding::testing::standard();
-        fresh.apply_choices_text(
-            "version=2\nlighting=off\nnot-a-mod=on\nmenus=nope\n\ninventory=off\ndiffusion=on\ndiffusion.state=relief=150\nunknown.state=tile=16\n",
-        );
-        let restored = fresh.choices_text();
-        assert!(restored.contains("lighting=off"));
-        assert!(restored.contains("inventory=off"));
-        assert!(restored.contains("diffusion=on"));
-        assert!(restored.contains("menus=on"), "malformed value must not change the default");
-        assert_eq!(payload_cfg(&fresh).relief, 150);
-    }
-
-    /// A pre-marker file wrote `diffusion=off` (and an unrelated knob payload) for everyone:
-    /// it must not switch off the world generator, while its other choices still apply.
-    #[test]
-    fn version_one_choices_keep_the_world_generator() {
-        let mut mods = crate::modding::testing::standard();
-        mods.apply_choices_text("lighting=off\ndiffusion=off\ndiffusion.state=tile=16,stride=16,phases=8,relief=1.00\ncrafting=on\n");
-        let text = mods.choices_text();
-        assert!(text.starts_with("version=2\n"));
-        assert!(text.contains("lighting=off"));
-        assert!(text.contains("diffusion=on"), "{text}");
-        assert_eq!(payload_cfg(&mods).relief, 100);
-        mods.apply_choices_text(&text.replace("diffusion=on", "diffusion=off"));
-        assert!(mods.choices_text().contains("diffusion=off"), "a current file's choice applies");
-    }
-
-    #[test]
-    fn choices_file_round_trips_toggles_and_knobs() {
-        let path = temp_choices_path();
-        let mut mods = crate::modding::testing::standard();
-        let i = index_of(&mods, "diffusion");
-        mods.set_enabled("lighting", false);
-        mods.step_knob(i, 0, 1);
-        mods.step_knob(i, 1, -1);
-        let cfg = payload_cfg(&mods);
-        mods.save_choices_to(&path).unwrap();
-        let tmp = {
-            let mut name = path.as_os_str().to_os_string();
-            name.push(".tmp");
-            std::path::PathBuf::from(name)
-        };
-        assert!(!tmp.exists(), "atomic save must not leave a .tmp");
-
-        let mut fresh = crate::modding::testing::standard();
-        fresh.load_choices_from(&path);
-        let _ = fs::remove_file(&path);
-        assert!(!fresh.is_enabled(index_of(&fresh, "lighting")));
-        assert!(fresh.is_enabled(index_of(&fresh, "diffusion")));
-        assert_eq!(payload_cfg(&fresh), cfg);
-    }
-
-    #[test]
-    fn unknown_choice_ids_are_ignored() {
-        let mut mods = crate::modding::testing::standard();
-        let before = mods.choices_text();
-        mods.apply_choices_text("not-a-mod=on\nunknown.state=tile=64\nmenus=nope\n");
-        assert_eq!(mods.choices_text(), before);
-    }
-
-    #[test]
-    fn corrupt_choices_file_falls_back_to_defaults() {
-        let defaults = crate::modding::testing::standard().choices_text();
-
-        let bad_utf8 = temp_choices_path();
-        fs::write(&bad_utf8, [0xff, 0xfe, 0x00, 0x01]).unwrap();
-        let mut mods = crate::modding::testing::standard();
-        mods.load_choices_from(&bad_utf8);
-        let _ = fs::remove_file(&bad_utf8);
-        assert_eq!(mods.choices_text(), defaults);
-
-        let garbage = temp_choices_path();
-        fs::write(&garbage, "{{{{ not a config\n!!!\n").unwrap();
-        let mut mods = crate::modding::testing::standard();
-        mods.load_choices_from(&garbage);
-        let _ = fs::remove_file(&garbage);
-        assert_eq!(mods.choices_text(), defaults);
-
-        let mut mods = crate::modding::testing::standard();
-        mods.load_choices_from(Path::new("/tmp/watt-mods-does-not-exist.cfg"));
-        assert_eq!(mods.choices_text(), defaults);
-    }
-
-    #[test]
-    fn apply_bench_env_pins_worldgen_and_visuals() {
-        let mut mods = crate::modding::testing::standard();
-        mods.apply_bench_env(Some(true), Some(true));
-        assert_eq!(mods.worldgen_kind(), WorldgenKind::Diffusion);
-        let mask = mods.visual_mask();
-        assert!(!mask.atmosphere && !mask.post && !mask.lighting);
-        mods.apply_bench_env(Some(false), Some(false));
-        assert_eq!(mods.worldgen_kind(), WorldgenKind::Flat);
-        let mask = mods.visual_mask();
-        assert!(!mask.atmosphere && !mask.post && !mask.lighting);
-    }
-
-    #[test]
-    fn apply_bench_env_does_not_write_choices() {
-        let path = temp_choices_path();
-        let mut mods = crate::modding::testing::standard();
-        mods.save_choices_to(&path).unwrap();
-        let on_disk = fs::read_to_string(&path).unwrap();
-        assert!(on_disk.contains("diffusion=on"));
-        mods.apply_bench_env(Some(false), Some(true));
-        assert_eq!(mods.worldgen_kind(), WorldgenKind::Flat);
-        assert_eq!(fs::read_to_string(&path).unwrap(), on_disk);
-        assert!(mods.choices_text().contains("diffusion=off"));
-        let _ = fs::remove_file(&path);
-    }
-
-    #[test]
-    fn essentials_lists_every_member_in_install_order() {
-        let mods = crate::modding::testing::standard();
-        let groups: Vec<&Group> = mods.groups().collect();
-        assert_eq!(groups.len(), 1, "only the well-known group when no package declares one");
-        let g = groups[0];
-        assert_eq!(g.id, ESSENTIALS);
-        assert_eq!(g.name, "Essentials");
-        assert!(
-            g.description.chars().count() <= 60,
-            "group description must fit the mods panel: {} chars",
-            g.description.chars().count()
-        );
-        let members: Vec<&str> = (0..mods.len())
-            .filter(|&i| mods.group(i) == ESSENTIALS)
-            .map(|i| mods.id(i))
-            .collect();
-        assert_eq!(members, BUILTINS);
-        assert!((0..mods.len()).all(|i| mods.group_of(i) == Some(ESSENTIALS_GROUP)));
-    }
-
-    #[test]
-    fn group_toggle_persists_each_member_line() {
-        let path = temp_choices_path();
-        let mut mods = crate::modding::testing::standard();
-        mods.set_group_enabled(ESSENTIALS, false);
-        let text = mods.choices_text();
-        for id in BUILTINS {
-            assert!(
-                text.contains(&format!("{id}=off")),
-                "{id} should be off in:\n{text}"
-            );
-        }
-        assert!(
-            !text.lines().any(|l| l.starts_with("essentials=")),
-            "group toggle must not write a group-level key"
-        );
-        mods.save_choices_to(&path).unwrap();
-
-        let mut fresh = crate::modding::testing::standard();
-        fresh.load_choices_from(&path);
-        let _ = fs::remove_file(&path);
-        for i in 0..fresh.len() {
-            assert!(!fresh.is_enabled(i), "{} still on", fresh.id(i));
-        }
-
-        fresh.set_group_enabled(ESSENTIALS, true);
-        let on_text = fresh.choices_text();
-        for id in BUILTINS {
-            assert!(
-                on_text.contains(&format!("{id}=on")),
-                "{id} should be on in:\n{on_text}"
-            );
+        fn update(&mut self, _ctx: &mut ModContext) {
+            self.calls.set(self.calls.get() + 1);
         }
     }
 
+    /// A refused package stops running for the session and comes back on resume; nothing about
+    /// it is written anywhere, and a mod's display name defaults to its id.
     #[test]
-    fn server_hold_turns_the_package_off_without_changing_saved_choices() {
+    fn a_suspended_package_skips_every_hook_until_resumed() {
+        let calls = Rc::new(Cell::new(0));
         let mut mods = Mods::empty();
-        mods.install_from(Some("pwc.dev-toolkit"), Box::new(Stub::new("tools")), true);
-        let before = mods.choices_text();
-        assert!(before.contains("tools=on"));
-        mods.hold_packages(&["pwc.dev-toolkit".to_string()]);
-        assert!(!mods.is_enabled(0));
-        assert!(mods.server_off(0));
-        assert!(!mods.toggle(0), "a held mod cannot be turned back on");
-        assert!(!mods.is_enabled(0));
-        assert_eq!(mods.choices_text(), before, "the hold is not a saved choice");
-        mods.release_server();
-        assert!(mods.is_enabled(0));
-        assert!(!mods.server_off(0));
-        assert!(mods.toggle(0));
+        mods.install_from(Some("pwc.dev-toolkit"), Box::new(Counter { id: "tools", calls: calls.clone() }));
+        mods.install_from(Some("pwc.hotbar"), Box::new(Stub::new("hotbar")));
+        assert_eq!(mods.name(0), "tools");
+        let mut world = World::new(1);
+        let mut player = Player::new(glam::DVec3::ZERO);
+        let mut tick = |mods: &mut Mods| mods.update(&mut ModContext::new(&mut player, &mut world));
+        tick(&mut mods);
+        assert_eq!(calls.get(), 1);
+        let generation = mods.action_generation();
+        suspend(&mut mods, &["pwc.dev-toolkit"]);
+        assert!(!mods.is_active(0) && mods.is_active(1));
+        assert_eq!(mods.suspended(), ["pwc.dev-toolkit"]);
+        assert_ne!(mods.action_generation(), generation, "the input table rebuilds once");
+        tick(&mut mods);
+        assert_eq!(calls.get(), 1, "a suspended mod's update does not run");
+        mods.install_from(Some("pwc.dev-toolkit"), Box::new(Stub::new("late")));
+        assert!(!mods.is_active(2), "a later mod of a suspended package starts suspended");
+        mods.resume_packages();
+        assert!(mods.is_active(0) && mods.is_active(2));
+        assert!(mods.suspended().is_empty());
+        tick(&mut mods);
+        assert_eq!(calls.get(), 2);
+    }
+
+    /// Bench pins stay through a server's session suspension and its end.
+    #[test]
+    fn pinned_packages_stay_suspended_through_a_session() {
+        let mut mods = crate::modding::testing::standard();
+        mods.pin_suspended(&["pwc.visuals".to_string()]);
+        assert_eq!(mods.visual_mask(), VisualMask::NONE);
+        suspend(&mut mods, &["pwc.hotbar", "pwc.visuals"]);
+        assert_eq!(mods.suspended(), ["pwc.visuals", "pwc.hotbar"], "pinned first, each once");
+        mods.resume_packages();
+        assert_eq!(mods.suspended(), ["pwc.visuals"]);
+        assert_eq!(mods.visual_mask(), VisualMask::NONE);
+        assert_eq!(mods.visual_packages(), ["pwc.visuals"], "the package behind every visual group, once");
     }
 
     fn register_tools(r: &mut ModRegistrar) {
@@ -1593,7 +1141,7 @@ mod tests {
     fn register_nothing(_: &mut ModRegistrar) {}
 
     #[test]
-    fn hello_reports_only_enabled_mod_packages() {
+    fn hello_reports_every_mod_package_that_is_not_suspended() {
         const fn package(id: &'static str, kind: PackageKind, register: Option<fn(&mut ModRegistrar)>) -> PackageInfo {
             PackageInfo { id, name: id, version: "1.0.0", description: "", kind, dependencies: &[], register }
         }
@@ -1606,64 +1154,20 @@ mod tests {
         ];
         let build = GameBuild::from_static("sha256:02", PACKAGES);
         let mut mods = build.mods();
-        let report = |mods: &Mods| mods.enabled_package_reports(build.packages());
-        let both = vec![("test.tools".to_string(), "1.0.0".to_string()), ("test.hud".to_string(), "1.0.0".to_string())];
-        assert_eq!(report(&mods), both, "libraries, bundles and mod packages with no mod are not reported");
-        mods.hold_packages(&["test.tools".to_string()]);
-        assert_eq!(report(&mods), both[1..], "a held package is off");
-        mods.release_server();
-        assert_eq!(report(&mods), both);
-    }
-
-    #[test]
-    fn worldgen_config_is_the_winning_kind_payload() {
-        let mut off = crate::modding::testing::standard();
-        off.set_enabled("diffusion", false);
-        assert_eq!(off.worldgen_kind(), WorldgenKind::Flat);
-        assert_eq!(off.worldgen_config(), None);
-        let mut on = crate::modding::testing::standard();
-        let text = on.worldgen_config().expect("payload");
-        assert_eq!(TerrainCfg::from_text(&text), TerrainCfg::default());
-        on.step_knob(index_of(&on, "diffusion"), 3, 1);
-        let cfg = TerrainCfg::from_text(&on.worldgen_config().unwrap());
-        assert_eq!(cfg.space, 125);
-    }
-
-    #[test]
-    fn fallback_theme_with_essentials_disabled() {
-        let mut mods = crate::modding::testing::standard();
-        mods.set_group_enabled(ESSENTIALS, false);
-        assert!(mods.menu_theme().is_none());
-        let fallback = crate::menu::theme::DefaultTheme;
-        let theme: &dyn crate::menu::theme::MenuTheme = mods.menu_theme().unwrap_or(&fallback);
-        let snap = crate::menu::ModRow::snapshot(&mods);
-        let mut settings = crate::settings::Settings::default();
-        let session = crate::session::Session::default();
-        let ctx = crate::menu::Ctx {
-            settings: &mut settings,
-            saves: &[],
-            mods: &snap,
-            session: &session,
-            mods_save_error: None,
-        };
-        let view = crate::menu::menus::ModsMenu.view(&ctx);
-        let pv = crate::menu::present(&view, 1.0);
-        let rects = theme.layout(&pv, 1280, 720);
-        assert_eq!(rects.len(), view.rows.len());
-        assert!(matches!(view.rows[0].kind, crate::menu::RowKind::Heading));
-        let mut cursor = crate::menu::Cursor::default();
-        cursor.normalize(&view);
-        assert!(view.is_selectable(cursor.index));
-        assert_ne!(cursor.index, 0, "cursor must skip the group header");
+        let report = |mods: &Mods| mods.active_package_reports(build.packages());
+        let pair = |id: &str| (id.to_string(), "1.0.0".to_string());
+        let all = vec![pair("test.tools"), pair("test.hud"), pair("test.empty")];
+        assert_eq!(report(&mods), all, "libraries and bundles are never reported; a mod package always is");
+        suspend(&mut mods, &["test.tools"]);
+        assert_eq!(report(&mods), all[1..], "a suspended package is not reported");
+        mods.resume_packages();
+        assert_eq!(report(&mods), all);
     }
 
     /// A mod written against the context-free hook only.
     struct Legacy;
 
     impl Mod for Legacy {
-        fn name(&self) -> &str {
-            "Legacy"
-        }
         fn id(&self) -> &'static str {
             "legacy"
         }
@@ -1679,14 +1183,15 @@ mod tests {
     ];
 
     #[test]
-    fn the_first_enabled_mod_that_knows_a_command_runs_it() {
+    fn the_first_active_mod_that_knows_a_command_runs_it() {
         let mut mods = Mods::empty();
-        mods.install(Box::new(Stub::new("a").commands(A)), true);
-        mods.install(Box::new(Stub::new("b").commands(B)), true);
-        mods.install(Box::new(Legacy), true);
-        mods.install(Box::new(Stub::new("off").commands(&[Command { name: "hidden", args: "", help: "" }])), false);
+        mods.install(Box::new(Stub::new("a").commands(A)));
+        mods.install(Box::new(Stub::new("b").commands(B)));
+        mods.install(Box::new(Legacy));
+        mods.install_from(Some("test.off"), Box::new(Stub::new("off").commands(&[Command { name: "hidden", args: "", help: "" }])));
+        suspend(&mut mods, &["test.off"]);
         let names: Vec<&str> = mods.commands().map(|c| c.name).collect();
-        assert_eq!(names, ["tp", "time"], "enabled mods only, in install order, a shadowed name once");
+        assert_eq!(names, ["tp", "time"], "active mods only, in install order, a shadowed name once");
 
         let mut world = World::new(1);
         let mut player = Player::new(glam::DVec3::ZERO);
@@ -1696,7 +1201,7 @@ mod tests {
         assert_eq!(first(mods.run_command(&mut ctx, "tp", &[])).as_deref(), Some("a"));
         assert_eq!(first(mods.run_command(&mut ctx, "time", &[])).as_deref(), Some("b"));
         assert_eq!(first(mods.run_command(&mut ctx, "old", &["still", "works"])).as_deref(), Some("still works"));
-        assert!(mods.run_command(&mut ctx, "hidden", &[]).is_none(), "a disabled mod runs nothing");
+        assert!(mods.run_command(&mut ctx, "hidden", &[]).is_none(), "a suspended mod runs nothing");
         assert_eq!(ctx.player.position.y, 2.0, "the handlers reached the player through the context");
     }
 
@@ -1720,61 +1225,22 @@ mod tests {
         assert!(!flush.poll(10 + Debounce::IDLE_MS));
     }
 
-    /// Every host change the mods screen can show moves the revision; reading does not.
+    /// Every host change a mods screen can show moves the revision; reading does not.
     #[test]
-    fn revision_moves_with_what_the_mods_screen_lists() {
+    fn revision_moves_with_what_a_mods_screen_lists() {
         let mut mods = crate::modding::testing::standard();
         let mut last = mods.revision();
-        let _ = (mods.visual_mask(), mods.choices_text(), mods.knobs(index_of(&mods, "diffusion")));
+        let _ = (mods.visual_mask(), mods.suspended(), mods.worldgen_config());
         assert_eq!(mods.revision(), last, "reads");
         let mut moved = |mods: &Mods, what: &str| {
             assert_ne!(mods.revision(), last, "{what}");
             last = mods.revision();
         };
-        mods.set_enabled("post", false);
-        moved(&mods, "a switch");
-        mods.step_knob(index_of(&mods, "diffusion"), 0, 1);
-        moved(&mods, "a knob step");
-        mods.apply_choices_text("version=2\ndiffusion.state=relief=150\n");
-        moved(&mods, "a loaded knob payload");
-        mods.hold_packages(&["pwc.visuals".to_string()]);
-        moved(&mods, "a server hold");
-        mods.release_server();
-        moved(&mods, "a release");
-        mods.install(Box::new(Stub::new("extra")), false);
+        suspend(&mut mods, &["pwc.visuals"]);
+        moved(&mods, "a suspension");
+        mods.resume_packages();
+        moved(&mods, "a resume");
+        mods.install(Box::new(Stub::new("extra")));
         moved(&mods, "an install");
-    }
-
-    fn enabled(mods: &Mods, name: &str) -> bool {
-        (0..mods.len())
-            .find(|&i| mods.name(i) == name)
-            .map(|i| mods.is_enabled(i))
-            .expect("installed mod")
-    }
-
-    #[test]
-    fn choices_round_trip_through_the_config_root_and_ignore_unknown() {
-        let mut mods = crate::modding::testing::standard();
-        mods.set_enabled("diffusion", true);
-        mods.set_enabled("atmosphere", false);
-        mods.save_choices().unwrap();
-        let path = crate::paths::Paths::get().mods_file();
-        assert!(path.exists());
-        assert!(path.starts_with(&crate::paths::Paths::get().config));
-        assert_ne!(path, std::path::PathBuf::from("saves/mods.cfg"));
-
-        let mut loaded = crate::modding::testing::standard();
-        loaded.load_choices();
-        assert!(enabled(&loaded, "InfiniteDiffusion"));
-        assert!(!enabled(&loaded, "Atmosphere"));
-        assert!(enabled(&loaded, "Inventory"));
-
-        fs::write(&path, "no-such=on\ninventory=off\nnot-a-pair\natmosphere=true\n").unwrap();
-        let mut parsed = crate::modding::testing::standard();
-        parsed.load_choices();
-        assert!(!enabled(&parsed, "Inventory"));
-        assert!(enabled(&parsed, "Atmosphere"));
-        assert!(enabled(&parsed, "InfiniteDiffusion"), "an unmentioned mod keeps its default (on)");
-        let _ = fs::remove_file(path);
     }
 }

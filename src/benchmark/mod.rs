@@ -17,7 +17,7 @@
 //!   Each face of a cube has its own day, so a shot of a side face picks its time.
 //! - `WATT_BENCH_WARMUP`, `WATT_BENCH_READY_TIMEOUT`, `WATT_BENCH_TAG`,
 //!   `WATT_BENCH_POS`, `WATT_BENCH_PRESET`, `WATT_BENCH_SEED`,
-//!   `WATT_BENCH_WORLDGEN`, `WATT_BENCH_VISUALS`, `WATT_BENCH_PROFILE`,
+//!   `WATT_BENCH_WORLDGEN`, `WATT_BENCH_VISUALS`, `WATT_BENCH_SUSPEND`, `WATT_BENCH_PROFILE`,
 //!   `WATT_BENCH_GPU` — see `documentation/performance.md`.
 //! - `WATT_BENCH_PLANET_MAP=1` bakes the home map. Otherwise a benchmark draws the
 //!   sphere, and `scenario.planet_map` records which one ran.
@@ -34,6 +34,7 @@ use voxel_engine::{DVec3, Engine};
 
 use crate::settings::Settings;
 use crate::world::{MemoryCensus, RemeshDistribution, StreamGauges, World};
+use crate::world::generation::WorldgenKind;
 
 use json::Json;
 use system::{SystemInfo, display_json, resident_bytes, settings_json, software_json};
@@ -69,13 +70,16 @@ enum Phase {
     Complete,
 }
 
-/// Pins parsed from `WATT_BENCH_WORLDGEN` / `WATT_BENCH_VISUALS`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// Pins parsed from `WATT_BENCH_WORLDGEN` / `WATT_BENCH_VISUALS` / `WATT_BENCH_SUSPEND`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BenchModPins {
-    /// `Some(true)` enables InfiniteDiffusion; `Some(false)` pins the flat core world.
-    pub worldgen_diffusion: Option<bool>,
-    /// `Some(true)` strips visual mods (core look); `Some(false)` leaves them on.
+    /// The generator new worlds use, whatever the installed mods say.
+    pub worldgen: Option<WorldgenKind>,
+    /// `Some(true)` suspends every package that provides a visual group (core look);
+    /// `Some(false)` leaves them on.
     pub visuals_core: Option<bool>,
+    /// Package ids suspended for the whole run, as a server suspends them for a session.
+    pub suspend: Vec<String>,
 }
 
 /// Complete state for one `WATT_BENCH` run.
@@ -230,11 +234,11 @@ impl Benchmark {
         })
     }
 
-    /// The only parser for `WATT_BENCH_WORLDGEN` / `WATT_BENCH_VISUALS`.
+    /// The only parser for `WATT_BENCH_WORLDGEN` / `WATT_BENCH_VISUALS` / `WATT_BENCH_SUSPEND`.
     /// Applied even when `WATT_BENCH` itself is unset so a pin-and-play run
     /// uses the same accepted values as a timed harness run.
     pub fn mod_pins_from_env() -> BenchModPins {
-        let worldgen_diffusion = match std::env::var("WATT_BENCH_WORLDGEN") {
+        let worldgen = match std::env::var("WATT_BENCH_WORLDGEN") {
             Ok(value) => match parse_bench_worldgen(&value) {
                 Some(parsed) => Some(parsed),
                 None => {
@@ -258,9 +262,11 @@ impl Benchmark {
             },
             Err(_) => None,
         };
+        let suspend = std::env::var("WATT_BENCH_SUSPEND").map(|v| parse_bench_suspend(&v)).unwrap_or_default();
         BenchModPins {
-            worldgen_diffusion,
+            worldgen,
             visuals_core,
+            suspend,
         }
     }
 
@@ -974,12 +980,23 @@ fn parse_screenshot(value: Option<std::ffi::OsString>) -> Option<PathBuf> {
 }
 
 /// `Some(true)` enables InfiniteDiffusion; `Some(false)` pins the flat core world.
-fn parse_bench_worldgen(value: &str) -> Option<bool> {
+fn parse_bench_worldgen(value: &str) -> Option<WorldgenKind> {
     match value {
-        "diffusion" => Some(true),
-        "flat" | "classic" => Some(false),
+        "diffusion" => Some(WorldgenKind::Diffusion),
+        "flat" | "classic" => Some(WorldgenKind::Flat),
         _ => None,
     }
+}
+
+/// Comma- or space-separated package ids, each once, in the order given.
+fn parse_bench_suspend(value: &str) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    for id in value.split([',', ' ']).map(str::trim).filter(|id| !id.is_empty()) {
+        if !ids.iter().any(|seen| seen == id) {
+            ids.push(id.to_string());
+        }
+    }
+    ids
 }
 
 /// `Some(true)` strips the visual mods (core look); `Some(false)` leaves them on.
@@ -1293,14 +1310,16 @@ mod tests {
 
     #[test]
     fn bench_env_accepted_values() {
-        assert_eq!(parse_bench_worldgen("diffusion"), Some(true));
-        assert_eq!(parse_bench_worldgen("flat"), Some(false));
+        assert_eq!(parse_bench_worldgen("diffusion"), Some(WorldgenKind::Diffusion));
+        assert_eq!(parse_bench_worldgen("flat"), Some(WorldgenKind::Flat));
         assert_eq!(parse_bench_worldgen("Diffusion"), None);
         assert_eq!(parse_bench_visuals("off"), Some(true));
         assert_eq!(parse_bench_visuals("core"), Some(true));
         assert_eq!(parse_bench_visuals("on"), Some(false));
         assert_eq!(parse_bench_visuals("full"), Some(false));
         assert_eq!(parse_bench_visuals("pretty"), None);
+        assert_eq!(parse_bench_suspend("pwc.visuals, pwc.hotbar pwc.visuals,,"), ["pwc.visuals", "pwc.hotbar"]);
+        assert!(parse_bench_suspend(" ").is_empty());
     }
 
     #[test]

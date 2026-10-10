@@ -5,8 +5,7 @@ use std::cell::Cell;
 use voxel_engine::Frame;
 
 use crate::menu::theme::MenuTheme;
-use crate::modding::Mods;
-use crate::render_config::VisualGroup;
+use crate::modding::{BuildInfo, VisualMask};
 use crate::session::Session;
 use crate::settings::Settings;
 
@@ -186,8 +185,8 @@ pub enum Command {
 }
 
 /// A side effect only the App can carry out. Menus emit these instead of
-/// touching app state. Start-screen actions ([`StartAction`]) map 1:1 onto
-/// the start-related variants; the rest are mods-menu effects.
+/// touching app state. Start-screen actions ([`StartAction`](start::StartAction)) map 1:1 onto
+/// these.
 pub enum AppEffect {
     NewWorld,
     Load(crate::save::SlotId),
@@ -199,47 +198,7 @@ pub enum AppEffect {
     Settings,
     /// Push the core Mods screen (start screens emit this instead of pushing).
     Mods,
-    ToggleMod(usize),
-    StepModKnob { mod_index: usize, knob: usize, delta: i32 },
-    /// Enable or disable every member of a group (persists as per-mod lines).
-    SetGroup { id: &'static str, on: bool },
     Quit,
-}
-
-/// Per-frame snapshot of installed mods.
-pub struct ModRow {
-    pub name: String,
-    pub description: String,
-    pub enabled: bool,
-    /// `(label, value, hint)` per knob.
-    pub knobs: Vec<(String, String, String)>,
-    pub visual_group: Option<VisualGroup>,
-    pub worldgen: bool,
-    /// The mod's group (`None` if ungrouped or its group was never declared).
-    pub group: Option<crate::modding::Group>,
-    /// The connected server forced this mod's package off for the session.
-    pub server_off: bool,
-}
-
-impl ModRow {
-    pub fn snapshot(mods: &Mods) -> Vec<ModRow> {
-        (0..mods.len())
-            .map(|i| ModRow {
-                name: mods.name(i).to_string(),
-                description: mods.description(i).to_string(),
-                enabled: mods.is_enabled(i),
-                knobs: mods
-                    .knobs(i)
-                    .into_iter()
-                    .map(|k| (k.label.to_string(), k.value, k.hint))
-                    .collect(),
-                visual_group: mods.visual_group(i),
-                worldgen: mods.is_worldgen(i),
-                group: mods.group_of(i),
-                server_off: mods.server_off(i),
-            })
-            .collect()
-    }
 }
 
 /// Everything a menu may read or mutate while running. Settings step in place;
@@ -247,10 +206,22 @@ impl ModRow {
 pub struct Ctx<'a> {
     pub settings: &'a mut Settings,
     pub saves: &'a [crate::save::Slot],
-    pub mods: &'a [ModRow],
     pub session: &'a Session,
-    /// Last `mods.cfg` write error, shown on the Mods screen.
-    pub mods_save_error: Option<&'a str>,
+    /// Every package compiled into this build.
+    pub build: &'a BuildInfo,
+    /// Package ids the core suspended for this session.
+    pub suspended: &'a [String],
+    /// The visual groups the installed, unsuspended mods provide.
+    pub visuals: VisualMask,
+}
+
+impl<'a> Ctx<'a> {
+    /// A context over `settings` and `session` with no saves, an empty build and every visual
+    /// group provided.
+    pub fn bare(settings: &'a mut Settings, session: &'a Session) -> Self {
+        const EMPTY: &BuildInfo = &BuildInfo::EMPTY;
+        Self { settings, saves: &[], session, build: EMPTY, suspended: &[], visuals: VisualMask::ALL }
+    }
 }
 
 /// Pure view, effectful update.
@@ -617,7 +588,7 @@ mod tests {
     fn a_quiet_frame_builds_the_view_once() {
         let mut settings = Settings::default();
         let session = Session::default();
-        let mut ctx = Ctx { settings: &mut settings, saves: &[], mods: &[], session: &session, mods_save_error: None };
+        let mut ctx = Ctx::bare(&mut settings, &session);
         let mut framed = Framed::new(Counted(Cell::new(0)));
         let built = |f: &Framed<Counted>| f.menu.0.get();
         assert!(matches!(framed.update(&[], &mut ctx), Command::Stay));

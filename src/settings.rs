@@ -194,12 +194,10 @@ settings_fields! {
     physics_hz: u32 = 0,
     sky_hz: u32 = 0,
     mod_hz: u32 = 0,
-    simulation: bool = true,
     mod_logic: bool = true,
     autosave: bool = true,
     hud_mode: HudMode = HudMode::Full,
     minimap: bool = true,
-    mod_hud: bool = true,
     player_models: bool = true,
     name_tags: bool = true,
 
@@ -645,7 +643,7 @@ const PHYSICS_RATES: &[i32] = &[0, 30, 60, 120, 240, 500, 1000];
 
 /// Every setting, in menu/persistence order. The single source of the field set;
 /// persistence, `/gfx`, the menu, and [`Settings::clamp`] all fold over it.
-pub const SETTINGS: [Setting; 49] = [
+pub const SETTINGS: [Setting; 47] = [
     enum_setting!(
         apply, Profile::Personal, Category::Performance, preset, Preset, "Performance Preset",
         "preset custom|minimum|fast|default", &["profile"], "performance preset",
@@ -706,14 +704,6 @@ pub const SETTINGS: [Setting; 49] = [
     toggle_setting!(
         Profile::Owned,
         Category::Performance,
-        simulation,
-        "simulation",
-        "Simulation",
-        &["sim"]
-    ),
-    toggle_setting!(
-        Profile::Owned,
-        Category::Performance,
         mod_logic,
         "mod_logic",
         "Mod Updates",
@@ -727,14 +717,6 @@ pub const SETTINGS: [Setting; 49] = [
         "minimap",
         "Minimap",
         &["map"]
-    ),
-    toggle_setting!(
-        Profile::Owned,
-        Category::Performance,
-        mod_hud,
-        "mod_hud",
-        "Mod HUD",
-        &["modhud"]
     ),
     toggle_setting!(
         Profile::Owned,
@@ -1007,12 +989,10 @@ impl Settings {
                 physics_hz: 30,
                 sky_hz: 15,
                 mod_hz: 15,
-                simulation: false,
                 mod_logic: false,
                 autosave: false,
                 hud_mode: HudMode::Off,
                 minimap: false,
-                mod_hud: false,
                 player_models: false,
                 name_tags: false,
                 lod2: false,
@@ -1029,11 +1009,9 @@ impl Settings {
                 physics_hz: 60,
                 sky_hz: 60,
                 mod_hz: 60,
-                simulation: true,
                 autosave: true,
                 hud_mode: HudMode::Minimal,
                 minimap: false,
-                mod_hud: false,
                 player_models: true,
                 name_tags: false,
                 lod2: true,
@@ -1412,6 +1390,14 @@ impl Settings {
 
 // Shared value helpers — the single definition each surface reuses.
 
+/// Whether the material law's reaction scheduler runs in single player: always, unless the
+/// process starts with `WATT_SIMULATION=0` (a bench and dev override). The law is environment,
+/// not a player preference, so there is no setting for it.
+pub fn simulation_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !matches!(std::env::var("WATT_SIMULATION").as_deref(), Ok("0" | "off" | "false")))
+}
+
 /// Default Auto scale for a window pixel count. One comparison so the menu,
 /// session apply, and tests cannot disagree.
 pub fn auto_render_scale(window_w: u32, window_h: u32) -> f32 {
@@ -1474,7 +1460,7 @@ fn vertical_distance_clamp(s: &mut Settings) {
 }
 
 /// Walk `key=value` lines, skipping malformed ones. Shared by settings.cfg,
-/// session.cfg, and mods.cfg.
+/// session.cfg and the options' lines.
 pub(crate) fn each_kv_line(text: &str, mut visit: impl FnMut(&str, &str)) {
     for line in text.lines() {
         let Some((key, value)) = line.split_once('=') else {
@@ -1912,8 +1898,8 @@ mod tests {
             (15, 30, 15, 15)
         );
         assert_eq!(s.hud_mode, HudMode::Off);
-        assert!(!s.simulation && !s.mod_logic && !s.autosave);
-        assert!(!s.minimap && !s.mod_hud && !s.player_models && !s.name_tags);
+        assert!(!s.mod_logic && !s.autosave);
+        assert!(!s.minimap && !s.player_models && !s.name_tags);
         assert!(!s.lighting && !s.occlusion && !s.ao);
         assert_eq!(s.vrs, VrsChoice::Off);
         assert!(!s.sky && !s.bloom && !s.clouds);
@@ -1935,8 +1921,8 @@ mod tests {
             (60, 60, 60, 60)
         );
         assert_eq!(s.hud_mode, HudMode::Minimal);
-        assert!(s.simulation && s.mod_logic && s.autosave && s.player_models);
-        assert!(!s.minimap && !s.mod_hud && !s.name_tags);
+        assert!(s.mod_logic && s.autosave && s.player_models);
+        assert!(!s.minimap && !s.name_tags);
         assert_eq!(s.vrs, VrsChoice::Off);
 
         assert!(preset.parse_human(&mut s, "default"));

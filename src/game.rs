@@ -233,7 +233,7 @@ pub struct Game {
     /// sim lane (registered in [`Game::new`]); other lanes still run directly
     /// in `stream_phase` and migrate in one at a time.
     sched: crate::sched::Scheduler,
-    /// The sim producer's id, kept so the `simulation` settings gate can
+    /// The sim producer's id, kept so the `WATT_SIMULATION` override can
     /// enable/disable the lane on the scheduler instead of tearing it out.
     sim_source: voxel_engine::producer::SourceId,
     /// The autosave interval gate on the scheduler's frame clock
@@ -271,6 +271,8 @@ pub struct Game {
     // Settings-derived work gates: each stops its lane at the owning boundary
     // instead of merely hiding output.
     mod_logic: bool,
+    /// Always true: the Mod HUD setting is gone (HUD Off hides mod HUDs). `draw.rs` still reads
+    /// it until the HUD moves into game-ui (WP9), which deletes it.
     mod_hud: bool,
     player_models: bool,
     name_tags: bool,
@@ -476,7 +478,7 @@ impl Game {
 
         // The sim lane stays registered on the scheduler; the gate merely
         // stops it being ticked (no hidden periodic work while disabled).
-        self.sched.set_enabled(self.sim_source, settings.simulation);
+        self.sched.set_enabled(self.sim_source, crate::settings::simulation_enabled());
         if settings.minimap {
             if self.minimap.is_none() {
                 self.minimap = Some(Minimap::new(MinimapConfig::DEFAULT));
@@ -486,7 +488,7 @@ impl Game {
         }
 
         let mod_ui_will_be_active =
-            mod_ui_active(settings.mod_logic, settings.mod_hud, self.theme.hud);
+            mod_ui_active(settings.mod_logic, self.theme.hud);
         if mod_ui_will_be_active {
             self.pending_mod_overlay_close = false;
         } else if mod_ui_was_active {
@@ -497,7 +499,6 @@ impl Game {
             self.mod_gate.reset();
             self.pending_mod_input.clear();
         }
-        self.mod_hud = settings.mod_hud;
         self.player_models = settings.player_models;
         self.name_tags = settings.name_tags;
     }
@@ -506,7 +507,7 @@ impl Game {
     /// input. Keeping one predicate for routing and Escape prevents invisible
     /// overlays when either the mod lane or the master HUD is disabled.
     fn mod_ui_active(&self) -> bool {
-        mod_ui_active(self.mod_logic, self.mod_hud, self.theme.hud)
+        mod_ui_active(self.mod_logic, self.theme.hud)
     }
 
     /// The mod UI just became invisible: force-close any open overlay once and
@@ -1298,8 +1299,8 @@ impl Game {
 /// Whether a mod-supplied modal can both be seen and receive input. Free over
 /// its inputs so the live predicate and the would-be-applied check in
 /// `apply_settings` share one rule instead of restating it.
-fn mod_ui_active(mod_logic: bool, mod_hud: bool, hud: HudMode) -> bool {
-    mod_logic && mod_hud && hud.shows_mod_hud()
+fn mod_ui_active(mod_logic: bool, hud: HudMode) -> bool {
+    mod_logic && hud.shows_mod_hud()
 }
 
 /// Toggle capture and sync cursor grab with the OS.
@@ -1384,7 +1385,7 @@ mod tests {
 
     pub(super) fn probe_mods() -> Mods {
         let mut mods = Mods::empty();
-        mods.install(Box::new(Probe), true);
+        mods.install(Box::new(Probe));
         mods
     }
 
@@ -1405,7 +1406,7 @@ mod tests {
         assert!(!game.player.flying(), "a detached camera does not fly the frozen player");
         // Two flight mods: the first takes the key, so it toggles once.
         let mut two = probe_mods();
-        two.install(Box::new(Probe), true);
+        two.install(Box::new(Probe));
         game.fly_key(&input, false, &mut two);
         assert!(game.player.flying(), "the first flight mod toggles, on this frame, mod logic off");
         game.fly_key(&FrameInput::default(), false, &mut two);
@@ -1465,7 +1466,7 @@ mod tests {
         }
         let seen = Rc::new(Cell::new(0));
         let mut mods = Mods::empty();
-        mods.install(Box::new(Watch { seen: seen.clone() }), true);
+        mods.install(Box::new(Watch { seen: seen.clone() }));
         let mut router = Router::new();
         router.sync_actions(&mods);
         let sample = router.sample(&Press::key(Key::Num3), 1.0 / 60.0, true, true);

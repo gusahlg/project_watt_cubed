@@ -150,7 +150,7 @@ mod tests {
             }
         }
         let mut mods = Mods::empty();
-        mods.install(Box::new(Helper), true);
+        mods.install(Box::new(Helper));
         let (text, ..) = run(&mut game, &mut mods, &mut settings, "/nope");
         assert_eq!(text, "unknown command 'nope' - type '/help'");
     }
