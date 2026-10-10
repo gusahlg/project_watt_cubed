@@ -255,8 +255,9 @@ fn stop_closes_connections_before_the_final_save() {
 #[test]
 fn edits_past_the_spec_pool_stay_in_the_file() {
     let mut state = test_state(HashMap::new());
+    // Other blocks fill the pool: it counts ids, so ids past the registry stand in for them.
     for i in 0..MAX_SPEC_POOL {
-        state.intern(&format!("spec-{i}")).unwrap();
+        assert!(state.spec_pool.take(BlockId((40_000 + i) as u16)));
     }
     let rock = rock_spec();
     let kept = install_edits(&mut state, &[(1, 2, 3, rock.clone()), (4, 5, 6, "air".into())]);

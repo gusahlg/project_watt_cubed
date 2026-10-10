@@ -154,10 +154,12 @@ const MAX_CHANNELS: usize = 32;
 /// Tool uses one connection may send per second: each one evaluates the law and may intern two
 /// configurations under the [`State`] lock, so the budget is a human's swing rate, not a flood.
 const TOOL_RATE_LIMIT: u32 = 12;
-/// Ids the material table keeps for the world's own products (reactions, generation): a spec a
-/// A novel spec a client sends is interned only while at least this many ids stay free,
-/// so one client cannot fill the table (see [`take_novel_spec`]).
+/// Ids the material table keeps for the world's own products (reactions, generation): a novel
+/// spec a client sends is interned only while at least this many ids stay free, so one client
+/// cannot fill the table (see [`take_novel_spec`]).
 const CLIENT_INTERN_RESERVE: usize = crate::block::registry::MAX_BLOCK_TYPES / 4;
+/// The table size past which client specs no longer intern: [`CLIENT_INTERN_RESERVE`] below the cap.
+const CLIENT_INTERN_LIMIT: usize = crate::block::registry::MAX_BLOCK_TYPES - CLIENT_INTERN_RESERVE;
 const INTEREST_RADIUS: f64 = 160.0 * crate::math::PER_METER;
 /// Squared once so the hot per-listener check in [`on_move`] needs no sqrt.
 const INTEREST_RADIUS_SQ: f64 = INTEREST_RADIUS * INTEREST_RADIUS;
@@ -446,24 +448,7 @@ pub(crate) fn spawn(port: u16, config: Config) -> io::Result<ServerHandle> {
             crate::world::terrain::generator(&mut registry, loaded.seed, loaded.terrain)
         }
     };
-    let mut state = State {
-        edits: HashMap::new(),
-        spec_pool: HashMap::new(),
-        registry,
-        players: HashMap::default(),
-        grid: HashMap::new(),
-        next_id: 1,
-        day: loaded.day,
-        day_set: Instant::now(),
-        reactions: ReactionScheduler::new(),
-        tick: 1,
-        poses: PosesWriter::new(),
-        scratch: Scratch::default(),
-        terrain: TerrainCache::new(),
-        max_speed: finite_speed(config.max_speed),
-        #[cfg(test)]
-        panic_tick: false,
-    };
+    let mut state = State::new(registry, loaded.day, finite_speed(config.max_speed));
     let kept = install_edits(&mut state, &loaded.edits);
     state.reactions.restore(&contacts_of(&loaded.pending));
     let content = crate::net::content_id(&state.registry);

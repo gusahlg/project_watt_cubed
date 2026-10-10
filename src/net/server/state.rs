@@ -89,8 +89,8 @@ pub(super) struct Scratch {
     pub(super) fresh: Vec<u32>,
 }
 
-/// One edited cell: its block (so reads never parse the spec), the pooled spec
-/// the wire and saves carry, and the revision racing edits compare against.
+/// One edited cell: its block (so reads never parse the spec), the registry's own spec text
+/// for it (the wire and saves carry it), and the revision racing edits compare against.
 pub(super) struct Cell {
     pub(super) block: BlockId,
     pub(super) spec: Arc<str>,
@@ -99,12 +99,65 @@ pub(super) struct Cell {
     pub(super) natural: bool,
 }
 
+/// How many live cells name each block, by id, and how many blocks are named at all, which
+/// [`MAX_SPEC_POOL`] caps. The spec text is the registry's (`spec_ref`), so the pool holds no
+/// strings. Snapshot clones and broadcasts hold their own `Arc`s and are not counted: a block
+/// leaves when its cell count reaches zero.
+#[derive(Default)]
+pub(super) struct SpecPool {
+    cells: Vec<u32>,
+    named: usize,
+}
+
+impl SpecPool {
+    /// Count one more cell naming `id`. False when no live cell names `id` yet and the pool is
+    /// full; a block already named still resolves at the cap.
+    pub(super) fn take(&mut self, id: BlockId) -> bool {
+        let at = usize::from(id.0);
+        if at >= self.cells.len() {
+            self.cells.resize(at + 1, 0);
+        }
+        let n = &mut self.cells[at];
+        if *n == 0 {
+            if self.named >= MAX_SPEC_POOL {
+                return false;
+            }
+            self.named += 1;
+        }
+        *n = n.saturating_add(1);
+        true
+    }
+
+    /// One live cell stopped naming `id`.
+    pub(super) fn release(&mut self, id: BlockId) {
+        let Some(n) = self.cells.get_mut(usize::from(id.0)) else { return };
+        match *n {
+            0 => {}
+            1 => {
+                *n = 0;
+                self.named -= 1;
+            }
+            _ => *n -= 1,
+        }
+    }
+
+    /// Distinct blocks named by live cells.
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.named
+    }
+
+    /// Live cells naming `id`.
+    #[cfg(test)]
+    pub(super) fn cells(&self, id: BlockId) -> u32 {
+        self.cells.get(usize::from(id.0)).copied().unwrap_or(0)
+    }
+}
+
 pub(super) struct State {
+    /// Keyed by cells clients choose, so it keeps SipHash.
     pub(super) edits: HashMap<(i32, i32, i32), Cell>,
-    /// Distinct CANONICAL spec strings and how many live cells name them.
-    /// Snapshot clones and broadcasts hold their own `Arc`s and do not count:
-    /// an entry leaves when the cell count hits zero. Capped at [`MAX_SPEC_POOL`].
-    pub(super) spec_pool: HashMap<Arc<str>, u32>,
+    pub(super) spec_pool: SpecPool,
     /// The same compiled palette clients build, so specs validate/canonicalize
     /// under EXACTLY the rules clients apply.
     pub(super) registry: BlockRegistry,
@@ -125,6 +178,11 @@ pub(super) struct State {
     pub(super) day_set: Instant,
     /// Server-authoritative reaction scheduler. Clients never run one.
     pub(super) reactions: ReactionScheduler,
+    /// The reaction tick's commits, reused from tick to tick.
+    pub(super) mutations: Vec<Mutation>,
+    /// Each committed cell's last commit in a tick, reused from tick to tick. Keyed by cells
+    /// clients can choose, so it keeps SipHash.
+    pub(super) latest: HashMap<Pos, usize>,
     /// The next pose tick ([`broadcast_poses`]).
     pub(super) tick: u64,
     pub(super) poses: PosesWriter,
@@ -138,6 +196,30 @@ pub(super) struct State {
 }
 
 impl State {
+    /// An empty world on `registry`, with no players and the clock at `day`.
+    pub(super) fn new(registry: BlockRegistry, day: f32, max_speed: f64) -> Self {
+        Self {
+            edits: HashMap::new(),
+            spec_pool: SpecPool::default(),
+            registry,
+            players: HashMap::default(),
+            grid: HashMap::new(),
+            next_id: 1,
+            day,
+            day_set: Instant::now(),
+            reactions: ReactionScheduler::new(),
+            mutations: Vec::new(),
+            latest: HashMap::new(),
+            tick: 1,
+            poses: PosesWriter::new(),
+            scratch: Scratch::default(),
+            terrain: TerrainCache::new(),
+            max_speed,
+            #[cfg(test)]
+            panic_tick: false,
+        }
+    }
+
     /// Must run under the same lock hold as the roster/position change it
     /// mirrors, or the grid drifts.
     pub(super) fn grid_insert(&mut self, id: u32, pos: DVec3) {
@@ -183,30 +265,26 @@ impl State {
         (self.day + elapsed / clamp_day_secs(day_secs)).rem_euclid(1.0)
     }
 
-    /// `None` at the [`MAX_SPEC_POOL`] cap. An existing spec still resolves at the cap,
-    /// and its cell count goes up by one.
-    pub(super) fn intern(&mut self, spec: &str) -> Option<Arc<str>> {
-        if let Some(n) = self.spec_pool.get_mut(spec) {
-            *n = n.saturating_add(1);
-            return self.spec_pool.get_key_value(spec).map(|(k, _)| k.clone());
-        }
-        if self.spec_pool.len() >= MAX_SPEC_POOL {
-            return None;
-        }
-        let shared: Arc<str> = Arc::from(spec);
-        self.spec_pool.insert(shared.clone(), 1);
-        Some(shared)
+    /// The registry's spec text for `id`, counted as one more live cell naming it. `None` at the
+    /// [`MAX_SPEC_POOL`] cap for a block no live cell names yet.
+    pub(super) fn intern(&mut self, id: BlockId) -> Option<Arc<str>> {
+        self.spec_pool.take(id).then(|| Arc::clone(self.registry.spec_ref(id)))
     }
 
-    /// One live cell stopped naming `old`. The pool entry leaves at zero,
-    /// whatever other `Arc` clones (a snapshot list, a test) still exist.
-    pub(super) fn release(&mut self, old: Arc<str>) {
-        let Some(n) = self.spec_pool.get_mut(old.as_ref()) else { return };
-        if *n <= 1 {
-            self.spec_pool.remove(old.as_ref());
-        } else {
-            *n -= 1;
+    /// The revision of the cell at `at`: 0 for a cell never edited.
+    pub(super) fn rev(&self, at: Pos) -> u32 {
+        self.edits.get(&at).map_or(0, |c| c.rev)
+    }
+
+    /// Commit `block` at `at` at the next revision, and return that revision and the spec.
+    /// `None`, with nothing written, when the spec pool cannot name `block`.
+    pub(super) fn write(&mut self, at: Pos, block: BlockId, natural: bool) -> Option<(u32, Arc<str>)> {
+        let spec = self.intern(block)?;
+        let rev = self.rev(at).saturating_add(1);
+        if let Some(old) = self.edits.insert(at, Cell { block, spec: Arc::clone(&spec), rev, natural }) {
+            self.spec_pool.release(old.block);
         }
+        Some((rev, spec))
     }
 }
 
@@ -284,12 +362,7 @@ impl CellStore for ServerCells<'_> {
         if prev == id {
             return Some(prev);
         }
-        let canonical = crate::save::block_spec(&self.state.registry, id);
-        let spec = self.state.intern(&canonical)?;
-        let rev = self.state.edits.get(&pos).map_or(0, |c| c.rev).saturating_add(1);
-        if let Some(old) = self.state.edits.insert(pos, Cell { block: id, spec, rev, natural: false }) {
-            self.state.release(old.spec);
-        }
+        self.state.write(pos, id, false)?;
         Some(prev)
     }
 
@@ -312,6 +385,13 @@ pub(super) fn bucket_of(pos: DVec3) -> (i32, i32, i32) {
         block_coord(pos.y / INTEREST_RADIUS),
         block_coord(pos.z / INTEREST_RADIUS),
     )
+}
+
+/// Where a storage cell sits in the world: a round world's cell is judged where its chart embeds
+/// it, any other at its own centre.
+pub(super) fn cell_centre(generator: &crate::world::terrain::Generator, (x, y, z): Pos) -> DVec3 {
+    crate::space::atlas::embed_cell(generator.atlases(), (x, y, z))
+        .unwrap_or(DVec3::new(x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5))
 }
 
 pub(super) fn outside_world(pos: DVec3) -> bool {

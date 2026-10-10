@@ -35,7 +35,7 @@ fn a_tool_use_from_an_unready_player_is_not_evaluated() {
     let shared = Arc::new(Mutex::new(test_state(players)));
     let (_, tool) = place_pair(&shared, (8, 20, 8));
     let count = shared.lock_recover().registry.block_count();
-    on_tool_use(&shared, &test_generator(), 1, 7, 8, 20, 8, 1, &tool);
+    on_tool_use(&shared, &test_generator(), 1, 7, 8, 20, 8, 1, &Arc::from(tool.as_str()));
     assert_eq!(shared.lock_recover().registry.block_count(), count, "nothing interned");
     assert!(rx.try_recv().is_err());
 }
@@ -49,7 +49,7 @@ fn a_tool_use_runs_one_operation_of_the_law_on_the_server() {
     players.insert(2u32, test_player(DVec3::new(9.5, 20.0, 8.5), peer_out, test_kick()));
     let shared = Arc::new(Mutex::new(test_state(players)));
     let (_, tool) = place_pair(&shared, (8, 20, 8));
-    on_tool_use(&shared, &test_generator(), 1, 7, 8, 20, 8, 1, &tool);
+    on_tool_use(&shared, &test_generator(), 1, 7, 8, 20, 8, 1, &Arc::from(tool.as_str()));
     let replies = drain_msgs(&rx);
     let [ServerMessage::ToolResult { req: 7, reacted: true, rev: 2, cell_spec, tool_spec }] = replies.as_slice() else {
         panic!("expected one ToolResult, got {replies:?}");
@@ -67,9 +67,9 @@ fn a_tool_use_runs_one_operation_of_the_law_on_the_server() {
         "peers see the cell change"
     );
     // A stale revision, a void tool and a tool out of reach are refused with `reacted: false`.
-    on_tool_use(&shared, &test_generator(), 1, 8, 8, 20, 8, 1, &tool);
-    on_tool_use(&shared, &test_generator(), 1, 9, 8, 20, 8, 2, "air");
-    on_tool_use(&shared, &test_generator(), 1, 10, 80, 20, 8, 0, &tool);
+    on_tool_use(&shared, &test_generator(), 1, 8, 8, 20, 8, 1, &Arc::from(tool.as_str()));
+    on_tool_use(&shared, &test_generator(), 1, 9, 8, 20, 8, 2, &Arc::from("air"));
+    on_tool_use(&shared, &test_generator(), 1, 10, 80, 20, 8, 0, &Arc::from(tool.as_str()));
     let refused = drain_msgs(&rx);
     assert_eq!(refused.len(), 3);
     assert!(refused.iter().all(|m| matches!(m, ServerMessage::ToolResult { reacted: false, .. })));
@@ -82,7 +82,7 @@ fn reaction_snapshots_carry_each_cell_once_with_its_final_content() {
     players.insert(1u32, test_player(DVec3::new(8.5, 20.0, 8.5), out, test_kick()));
     let mut state = test_state(players);
     let rock = state.registry.lookup_spec(&rock_spec()).or_else(|| state.registry.parse_spec(&rock_spec())).unwrap();
-    let spec = state.intern(&state.registry.spec(rock)).unwrap();
+    let spec = state.intern(rock).unwrap();
     state.edits.insert((1, 2, 3), Cell { block: rock, spec: spec.clone(), rev: 2, natural: false });
     state.edits.insert((4, 5, 6), Cell { block: rock, spec, rev: 1, natural: false });
     let muts = [
@@ -257,22 +257,23 @@ fn spec_pool_canonicalizes_and_releases_dead_entries() {
     {
         let state = shared.lock_recover();
         assert_eq!(state.spec_pool.len(), 1, "only \"air\" remains interned");
-        assert!(state.spec_pool.contains_key("air"));
+        assert_eq!(state.spec_pool.cells(AIR), 2, "both cells name air");
     }
 }
 
+/// The pool counts blocks by id, so any ids exercise its cap.
 #[test]
 fn spec_pool_is_bounded_under_unique_mints() {
-    let mut state = test_state(HashMap::new());
+    let mut pool = SpecPool::default();
+    let id = |i: usize| BlockId((1000 + i) as u16);
     for i in 0..MAX_SPEC_POOL {
-        assert!(state.intern(&format!("spec-{i}")).is_some(), "slot {i} must intern");
+        assert!(pool.take(id(i)), "slot {i} must take");
     }
-    assert!(state.intern("one-too-many").is_none(), "cap must refuse a new spec");
-    assert!(state.intern("spec-0").is_some(), "an already-interned spec still resolves");
-    let old = state.spec_pool.get_key_value("spec-1").unwrap().0.clone();
-    state.release(old);
-    assert!(state.intern("fresh-after-release").is_some(), "release must free a slot");
-    assert_eq!(state.spec_pool.len(), MAX_SPEC_POOL);
+    assert!(!pool.take(id(MAX_SPEC_POOL)), "cap must refuse a new block");
+    assert!(pool.take(id(0)), "a block already named still resolves");
+    pool.release(id(1));
+    assert!(pool.take(id(MAX_SPEC_POOL + 1)), "release must free a slot");
+    assert_eq!(pool.len(), MAX_SPEC_POOL);
 }
 
 #[test]
@@ -370,7 +371,7 @@ fn six_hundred_reaction_mutations_reach_the_client_in_order() {
     let (block, spec) = {
         let mut state = shared.lock_recover();
         let block = state.registry.parse_spec(&rock_spec()).unwrap();
-        (block, state.intern(&rock_spec()).expect("spec pool"))
+        (block, state.intern(block).expect("spec pool"))
     };
     let mutations: Vec<Mutation> = (0..600)
         .map(|i| Mutation {
@@ -482,13 +483,15 @@ fn spec_pool_counts_cells_not_arc_clones() {
     on_edit(&shared, None, chartless(), 1, 2, 8, 21, 8, 0, &rock);
     let extra = {
         let state = shared.lock_recover();
-        assert_eq!(state.spec_pool.get(rock.as_str()).copied(), Some(2));
+        assert_eq!(state.spec_pool.cells(state.registry.lookup_spec(&rock).unwrap()), 2);
         state.edits[&(8, 21, 8)].spec.clone()
     };
     on_edit(&shared, None, chartless(), 1, 3, 8, 20, 8, 1, "air");
-    assert_eq!(shared.lock_recover().spec_pool.get(rock.as_str()).copied(), Some(1));
+    let rock_id = shared.lock_recover().registry.lookup_spec(&rock).unwrap();
+    assert_eq!(shared.lock_recover().spec_pool.cells(rock_id), 1);
     on_edit(&shared, None, chartless(), 1, 4, 8, 21, 8, 1, "air");
-    assert!(!shared.lock_recover().spec_pool.contains_key(rock.as_str()), "zero cells frees the entry");
+    assert_eq!(shared.lock_recover().spec_pool.cells(rock_id), 0, "zero cells frees the entry");
+    assert_eq!(shared.lock_recover().spec_pool.len(), 1, "only air is named");
     drop(extra);
 }
 
@@ -599,4 +602,113 @@ fn a_panicking_reaction_tick_keeps_the_server_running() {
     assert!(conn.is_alive());
     drop(conn);
     handle.stop();
+}
+
+/// Every ledger cell names its block with the registry's own text, after edits, tool uses and
+/// the reactions they wake, and the pool counts exactly the live cells.
+#[test]
+fn cells_name_their_block_after_edits_tool_uses_and_reactions() {
+    let (players, _rx) = pose(DVec3::new(8.5, 20.0, 8.5));
+    let (shared, ctx) = flat_shared(players, NoclipPolicy::All, &[]);
+    let (_, tool) = place_pair(&shared, (8, 20, 8));
+    on_edit(&shared, None, &ctx.generator, 1, 1, 8, 21, 8, 0, &tool);
+    on_edit(&shared, None, &ctx.generator, 1, 2, 9, 20, 8, 0, &rock_spec());
+    on_edit(&shared, None, &ctx.generator, 1, 3, 10, 20, 8, 0, "air");
+    place_pair(&shared, (7, 20, 8));
+    on_tool_use(&shared, &ctx.generator, 1, 4, 7, 20, 8, 1, &Arc::from(tool.as_str()));
+    for _ in 0..40 {
+        run_reactions(&shared, &ctx);
+    }
+    let state = shared.lock_recover();
+    assert!(state.edits[&(7, 20, 8)].rev > 1, "the tool use wrote its cell");
+    assert!(state.edits[&(8, 20, 8)].rev > 1 || state.edits[&(8, 21, 8)].rev > 1, "the pair reacted");
+    for (at, cell) in &state.edits {
+        assert_eq!(state.registry.lookup_spec(&cell.spec), Some(cell.block), "{at:?}");
+        assert!(Arc::ptr_eq(&cell.spec, state.registry.spec_ref(cell.block)), "{at:?} holds the registry's text");
+    }
+    let named: HashSet<BlockId> = state.edits.values().map(|c| c.block).collect();
+    assert_eq!(state.spec_pool.len(), named.len());
+    for block in named {
+        let cells = state.edits.values().filter(|c| c.block == block).count();
+        assert_eq!(state.spec_pool.cells(block) as usize, cells, "{block:?}");
+    }
+}
+
+/// A generator that counts its reads, and the reads made while the state lock was held.
+struct Watched {
+    inner: crate::world::terrain::Generator,
+    state: OnceLock<std::sync::Weak<Mutex<State>>>,
+    reads: AtomicUsize,
+    locked: AtomicUsize,
+}
+
+impl TerrainGenerator for Watched {
+    fn height(&self, x: i32, z: i32) -> i32 {
+        self.inner.height(x, z)
+    }
+
+    fn surface_at(&self, x: i32, z: i32) -> BlockId {
+        self.inner.surface_at(x, z)
+    }
+
+    fn deep(&self) -> BlockId {
+        self.inner.deep()
+    }
+
+    fn voxel_at(&self, x: i32, y: i32, z: i32) -> BlockId {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        if self.state.get().and_then(std::sync::Weak::upgrade).is_some_and(|s| s.try_lock().is_err()) {
+            self.locked.fetch_add(1, Ordering::Relaxed);
+        }
+        self.inner.voxel_at(x, y, z)
+    }
+}
+
+/// A refused tool use names the cell as it is, but an edited cell is answered from the ledger
+/// and a generated one is read with the state lock released.
+#[test]
+fn a_refused_tool_use_reads_the_generator_only_outside_the_lock() {
+    let (players, rx) = pose(DVec3::new(8.5, 20.0, 8.5));
+    let (shared, ctx) = flat_shared(players, NoclipPolicy::All, &[]);
+    let watched = Arc::new(Watched {
+        inner: ctx.generator.clone(),
+        state: OnceLock::new(),
+        reads: AtomicUsize::new(0),
+        locked: AtomicUsize::new(0),
+    });
+    let _ = watched.state.set(Arc::downgrade(&shared));
+    let generator: crate::world::terrain::Generator = watched.clone();
+    let tool: Arc<str> = rock_spec().into();
+    on_edit(&shared, None, &generator, 1, 1, 8, 21, 8, 0, "air");
+    let _ = drain(&rx);
+    watched.reads.store(0, Ordering::Relaxed);
+
+    // A stale revision, then a use over the tool budget, on the edited cell.
+    on_tool_use(&shared, &generator, 1, 2, 8, 21, 8, 0, &tool);
+    refuse_tool(shared.lock_recover(), &shared, &generator, 1, 3, (8, 21, 8), &tool);
+    assert_eq!(watched.reads.load(Ordering::Relaxed), 0, "an edited cell is answered from the ledger");
+    // The same on generated cells nobody has read yet.
+    on_tool_use(&shared, &generator, 1, 4, 8, 19, 8, 5, &tool);
+    refuse_tool(shared.lock_recover(), &shared, &generator, 1, 5, (9, 19, 8), &tool);
+    assert_eq!(watched.reads.load(Ordering::Relaxed), 2, "each generated cell is read once");
+    assert_eq!(watched.locked.load(Ordering::Relaxed), 0, "never under the state lock");
+
+    let generated = {
+        let state = shared.lock_recover();
+        state.registry.spec(ctx.generator.voxel_at(8, 19, 8))
+    };
+    let answers: Vec<_> = drain(&rx)
+        .into_iter()
+        .map(|m| match m {
+            ServerMessage::ToolResult { req, reacted, rev, cell_spec, tool_spec } => {
+                assert!(!reacted && tool_spec == tool, "request {req} hands the tool back");
+                (req, rev, cell_spec.to_string())
+            }
+            other => panic!("expected a ToolResult, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        answers,
+        vec![(2, 1, "air".to_string()), (3, 1, "air".to_string()), (4, 0, generated.clone()), (5, 0, generated)]
+    );
 }

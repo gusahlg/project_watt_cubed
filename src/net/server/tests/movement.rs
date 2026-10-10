@@ -371,8 +371,7 @@ fn noclip_snaps_a_body_in_solid_ground() {
         let spec = rock_spec();
         let id = state.registry.parse_spec(&spec).unwrap();
         assert!(state.registry.is_solid(id));
-        let canonical = state.registry.spec(id);
-        let shared_spec = state.intern(&canonical).unwrap();
+        let shared_spec = state.intern(id).unwrap();
         state.edits.insert(fresh, Cell { block: id, spec: shared_spec, rev: 1, natural: false });
     }
     step(&shared, &ctx, into);
@@ -388,22 +387,10 @@ fn noclip_reads_a_chart_edge_like_the_client() {
     let mut registry = BlockRegistry::with_builtins();
     let generator = crate::world::terrain::generator(&mut registry, 4242, TerrainCfg::default());
     let seams = Seams::new(generator.atlases().to_vec());
-    let state = State {
-        edits: HashMap::new(),
-        spec_pool: HashMap::new(),
-        registry,
-        players: HashMap::default(),
-        grid: HashMap::new(),
-        next_id: 2,
-        day: 0.3,
-        day_set: Instant::now(),
-        reactions: ReactionScheduler::new(),
-        tick: 1,
-        poses: PosesWriter::new(),
-        scratch: Scratch::default(),
-        terrain: TerrainCache::new(),
-        max_speed: crate::player::MAX_SPEED,
-        panic_tick: false,
+    let state = {
+        let mut state = State::new(registry, 0.3, crate::player::MAX_SPEED);
+        state.next_id = 2;
+        state
     };
     let home = generator.cosmos().expect("cosmos").home();
     let atlas = generator
@@ -447,22 +434,10 @@ fn noclip_check_stays_cheap() {
     let mut registry = BlockRegistry::with_builtins();
     let generator = crate::world::terrain::generator(&mut registry, 1, TerrainCfg::default());
     let seams = Seams::new(generator.atlases().to_vec());
-    let state = State {
-        edits: HashMap::new(),
-        spec_pool: HashMap::new(),
-        registry,
-        players: HashMap::default(),
-        grid: HashMap::new(),
-        next_id: 2,
-        day: 0.3,
-        day_set: Instant::now(),
-        reactions: ReactionScheduler::new(),
-        tick: 1,
-        poses: PosesWriter::new(),
-        scratch: Scratch::default(),
-        terrain: TerrainCache::new(),
-        max_speed: crate::player::MAX_SPEED,
-        panic_tick: false,
+    let state = {
+        let mut state = State::new(registry, 0.3, crate::player::MAX_SPEED);
+        state.next_id = 2;
+        state
     };
     let mut pos = DVec3::new(8.5, 80.0, 8.5);
     for _ in 0..40 {
@@ -626,11 +601,10 @@ fn a_move_cannot_pass_through_a_wall() {
     {
         let mut state = shared.lock_recover();
         let rock = state.registry.parse_spec(&rock_spec()).unwrap();
-        let canonical = state.registry.spec(rock);
         for x in 2..=4 {
             for y in ground..ground + 3 {
                 for z in -1..=1 {
-                    let spec = state.intern(&canonical).unwrap();
+                    let spec = state.intern(rock).unwrap();
                     state.edits.insert((x, y, z), Cell { block: rock, spec, rev: 1, natural: false });
                 }
             }

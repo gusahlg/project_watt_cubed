@@ -48,6 +48,8 @@ pub(super) fn run_reactions(shared: &Arc<Mutex<State>>, ctx: &Ctx) {
     }
     let budget = reactions::Budget::DEFAULT;
     let mut sched = std::mem::take(&mut state.reactions);
+    let mut mutations = std::mem::take(&mut state.mutations);
+    mutations.clear();
     let tick = catch_unwind(AssertUnwindSafe(|| {
         if force {
             panic!("reaction tick");
@@ -56,16 +58,17 @@ pub(super) fn run_reactions(shared: &Arc<Mutex<State>>, ctx: &Ctx) {
             state: &mut state,
             generator: &ctx.generator,
         };
-        sched.tick(&mut cells, budget)
+        sched.tick_into(&mut cells, budget, &mut mutations);
     }));
     state.reactions = sched;
     let wake = match tick {
-        Ok(mutations) => send_reaction_mutations(&mut state, &mutations),
+        Ok(()) => send_reaction_mutations(&mut state, &mutations),
         Err(payload) => {
             eprintln!("reaction tick panicked: {}", panic_text(&payload));
             Wake(Vec::new())
         }
     };
+    state.mutations = mutations;
     drop(state);
     drop(wake);
 }
@@ -140,7 +143,8 @@ pub(super) fn send_reaction_mutations(state: &mut State, mutations: &[Mutation])
     }
     // A cell committed by several contacts in one turn is sent once, with its
     // final content, at the point of its last commit (order is preserved).
-    let mut last: HashMap<Pos, usize> = HashMap::with_capacity(mutations.len());
+    let mut last = std::mem::take(&mut state.latest);
+    last.clear();
     for (i, m) in mutations.iter().enumerate() {
         last.insert(m.pos, i);
     }
@@ -149,7 +153,7 @@ pub(super) fn send_reaction_mutations(state: &mut State, mutations: &[Mutation])
         let mut writer = SnapshotWriter::new();
         let mut emit = |frame| frames.push(frame);
         for (i, m) in mutations.iter().enumerate() {
-            if last[&m.pos] != i {
+            if last.get(&m.pos) != Some(&i) {
                 continue;
             }
             let Some(cell) = state.edits.get(&m.pos) else { continue };
@@ -157,6 +161,7 @@ pub(super) fn send_reaction_mutations(state: &mut State, mutations: &[Mutation])
         }
         writer.finish(&mut emit);
     }
+    state.latest = last;
     for frame in frames {
         wake.join(broadcast_frame(state, frame, None, |pid, _| pid != WORLD_PLAYER));
     }

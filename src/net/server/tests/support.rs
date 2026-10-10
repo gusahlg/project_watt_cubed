@@ -130,22 +130,11 @@ pub(super) fn test_state(players: HashMap<u32, PlayerHandle>) -> State {
     // The palette first, exactly as `spawn` builds it, so generator ids mean the same here.
     let mut registry = BlockRegistry::with_builtins();
     crate::world::terrain::Materials::intern(&mut registry);
-    State {
-        edits: HashMap::new(),
-        spec_pool: HashMap::new(),
-        registry,
-        players: players.into_iter().collect(),
-        grid: HashMap::new(),
-        next_id: 2,
-        day: 0.3,
-        day_set: Instant::now(),
-        reactions: ReactionScheduler::new(),
-        tick: 1,
-        poses: PosesWriter::new(),
-        scratch: Scratch::default(),
-        terrain: TerrainCache::new(),
-        max_speed: crate::player::MAX_SPEED,
-        panic_tick: false,
+    {
+        let mut state = State::new(registry, 0.3, crate::player::MAX_SPEED);
+        state.players = players.into_iter().collect();
+        state.next_id = 2;
+        state
     }
 }
 
@@ -183,7 +172,7 @@ pub(super) fn place_pair(shared: &Arc<Mutex<State>>, cell: Pos) -> (String, Stri
     let mut state = shared.lock_recover();
     let (a, e) = crate::sim::reactions::destructive_pair(&mut state.registry);
     let (sa, se) = (state.registry.spec(a), state.registry.spec(e));
-    let spec = state.intern(&sa).unwrap();
+    let spec = state.intern(a).unwrap();
     state.edits.insert(cell, Cell { block: a, spec, rev: 1, natural: false });
     (sa, se)
 }
@@ -283,22 +272,11 @@ pub(super) fn flat_shared(
     let mut registry = BlockRegistry::with_builtins();
     let generator: crate::world::terrain::Generator =
         Arc::new(crate::world::generation::FlatTerrain::new(&mut registry, 1));
-    let state = State {
-        edits: HashMap::new(),
-        spec_pool: HashMap::new(),
-        registry,
-        players: players.into_iter().collect(),
-        grid: HashMap::new(),
-        next_id: 2,
-        day: 0.3,
-        day_set: Instant::now(),
-        reactions: ReactionScheduler::new(),
-        tick: 1,
-        poses: PosesWriter::new(),
-        scratch: Scratch::default(),
-        terrain: TerrainCache::new(),
-        max_speed: crate::player::MAX_SPEED,
-        panic_tick: false,
+    let state = {
+        let mut state = State::new(registry, 0.3, crate::player::MAX_SPEED);
+        state.players = players.into_iter().collect();
+        state.next_id = 2;
+        state
     };
     let ctx = Ctx {
         password: String::new(),

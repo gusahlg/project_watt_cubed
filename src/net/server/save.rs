@@ -12,8 +12,7 @@ pub(super) fn install_edits(state: &mut State, edits: &[(i32, i32, i32, String)]
             kept.push((*x, *y, *z, spec.clone()));
             continue;
         };
-        let canonical = state.registry.spec(id);
-        let Some(shared) = state.intern(&canonical) else {
+        let Some(shared) = state.intern(id) else {
             over += 1;
             kept.push((*x, *y, *z, spec.clone()));
             continue;

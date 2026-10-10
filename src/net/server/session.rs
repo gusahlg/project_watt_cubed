@@ -83,7 +83,7 @@ pub(super) fn client_loop(
             ClientMessage::ToolUse { req, x, y, z, expect, tool_spec } => {
                 if !tool_rate.allow(now) {
                     // Over the tool budget this second: refuse, so the client's swing resolves.
-                    refuse_tool(shared, &ctx.generator, id, req, x, y, z, &tool_spec);
+                    refuse_tool(shared.lock_recover(), shared, &ctx.generator, id, req, (x, y, z), &tool_spec);
                     continue;
                 }
                 on_tool_use(shared, &ctx.generator, id, req, x, y, z, expect, &tool_spec)
