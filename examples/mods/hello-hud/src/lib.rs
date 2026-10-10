@@ -34,7 +34,11 @@ impl Mod for HelloHud {
         self.broken += 1;
     }
 
-    fn hud(&self, _world: &World, _player: &Player, _screen: (i32, i32), out: &mut Vec<HudElement>) {
+    fn hud(&self, facts: &HudFacts, _world: &World, _player: &Player, out: &mut Vec<HudElement>) {
+        // The core asks in every HUD mode; this line shows in Full and Minimal.
+        if !facts.hud_mode.shows_mod_hud() {
+            return;
+        }
         out.push(HudElement::Label {
             at: Anchor::TopRight,
             off: (-12, 96),
