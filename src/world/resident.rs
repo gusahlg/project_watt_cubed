@@ -273,6 +273,8 @@ pub(in crate::world) enum SectionState {
 pub(in crate::world) struct ChartBend {
     pub(super) atlas: Arc<crate::space::atlas::Atlas>,
     pub(super) patch: crate::space::atlas::Patch,
+    /// Storage `(x, z)` a chart tile's coordinates count from (zero on a cube).
+    pub(super) origin: (i32, i32),
 }
 
 impl SectionState {
@@ -329,7 +331,8 @@ impl SectionState {
         let bend = bend?;
         let extent = (1i32 << detail.0).saturating_mul(16);
         let y0 = floor_a + origin_y as i32 * pos.cell_size();
-        let (anchor, corners) = section::chart_slab_corners(&bend.atlas, bend.patch, pos.min_x(), y0, pos.min_z(), extent)?;
+        let (x0, z0) = (bend.origin.0 + pos.min_x(), bend.origin.1 + pos.min_z());
+        let (anchor, corners) = section::chart_slab_corners(&bend.atlas, bend.patch, x0, y0, z0, extent)?;
         let cage = eng.create_cage(anchor, corners)?;
         cages.push(cage);
         Some(voxel_engine::MeshPlacement::caged(cage, detail))

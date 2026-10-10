@@ -693,12 +693,19 @@ impl World {
     fn chart_sections(&self, center: Coord, memo: &mut NearBounds, held: &mut Vec<(SectionPos, [i32; 2])>) -> Vec<SectionPos> {
         let Some(seat) = self.seams.chart_seat(center) else { return Vec::new() };
         let Some((cfg, max_d)) = self.chart_pyramid(seat.radius) else { return Vec::new() };
-        let base = self.chart_pick(center, DVec3::ZERO, &seat, &cfg, max_d, memo, held);
+        let mut storage_held = Vec::new();
+        let base = self.chart_pick(center, DVec3::ZERO, &seat, &cfg, max_d, memo, &mut storage_held);
         let delta = chart_delta(self.section_vel);
-        if delta == DVec3::ZERO {
-            return base;
-        }
-        quadtree::union_frontiers(base, self.chart_pick(center, delta, &seat, &cfg, max_d, memo, held))
+        let picked = if delta == DVec3::ZERO {
+            base
+        } else {
+            quadtree::union_frontiers(base, self.chart_pick(center, delta, &seat, &cfg, max_d, memo, &mut storage_held))
+        };
+        // Picked in storage; every tile counts from its own patch.
+        held.extend(storage_held.into_iter().map(|(s, layers)| (self.patch_tile(s), layers)));
+        let mut out: Vec<SectionPos> = picked.into_iter().map(|s| self.patch_tile(s)).collect();
+        out.sort_unstable_by_key(section_key);
+        out
     }
 
     /// Pyramid stopped at the largest detail whose span still satisfies `L² ≤ 8R`, on the
@@ -859,7 +866,7 @@ impl World {
             return None;
         }
         let (u0, v0, u1, v1) = overlap_storage(s, near, across)?;
-        let surface = || self.generator.surface_rect(s.body, Face::PosY, u0, v0, u1, v1);
+        let surface = || self.storage_rect(s.body, u0, v0, u1, v1);
         let (lo, hi) = self.with_edits(memo.get((s.body, [u0, v0, u1, v1]), surface)?, [u0, v0, u1, v1]);
         let (top_lo, top_hi) = (lo.saturating_sub(1), hi.saturating_sub(1));
         let cs = CHUNK_SIZE as i32;
@@ -876,7 +883,7 @@ impl World {
         }
         let near = self.near_block_box(center);
         let span = i32::try_from((near.1 - near.0).max(near.3 - near.2)).unwrap_or(i32::MAX);
-        match self.generator.surface_bounds(body, Face::PosY, near.0 as i32, near.2 as i32, span) {
+        match self.storage_bounds(body, near.0 as i32, near.2 as i32, span) {
             Some((_, hi)) if i64::from(hi) - 1 < y0 => NONE,
             _ => near,
         }

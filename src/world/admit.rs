@@ -577,7 +577,8 @@ impl StreamLane for SectionLane {
     }
     fn order(world: &World, center: Coord, key: SectionPos) -> u64 {
         let span = key.span() as i64;
-        let (x, z) = world.net_column(center, key.min_x() as i64 + span / 2, key.min_z() as i64 + span / 2);
+        let (x, z) = world.tile_centre(key);
+        let (x, z) = world.net_column(center, x, z);
         let cs = CHUNK_SIZE as i64;
         let (psx, psz) = ((center.x as i64 * cs).div_euclid(span), (center.z as i64 * cs).div_euclid(span));
         let (sx, sz) = (x.div_euclid(span), z.div_euclid(span));
@@ -588,9 +589,9 @@ impl StreamLane for SectionLane {
         // `dy` is 0 and a vertical move does not reshuffle them. A neighbour
         // chart's column is measured where the net puts it, or its storage
         // distance admits the far side of the box ahead of the seam.
-        let span = key.span() as i64;
         let py = center.y as i64 * CHUNK_SIZE as i64 + CHUNK_SIZE as i64 / 2;
-        let (cx, cz) = world.net_column(center, key.min_x() as i64 + span / 2, key.min_z() as i64 + span / 2);
+        let (cx, cz) = world.tile_centre(key);
+        let (cx, cz) = world.net_column(center, cx, cz);
         let base = player_dist2(center, cx, py, cz);
         // Bias by motion direction so leading edge fills first.
         let cs = CHUNK_SIZE as i64;
@@ -623,6 +624,7 @@ impl StreamLane for SectionLane {
         let token = pipeline::ClaimToken(world.section_claim_seq);
         let job = pipeline::Job::Section {
             pos: key,
+            at: world.tile_centre(key),
             epoch: world.section_epoch,
             token,
             generator: world.generator.clone(),

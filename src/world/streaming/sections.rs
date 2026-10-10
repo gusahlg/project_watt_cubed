@@ -139,12 +139,55 @@ impl World {
             let atlas = self.seams.atlases().iter().find(|a| {
                 a.grid.as_ref().is_some_and(|g| g.body == pos.body) && a.warp.is_some()
             })?;
-            return Some(super::ChartBend { atlas: atlas.clone(), patch: crate::space::atlas::Patch::Grid });
+            return Some(super::ChartBend { atlas: atlas.clone(), patch: crate::space::atlas::Patch::Grid, origin: (0, 0) });
         }
         let index = (pos.body - super::section::CHART_BODY_BASE) as usize;
         let atlas = self.seams.atlases().get(index)?.clone();
-        let (patch, _) = atlas.locate([pos.min_x() as i64, 0, pos.min_z() as i64])?;
-        Some(super::ChartBend { atlas, patch })
+        let origin = self.generator.chart_origin(pos.body, pos.face)?;
+        let patch = crate::space::atlas::Patch::Shell { band: 0, face: pos.face };
+        Some(super::ChartBend { atlas, patch, origin })
+    }
+
+    /// Storage `(x, z)` of `pos`'s centre: a chart tile counts from its patch origin, any other
+    /// tile is in its own frame already.
+    pub(in crate::world) fn tile_centre(&self, pos: SectionPos) -> (i64, i64) {
+        let (ox, oz) = self.generator.chart_origin(pos.body, pos.face).unwrap_or((0, 0));
+        let half = i64::from(pos.span()) / 2;
+        (i64::from(ox) + i64::from(pos.min_x()) + half, i64::from(oz) + i64::from(pos.min_z()) + half)
+    }
+
+    /// The chart tile counted from its patch that storage-frame tile `s` (face +Y, storage `x`, `z`)
+    /// is. Any other tile stays.
+    pub(in crate::world) fn patch_tile(&self, s: SectionPos) -> SectionPos {
+        let Some(atlas) = s.body.checked_sub(super::section::CHART_BODY_BASE).and_then(|i| self.seams.atlases().get(usize::from(i))) else {
+            return s;
+        };
+        let Some((crate::space::atlas::Patch::Shell { band: 0, face }, _, _)) = atlas.column(i64::from(s.min_x()), i64::from(s.min_z())) else {
+            return s;
+        };
+        let Some((ox, oz)) = self.generator.chart_origin(s.body, face) else { return s };
+        let span = s.span();
+        SectionPos { face, x: s.x - ox / span, z: s.z - oz / span, ..s }
+    }
+
+    /// The generator's surface over storage rect `[x0, x1) × [z0, z1)` of chart `body`: callers still
+    /// on the storage grid read through its +Y patch's frame, which spans all of storage.
+    pub(in crate::world) fn storage_rect(&self, body: u16, x0: i32, z0: i32, x1: i32, z1: i32) -> Option<(i32, i32)> {
+        let (ox, oz) = self.generator.chart_origin(body, Face::PosY).unwrap_or((0, 0));
+        self.generator.surface_rect(body, Face::PosY, x0 - ox, z0 - oz, x1 - ox, z1 - oz)
+    }
+
+    /// [`storage_rect`](Self::storage_rect) over the `span` square at storage `(x0, z0)`.
+    pub(in crate::world) fn storage_bounds(&self, body: u16, x0: i32, z0: i32, span: i32) -> Option<(i32, i32)> {
+        let (ox, oz) = self.generator.chart_origin(body, Face::PosY).unwrap_or((0, 0));
+        self.generator.surface_bounds(body, Face::PosY, x0 - ox, z0 - oz, span)
+    }
+
+    /// The storage-frame tile (face +Y, storage `x`, `z`) of chart tile `s`. Any other tile stays.
+    pub(in crate::world) fn storage_tile(&self, s: SectionPos) -> SectionPos {
+        let Some((ox, oz)) = self.generator.chart_origin(s.body, s.face) else { return s };
+        let span = s.span();
+        SectionPos { face: Face::PosY, x: s.x + ox / span, z: s.z + oz / span, ..s }
     }
 
     /// Ready tiles under an uncovered desired cell, once the section floor is full.
@@ -403,13 +446,15 @@ impl World {
                 if self.stands_under_hole(*s, &holes) {
                     return false;
                 }
-                let span = s.span() as i64;
                 // In the chart net. A neighbour's own storage is a different box, so the raw
                 // column reads as past the horizon and the fold deletes a section the player
                 // is about to walk back onto.
-                let (cx, cz) = self.net_column(center, s.min_x() as i64 + span / 2, s.min_z() as i64 + span / 2);
-                // A section on another face is kept only while it is still desired.
-                let dist = if s.body == metric_body && s.face == metric_face {
+                let (cx, cz) = self.tile_centre(*s);
+                let (cx, cz) = self.net_column(center, cx, cz);
+                // A section on another face is kept only while it is still desired. Every patch
+                // of a chart is measured in its storage.
+                let chart = s.body >= super::section::CHART_BODY_BASE;
+                let dist = if s.body == metric_body && (chart || s.face == metric_face) {
                     metric.point(cx as f64, cz as f64)
                 } else {
                     EyeDist::new(f32::MAX)

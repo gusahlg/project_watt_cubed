@@ -416,7 +416,8 @@ pub(in crate::world) fn extract_section_mesh<G: TerrainGenerator + ?Sized>(
         sample_columns(pos, r#gen, edits, alo, n_cells, dense);
     });
     mesh.altitude_floor = alo;
-    if pos.face != Face::PosY {
+    // A chart patch is storage +Y up whatever its face; a cube face meshes face-local.
+    if pos.face != Face::PosY && !chart {
         orient_section(&mut mesh, pos.face);
     }
     mesh
@@ -451,7 +452,7 @@ fn ring_floor_face<G: TerrainGenerator + ?Sized>(pos: SectionPos, r#gen: &G, alo
     let n = SECTION_N as i32;
     let top = |ix: i32, iz: i32| {
         let (u, v) = (pos.min_x() + ix * cell + cell / 2, pos.min_z() + iz * cell + cell / 2);
-        let h = r#gen.surface(pos.face, u, v);
+        let h = r#gen.surface_on(pos.body, pos.face, u, v);
         if h == i32::MIN {
             i32::MAX
         } else {
@@ -595,14 +596,7 @@ fn sample_columns<G: TerrainGenerator + ?Sized>(
 ) {
     let cell = pos.cell_size();
     let ys = super::column_ys(pos.detail, alo, n_cells as i32, cell);
-    let flat = super::flatten_edits(edits);
-    let remapped;
-    let used: &[_] = if pos.face == Face::PosY {
-        &flat
-    } else {
-        remapped = face_edits(&flat, pos.face);
-        &remapped
-    };
+    let used = super::frame_edits(pos, r#gen, edits);
     let chart = pos.body >= super::CHART_BODY_BASE;
     for iz in 0..SECTION_N {
         for ix in 0..SECTION_N {
@@ -613,7 +607,7 @@ fn sample_columns<G: TerrainGenerator + ?Sized>(
             } else {
                 r#gen.lod_column_face(pos.body, pos.face, fx, fz, &ys, column);
             }
-            super::apply_edits(column, used, fx, fz, cell, alo);
+            super::apply_edits(column, &used, fx, fz, cell, alo);
         }
     }
 }
@@ -1850,7 +1844,8 @@ mod tests {
         // The window streaming places around this centre, from scratch.
         world.window = crate::world::streaming::Window::default();
         world.place_window(center, true);
-        let desired = world.desired_sections(center);
+        // Read in storage, where the tiles of neighbouring charts meet; each meshes from its patch.
+        let desired: Vec<SectionPos> = world.desired_sections(center).into_iter().map(|s| world.storage_tile(s)).collect();
         let cut = quadtree::resolve_covering(&desired, Detail(9), &|_| true);
         let drawn: Vec<SectionPos> = cut.iter().map(|(p, _)| *p).collect();
         let tables = world.registry.hot_tables();
@@ -1863,7 +1858,7 @@ mod tests {
         let mut order: Vec<SectionPos> = drawn.clone();
         order.sort_by_key(|p| (p.detail, p.x, p.z));
         for pos in &order {
-            let mesh = extract_section_mesh(*pos, world.terrain(), &[], &tables);
+            let mesh = extract_section_mesh(world.patch_tile(*pos), world.terrain(), &[], &tables);
             mix(&mut hash, mesh.shift);
             for b in mesh.altitude_floor.to_le_bytes() {
                 mix(&mut hash, b);
@@ -2023,7 +2018,8 @@ mod tests {
         let eye = (i64::from(center.x) * 16 + 8, i64::from(center.z) * 16 + 8);
         let kept = desired
             .iter()
-            .map(|s| {
+            .map(|&s| {
+                let s = world.storage_tile(s);
                 let half = i64::from(s.span()) / 2;
                 let (x, z) = unfold.fold_column(i64::from(s.min_x()) + half, i64::from(s.min_z()) + half).expect("a section in the net");
                 ((x - eye.0) as f64).hypot((z - eye.1) as f64)

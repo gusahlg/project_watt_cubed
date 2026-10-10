@@ -3378,7 +3378,7 @@ fn far_face_storage_selects_chart_sections() {
     assert!(world.adopt_fold(centre), "storage centre did not fold");
     assert!(!world.fold.is_identity());
     world.section_eye_y = ground as f64;
-    let desired = world.desired_sections(centre);
+    let desired: Vec<SectionPos> = world.desired_sections(centre).into_iter().map(|s| world.storage_tile(s)).collect();
     assert!(!desired.is_empty(), "Verdance selected no chart sections");
     let body = section::CHART_BODY_BASE + index as u16;
     assert!(desired.iter().all(|s| s.body == body && s.face == Face::PosY), "frontier left the chart: {desired:?}");
@@ -3411,7 +3411,7 @@ fn far_face_storage_selects_chart_sections() {
     }
     let clip = world.lod_clip();
     assert!(clip.half.x <= 0.0 && clip.half.y <= 0.0 && clip.half.z <= 0.0, "chart clip is not empty: {:?}", clip.half);
-    let pos = desired
+    let stored = desired
         .iter()
         .copied()
         .filter(|s| s.detail == section::FINEST_DETAIL)
@@ -3419,7 +3419,8 @@ fn far_face_storage_selects_chart_sections() {
         .expect("a finest chart section");
     let tables = world.registry().hot_tables();
     let t0 = Instant::now();
-    let mesh = section::extract_section_mesh(pos, world.terrain(), &[], &tables);
+    let mesh = section::extract_section_mesh(world.patch_tile(stored), world.terrain(), &[], &tables);
+    let pos = stored;
     let ms = t0.elapsed().as_secs_f64() * 1.0e3;
     println!("chart section extract+mesh: {ms:.1} ms, {} vertex bytes, shift {}", mesh.vertex_bytes(), mesh.shift);
     assert!(mesh.vertex_bytes() > 0, "chart section meshed empty");
@@ -3452,7 +3453,7 @@ fn far_face_chart_edge_selects_the_neighbour() {
     let centre = chunk_holding(si, ground, sj);
     assert!(world.adopt_fold(centre), "edge centre did not fold");
     world.section_eye_y = ground as f64;
-    let desired = world.desired_sections(centre);
+    let desired: Vec<SectionPos> = world.desired_sections(centre).into_iter().map(|s| world.storage_tile(s)).collect();
     let body = section::CHART_BODY_BASE + index as u16;
     assert!(desired.iter().all(|s| s.body == body && s.face == Face::PosY));
     let outside: Vec<_> = desired
@@ -3531,7 +3532,7 @@ fn home_storage_column(world: &World, face: Face) -> (usize, i32, i32, i32) {
     (index, x, z, ground)
 }
 
-/// The start world's far field is its chart sections (storage +Y), on every face.
+/// The start world's far field is its chart sections, read in storage, on every face.
 #[test]
 fn far_face_home_chart_selects_chart_sections() {
     for face in [Face::PosY, Face::PosX] {
@@ -3546,7 +3547,7 @@ fn far_face_home_chart_selects_chart_sections() {
         }
         assert!(!world.fold.is_identity(), "{face:?} fold stayed physical");
         world.section_eye_y = ground as f64;
-        let desired = world.desired_sections(centre);
+        let desired: Vec<SectionPos> = world.desired_sections(centre).into_iter().map(|s| world.storage_tile(s)).collect();
         let body = section::CHART_BODY_BASE + index as u16;
         assert!(!desired.is_empty(), "{face:?} selected nothing");
         assert!(
@@ -3560,7 +3561,7 @@ fn far_face_home_chart_selects_chart_sections() {
     }
 }
 
-/// An edit on the start world's chart dirties that chart section.
+/// An edit on the start world's chart dirties that chart section, counted from its patch.
 #[test]
 fn far_face_home_chart_edit_dirties_the_chart_section() {
     let mut world = lod2_world();
@@ -3570,14 +3571,11 @@ fn far_face_home_chart_edit_dirties_the_chart_section() {
     let span = section::section_span(section::FINEST_DETAIL);
     let body = section::CHART_BODY_BASE + index as u16;
     let home = world.terrain().cosmos().unwrap().home().id;
+    let stored = SectionPos { body, face: Face::PosY, detail: section::FINEST_DETAIL, x: x.div_euclid(span), z: z.div_euclid(span) };
+    let want = world.patch_tile(stored);
+    assert_ne!(want, stored, "the chart section is counted from its patch");
     assert!(
-        world.dirty_sections.iter().any(|p| {
-            p.body == body
-                && p.face == Face::PosY
-                && p.detail == section::FINEST_DETAIL
-                && p.x == x.div_euclid(span)
-                && p.z == z.div_euclid(span)
-        }),
+        world.dirty_sections.contains(&want),
         "dirty set {:?} missed the chart section",
         world.dirty_sections
     );

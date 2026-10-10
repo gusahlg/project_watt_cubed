@@ -133,6 +133,8 @@ pub(in crate::world) enum Job {
     /// live section at the same position.
     Section {
         pos: SectionPos,
+        /// The tile's centre where the far gate measures it: chart storage, or its face frame.
+        at: (i64, i64),
         epoch: u32,
         token: ClaimToken,
         generator: Generator,
@@ -1050,14 +1052,7 @@ fn near_anchor(job: &Job, center: Coord) -> Coord {
 /// re-keying and horizon descheduling without any callback into the `World`.
 fn far_center_span(job: &Job) -> (i64, i64, i64) {
     match job {
-        Job::Section { pos, .. } => {
-            let span = pos.span() as i64;
-            (
-                pos.min_x() as i64 + span / 2,
-                pos.min_z() as i64 + span / 2,
-                span,
-            )
-        }
+        Job::Section { pos, at, .. } => (at.0, at.1, pos.span() as i64),
         _ => (0, 0, 0),
     }
 }
@@ -1605,6 +1600,7 @@ fn run(job: Job, stager: Option<&MeshStager>, stats: &StagingStats) -> Done {
             generator,
             edits,
             tables,
+            ..
         } => {
             // Fused extract+mesh on owned data: the generator samples straight
             // into the dense section grid — no RLE brick storage is built for
@@ -1639,12 +1635,10 @@ mod tests {
 
     /// Create a far section job tagged by id for scheduler tests.
     fn section_job(terrain: &Generator, id: i32) -> Job {
+        let pos = SectionPos { body: 0, face: Face::PosY, detail: crate::ident::Detail(2), x: id, z: 0 };
         Job::Section {
-            pos: SectionPos { body: 0, face: Face::PosY,
-                detail: crate::ident::Detail(2),
-                x: id,
-                z: 0,
-            },
+            pos,
+            at: (i64::from(pos.min_x()) + 64, 64),
             epoch: 0,
             token: ClaimToken(id as u64),
             generator: Arc::clone(terrain),
@@ -3121,8 +3115,10 @@ mod tests {
                             z: (c.z * CHUNK_SIZE as i32).div_euclid(span) + next(5) - 2,
                         };
                         let token = ClaimToken(next(1 << 20) as u64);
+                        let half = i64::from(span) / 2;
                         let job = || Job::Section {
                             pos,
+                            at: (i64::from(pos.min_x()) + half, i64::from(pos.min_z()) + half),
                             epoch: 0,
                             token,
                             generator: terrain.clone(),

@@ -411,14 +411,7 @@ fn resample_face_cell<G: TerrainGenerator + ?Sized>(
     let (alo, ahi) = super::section::sample_window(lo, hi, cell);
     let n = ((ahi - alo) / cell).max(1);
     let ys = super::section::column_ys(pos.detail, alo, n, cell);
-    let flat = super::section::flatten_edits(edits);
-    let remapped;
-    let used: &[_] = if pos.face == Face::PosY {
-        &flat
-    } else {
-        remapped = super::section::face_edits(&flat, pos.face);
-        &remapped
-    };
+    let used = super::section::frame_edits(pos, terra, edits);
     let mut column = vec![AIR; ys.len()];
     let mut fold = MipFold::new();
     for iz in 0..SECTION_N as i32 {
@@ -430,7 +423,7 @@ fn resample_face_cell<G: TerrainGenerator + ?Sized>(
             } else {
                 terra.lod_column_face(pos.body, pos.face, u, v, &ys, &mut column);
             }
-            super::section::apply_edits(&mut column, used, fx, fz, cell, alo);
+            super::section::apply_edits(&mut column, &used, fx, fz, cell, alo);
             let (h, block) = match column.iter().rposition(|&id| id != AIR) {
                 Some(j) => (alo + (j as i32 + 1) * cell, column[j]),
                 None => (alo, AIR),
@@ -451,6 +444,9 @@ fn resample_face_cell<G: TerrainGenerator + ?Sized>(
 
 /// The block whose colour the bake records for column `(u, v)` ([`sample_section`]).
 fn bake_surface_block<G: TerrainGenerator + ?Sized>(terra: &G, body: u16, face: Face, u: i32, v: i32) -> crate::block::registry::BlockId {
+    if let Some((ox, oz)) = terra.chart_origin(body, face) {
+        return terra.surface_at(u + ox, v + oz);
+    }
     if face == Face::PosY {
         return terra.surface_at(u, v);
     }
@@ -844,16 +840,18 @@ mod tests {
         let body = super::super::section::CHART_BODY_BASE + index as u16;
         for detail in [FINEST_DETAIL, Detail(FINEST_DETAIL.0 + 4)] {
             let span = section_span(detail);
-            let pos = SectionPos {
+            let stored = SectionPos {
                 body,
                 face: Face::PosY,
                 detail,
                 x: (eye.x as i32).div_euclid(span),
                 z: (eye.z as i32).div_euclid(span),
             };
-            let datum = terra.face_datum(body, Face::PosY);
+            // The overlay reads the tile counted from its patch; the bake reads storage.
+            let pos = world.patch_tile(stored);
+            let datum = terra.face_datum(body, pos.face);
             assert!(datum > 1_000_000, "the chart datum sits far up storage +Y: {datum}");
-            let bake = sample_section(terra, &colors, detail, pos.x, pos.z, Face::PosY, body, datum);
+            let bake = sample_section(terra, &colors, detail, stored.x, stored.z, Face::PosY, body, datum);
             let got = resample_cell(pos, terra, &[], &colors).expect("the chart has a surface here");
             let cell = pos.cell_size() as f32;
             assert!(
@@ -872,9 +870,9 @@ mod tests {
             // Fill the first column's top sample cell of the window: the overlay sees it.
             let rock = world.registry().id_by_label("rock").unwrap();
             let c = pos.cell_size();
-            let (lo, hi) = terra.surface_bounds(body, Face::PosY, pos.min_x(), pos.min_z(), pos.span()).unwrap();
+            let (lo, hi) = terra.surface_bounds(body, pos.face, pos.min_x(), pos.min_z(), pos.span()).unwrap();
             let (_, ahi) = super::super::section::sample_window(lo, hi, c);
-            let (wx, wz) = (pos.min_x() + c / 2, pos.min_z() + c / 2);
+            let (wx, wz) = (stored.min_x() + c / 2, stored.min_z() + c / 2);
             let edits: Vec<_> = (ahi - c..ahi)
                 .map(|y| {
                     let (coord, local) = BlockCoord::new(wx, y, wz).split();

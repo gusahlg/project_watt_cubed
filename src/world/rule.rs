@@ -107,7 +107,8 @@ impl World {
     pub(in crate::world) fn node_box(&self, s: SectionPos) -> Option<PhysBox> {
         let (lo, hi) = self.node_bounds(s)?;
         let span = f64::from(s.span());
-        let (x0, z0) = (f64::from(s.min_x()), f64::from(s.min_z()));
+        let (cx, cz) = self.tile_centre(s);
+        let (x0, z0) = (cx as f64 - span / 2.0, cz as f64 - span / 2.0);
         let corners = (0..8).map(|c| DVec3::new(x0 + span * f64::from(c & 1), if c & 2 == 0 { lo } else { hi }, z0 + span * f64::from((c >> 2) & 1)));
         let bend = self.chart_bend(s);
         if s.body >= CHART_BODY_BASE {

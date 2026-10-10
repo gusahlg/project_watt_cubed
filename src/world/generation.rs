@@ -358,6 +358,17 @@ pub trait TerrainGenerator: Send + Sync {
         0
     }
 
+    /// Storage `(x, z)` that chart body `body`'s patch `face` counts its tiles from: a chart tile's
+    /// coordinates are relative to it. `None` off charts.
+    fn chart_origin(&self, _body: u16, _face: Face) -> Option<(i32, i32)> {
+        None
+    }
+
+    /// [`surface`](Self::surface) of `body`: a chart patch's column at its local `(u, v)`.
+    fn surface_on(&self, _body: u16, face: Face, u: i32, v: i32) -> i32 {
+        self.surface(face, u, v)
+    }
+
     /// Generate chunk; default dense then collapse; generators shortcut.
     fn generate(&self, cx: i32, cy: i32, cz: i32) -> ChunkData {
         let y0 = cy * CHUNK_SIZE as i32;

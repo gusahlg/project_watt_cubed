@@ -387,7 +387,7 @@ impl World {
                 for cx in center.x - h..=center.x + h {
                     let Some(c) = fold.unfold(Coord::new(cx, floor, cz)) else { continue };
                     let rect = [c.x * n, c.z * n, c.x * n + n, c.z * n + n];
-                    let surface = || self.generator.surface_rect(body, Face::PosY, rect[0], rect[1], rect[2], rect[3]);
+                    let surface = || self.storage_rect(body, rect[0], rect[1], rect[2], rect[3]);
                     if let Some(b) = memo.get((body, rect), surface) {
                         let (lo, hi) = self.with_edits(b, rect);
                         out = Some(out.map_or((lo, hi), |(a, b)| (a.min(lo), b.max(hi))));
@@ -453,6 +453,7 @@ impl World {
     /// of a neighbour chart is placed through the net; a section of another face, or outside the
     /// net, counts wherever it lies.
     fn near_meets(&self, center: Coord, s: SectionPos) -> bool {
+        let s = self.storage_tile(s);
         let h = self.view.horizontal;
         let n = CHUNK_SIZE as i32;
         let (c0, c1) = ((s.min_x().div_euclid(n), s.min_z().div_euclid(n)), ((s.min_x() + s.span() - 1).div_euclid(n), (s.min_z() + s.span() - 1).div_euclid(n)));
@@ -514,6 +515,7 @@ impl World {
 
     /// Every chunk under `s` in `layers` is final (see [`chunk_final`](Self::chunk_final)).
     fn backing_settled(&self, s: SectionPos, layers: [i32; 2]) -> bool {
+        let s = self.storage_tile(s);
         let n = CHUNK_SIZE as i32;
         let (x0, z0, w) = (s.min_x().div_euclid(n), s.min_z().div_euclid(n), s.span() / n);
         (layers[0]..=layers[1])
@@ -663,7 +665,9 @@ mod tests {
         out
     }
 
-    fn in_rect(s: SectionPos, x: i32, z: i32) -> bool {
+    /// Whether tile `s` (a chart tile read in storage) holds column `(x, z)`.
+    fn in_rect(world: &World, s: SectionPos, x: i32, z: i32) -> bool {
+        let s = world.storage_tile(s);
         let span = s.span();
         (s.min_x()..s.min_x() + span).contains(&x) && (s.min_z()..s.min_z() + span).contains(&z)
     }
@@ -678,7 +682,7 @@ mod tests {
             .filter(|&&(x, z, top)| {
                 let (bx, bz) = (i64::from(x), i64::from(z));
                 let deep = bx - x0 >= 32 && x1 - bx > 32 && bz - z0 >= 32 && z1 - bz > 32;
-                deep && (y0..y1).contains(&i64::from(top)) && desired.iter().any(|&s| in_rect(s, x, z))
+                deep && (y0..y1).contains(&i64::from(top)) && desired.iter().any(|&s| in_rect(world, s, x, z))
             })
             .count()
     }
@@ -687,7 +691,8 @@ mod tests {
     fn far_drawn(world: &World, x: i32, z: i32) -> bool {
         world.section_visible.iter().any(|&(s, mask)| {
             let half = s.span() / 2;
-            in_rect(s, x, z) && mask.iter().any(|q| (x - s.min_x()) / half == q.dx() && (z - s.min_z()) / half == q.dz())
+            let st = world.storage_tile(s);
+            in_rect(world, s, x, z) && mask.iter().any(|q| (x - st.min_x()) / half == q.dx() && (z - st.min_z()) / half == q.dz())
         })
     }
 
@@ -1103,7 +1108,7 @@ mod tests {
         let (ex, ez) = (f64::from(center.x * 16 + 8), f64::from(center.z * 16 + 8));
         let drawn = cols
             .iter()
-            .filter(|&&(x, z, _)| (f64::from(x) - ex).hypot(f64::from(z) - ez) < r && desired.iter().any(|&s| in_rect(s, x, z)))
+            .filter(|&&(x, z, _)| (f64::from(x) - ex).hypot(f64::from(z) - ez) < r && desired.iter().any(|&s| in_rect(&world, s, x, z)))
             .count();
         assert_eq!(drawn, 0, "far sections within the near radius");
     }
@@ -1244,6 +1249,7 @@ mod tests {
         world.refresh_frontier(far);
         let seat = world.seams.chart_seat(far).expect("the eye stands on a chart");
         let outside = |s: SectionPos| {
+            let s = world.storage_tile(s);
             let span = s.span() as i64;
             let (x, z) = (s.min_x() as i64, s.min_z() as i64);
             x + span <= seat.lo[0] || x >= seat.hi[0] || z + span <= seat.lo[2] || z >= seat.hi[2]
@@ -1258,9 +1264,10 @@ mod tests {
         let span = neighbour.span() as i64;
         let cs = 16i64;
         let (psx, psz) = ((far.x as i64 * cs).div_euclid(span), (far.z as i64 * cs).div_euclid(span));
+        let stored = world.storage_tile(neighbour);
         let (sx, sz) = (
-            (neighbour.min_x() as i64 + span / 2).div_euclid(span),
-            (neighbour.min_z() as i64 + span / 2).div_euclid(span),
+            (stored.min_x() as i64 + span / 2).div_euclid(span),
+            (stored.min_z() as i64 + span / 2).div_euclid(span),
         );
         let raw = (sx - psx).unsigned_abs().max((sz - psz).unsigned_abs());
         let folded = <SectionLane as StreamLane>::order(&world, far, neighbour);
@@ -1339,10 +1346,11 @@ mod tests {
         world.refresh_frontier(far);
         let (&s, &layers) = world.section_held.iter().min_by_key(|(s, _)| (s.span(), s.x, s.z)).expect("held sections wait");
         let n = 16;
+        let stored = world.storage_tile(s);
         let mut chunks: Vec<Coord> = Vec::new();
         for y in layers[0]..=layers[1] {
-            for z in s.min_z().div_euclid(n)..(s.min_z() + s.span()).div_euclid(n) {
-                for x in s.min_x().div_euclid(n)..(s.min_x() + s.span()).div_euclid(n) {
+            for z in stored.min_z().div_euclid(n)..(stored.min_z() + stored.span()).div_euclid(n) {
+                for x in stored.min_x().div_euclid(n)..(stored.min_x() + stored.span()).div_euclid(n) {
                     chunks.push(Coord::new(x, y, z));
                 }
             }
@@ -1716,7 +1724,7 @@ mod tests {
                 return false;
             }
             let half = s.span() / 2;
-            in_rect(s, u, v) && mask.iter().any(|q| (u - s.min_x()) / half == q.dx() && (v - s.min_z()) / half == q.dz())
+            in_rect(world, s, u, v) && mask.iter().any(|q| (u - s.min_x()) / half == q.dx() && (v - s.min_z()) / half == q.dz())
         })
     }
 
@@ -1751,6 +1759,7 @@ mod tests {
         let mut nearest = i32::MAX;
         let mut nearest_coarse = i32::MAX;
         for &(s, _) in &world.section_visible {
+            let s = world.storage_tile(s);
             if s.face != face {
                 other_face += 1;
                 continue;
@@ -2066,6 +2075,7 @@ mod tests {
         let mut nearest = i32::MAX;
         let mut hits = String::new();
         for &(s, _) in &world.section_visible {
+            let s = world.storage_tile(s);
             if s.face != Face::PosY {
                 other_face += 1;
                 continue;
@@ -2097,7 +2107,7 @@ mod tests {
             let wholly = super::super::inside_near(s, near, None);
             let mut relief_in = false;
             if wholly
-                && let Some((lo, hi)) = world.generator.surface_rect(s.body, Face::PosY, x0, z0, x0 + span, z0 + span)
+                && let Some((lo, hi)) = world.storage_rect(s.body, x0, z0, x0 + span, z0 + span)
             {
                 let (top_lo, top_hi) = (lo.saturating_sub(1), hi.saturating_sub(1));
                 relief_in = i64::from(top_lo) >= y0 && i64::from(top_hi) < y1;

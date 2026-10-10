@@ -39,7 +39,13 @@ pub(in crate::world) use mesh::{SectionMeshData, chart_slab_corners, extract_sec
 pub(in crate::world) const SECTION_N: usize = 32;
 
 /// Body id of a charted round world: `CHART_BODY_BASE + atlas index`. Above every cosmos catalog id.
+/// A chart tile's face is its band-0 patch's face, and its `(x, z)` count from that patch's
+/// [`chart_origin`](super::generation::TerrainGenerator::chart_origin) in storage.
 pub(in crate::world) const CHART_BODY_BASE: u16 = 1 << 15;
+
+/// A chart patch's tiles count from its storage origin rounded down to this, a multiple of every
+/// section span.
+pub(in crate::world) const CHART_ALIGN: i64 = 1 << 20;
 
 /// Finest LOD detail level: cell size is 2^k metres. Zone-1 full-res chunks are finer.
 pub(in crate::world) const FINEST_DETAIL: Detail = Detail(2);
@@ -414,6 +420,20 @@ pub(in crate::world) fn flatten_edits(
     }
     out.sort_unstable_by_key(|&(x, y, z, _)| (y, x, z));
     out
+}
+
+/// Flattened `edits` in `pos`'s own frame, ordered as [`apply_edits`] requires: a chart tile's
+/// counted from its patch origin, a cube face's rotated into face-local `(u, a, v)`.
+pub(in crate::world) fn frame_edits<G: super::generation::TerrainGenerator + ?Sized>(
+    pos: SectionPos,
+    r#gen: &G,
+    edits: &[(ChunkCoord, Vec<(usize, BlockId)>)],
+) -> Vec<(i32, i32, i32, BlockId)> {
+    let flat = flatten_edits(edits);
+    if let Some((ox, oz)) = r#gen.chart_origin(pos.body, pos.face) {
+        return flat.into_iter().map(|(x, y, z, id)| (x - ox, y, z - oz, id)).collect();
+    }
+    if pos.face == Face::PosY { flat } else { face_edits(&flat, pos.face) }
 }
 
 /// Apply edits to one column's coarse cells — an ORDER-INDEPENDENT reduction.

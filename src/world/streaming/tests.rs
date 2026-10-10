@@ -1445,7 +1445,7 @@ fn far_chart_strip_hole_is_closed() {
             "{name}: the near square meets a seam"
         );
         let (y0, y1) = world.near_y_range(center);
-        let desired = world.desired_sections(center);
+        let desired: Vec<SectionPos> = world.desired_sections(center).into_iter().map(|s| world.storage_tile(s)).collect();
         let mut rects = Vec::new();
         for s in &desired {
             let span = s.span() as i64;
@@ -1573,7 +1573,7 @@ fn far_chart_seam_has_no_hole() {
         world.section_eye_y = storage.y;
         world.adopt_fold(center);
         let seat = world.seams.chart_seat(center).unwrap_or_else(|| panic!("{name}: no chart seat"));
-        let desired = world.desired_sections(center);
+        let desired: Vec<SectionPos> = world.desired_sections(center).into_iter().map(|s| world.storage_tile(s)).collect();
         let (ex, _, ez) = storage_eye_block(center, storage.y, DVec3::ZERO);
         let across = world.seams.seam_across(seat, [ex, storage.y.round() as i64, ez], outer);
         let near = world.near_block_box(center);

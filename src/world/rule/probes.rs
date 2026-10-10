@@ -114,7 +114,7 @@ fn not_full_res(world: &World, eye: DVec3) -> (usize, usize) {
     let center = world.center.expect("a centre");
     let h = world.view.horizontal;
     let reach = f64::from(h * cs) - f64::from(cs) * 0.75;
-    let tiles = drawn(world);
+    let tiles: Vec<SectionPos> = drawn(world).into_iter().map(|s| world.storage_tile(s)).collect();
     let covers = |body: u16, face: Face, u: i32, v: i32| {
         tiles.iter().any(|s| s.body == body && s.face == face && (s.min_x()..s.min_x() + s.span()).contains(&u) && (s.min_z()..s.min_z() + s.span()).contains(&v))
     };
@@ -193,7 +193,7 @@ fn steep_site(world: &World) -> DVec3 {
             let (x, z) = (storage.x.floor() as i32, storage.z.floor() as i32);
             let Some(seat) = world.seams.chart_seat(World::chunk_of(x, storage.y.floor() as i32, z)) else { continue };
             let body = crate::world::section::CHART_BODY_BASE + seat.index as u16;
-            if let Some((lo, hi)) = world.generator.surface_rect(body, Face::PosY, x - half, z - half, x + half, z + half)
+            if let Some((lo, hi)) = world.storage_rect(body, x - half, z - half, x + half, z + half)
                 && hi - lo > best.0
             {
                 best = (hi - lo, eye);
@@ -398,9 +398,9 @@ impl Surface for Charts<'_> {
         let (x0, z0) = (i64::from(s.min_x()).max(lo[0]), i64::from(s.min_z()).max(lo[2]));
         let (x1, z1) = ((i64::from(s.min_x()) + w).min(hi[0]), (i64::from(s.min_z()) + w).min(hi[2]));
         let (a, b) = if (x1 - x0, z1 - z0) == (w, w) {
-            self.world.generator.surface_bounds(s.body, Face::PosY, x0 as i32, z0 as i32, w as i32)?
+            self.world.storage_bounds(s.body, x0 as i32, z0 as i32, w as i32)?
         } else {
-            self.world.generator.surface_rect(s.body, Face::PosY, x0 as i32, z0 as i32, x1 as i32, z1 as i32)?
+            self.world.storage_rect(s.body, x0 as i32, z0 as i32, x1 as i32, z1 as i32)?
         };
         let atlas = &self.world.seams.atlases()[self.index];
         let pts = (0..8).map(|c| {

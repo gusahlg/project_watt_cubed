@@ -348,6 +348,9 @@ impl World {
         // by one chunk half-diagonal so the true eye can't sit outside our bound.
         let margin = cs as f32 * 0.5 * std::f32::consts::SQRT_2;
         let (reference, eye_y, in_cube) = self.lod_place(center);
+        // A chart tile is measured in storage; its relief stays keyed by the tile.
+        let band = key;
+        let key = self.storage_tile(key);
         let frame = FaceFrame::new(key.face);
         let mid = |c: i32| (i64::from(c) * i64::from(cs) + i64::from(cs / 2)) as i32;
         let (eu, _, ev) = frame.cell_to_local((mid(reference.x), mid(reference.y), mid(reference.z)));
@@ -358,7 +361,7 @@ impl World {
         // slab without one). If unbaked, can't prove, so don't skip. An edited footprint
         // prefers the fresh overlay over the (possibly stale) bake. Window altitudes are
         // storage-frame; the bake is reference-frame.
-        let Some((lo, hi)) = self.cover_band(key, in_cube) else {
+        let Some((lo, hi)) = self.cover_band(band, in_cube) else {
             return false;
         };
         let (floor, ceil) = match self.window_alts() {
@@ -387,7 +390,7 @@ impl World {
         }
         // Every chunk backing the footprint is settled, so the near area is
         // actually covered now, not just in-range.
-        self.backing_chunks_ready(center, reference, in_cube, key)
+        self.backing_chunks_ready(center, reference, in_cube, band, key)
     }
 
     /// Whether every full-res chunk backing `key`'s footprint is settled
@@ -395,9 +398,10 @@ impl World {
     /// to skip the near-LOD load only where full-res provably covers. A footprint
     /// whose vertical band can't be proven (no overlay, no baked mip) reads as
     /// NOT ready — fail toward keeping the section loaded, never toward a hole.
-    /// Chunks of a warped cube are loaded in its storage box; `key` is reference-frame.
-    fn backing_chunks_ready(&self, storage: Coord, reference: Coord, in_cube: bool, key: SectionPos) -> bool {
-        let Some((lo, hi)) = self.cover_band(key, in_cube) else {
+    /// Chunks of a warped cube are loaded in its storage box; `key` is reference-frame, a chart
+    /// tile in storage, and `band` the tile its relief is keyed by.
+    fn backing_chunks_ready(&self, storage: Coord, reference: Coord, in_cube: bool, band: SectionPos, key: SectionPos) -> bool {
+        let Some((lo, hi)) = self.cover_band(band, in_cube) else {
             return false;
         };
         let frame = FaceFrame::new(key.face);
