@@ -61,6 +61,16 @@ impl Writer {
         Self(Vec::new())
     }
 
+    /// An empty writer whose buffer holds `bytes` before it grows.
+    pub fn with_capacity(bytes: usize) -> Self {
+        Self(Vec::with_capacity(bytes))
+    }
+
+    /// Append to `buf`, keeping what it already holds and its capacity.
+    pub fn from_vec(buf: Vec<u8>) -> Self {
+        Self(buf)
+    }
+
     pub fn into_inner(self) -> Vec<u8> {
         self.0
     }

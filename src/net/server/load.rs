@@ -17,7 +17,7 @@ use quinn::{Endpoint, RecvStream, SendStream};
 use tokio::runtime::Runtime;
 use voxel_engine::{DVec3, Vec3};
 
-use super::{Config, LockRecover, NoclipPolicy, ServerHandle, State, TeleportPolicy, install_edits, spawn};
+use super::{Config, LockRecover, Policy, ServerHandle, State, install_edits, spawn};
 use crate::block::registry::BlockId;
 use crate::coord::Face;
 use crate::net::protocol::{self, ClientMessage, ServerMessage};
@@ -34,11 +34,11 @@ pub(super) struct Histogram {
 }
 
 #[derive(Clone, Copy, Default)]
-struct Summary {
-    count: u64,
-    p50: u64,
-    p99: u64,
-    max: u64,
+pub(super) struct Summary {
+    pub(super) count: u64,
+    pub(super) p50: u64,
+    pub(super) p99: u64,
+    pub(super) max: u64,
 }
 
 impl Histogram {
@@ -51,14 +51,14 @@ impl Histogram {
         self.max.fetch_max(v, Ordering::Relaxed);
     }
 
-    fn reset(&self) {
+    pub(super) fn reset(&self) {
         for b in &self.buckets {
             b.store(0, Ordering::Relaxed);
         }
         self.max.store(0, Ordering::Relaxed);
     }
 
-    fn summary(&self) -> Summary {
+    pub(super) fn summary(&self) -> Summary {
         let counts: Vec<u64> = self.buckets.iter().map(|b| b.load(Ordering::Relaxed)).collect();
         let count: u64 = counts.iter().sum();
         let max = self.max.load(Ordering::Relaxed);
@@ -383,7 +383,7 @@ async fn play(bot: &Bot, session: Session) {
         let pos = spawn + DVec3::new(RADIUS * cos, LIFT + layer.min(CLIMB * t), RADIUS * sin);
         let velocity = Vec3::new((-RADIUS * SPIN * sin) as f32, rise as f32, (RADIUS * SPIN * cos) as f32);
         let mut frames = vec![
-            ClientMessage::Move {
+            ClientMessage::Move { pose: protocol::Pose {
                 pos,
                 yaw: a as f32,
                 pitch: 0.0,
@@ -391,7 +391,7 @@ async fn play(bot: &Bot, session: Session) {
                 velocity,
                 up: Face::PosY,
                 stance: Stance::Standing,
-            },
+            } },
         ];
         if climbed && now >= next_edit && mine.acked.load(Ordering::Relaxed) == edits {
             let spec = if edits % 2 == 0 { bot.rock.clone() } else { Arc::from("air") };
@@ -466,7 +466,7 @@ fn cpu() -> (u64, u64) {
 fn dedicated() -> ServerHandle {
     spawn(
         0,
-        Config { seed: 4242, teleport: TeleportPolicy::Ops, noclip: NoclipPolicy::Ops, ..Config::default() },
+        Config { seed: 4242, teleport: Policy::Ops, noclip: Policy::Ops, ..Config::default() },
     )
     .unwrap()
 }

@@ -310,7 +310,8 @@ impl ViewVolume {
     }
 }
 
-/// Fast multiply-based hasher for well-distributed grid coordinate keys (chunk hot path).
+/// Fast multiply-based hasher for well-distributed grid coordinate keys (chunk hot path) and
+/// ids the program assigns itself. Not for keys a remote peer chooses.
 #[derive(Default)]
 pub(crate) struct FastHasher(u64);
 
@@ -329,10 +330,16 @@ impl Hasher for FastHasher {
     fn write_usize(&mut self, i: usize) {
         self.0 = (self.0 ^ i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     }
+    fn write_u32(&mut self, i: u32) {
+        self.0 = (self.0 ^ u64::from(i)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+    fn write_u64(&mut self, i: u64) {
+        self.0 = (self.0 ^ i).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
 }
 
 pub(crate) type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<FastHasher>>;
-pub(in crate::world) type FastSet<K> = HashSet<K, BuildHasherDefault<FastHasher>>;
+pub(crate) type FastSet<K> = HashSet<K, BuildHasherDefault<FastHasher>>;
 
 /// Raise-then-consume flag: can be raised or consumed, never lowered (so a queued
 /// shrink survives an intervening grow; a queued raise can't be silently clobbered).
