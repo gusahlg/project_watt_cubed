@@ -180,6 +180,14 @@ impl Player {
         }
     }
 
+    /// A fresh player at `position`, standing in `gravity` as [`stand_in`](Self::stand_in) does:
+    /// how a spawn, a join and a scripted world place the player.
+    pub fn standing(position: DVec3, gravity: DVec3) -> Self {
+        let mut player = Self::new(position);
+        player.stand_in(gravity);
+        player
+    }
+
     /// The player's current velocity.
     pub fn velocity(&self) -> DVec3 {
         self.motion.velocity()
@@ -380,14 +388,12 @@ mod tests {
 
         let (frame, face) = standing_pose(DVec3::new(-STANDARD_GRAVITY, 0.0, 0.0));
         assert_eq!(face, Face::PosX);
-        let mut player = Player::new(DVec3::ZERO);
-        player.stand_in(DVec3::new(-STANDARD_GRAVITY, 0.0, 0.0));
+        let player = Player::standing(DVec3::ZERO, DVec3::new(-STANDARD_GRAVITY, 0.0, 0.0));
         assert_eq!(player.orientation.frame, frame);
         assert_eq!(player.up_axis, Face::PosX);
         assert!((player.up() - DVec3::X).length() < 1e-9);
 
-        let mut loose = Player::new(DVec3::ZERO);
-        loose.stand_in(DVec3::new(0.0, -0.01, 0.0));
+        let loose = Player::standing(DVec3::ZERO, DVec3::new(0.0, -0.01, 0.0));
         assert_eq!(loose.orientation.frame, DQuat::IDENTITY);
         assert_eq!(loose.up_axis, Face::PosY);
     }

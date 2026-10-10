@@ -323,7 +323,7 @@ impl Game {
                 .get_or(fps, || format!("{fps:2} FPS"));
         }
         if let Some(net) = &self.net {
-            let count = net.peers().count() + 1;
+            let count = net.peer_count() + 1;
             let ping = net.ping_ms();
             self.drawing
                 .online_cache
@@ -577,7 +577,7 @@ impl Game {
             }
             let r = &frame.rendered;
             let feet = r.pos.feet(r.stance, r.up);
-            let color = peer_color(&peer.name);
+            let color = peer.color();
             let model = want_models.then(|| {
                 let rp = RenderPose::new(
                     feet,
@@ -687,22 +687,6 @@ fn tag_visibility(
         return TagVisibility::Hidden;
     };
     TagVisibility::of(distance, occluded(distance))
-}
-
-/// A stable, cheerful colour for a player, hashed from their name so the same player
-/// keeps the same tint across clients.
-pub(super) fn peer_color(name: &str) -> Color {
-    const PALETTE: [Color; 6] = [
-        Color::new(230, 90, 90, 255),
-        Color::new(90, 170, 230, 255),
-        Color::new(110, 210, 120, 255),
-        Color::new(230, 190, 90, 255),
-        Color::new(200, 120, 220, 255),
-        Color::new(240, 150, 90, 255),
-    ];
-    // FNV-1a over the name, then index the palette.
-    let h = crate::hash::fnv1a_32(name.as_bytes());
-    PALETTE[h as usize % PALETTE.len()]
 }
 
 #[cfg(test)]

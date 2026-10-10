@@ -207,7 +207,7 @@ impl Game {
                     if let Some(peer) = self
                         .net
                         .as_ref()
-                        .and_then(|net| net.peers().find(|p| p.id() == id))
+                        .and_then(|net| net.peer(id))
                     {
                         events.push(GameEvent::PeerSwing {
                             at: peer.sample(Instant::now()).pos.0,
