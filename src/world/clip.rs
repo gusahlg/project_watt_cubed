@@ -334,24 +334,22 @@ impl World {
     pub(super) fn full_res_covers(&self, center: Coord, key: SectionPos) -> bool {
         let cov = self.view.coverage();
         let cs = CHUNK_SIZE as i32;
-        let (mut h_lim, mut v_lim) = (0.75 * cov.half.x, 0.75 * cov.half.y);
+        let (mut h, mut v_lim) = (self.view.horizontal, cov.half.y);
         // A speed-reduced window is not covering the view. Only chunks it
         // actually loads can prove a section redundant; the rest of the view
         // keeps its far-field draw without a backing-chunk scan.
         if self.load_h >= 0 && self.load_h < self.view.horizontal {
-            h_lim = 0.75 * (self.load_h.max(0) * cs) as f32;
+            h = self.load_h.max(0);
         }
         if self.load_v >= 0 && self.load_v < self.view.vertical {
-            v_lim = 0.75 * (self.load_v.max(0) * cs) as f32;
+            v_lim = (self.load_v.max(0) * cs) as f32;
         }
         // The f64 eye tangents were floored to the centre chunk; inflate the reach
         // by one chunk half-diagonal so the true eye can't sit outside our bound.
-        let margin = cs as f32 * 0.5 * std::f32::consts::SQRT_2;
         let (reference, eye_y, in_cube) = self.lod_place(center);
         let frame = FaceFrame::new(key.face);
         let mid = |c: i32| (i64::from(c) * i64::from(cs) + i64::from(cs / 2)) as i32;
-        let (eu, _, ev) = frame.cell_to_local((mid(reference.x), mid(reference.y), mid(reference.z)));
-        if streaming::span_reach(key, eu, ev).0 + margin > h_lim {
+        if !streaming::inside_near(key, Self::face_near_rect(reference, key.face, h), None) {
             return false;
         }
         // Vertical: the section's terrain must sit inside the near window (the eye's

@@ -382,6 +382,7 @@ pub(in crate::world) struct StagedSection {
 /// One staged slab of a [`StagedSection`].
 pub(in crate::world) struct StagedSlab {
     pub origin_y: u32,
+    pub quadrant: section::Quadrant,
     pub passes: ByPass<Option<StagedPass>>,
 }
 
@@ -530,7 +531,7 @@ fn try_stage_section(
             }
             passes[p] = Some(stage_pass(stager, &slab.data[p])?);
         }
-        slabs.push(StagedSlab { origin_y: slab.origin_y, passes });
+        slabs.push(StagedSlab { origin_y: slab.origin_y, quadrant: slab.quadrant, passes });
     }
     Some(Box::new(StagedSection { shift: data.shift, slabs, altitude_floor: data.altitude_floor }))
 }

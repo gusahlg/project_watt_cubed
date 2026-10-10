@@ -1600,13 +1600,8 @@ mod tests {
             let (_, eye) = ColumnKey::of(face, storage);
             assert!(punch[0] <= eye - 4 && punch[1] >= eye + 4, "{face:?} punch {punch:?} dropped the eye");
             assert_eq!(world.lod_clip().half.x, 0.0, "{face:?} clip came on");
-            // A coarse tile must not cross the skip disk: the part over the player is a wholly
-            // inside piece (the chunks draw it) and the part outside stops at detail 0.
-            let h_lim = 0.75 * world.view.coverage().half.x;
-            let margin = (CHUNK_SIZE as f32) * 0.5 * std::f32::consts::SQRT_2;
-            let n = CHUNK_SIZE as i32;
-            let mid = |c: i32| (i64::from(c) * i64::from(n) + i64::from(n / 2)) as i32;
-            let (eu, _, ev) = FaceFrame::new(face).cell_to_local((mid(placed.x), mid(placed.y), mid(placed.z)));
+            // The complete chunk square, including its corners, hands over to full detail.
+            let near_box = World::face_near_rect(placed, face, world.view.horizontal);
             world.gpu_live_slots = 6000;
             let desired = world.desired_sections(storage);
             assert!(
@@ -1617,12 +1612,12 @@ mod tests {
             let shift = World::face_alt_shift(storage, placed, face);
             let [a0, a1] = world.window_alts().expect("window");
             for s in desired.iter().copied().filter(|s| s.face == face && s.detail.0 > 0) {
-                let (far, near) = super::super::span_reach(s, eu, ev);
+                let inside = super::super::inside_near(s, near_box, None);
                 assert!(
-                    !(near < h_lim - margin && far + margin > h_lim),
-                    "{face:?} coarse tile {s:?} still crosses the near disk"
+                    !(i64::from(s.min_x()) < near_box.1 && i64::from(s.min_x() + s.span()) > near_box.0 && i64::from(s.min_z()) < near_box.3 && i64::from(s.min_z() + s.span()) > near_box.2) || inside,
+                    "{face:?} coarse tile {s:?} still crosses the full-detail square"
                 );
-                if far + margin <= h_lim
+                if inside
                     && let Some((lo, hi)) = world.cover_band(s, true)
                 {
                     let (floor, ceil) = (world.baked_height(s, a0 + shift), world.baked_height(s, a1 + shift));

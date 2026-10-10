@@ -67,6 +67,7 @@ impl World {
         {
             self.section_mip = Some(mip);
             self.section_mip_rx = None;
+            self.section_frontier_key = None;
             self.pending_sections.set();
             // Off a chart the window's ground comes from this bake.
             self.window.stale = true;

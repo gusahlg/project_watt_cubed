@@ -159,28 +159,24 @@ pub(in crate::world) fn span_reach(s: SectionPos, eu: i32, ev: i32) -> (f32, f32
 /// stays: dropping it would hole the sliver outside the disk.
 fn push_split(
     s: SectionPos,
-    eu: i32,
-    ev: i32,
-    h_lim: f32,
-    margin: f32,
+    near: (i64, i64, i64, i64),
     out: &mut Vec<SectionPos>,
     sticks: &impl Fn(SectionPos) -> bool,
 ) {
-    let (far, near) = span_reach(s, eu, ev);
-    let inside = far + margin <= h_lim;
-    let crosses = near < h_lim - margin && !inside;
+    let inside = inside_near(s, near, None);
+    let crosses = covers_near(s, near, None) && !inside;
     if s.detail.0 == 0 || !(crosses || (inside && sticks(s))) {
         out.push(s);
         return;
     }
     for q in super::section::Quadrant::ALL {
-        push_split(s.child(q), eu, ev, h_lim, margin, out, sticks);
+        push_split(s.child(q), near, out, sticks);
     }
 }
 
 /// Merge tiles that miss the skip disk until `set` fits `budget`. A parent that meets the disk
 /// is left split: merging it would put a coarse tile back over the player.
-fn coarsen_off_disk(set: &mut FastSet<SectionPos>, budget: usize, eu: i32, ev: i32, limit: f32) {
+fn coarsen_outside_near(set: &mut FastSet<SectionPos>, budget: usize, near: (i64, i64, i64, i64)) {
     let cap = crate::render_config::LOD_COARSEST_DETAIL as i8;
     while set.len() > budget {
         let mut merged = false;
@@ -194,7 +190,7 @@ fn coarsen_off_disk(set: &mut FastSet<SectionPos>, budget: usize, eu: i32, ev: i
                 if set.len() <= budget {
                     break;
                 }
-                if span_reach(p, eu, ev).1 < limit {
+                if covers_near(p, near, None) {
                     continue;
                 }
                 let mut removed = 0u8;
@@ -563,7 +559,7 @@ impl World {
             velocity,
             vertical: self.view.vertical,
             up: self.live_up(),
-            window: self.window.punch.filter(|_| on_chart),
+            window: self.window.punch,
             unit: self.far_pyramid().unit.to_bits(),
             finest: self.section_pyramid.finest.0,
             levels: self.section_pyramid.levels.get(),
@@ -652,39 +648,9 @@ impl World {
             s.body = body;
             s.face = face;
         }
-        let anchor = self.section_mip_anchor;
-        let selected = match &self.section_mip {
-            Some(mip) => {
-                let summary_at = |c: SectionPos| {
-                    if let Some((b, f, _, _)) = anchor
-                        && (c.body != b || c.face != f)
-                    {
-                        return CellSummary {
-                            env: HeightEnvelope::new(0.0, super::section::DOMAIN_H as f32),
-                            err: CellError::worst_case(c.detail),
-                        };
-                    }
-                    match self.section_overlay.get(&c) {
-                        Some(ov) => CellSummary {
-                            env: HeightEnvelope::new(ov.lo, ov.hi),
-                            err: CellError::from_metres(ov.hi - ov.lo),
-                        },
-                        None => mip.summary(c),
-                    }
-                };
-                quadtree::coarsen_by_error(radial, metric, cfg, &summary_at, &self.sse_budget())
-            }
-            None => radial,
-        };
-        // Prefer coarser tiles over dropping coverage when the far field
-        // would exceed its section-slot budget (outermost ring first).
-        quadtree::coarsen_to_budget(selected, self.sections_allowed(), cfg)
-    }
-
-    /// Ladder-pinned SSE budget for current view radius. Rebuilt per query
-    /// as `unit` tracks view distance.
-    fn sse_budget(&self) -> SseBudget {
-        SseBudget::ladder(self.section_pyramid.unit, self.section_pyramid.finest.0)
+        // Detail follows the player's distance ladder. Terrain-error merges could put
+        // coarse flat tiles beside the eye while rougher, farther terrain stayed fine.
+        quadtree::coarsen_to_budget(radial, self.sections_allowed(), cfg)
     }
 
     /// Far sections of the home chart and, where the far field reaches a side, its neighbours.
@@ -693,12 +659,8 @@ impl World {
     fn chart_sections(&self, center: Coord, memo: &mut NearBounds, held: &mut Vec<(SectionPos, [i32; 2])>) -> Vec<SectionPos> {
         let Some(seat) = self.seams.chart_seat(center) else { return Vec::new() };
         let Some((cfg, max_d)) = self.chart_pyramid(seat.radius) else { return Vec::new() };
-        let base = self.chart_pick(center, DVec3::ZERO, &seat, &cfg, max_d, memo, held);
-        let delta = chart_delta(self.section_vel);
-        if delta == DVec3::ZERO {
-            return base;
-        }
-        quadtree::union_frontiers(base, self.chart_pick(center, delta, &seat, &cfg, max_d, memo, held))
+        // Motion prediction must not move the visible detail rings away from the player.
+        self.chart_pick(center, DVec3::ZERO, &seat, &cfg, max_d, memo, held)
     }
 
     /// Pyramid stopped at the largest detail whose span still satisfies `L² ≤ 8R`, on the
@@ -894,6 +856,12 @@ impl World {
         (y0, y0 + i64::from(b.size().1) * cs)
     }
 
+    pub(in crate::world) fn face_near_rect(center: Coord, face: Face, radius: i32) -> (i64, i64, i64, i64) {
+        let (u, _, v) = FaceFrame::new(face).chunk_to_local(center);
+        let (u, v, r, cs) = (i64::from(u), i64::from(v), i64::from(radius), CHUNK_SIZE as i64);
+        ((u - r) * cs, (u + r + 1) * cs, (v - r) * cs, (v + r + 1) * cs)
+    }
+
     /// Full-res chunk box in storage blocks (`hi` exclusive), wide on x/z. Up is storage Y, so this
     /// is the footprint a chart section overlaps when it meets the near square.
     pub(super) fn near_block_box(&self, center: Coord) -> (i64, i64, i64, i64) {
@@ -914,9 +882,8 @@ impl World {
         self.desired_sections_with(center, &mut NearBounds::default(), &mut Vec::new())
     }
 
-    /// Desired frontier: union of static eye and velocity-predicted eye position.
-    /// Pulls sections ahead of player motion. At rest, velocity is zero so returns
-    /// static frontier bit-for-bit. Open space and a round body seen from past the far reach
+    /// Desired visible frontier around the current player position.
+    /// Open space and a round body seen from past the far reach
     /// select nothing; a far-field centre on a chart (in or above its box) selects that chart's
     /// sections, reading chart surfaces through `memo`; the sections its near window holds go to
     /// `held`. On a warped cube, up-face tiles that cross the near disk are split to detail 0.
@@ -931,9 +898,9 @@ impl World {
         }
         let focus = if self.section_face_set { self.section_lod_face } else { self.dominant_lod_face(center) };
         let Some((body, face)) = focus else { return Vec::new() };
-        let mut out = self.frontier_union(center, body, face);
+        let mut out = self.frontier_at(center, body, face);
         for nface in self.edge_faces(center, body, face) {
-            out = quadtree::union_frontiers(out, self.frontier_union(center, body, nface));
+            out = quadtree::union_frontiers(out, self.frontier_at(center, body, nface));
         }
         // The disk is the full view, not the reduced loading window: the frontier key has no
         // load radius, and a fast flight must not bake the small disk in.
@@ -951,12 +918,7 @@ impl World {
             return sections;
         };
         let (reference, _, _) = self.lod_place(center);
-        let cs = CHUNK_SIZE as i32;
-        let h_lim = 0.75 * self.view.coverage().half.x;
-        let margin = cs as f32 * 0.5 * std::f32::consts::SQRT_2;
-        let frame = FaceFrame::new(face);
-        let mid = |c: i32| (i64::from(c) * i64::from(cs) + i64::from(cs / 2)) as i32;
-        let (eu, _, ev) = frame.cell_to_local((mid(reference.x), mid(reference.y), mid(reference.z)));
+        let near = Self::face_near_rect(reference, face, self.view.horizontal);
         let shift = Self::face_alt_shift(center, reference, face);
         let band = self.window_alts().map(|[a0, a1]| (a0 + shift, a1 + shift));
         let sticks = |s: SectionPos| {
@@ -967,7 +929,7 @@ impl World {
         let mut split = Vec::with_capacity(sections.len());
         for s in sections {
             if s.face == face {
-                push_split(s, eu, ev, h_lim, margin, &mut split, &sticks);
+                push_split(s, near, &mut split, &sticks);
             } else {
                 split.push(s);
             }
@@ -975,22 +937,16 @@ impl World {
         let budget = self.sections_allowed();
         if split.len() > budget {
             let mut set: FastSet<SectionPos> = split.into_iter().collect();
-            coarsen_off_disk(&mut set, budget, eu, ev, h_lim - margin);
+            coarsen_outside_near(&mut set, budget, near);
             split = set.into_iter().collect();
         }
         split.sort_unstable_by_key(section_key);
         split
     }
 
-    fn frontier_union(&self, center: Coord, body: u16, face: Face) -> Vec<SectionPos> {
+    fn frontier_at(&self, center: Coord, body: u16, face: Face) -> Vec<SectionPos> {
         let datum = self.generator.face_datum(body, face);
-        let base = self.frontier(&self.section_metric_on(center, DVec3::ZERO, face, datum), body, face);
-        let delta = self.section_vel * TAU_STREAM;
-        if delta == DVec3::ZERO {
-            return base;
-        }
-        let predicted = self.frontier(&self.section_metric_on(center, delta, face, datum), body, face);
-        quadtree::union_frontiers(base, predicted)
+        self.frontier(&self.section_metric_on(center, DVec3::ZERO, face, datum), body, face)
     }
 
     /// Chunk-centre sample the far field treats as the eye (tangents quantised, altitude exact on Y).
@@ -1117,5 +1073,45 @@ impl World {
         let local_y = ground as f64 - origin[1] as f64;
         let surf = atlas.embed(patch, DVec3::new(i as f64 + 0.5, local_y, j as f64 + 0.5));
         surf + (surf - atlas.centre).normalize() * above
+    }
+}
+
+#[cfg(test)]
+mod player_lod_tests {
+    use super::*;
+    use crate::render_config::RenderConfig;
+    use crate::world::generation::WorldgenKind;
+
+    #[test]
+    fn relief_bakes_do_not_change_the_players_distance_ladder() {
+        let mut w = World::with_kind(42, RenderConfig { lod2: true, ..RenderConfig::default() }, WorldgenKind::Flat, false);
+        let center = Coord::new(-2, 20, 6);
+        w.section_eye_y = 325.7;
+        let before = w.desired_sections(center);
+        assert!(!before.is_empty());
+        w.section_mip = Some(HeightMip::bake(&*w.generator, &w.registry.color_snapshot(), BakeExtent::new(4096, w.section_pyramid.coarsest())));
+        w.section_mip_anchor = Some((0, Face::PosY, 0, 0));
+        assert_eq!(w.desired_sections(center), before, "flat relief must not coarsen nearby tiles independently of player distance");
+    }
+
+    #[test]
+    fn motion_does_not_move_visible_detail_ahead_of_the_player() {
+        for charted in [false, true] {
+            let mut w = if charted {
+                crate::world::fixtures::round_world(42, RenderConfig { lod2: true, ..RenderConfig::default() })
+            } else {
+                World::with_kind(42, RenderConfig { lod2: true, ..RenderConfig::default() }, WorldgenKind::Flat, false)
+            };
+            let eye = if charted { w.chart_spawn().unwrap() } else { DVec3::new(-27.7, 325.7, 97.3) };
+            let (center, far, ..) = w.begin_stream(eye, None);
+            w.cross_boundary(center);
+            w.section_vel = DVec3::ZERO;
+            let before = w.desired_sections(far);
+            assert!(!before.is_empty());
+            for velocity in [DVec3::new(400.0, 0.0, 0.0), DVec3::new(-400.0, -100.0, 200.0)] {
+                w.section_vel = velocity;
+                assert_eq!(w.desired_sections(far), before, "motion changed the visible distance ladder (chart={charted})");
+            }
+        }
     }
 }

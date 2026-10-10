@@ -32,7 +32,7 @@ use crate::space::FaceFrame;
 
 use super::super::generation::TerrainGenerator;
 use super::super::mesh::{ChunkMeshData, new_chunk_mesh_data};
-use super::{ChunkCoord, FINEST_DETAIL, SECTION_N, SectionPos};
+use super::{ChunkCoord, FINEST_DETAIL, SECTION_N, SectionPos, Quadrant};
 #[cfg(test)]
 use super::{DOMAIN_H, Section};
 use crate::block::registry::{AIR, BlockId, HotTables};
@@ -55,6 +55,8 @@ pub(in crate::world) struct SectionMeshData {
 /// One packed slab: up to 16 packed cells tall, its origin at native-cell Y `origin_y`.
 pub(in crate::world) struct SlabMesh {
     pub origin_y: u32,
+    /// Footprint quarter; its GPU meshes follow the covering mask independently.
+    pub quadrant: Quadrant,
     pub data: ChunkMeshData,
 }
 
@@ -84,7 +86,7 @@ const NESTED_SLABS: i32 = 8;
 thread_local! {
     static DENSE_NATIVE: RefCell<Vec<BlockId>> = const { RefCell::new(Vec::new()) };
     static DENSE_COARSE: RefCell<Vec<BlockId>> = const { RefCell::new(Vec::new()) };
-    static MESH_SCRATCH: RefCell<ChunkMeshData> = RefCell::new(new_chunk_mesh_data());
+    static MESH_SCRATCH: RefCell<[ChunkMeshData; 4]> = RefCell::new(std::array::from_fn(|_| new_chunk_mesh_data()));
 }
 
 /// Packed section cells as a dense column-major grid: `nx × nz` columns of
@@ -240,7 +242,7 @@ fn face_sample(
 
 /// Greedy-mesh one slab of the packed volume: merge adjacent quads with identical
 /// properties across it (one mesh, vertex coords `0..=16` relative to the slab).
-fn build_volume(grid: &DenseGrid<'_>, tables: &HotTables, out: &mut ChunkMeshData) -> bool {
+fn build_volume(grid: &DenseGrid<'_>, tables: &HotTables, out: &mut [ChunkMeshData; 4]) -> bool {
     let mut mask: [Option<FaceSample>; SLICE] = [None; SLICE];
     let mut emitted = false;
 
@@ -283,12 +285,19 @@ fn build_volume(grid: &DenseGrid<'_>, tables: &HotTables, out: &mut ChunkMeshDat
                 for u0 in 0..n_u {
                     let key = mask[(u0 + v0 * n_u) as usize];
                     let Some(sample) = key else { continue };
+                    // A merged face must not cross a visibility-quarter boundary. Keep the
+                    // full grid as neighbour context so no internal walls are introduced.
+                    let edge = |axis: usize, start: i32, extent: i32| {
+                        if axis == 1 || extent < 2 { extent } else { ((start / (extent / 2) + 1) * (extent / 2)).min(extent) }
+                    };
+                    let u_end = edge(dir.face.u_axis, u0, n_u);
+                    let v_end = edge(dir.face.v_axis, v0, n_v);
                     let mut w = 1;
-                    while u0 + w < n_u && mask[(u0 + w + v0 * n_u) as usize] == key {
+                    while u0 + w < u_end && mask[(u0 + w + v0 * n_u) as usize] == key {
                         w += 1;
                     }
                     let mut h = 1;
-                    'grow: while v0 + h < n_v {
+                    'grow: while v0 + h < v_end {
                         for k in 0..w {
                             if mask[(u0 + k + (v0 + h) * n_u) as usize] != key {
                                 break 'grow;
@@ -302,7 +311,12 @@ fn build_volume(grid: &DenseGrid<'_>, tables: &HotTables, out: &mut ChunkMeshDat
                             mask[(u0 + du + row) as usize] = None;
                         }
                     }
-                    emit(out, dir, n, u0, v0, w, h, sample, tables);
+                    let mut cell = [0; 3];
+                    cell[dir.face.n_axis] = n;
+                    cell[dir.face.u_axis] = u0;
+                    cell[dir.face.v_axis] = v0;
+                    let q = Quadrant::of_coords(i32::from(cell[0] >= grid.nx / 2), i32::from(cell[2] >= grid.nz / 2));
+                    emit(&mut out[q.get() as usize], dir, n, u0, v0, w, h, sample, tables);
                     emitted = true;
                 }
             }
@@ -817,7 +831,8 @@ fn mesh_packed(
     let mut y0 = global_y0(alo, ylo, cell);
     let mut ny = ((yhi + step - 1) / step * step - y0) / step;
     if ny > BLOCK * NESTED_SLABS {
-        shift = relief_shift(ylo, yhi);
+        // Keep at least two packed cells across, so every footprint quarter is representable.
+        shift = relief_shift(ylo, yhi).min(4);
         step = 1 << shift;
         y0 = ylo / step * step;
         ny = ((yhi + step - 1) / step * step - y0) / step;
@@ -848,15 +863,21 @@ fn mesh_packed(
         MESH_SCRATCH.with_borrow_mut(|scratch| {
             let mut slabs = Vec::new();
             for y_lo in (0..ny).step_by(BLOCK as usize) {
-                for (_, m) in scratch.iter_mut() {
-                    m.clear();
+                for quarter in scratch.iter_mut() {
+                    for (_, m) in quarter.iter_mut() { m.clear(); }
                 }
                 let grid = DenseGrid { cells: coarse, nx, ny, nz, y_lo, y_hi: (y_lo + BLOCK).min(ny) };
                 if build_volume(&grid, tables, scratch) {
-                    slabs.push(SlabMesh {
-                        origin_y: (y0 + y_lo * step) as u32,
-                        data: std::mem::replace(scratch, new_chunk_mesh_data()),
-                    });
+                    for q in Quadrant::ALL {
+                        let data = &mut scratch[q.get() as usize];
+                        if data.iter().any(|(_, m)| !m.is_empty()) {
+                            slabs.push(SlabMesh {
+                                origin_y: (y0 + y_lo * step) as u32,
+                                quadrant: q,
+                                data: std::mem::replace(data, new_chunk_mesh_data()),
+                            });
+                        }
+                    }
                 }
             }
             SectionMeshData {
@@ -984,8 +1005,12 @@ mod tests {
         })
     }
 
+    fn slab_levels(mesh: &SectionMeshData) -> Vec<u32> {
+        mesh.slabs.iter().map(|s| s.origin_y).collect::<std::collections::BTreeSet<_>>().into_iter().collect()
+    }
+
     /// One pass of one slab with its placement: `(origin_y, shift, pass, vertices, quad counts)`.
-    type FlatPass = (u32, u8, u8, Vec<MeshVertex>, [u32; 6]);
+    type FlatPass = (u32, u8, u8, u8, Vec<MeshVertex>, [u32; 6]);
 
     /// Every slab's every pass, with its placement, for byte-parity comparisons.
     fn flatten(m: &SectionMeshData) -> Vec<FlatPass> {
@@ -995,6 +1020,7 @@ mod tests {
                 Pass::ALL.into_iter().map(move |p| {
                     (
                         slab.origin_y,
+                        slab.quadrant.get(),
                         m.shift,
                         p as u8,
                         slab.data[p].vertices(),
@@ -1048,6 +1074,42 @@ mod tests {
                 assert_eq!(micro, [0, 0, 0], "a top/bottom face carries a spurious micro offset");
             }
         }
+    }
+
+    #[test]
+    fn visibility_quarters_partition_faces_without_internal_walls() {
+        let (_, tables, b) = setup();
+        let n = 16;
+        let cells = vec![b.stone; (n * n * n) as usize];
+        let grid = DenseGrid { cells: &cells, nx: n, ny: n, nz: n, y_lo: 0, y_hi: n };
+        let mut quarters = std::array::from_fn(|_| new_chunk_mesh_data());
+        assert!(build_volume(&grid, &tables, &mut quarters));
+        let mut total_area = 0;
+        for q in Quadrant::ALL {
+            let (x0, z0) = (q.dx() * 8, q.dz() * 8);
+            let mut top_area = 0;
+            for pass in Pass::ALL {
+                for face in quarters[q.get() as usize][pass].vertices().chunks_exact(4) {
+                    let mut lo = [16; 3];
+                    let mut hi = [0; 3];
+                    for vertex in face {
+                        let p = vertex.local_pos().map(|a| a as i32);
+                        assert!((x0..=x0 + 8).contains(&p[0]) && (z0..=z0 + 8).contains(&p[2]), "a face crosses its visibility quarter");
+                        for a in 0..3 { lo[a] = lo[a].min(p[a]); hi[a] = hi[a].max(p[a]); }
+                    }
+                    let area: i32 = (0..3).map(|a| hi[a] - lo[a]).filter(|&d| d > 0).product();
+                    total_area += area;
+                    match face[0].normal() {
+                        Normal::PosY => { assert_eq!(lo[1], 16); top_area += area; }
+                        Normal::PosX | Normal::NegX => assert!(lo[0] == 0 || lo[0] == 16, "internal X wall"),
+                        Normal::PosZ | Normal::NegZ => assert!(lo[2] == 0 || lo[2] == 16, "internal Z wall"),
+                        _ => panic!("unexpected floor face"),
+                    }
+                }
+            }
+            assert_eq!(top_area, 64, "each mask bit owns exactly a quarter of the top");
+        }
+        assert_eq!(total_area, 5 * 16 * 16, "partitioning changes neither exposed area nor coverage");
     }
 
     #[test]
@@ -1118,10 +1180,11 @@ mod tests {
             (0..SECTION_N * SECTION_N).flat_map(|i| column(if tall && i % SECTION_N < 12 { 1_100 } else { 50 })).collect()
         };
         let flat = mesh_packed(&grid(false), n_cells, &tables, None, 0, 4);
-        assert_eq!((flat.shift, flat.slabs.len()), (1, 1), "flat ground");
+        assert_eq!((flat.shift, slab_levels(&flat).len()), (1, 1), "flat ground");
         let cliff = mesh_packed(&grid(true), n_cells, &tables, None, 0, 4);
         assert!(cliff.shift > flat.shift, "a 4 km cliff coarsens instead of stacking");
-        assert!(!cliff.slabs.is_empty() && cliff.slabs.len() <= MAX_SLABS as usize, "{} slabs", cliff.slabs.len());
+        assert!(cliff.shift <= 4, "every footprint quarter remains representable");
+        assert!(!cliff.slabs.is_empty() && slab_levels(&cliff).len() <= n_cells.div_ceil(16 * (1usize << cliff.shift)), "{} slab levels", slab_levels(&cliff).len());
     }
 
     /// Relief splits into stacked slabs at the least shift instead of coarsening every axis: a
@@ -1131,7 +1194,7 @@ mod tests {
     fn tall_relief_stacks_slabs_at_the_least_shift() {
         let (_r, tables, b) = setup();
         let flat = mesh_of(&extract(FINEST, &terrain_gen(&b, 200, 0, None)), &tables);
-        assert_eq!(flat.slabs.len(), 1, "flat ground is one slab");
+        assert_eq!(slab_levels(&flat).len(), 1, "flat ground is one vertical level");
         // A peak over part of the section: columns 0..12 rise 300 m above the rest.
         let (stone, grass) = (b.stone, b.grass);
         let peak = FnGen {
@@ -1142,11 +1205,11 @@ mod tests {
         };
         let tall = mesh_of(&extract(FINEST, &peak), &tables);
         assert_eq!(tall.shift, flat.shift, "relief must not coarsen the horizontal packing");
-        assert!(tall.slabs.len() > 1, "a tall section stacks slabs");
-        assert!(tall.slabs.len() <= MAX_SLABS as usize);
+        assert!(slab_levels(&tall).len() > 1, "a tall section stacks slabs");
+        assert!(slab_levels(&tall).len() <= MAX_SLABS as usize);
         let step = 1u32 << tall.shift;
-        for w in tall.slabs.windows(2) {
-            assert!(w[1].origin_y > w[0].origin_y && (w[1].origin_y - w[0].origin_y) % (BLOCK as u32 * step) == 0);
+        for w in slab_levels(&tall).windows(2) {
+            assert!(w[1] > w[0] && (w[1] - w[0]) % (BLOCK as u32 * step) == 0);
         }
         // The peak's columns cross every seam: the only horizontal faces are its top and the
         // low ground's top, none at the seams.
@@ -1171,7 +1234,7 @@ mod tests {
         let tops = all_quads(&build_section_mesh(&flat, &tables, None))
             .filter(|(_, q)| q[0].normal() == Normal::PosY)
             .count();
-        assert_eq!(tops, 1, "a uniform flat top merges across the whole section");
+        assert_eq!(tops, 4, "a uniform flat top merges within each visibility quarter");
 
         let (grass, dirt) = (b.grass, b.dirt);
         let stone = b.stone;
@@ -1331,9 +1394,17 @@ mod tests {
             cells[at(x, y, z)] = b.stone;
         }
         let mesh_of = |grid: &[BlockId]| {
-            let mut out = new_chunk_mesh_data();
+            let mut quarters = std::array::from_fn(|_| new_chunk_mesh_data());
             let g = DenseGrid { cells: grid, nx: n, ny: n, nz: n, y_lo: 0, y_hi: n };
-            assert!(build_volume(&g, &tables, &mut out), "the feature emits no faces");
+            assert!(build_volume(&g, &tables, &mut quarters), "the feature emits no faces");
+            let mut out = new_chunk_mesh_data();
+            for quarter in quarters {
+                for pass in Pass::ALL {
+                    for q in quarter[pass].vertices().chunks_exact(4) {
+                        out[pass].quad([q[0], q[1], q[2], q[3]]);
+                    }
+                }
+            }
             out
         };
         let key = |v: MeshVertex| {
@@ -2059,7 +2130,7 @@ mod tests {
         let (center, storage) = home_altitude_eye(&world, DVec3::new(0.0, 1.0, 0.0), 0.0);
         world.section_eye_y = storage.y;
         let spawn = frontier_counts(&mut world, center);
-        assert_eq!(spawn.hash, 0x46ae3b3a, "spawn ground-level far-field bytes changed");
+        assert_eq!(spawn.hash, 0x89910a9e, "spawn ground-level quarter-mesh bytes changed");
         assert_eq!(spawn.bare, 0, "spawn ground-level bare columns");
         assert_eq!(spawn.gaps, 0, "spawn ground-level seam gaps");
         assert_eq!(spawn.missing, 0, "spawn ground-level missing tops");

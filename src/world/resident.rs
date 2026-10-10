@@ -257,10 +257,10 @@ pub(in crate::world) enum SectionState {
     /// One mesh per pass for each of the section's stacked slabs (none for an
     /// empty section). Positions and packed detail (`pos.detail + shift`) are
     /// pinned at upload; visibility is one `set_visible` over all of them
-    /// (partial covering draws the whole tile — overlap is depth-biased) and
+    /// (each footprint quarter follows its covering bit independently) and
     /// style a `set_style` push.
     Ready {
-        meshes: Vec<ChunkMeshes>,
+        meshes: Vec<(section::Quadrant, ChunkMeshes)>,
         /// Cages bending a chart section's slabs. Empty on a cube face. Freed with the meshes.
         cages: Vec<voxel_engine::CageHandle>,
         /// Last `(style, flat_rgba)` pushed via [`Self::push_style`], so a value
@@ -291,7 +291,7 @@ impl SectionState {
             .filter_map(|slab| {
                 let placement = Self::slab_place(pos, slab.origin_y, detail, mesh.altitude_floor, bend, eng, &mut cages)?;
                 match ChunkMeshes::from_upload_handles(ByPass::from_fn(|p| eng.upload_mesh_placed(&slab.data[p], placement))) {
-                    Some(m) => Some(m),
+                    Some(m) => Some((slab.quadrant, m)),
                     None => {
                         Self::drop_failed_cage(eng, &mut cages, placement);
                         None
@@ -391,7 +391,7 @@ impl SectionState {
                         .take()
                         .and_then(|pass| eng.upload_mesh_staged(pass.staging, pass.quad_counts, p, placement))
                 })) {
-                    Some(m) => Some(m),
+                    Some(m) => Some((slab.quadrant, m)),
                     None => {
                         Self::drop_failed_cage(eng, &mut cages, placement);
                         None
@@ -406,16 +406,18 @@ impl SectionState {
         matches!(self, SectionState::Ready { .. })
     }
 
-    /// Project `mask` onto this region's slots. The slabs cover the whole
-    /// section: any non-empty mask draws them (overlap with finer children is
-    /// depth-biased); `None` / empty hides them.
+    /// Project each covering bit onto only that footprint quarter's slots.
+    /// `None` / empty hides every quarter.
     pub(super) fn set_visible(&self, eng: &mut Engine, mask: Option<QuadrantMask>) {
-        let SectionState::Ready { meshes, .. } = self else {
-            return;
-        };
-        let on = mask.is_some_and(|m| !m.is_empty());
-        for m in meshes {
-            m.set_visible(eng, on);
+        self.visit_visibility(mask, |m, on| m.set_visible(eng, on));
+    }
+
+    /// The upload and subsequent covering changes share this exact projection.
+    fn visit_visibility(&self, mask: Option<QuadrantMask>, mut set: impl FnMut(&ChunkMeshes, bool)) {
+        if let Self::Ready { meshes, .. } = self {
+            for (q, m) in meshes {
+                set(m, mask.is_some_and(|mask| mask.contains(*q)));
+            }
         }
     }
     /// Push the far-material style onto this section's mesh
@@ -424,7 +426,7 @@ impl SectionState {
         let SectionState::Ready { meshes, .. } = self else {
             return;
         };
-        for m in meshes {
+        for (_, m) in meshes {
             m.set_style(eng, style, flat_rgba);
         }
     }
@@ -444,7 +446,7 @@ impl SectionState {
     }
     pub(super) fn free(self, eng: &mut Engine) {
         if let SectionState::Ready { meshes, cages, .. } = self {
-            for m in meshes {
+            for (_, m) in meshes {
                 m.free(eng);
             }
             for c in cages {
@@ -455,7 +457,7 @@ impl SectionState {
 
     fn slot_count(&self) -> usize {
         match self {
-            SectionState::Ready { meshes, .. } => meshes.iter().map(ChunkMeshes::slot_count).sum(),
+            SectionState::Ready { meshes, .. } => meshes.iter().map(|(_, m)| m.slot_count()).sum(),
             _ => 0,
         }
     }
@@ -648,6 +650,38 @@ impl MeshState {
             for h in meshes.handles() {
                 mesh_free_log::record(h);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod section_visibility_tests {
+    use super::*;
+    use voxel_engine::Pass;
+
+    #[test]
+    fn each_covering_bit_controls_only_its_uploaded_quarter() {
+        let meshes = section::Quadrant::ALL.into_iter().map(|q| {
+            let m = ChunkMeshes::from_upload_handles(ByPass::from_fn(|p| {
+                (p == Pass::Opaque).then(|| MeshHandle::from_raw_parts(u32::from(q.get()) + 1, 1))
+            })).unwrap();
+            (q, m)
+        }).collect();
+        let state = SectionState::Ready { meshes, cages: Vec::new(), last_style: None };
+        for selected in section::Quadrant::ALL {
+            let mut mask = QuadrantMask::EMPTY;
+            mask.insert(selected);
+            let mut actual = Vec::new();
+            state.visit_visibility(Some(mask), |m, on| actual.push((m.handles()[0], on)));
+            let expected: Vec<_> = section::Quadrant::ALL.into_iter().map(|q| {
+                (MeshHandle::from_raw_parts(u32::from(q.get()) + 1, 1), q == selected)
+            }).collect();
+            assert_eq!(actual, expected, "a parent quarter must disappear when its child replaces it");
+        }
+        for mask in [None, Some(QuadrantMask::EMPTY)] {
+            let mut actual = Vec::new();
+            state.visit_visibility(mask, |_, on| actual.push(on));
+            assert_eq!(actual, [false; 4]);
         }
     }
 }
