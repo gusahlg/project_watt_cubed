@@ -273,7 +273,6 @@ pub struct Game {
     // Settings-derived work gates: each stops its lane at the owning boundary
     // instead of merely hiding output.
     mod_logic: bool,
-    mod_hud: bool,
     player_models: bool,
     name_tags: bool,
 
@@ -392,7 +391,6 @@ impl Game {
             pending_mod_input: Vec::new(),
             pending_mod_overlay_close: false,
             mod_logic: true,
-            mod_hud: true,
             player_models: true,
             name_tags: true,
             content_rev: Revision::default(),
@@ -490,8 +488,7 @@ impl Game {
             self.minimap = None;
         }
 
-        let mod_ui_will_be_active =
-            mod_ui_active(settings.mod_logic, settings.mod_hud, self.theme.hud);
+        let mod_ui_will_be_active = mod_ui_active(settings.mod_logic, self.theme.hud);
         if mod_ui_will_be_active {
             self.pending_mod_overlay_close = false;
         } else if mod_ui_was_active {
@@ -502,7 +499,6 @@ impl Game {
             self.mod_gate.reset();
             self.pending_mod_input.clear();
         }
-        self.mod_hud = settings.mod_hud;
         self.player_models = settings.player_models;
         self.name_tags = settings.name_tags;
     }
@@ -511,7 +507,7 @@ impl Game {
     /// input. Keeping one predicate for routing and Escape prevents invisible
     /// overlays when either the mod lane or the master HUD is disabled.
     fn mod_ui_active(&self) -> bool {
-        mod_ui_active(self.mod_logic, self.mod_hud, self.theme.hud)
+        mod_ui_active(self.mod_logic, self.theme.hud)
     }
 
     /// The mod UI just became invisible: force-close any open overlay once and
@@ -1384,8 +1380,8 @@ impl Game {
 /// Whether a mod-supplied modal can both be seen and receive input. Free over
 /// its inputs so the live predicate and the would-be-applied check in
 /// `apply_settings` share one rule instead of restating it.
-fn mod_ui_active(mod_logic: bool, mod_hud: bool, hud: HudMode) -> bool {
-    mod_logic && mod_hud && hud.shows_mod_hud()
+fn mod_ui_active(mod_logic: bool, hud: HudMode) -> bool {
+    mod_logic && hud.shows_mod_hud()
 }
 
 /// Toggle capture and sync cursor grab with the OS.

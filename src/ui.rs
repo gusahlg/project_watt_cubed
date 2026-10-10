@@ -99,34 +99,6 @@ impl Anchor {
     }
 }
 
-/// The aiming reticle, as data: swap the value to restyle it.
-#[derive(Clone, Copy)]
-pub struct Crosshair {
-    /// Length of each arm in pixels.
-    pub arm: i32,
-    /// Gap between the centre and the start of each arm.
-    pub gap: i32,
-    pub color: Color,
-}
-
-impl Crosshair {
-    pub const DEFAULT: Self = Self {
-        arm: 8,
-        gap: 0,
-        color: Color::new(255, 255, 255, 180),
-    };
-
-    /// Draw the reticle centred on the screen.
-    pub fn draw(&self, f: &mut Frame, screen: Px) {
-        let (cx, cy) = (screen.0 / 2, screen.1 / 2);
-        let (a, g) = (self.arm, self.gap);
-        f.draw_line(cx - a - g, cy, cx - g, cy, self.color);
-        f.draw_line(cx + g, cy, cx + a + g, cy, self.color);
-        f.draw_line(cx, cy - a - g, cx, cy - g, self.color);
-        f.draw_line(cx, cy + g, cx, cy + a + g, self.color);
-    }
-}
-
 crate::macros::code_enum! {
     /// How much of the HUD is shown. A three-state cycle rather than a bool: `Minimal`
     /// keeps the reticle (and world-space name tags) but hides the informational text.
@@ -174,7 +146,6 @@ impl HudMode {
 /// size; `hud` is the master visibility cycle.
 pub struct Theme {
     pub scale: f32,
-    pub crosshair: Crosshair,
     pub hud: HudMode,
 }
 
@@ -182,7 +153,6 @@ impl Theme {
     pub fn new() -> Self {
         Self {
             scale: 1.0,
-            crosshair: Crosshair::DEFAULT,
             hud: HudMode::Full,
         }
     }

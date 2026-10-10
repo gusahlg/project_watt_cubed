@@ -16,12 +16,14 @@
 //! matter and only what it draws where it wouldn't.
 mod build;
 mod frame;
+mod hud;
 mod message;
 #[cfg(test)]
 pub(crate) mod testing;
 
 pub use build::{BuildInfo, GameBuild, ModDescriptor, ModRegistrar, PackageInfo, PackageKind};
 pub use frame::{Channel, FrameContext, GameContext, TextFrame};
+pub use hud::HudFacts;
 pub use message::{Message, Notice, NoticeLevel, Notices};
 
 use std::fs;
@@ -446,13 +448,16 @@ pub trait Mod {
     }
 
     /// This mod's HUD contribution while enabled, as data — [`HudElement`]s
-    /// pushed into a caller-owned buffer the core renders over the world and
-    /// under the console. A mod describes *what* to show and never draws, so
-    /// panel chrome and layout live in one place ([`crate::ui::render_hud`]).
-    /// `world` gives read access to the registry so names resolve at build time
-    /// rather than being cached. `player` is the one path to the core inventory.
-    fn hud(&self, world: &World, player: &Player, screen: (i32, i32), out: &mut Vec<HudElement>) {
-        let _ = (world, player, screen, out);
+    /// pushed into a caller-owned buffer the core renders over the world. A mod
+    /// describes *what* to show and never draws, so panel chrome and layout live in
+    /// one place ([`crate::ui::render_hud`]). Called every frame in every HUD mode,
+    /// Off included: `facts.hud_mode` says which mode it is, and each mod decides
+    /// what to show in it. `facts` also has the screen size, the UI scale and the
+    /// facts only the core knows (frame rate, the link, loading). `world` gives read
+    /// access to the registry so names resolve at build time rather than being
+    /// cached. `player` is the one path to the core inventory.
+    fn hud(&self, facts: &HudFacts, world: &World, player: &Player, out: &mut Vec<HudElement>) {
+        let _ = (facts, world, player, out);
     }
 
     /// Close a modal in-world overlay before the core interprets Escape as
@@ -770,10 +775,10 @@ impl Mods {
     /// Push every enabled mod's HUD contribution into `out`, in install order
     /// (so a later mod draws over an earlier one). The caller owns `out` and
     /// clears it per frame so capacity is retained.
-    pub fn hud(&self, world: &World, player: &Player, screen: (i32, i32), out: &mut Vec<HudElement>) {
+    pub fn hud(&self, facts: &HudFacts, world: &World, player: &Player, out: &mut Vec<HudElement>) {
         for entry in &self.entries {
             if entry.enabled {
-                entry.module.hud(world, player, screen, out);
+                entry.module.hud(facts, world, player, out);
             }
         }
     }
