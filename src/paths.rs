@@ -72,6 +72,11 @@ impl Paths {
         self.config.join("session.cfg")
     }
 
+    /// The mod choices file older games wrote. Read once for knob values, never written.
+    pub(crate) fn legacy_mods_file(&self) -> PathBuf {
+        self.config.join("mods.cfg")
+    }
+
     pub(crate) fn checkout_dir(&self) -> Option<&Path> {
         self.checkout.as_deref()
     }

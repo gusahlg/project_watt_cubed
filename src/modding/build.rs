@@ -15,7 +15,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 
 use super::{Mod, Mods};
-use crate::settings::{OptionId, OptionSpec};
+use crate::settings::{OptionId, OptionSpec, Options};
 
 /// What a package is: `kind` in its `mod.toml`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -175,9 +175,11 @@ impl GameBuild {
         self.info.environment()
     }
 
-    /// Instantiate this build's mods.
-    pub fn mods(&self) -> Mods {
-        Mods::from_build(self)
+    /// Instantiate this build's mods, dropping the options they declare (tests that read options
+    /// call [`Mods::from_build`] with their own).
+    #[cfg(test)]
+    pub(crate) fn mods(&self) -> Mods {
+        Mods::from_build(self, &mut Options::new())
     }
 }
 
@@ -194,6 +196,7 @@ pub struct ModRegistrar<'a> {
     package: &'a PackageInfo,
     build: &'a BuildInfo,
     mods: &'a mut Mods,
+    options: &'a mut Options,
     resources: &'a mut Resources,
 }
 
@@ -202,9 +205,10 @@ impl<'a> ModRegistrar<'a> {
         package: &'a PackageInfo,
         build: &'a BuildInfo,
         mods: &'a mut Mods,
+        options: &'a mut Options,
         resources: &'a mut Resources,
     ) -> Self {
-        Self { package, build, mods, resources }
+        Self { package, build, mods, options, resources }
     }
 
     /// The package being registered.
@@ -230,7 +234,7 @@ impl<'a> ModRegistrar<'a> {
     /// lists it on `spec.page` without knowing this package. Read it in
     /// [`Mod::on_options`](super::Mod::on_options).
     pub fn option(&mut self, spec: OptionSpec) -> OptionId {
-        self.mods.options.declare(self.package.id, spec)
+        self.options.declare(self.package.id, spec)
     }
 
     /// Offer a screen (a settings menu, a package list) on the screen out of a world and/or the

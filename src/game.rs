@@ -30,7 +30,7 @@ use crate::net::client::Connection;
 use crate::player::Player;
 use crate::presence;
 use crate::sched::{Ctx as SchedCtx, RateGate};
-use crate::settings::Settings;
+use crate::settings::{Options, Settings};
 use crate::sim::Simulation;
 use crate::sky::Sky;
 use crate::ui::{HudElement, HudMode, Theme};
@@ -122,6 +122,7 @@ struct OverlayPhase<'a> {
     router: &'a mut Router,
     mods: &'a mut Mods,
     settings: &'a mut Settings,
+    options: &'a mut Options,
     sound: &'a mut SoundSystem,
     events: &'a mut Vec<GameEvent>,
 }
@@ -669,6 +670,7 @@ impl Game {
         router: &mut Router,
         mods: &mut Mods,
         settings: &mut Settings,
+        options: &mut Options,
         sound: &mut SoundSystem,
         audio: &mut AudioService,
         cues: &CueSymbols,
@@ -722,6 +724,7 @@ impl Game {
             router,
             mods,
             settings,
+            options,
             sound,
             events: &mut events,
         });
@@ -855,6 +858,7 @@ impl Game {
             router,
             mods,
             settings,
+            options,
             sound,
             events,
         } = phase;
@@ -863,7 +867,7 @@ impl Game {
         }
 
         let screen = (eng.screen_width(), eng.screen_height());
-        self.frame_hook(input, screen, router.action_ids(), mods, settings, sound, events);
+        self.frame_hook(input, screen, router.action_ids(), mods, (settings, options), sound, events);
 
         if self.input_locked {
             return None;
@@ -977,7 +981,7 @@ impl Game {
         screen: (i32, i32),
         ids: &[&'static str],
         mods: &mut Mods,
-        settings: &mut Settings,
+        (settings, options): (&mut Settings, &mut Options),
         sound: &mut SoundSystem,
         events: &mut Vec<GameEvent>,
     ) {
@@ -991,11 +995,9 @@ impl Game {
             edit: input.text_edit,
             escape: input.g_escape,
         });
-        let mut game = GameContext::new(&mut self.player, &mut self.world, settings, &mut self.sky).with_queues(
-            std::mem::take(events),
-            std::mem::take(&mut self.chat_out),
-            std::mem::take(&mut self.hook_notices),
-        );
+        let mut game = GameContext::new(&mut self.player, &mut self.world, settings, &mut self.sky)
+            .with_options(options)
+            .with_queues(std::mem::take(events), std::mem::take(&mut self.chat_out), std::mem::take(&mut self.hook_notices));
         game.networked = networked;
         game.detached = matches!(self.camera.mode, CameraMode::Free { .. });
         game.visuals = self.visual_mask;
@@ -1353,7 +1355,8 @@ impl Game {
             router.drain_frame();
         }
         let input = FrameInput::default();
-        self.frame_hook(&input, (1280, 720), router.action_ids(), mods, settings, sound, &mut events);
+        let mut options = Options::new();
+        self.frame_hook(&input, (1280, 720), router.action_ids(), mods, (settings, &mut options), sound, &mut events);
         if self.world.spawn_ready() {
             let _ = self.motion_phase(&input, dt);
         }
@@ -1548,7 +1551,8 @@ mod tests {
     fn hook(game: &mut Game, mods: &mut Mods, settings: &mut Settings, input: &FrameInput) -> Vec<GameEvent> {
         let (mut sound, _) = SoundSystem::mute();
         let mut events = Vec::new();
-        game.frame_hook(input, (800, 600), PROBE_IDS, mods, settings, &mut sound, &mut events);
+        let mut options = crate::settings::Options::new();
+        game.frame_hook(input, (800, 600), PROBE_IDS, mods, (settings, &mut options), &mut sound, &mut events);
         events
     }
 

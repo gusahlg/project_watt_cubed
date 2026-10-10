@@ -27,7 +27,7 @@ use crate::screen::{
     AppRequest, MenuInput, Phase, ScreenContext, ScreenFacts, ScreenStack, StackEvent, UiElement, VERSION,
 };
 use crate::session::Session;
-use crate::settings::{GfxEngine, Settings};
+use crate::settings::{GfxEngine, Options, Settings};
 use crate::world::generation::WorldgenKind;
 use crate::world::terrain::TerrainCfg;
 use crate::world::World;
@@ -131,6 +131,8 @@ pub struct App {
     host: Host,
     /// Graphics settings, persisted as `settings.cfg` under the config root.
     settings: Settings,
+    /// The packages' options, persisted after the settings in the same file.
+    options: Options,
     /// Last-used connection details, persisted as `session.cfg` under the config root.
     session: Session,
     /// Self-describing benchmark mode (`WATT_BENCH=<seconds>`).
@@ -237,13 +239,14 @@ struct ScreenParts<'a> {
     session: &'a Session,
     build: &'a BuildInfo,
     hosting: bool,
-    mods: &'a mut Mods,
+    mods: &'a Mods,
     settings: &'a mut Settings,
+    options: &'a mut Options,
 }
 
 impl<'a> ScreenParts<'a> {
     fn ctx(self, phase: Phase, in_world: bool, notice: Option<&'a str>) -> ScreenContext<'a> {
-        let (suspended, entries, visuals, options) = self.mods.screen_parts();
+        let (suspended, entries, visuals) = self.mods.screen_view();
         let facts = ScreenFacts {
             saves: self.saves,
             session: self.session,
@@ -257,7 +260,7 @@ impl<'a> ScreenParts<'a> {
             entries,
             visuals,
         };
-        ScreenContext::new(facts, self.settings, options)
+        ScreenContext::new(facts, self.settings, self.options)
     }
 }
 
@@ -295,7 +298,8 @@ impl App {
         }
         // While the menu is up, so the first world's frame does not pay for it.
         crate::world::terrain::prewarm();
-        let mut mods = Mods::from_build(build);
+        let mut options = Options::new();
+        let mut mods = Mods::from_build(build, &mut options);
         let pins = Benchmark::mod_pins_from_env();
         let mut pinned = pins.suspend;
         if pins.visuals_core == Some(true) {
@@ -310,9 +314,9 @@ impl App {
             mods.pin_suspended(&pinned);
         }
         let saves = save::list();
-        let mut settings = Settings::load(mods.options_mut());
-        mods.options_changed();
-        let options_seen = mods.options().revision();
+        let mut settings = Settings::load(&mut options);
+        mods.options_changed(&options);
+        let options_seen = options.revision();
         let (caps, display) = crate::benchmark::graphics_caps();
         settings.set_device_caps(caps, display);
         let session = Session::load();
@@ -360,6 +364,7 @@ impl App {
             entry_notice: None,
             host: Host::default(),
             settings,
+            options,
             session,
             bench,
             sound,
@@ -387,16 +392,16 @@ impl App {
 
     /// Tell the mods once the options moved since they last heard.
     fn tell_options(&mut self) {
-        let revision = self.mods.options().revision();
+        let revision = self.options.revision();
         if revision != self.options_seen {
             self.options_seen = revision;
-            self.mods.options_changed();
+            self.mods.options_changed(&self.options);
         }
     }
 
     fn flush_settings_if_dirty(&mut self) {
         if self.settings_flush.take() && self.bench.is_none() {
-            self.settings.save(self.mods.options());
+            self.settings.save(&self.options);
         }
     }
 
@@ -407,8 +412,9 @@ impl App {
             session: &self.session,
             build: &self.build,
             hosting: self.host.running(),
-            mods: &mut self.mods,
+            mods: &self.mods,
             settings: &mut self.settings,
+            options: &mut self.options,
         }
     }
 
@@ -448,7 +454,7 @@ impl App {
     /// Save everything that waits on quitting.
     fn save_on_quit(&mut self) {
         if self.bench.is_none() {
-            self.settings.save(self.mods.options());
+            self.settings.save(&self.options);
         }
         self.flush_save();
     }
@@ -564,13 +570,13 @@ impl App {
     /// After a frame of screens: a moved options revision tells the mods, re-mixes the audio,
     /// and saves once the steps go quiet. True when it moved.
     fn after_screens(&mut self, revision_before: u64, now_ms: u64) -> bool {
-        let changed = self.mods.options().revision() != revision_before;
+        let changed = self.options.revision() != revision_before;
         if changed {
             self.sound.set_mix(self.settings.mix_change());
         }
         self.tell_options();
         if settings_write_due(&mut self.settings_flush, changed, now_ms) && self.bench.is_none() {
-            self.settings.save(self.mods.options());
+            self.settings.save(&self.options);
         }
         changed
     }
@@ -581,7 +587,7 @@ impl App {
         self.read_menu_input(eng);
         let click = menu_click(&self.menu_input);
         self.fan_audio(dt, false, click);
-        let before = self.mods.options().revision();
+        let before = self.options.revision();
         let now_ms = self.now_ms();
         let event = match self.menus.take() {
             Some(mut stack) => {
@@ -954,7 +960,7 @@ impl App {
             let mut api = self.audio.api(&mut self.sound, &self.cues, None, None);
             self.mods.on_game_event(&click, &mut api);
         }
-        let before = self.mods.options().revision();
+        let before = self.options.revision();
         let now_ms = self.now_ms();
         let input = std::mem::take(&mut self.menu_input);
         let event = {
@@ -964,7 +970,7 @@ impl App {
         self.menu_input = input;
         self.pause = Some(stack);
         // A change made here is the same as a console change: the game applies it after the push.
-        let changed = self.mods.options().revision() != before;
+        let changed = self.options.revision() != before;
         if changed {
             self.sound.set_mix(self.settings.mix_change());
             if let Screen::Playing(game) = &mut self.screen {
@@ -973,7 +979,7 @@ impl App {
         }
         self.tell_options();
         if settings_write_due(&mut self.settings_flush, changed, now_ms) && self.bench.is_none() {
-            self.settings.save(self.mods.options());
+            self.settings.save(&self.options);
         }
         Some(event)
     }
@@ -1004,6 +1010,7 @@ impl App {
             &mut self.router,
             &mut self.mods,
             &mut self.settings,
+            &mut self.options,
             &mut self.sound,
             &mut self.audio,
             &self.cues,
@@ -1012,8 +1019,11 @@ impl App {
             game.hold_input(false);
             game.on_enter(eng, &mut self.router);
         }
-        if settings_write_due(&mut self.settings_flush, game.take_settings_dirty(), now_ms) && self.bench.is_none() {
-            self.settings.save(self.mods.options());
+        let dirty = game.take_settings_dirty();
+        // A frame hook may have changed an option (`/set`): the mods hear it now.
+        self.tell_options();
+        if settings_write_due(&mut self.settings_flush, dirty, now_ms) && self.bench.is_none() {
+            self.settings.save(&self.options);
         }
         match signal {
             Signal::Continue => {}
@@ -1102,7 +1112,7 @@ impl App {
                 if let Screen::Playing(game) = &mut self.screen {
                     let fov = self.settings.fov;
                     let shake = self.settings.shake;
-                    game.draw(eng, &mut self.mods, fov, shake);
+                    game.draw(eng, &mut self.mods, fov, shake, &[]);
                 }
                 return;
             }
@@ -1121,9 +1131,15 @@ impl App {
                 stack.draw(&ctx, &mut ui, size);
             }
         }
-        let mut f = eng.begin_frame(MENU_CLEAR.to_linear());
-        crate::screen::render(&mut f, &ui);
-        drop(f);
+        // The pause screen draws over the running world (the screen dims it); every other screen
+        // has the frame to itself.
+        if let Screen::Playing(game) = &mut self.screen {
+            let (fov, shake) = (self.settings.fov, self.settings.shake);
+            game.draw(eng, &mut self.mods, fov, shake, &ui);
+        } else {
+            let mut f = eng.begin_frame(MENU_CLEAR.to_linear());
+            crate::screen::render(&mut f, &ui);
+        }
         self.ui = ui;
         if in_world {
             self.pause = stack;
@@ -1544,7 +1560,8 @@ mod tests {
     #[test]
     fn holding_left_writes_settings_at_most_once_per_debounce_window() {
         let mut settings = Settings::default();
-        let mut mods = Mods::empty();
+        let mut options = Options::new();
+        let mods = Mods::empty();
         let session = Session::default();
         let build = BuildInfo::EMPTY;
         let mut stack = ScreenStack::new(Box::new(DistanceRow));
@@ -1554,11 +1571,11 @@ mod tests {
             let now_ms = frame * 8;
             let held = now_ms < 2000 && frame % 4 == 0;
             let input = if held { MenuInput::new().with(MenuEvent::Left) } else { MenuInput::new() };
-            let before = mods.options().revision();
-            let parts = ScreenParts { saves: &[], session: &session, build: &build, hosting: false, mods: &mut mods, settings: &mut settings };
+            let before = options.revision();
+            let parts = ScreenParts { saves: &[], session: &session, build: &build, hosting: false, mods: &mods, settings: &mut settings, options: &mut options };
             let mut ctx = parts.ctx(Phase::Idle, false, None);
             stack.update(&input, &mut ctx);
-            let changed = mods.options().revision() != before;
+            let changed = options.revision() != before;
             steps += changed as u32;
             if settings_write_due(&mut flush, changed, now_ms) {
                 writes.push(now_ms);

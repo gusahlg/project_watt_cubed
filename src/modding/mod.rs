@@ -510,8 +510,6 @@ pub struct Mods {
     suspended: Vec<String>,
     /// Install index of the mod holding the keyboard (see [`FrameContext::capture_text`]).
     capture: Option<usize>,
-    /// The options the packages declared, and their values.
-    options: Options,
     /// Every registered screen entry, with its package.
     registered_screens: Vec<(Option<&'static str>, ScreenEntry)>,
     /// The screen entries of active packages, by order (ties in registration order).
@@ -521,17 +519,18 @@ pub struct Mods {
 impl Mods {
     /// Instantiate every package of `build` that has an entry point, in its (dependency) order.
     /// Each package's `register` sees the resources its dependencies provided and the whole
-    /// package list.
-    pub fn from_build(build: &GameBuild) -> Self {
+    /// package list, and declares its options into `options` (the app keeps them beside the
+    /// settings). Every mod hears the defaults before this returns.
+    pub fn from_build(build: &GameBuild, options: &mut Options) -> Self {
         let mut mods = Self::empty();
         let mut resources = build::Resources::default();
         let info = build.info();
         for package in info.packages() {
             let Some(register) = package.register else { continue };
-            let mut registrar = ModRegistrar::new(package, info, &mut mods, &mut resources);
+            let mut registrar = ModRegistrar::new(package, info, &mut mods, options, &mut resources);
             register(&mut registrar);
         }
-        mods.options_changed();
+        mods.options_changed(options);
         mods
     }
 
@@ -545,7 +544,6 @@ impl Mods {
             pinned: Vec::new(),
             suspended: Vec::new(),
             capture: None,
-            options: Options::new(),
             registered_screens: Vec::new(),
             screens: Vec::new(),
         }
@@ -583,11 +581,6 @@ impl Mods {
         (&self.suspended, &self.screens, self.visuals)
     }
 
-    /// What a screen reads beside the options it changes: the suspended packages, the screen
-    /// entries and the visual mask, borrowed alongside the options.
-    pub fn screen_parts(&mut self) -> (&[String], &[ScreenEntry], VisualMask, &mut Options) {
-        (&self.suspended, &self.screens, self.visuals, &mut self.options)
-    }
 
     /// The first active mod's root screen, if any (see [`Mod::root_screen`]).
     pub fn root_screen(&self, facts: &ScreenFacts) -> Option<Box<dyn Screen>> {
@@ -603,20 +596,10 @@ impl Mods {
         self.entries.iter().filter(|e| e.active).map(|e| &*e.module)
     }
 
-    /// The options the packages declared.
-    pub fn options(&self) -> &Options {
-        &self.options
-    }
-
-    /// The options, to change or load. Call [`options_changed`](Self::options_changed) after.
-    pub fn options_mut(&mut self) -> &mut Options {
-        &mut self.options
-    }
-
-    /// Tell every mod, suspended ones too, that the options changed.
-    pub fn options_changed(&mut self) {
+    /// Tell every mod, suspended ones too, that `options` changed.
+    pub fn options_changed(&mut self, options: &Options) {
         for entry in &mut self.entries {
-            entry.module.on_options(&self.options);
+            entry.module.on_options(options);
         }
     }
 
@@ -1331,6 +1314,31 @@ mod tests {
         assert_eq!((Channel::Global.wire(), Channel::from_wire(Channel::Local.wire())), (crate::net::chat::GLOBAL, Channel::Local));
     }
 
+    /// A frame hook changes core settings and package options through one view (`/set`); the
+    /// change counts as a settings change the core applies and saves.
+    #[test]
+    fn a_frame_hook_sets_core_settings_and_package_options_through_one_view() {
+        use crate::settings::{Category, OptionSpec};
+        let mut options = Options::new();
+        let relief = options.declare("pwc.worldgen", OptionSpec::percent("relief", "Relief", Category::World, (25, 200, 25), 100));
+        let mut world = World::new(1);
+        let mut player = Player::new(glam::DVec3::ZERO);
+        let (mut settings, mut sky) = (Settings::default(), crate::sky::Sky::new());
+        let mut game = GameContext::new(&mut player, &mut world, &mut settings, &mut sky).with_options(&mut options);
+        assert!(!game.settings_changed());
+        let at = game.options().find("pwc.worldgen.relief").expect("a package option by its full key");
+        assert!(game.options_mut().parse(at, "150"));
+        assert!(game.settings_changed(), "an option change is a settings change");
+        let fov = game.options().find("fov").expect("a core key");
+        assert!(game.options_mut().parse(fov, "100"));
+        assert_eq!(game.settings().fov, 100.0);
+        drop(game);
+        assert_eq!(options.int(relief), 150);
+        let mut fresh = GameContext::new(&mut player, &mut world, &mut settings, &mut sky);
+        assert_eq!(fresh.options().len(), crate::settings::SETTINGS.len(), "a test context has the core settings only");
+        assert!(!fresh.options_mut().parse(0, "nonsense"));
+    }
+
     #[test]
     fn debounce_waits_250ms_then_resets_on_mark() {
         let mut flush = Debounce::new();
@@ -1391,15 +1399,16 @@ mod tests {
             dependencies: &[],
             register: Some(register_knobbed),
         }];
-        let mut mods = GameBuild::from_static("sha256:03", PACKAGES).mods();
+        let mut options = Options::new();
+        let mut mods = Mods::from_build(&GameBuild::from_static("sha256:03", PACKAGES), &mut options);
         assert_eq!(mods.worldgen_config().as_deref(), Some("relief=100"), "registration ends with the defaults delivered");
-        let id = mods.options().find("test.worldgen.relief").expect("declared under the package id");
-        assert_eq!(mods.options().spec(id).applies, Applies::NextWorld);
-        assert_eq!(mods.options().owner(id), "test.worldgen");
-        assert!(mods.options_mut().set(id, OptionValue::Int(175)));
+        let id = options.find("test.worldgen.relief").expect("declared under the package id");
+        assert_eq!(options.spec(id).applies, Applies::NextWorld);
+        assert_eq!(options.owner(id), "test.worldgen");
+        assert!(options.set(id, OptionValue::Int(175)));
         assert_eq!(mods.worldgen_config().as_deref(), Some("relief=100"), "the mod hears at the next fan-out");
         mods.suspend_packages(&["test.worldgen".to_string()]);
-        mods.options_changed();
+        mods.options_changed(&options);
         mods.resume_packages();
         assert_eq!(mods.worldgen_config().as_deref(), Some("relief=175"), "suspended mods hear too");
     }

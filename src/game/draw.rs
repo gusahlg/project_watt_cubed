@@ -97,7 +97,8 @@ impl Game {
     /// The camera is at the origin looking along the view direction, and all
     /// 3D draws are camera-relative. Differences are computed at f64 precision
     /// before narrowing to f32 for the GPU, keeping far terrain stable.
-    pub fn draw(&mut self, eng: &mut Engine, mods: &mut Mods, fov: f32, shake: f32) {
+    /// `overlay` is a screen over the world (the pause screen), drawn last; `&[]` for none.
+    pub fn draw(&mut self, eng: &mut Engine, mods: &mut Mods, fov: f32, shake: f32, overlay: &[crate::screen::UiElement]) {
         // The home map is installed on the engine, so it has to land before the frame opens.
         if matches!(self.debug_view, DebugView::Normal) {
             // Benchmarks and the scripted harness stay on the sphere unless a bench opts in.
@@ -115,6 +116,7 @@ impl Game {
         let mut f = eng.begin_frame(scene.lighting.clear);
         self.scene_phase(&mut f, &scene);
         self.hud_phase(&mut f, mods, &scene);
+        crate::screen::render(&mut f, overlay);
         // Reclaim peer capacity after both consumers finish with the immutable
         // scene. Stable multiplayer frames allocate no new draw-record vector.
         self.drawing.peer_scratch = std::mem::take(&mut scene.peers);

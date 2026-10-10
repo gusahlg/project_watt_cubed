@@ -1033,13 +1033,13 @@ impl Settings {
     }
 
     /// Load from disk, falling back to defaults for missing/invalid entries. The packages'
-    /// option lines in the same file go to `options` (declare the options first).
+    /// option lines in the same file go to `options` (declare the options first). Until
+    /// `settings.cfg` records the options format, an old `mods.cfg` is read once for the knob
+    /// values packages name as legacy keys; the file itself is left alone.
     pub fn load(options: &mut Options) -> Self {
-        let mut settings = Self::default();
-        if let Ok(text) = fs::read_to_string(settings_path()) {
-            settings.parse_from(&text);
-            options.read_text(&text, |key| SETTINGS.iter().any(|f| f.matches(key)));
-        }
+        let text = fs::read_to_string(settings_path()).ok();
+        let legacy_mods_cfg = || fs::read_to_string(crate::paths::Paths::get().legacy_mods_file()).ok();
+        let mut settings = Self::from_text(text.as_deref(), legacy_mods_cfg, options);
         // The engine picks the six-way cull itself; `WATT_CULL=0|1` forces it (env-only, not in the
         // persisted table). Read after the file parse so it can't be overwritten.
         settings.cull_faces = match std::env::var("WATT_CULL").as_deref() {
@@ -1048,6 +1048,19 @@ impl Settings {
             _ => None,
         };
         settings.clamp();
+        settings
+    }
+
+    /// The settings and options in a `settings.cfg` text (`None`: no file). `mods_cfg` is asked
+    /// for an old `mods.cfg` only when the text does not record the options format yet.
+    fn from_text(text: Option<&str>, mods_cfg: impl FnOnce() -> Option<String>, options: &mut Options) -> Self {
+        let mut settings = Self::default();
+        let text = text.unwrap_or("");
+        settings.parse_from(text);
+        let mut migrated = false;
+        each_kv_line(text, |key, _| migrated |= key == options::FORMAT_KEY);
+        let legacy = if migrated { String::new() } else { mods_cfg().map(|t| options::flatten_mods_cfg(&t)).unwrap_or_default() };
+        options.read_text(text, &legacy, |key| SETTINGS.iter().any(|f| f.matches(key)));
         settings
     }
 
@@ -1071,6 +1084,8 @@ impl Settings {
             (field.write)(self, &mut text);
             text.push('\n');
         }
+        text.push_str(options::FORMAT_KEY);
+        text.push_str("=1\n");
         options.write_text(&mut text);
         text
     }
@@ -1637,6 +1652,51 @@ mod tests {
         assert_eq!(loaded, s);
     }
 
+    /// The knob values an old game kept in `mods.cfg` reach the package options that name them,
+    /// once: a `settings.cfg` written since records the format, and `mods.cfg` is not read again.
+    #[test]
+    fn old_knob_values_migrate_from_mods_cfg_once() {
+        fn options() -> (Options, [OptionId; 3]) {
+            let mut o = Options::new();
+            let relief = o.declare(
+                "pwc.infinite-diffusion",
+                OptionSpec::percent("relief", "Relief", Category::World, (25, 200, 25), 100).legacy_key("diffusion.state.relief"),
+            );
+            let detail = o.declare(
+                "pwc.neural-textures",
+                OptionSpec::float("detail", "Detail", Category::Video, (0.1, 2.0, 0.1), 1.0).legacy_key("neural_textures.state.detail"),
+            );
+            let style = o.declare(
+                "pwc.material-names",
+                OptionSpec::choice("style", "Style", Category::Interface, &["Mineral", "Arcane"], 0).legacy_key("material_names.state.style"),
+            );
+            (o, [relief, detail, style])
+        }
+        let mods_cfg = "version=2\ndiffusion=on\ndiffusion.state=relief=150,caves=75\nneural_textures.state=detail=1.3,contrast=0.5\nmaterial_names.state=style=arcane\n";
+        let (mut o, [relief, detail, style]) = options();
+        let settings = Settings::from_text(Some("fov=100\n"), || Some(mods_cfg.to_string()), &mut o);
+        assert_eq!(settings.fov, 100.0);
+        assert_eq!((o.int(relief), o.float(detail), o.choice(style)), (150, 1.3, 1), "the old knobs carry over");
+        let written = settings.to_text(&o);
+        assert!(written.contains("options_format=1\n") && written.contains("pwc.infinite-diffusion.relief=150\n"), "{written}");
+
+        // From now on the file is not read: a later change in it is ignored.
+        let (mut again, [relief, ..]) = options();
+        let asked = std::cell::Cell::new(false);
+        Settings::from_text(Some(&written), || { asked.set(true); Some("diffusion.state=relief=25\n".to_string()) }, &mut again);
+        assert!(!asked.get(), "mods.cfg is not read once settings.cfg records the format");
+        assert_eq!(again.int(relief), 150);
+
+        // An option's own line wins over the old file, and no files mean defaults.
+        let (mut own, [relief, ..]) = options();
+        Settings::from_text(Some("pwc.infinite-diffusion.relief=50\n"), || Some(mods_cfg.to_string()), &mut own);
+        assert_eq!(own.int(relief), 50);
+        let (mut none, [relief, detail, style]) = options();
+        Settings::from_text(None, || None, &mut none);
+        assert_eq!((none.int(relief), none.float(detail), none.choice(style)), (100, 1.0, 0));
+        assert_eq!(options::flatten_mods_cfg("a.state=x=1, y = 2\nb=on\njunk\n"), "a.state.x=1\na.state.y=2\n");
+    }
+
     #[test]
     fn save_and_load_use_the_config_root() {
         let path = settings_path();
@@ -1649,7 +1709,7 @@ mod tests {
         s.save(&options);
         assert!(path.exists());
         let text = fs::read_to_string(&path).unwrap();
-        assert!(text.contains("\nfov=110\n") && text.ends_with("test.worldgen.relief=150\n"), "{text}");
+        assert!(text.contains("\nfov=110\n") && text.ends_with("options_format=1\ntest.worldgen.relief=150\n"), "{text}");
         let mut fresh = Options::new();
         let relief = fresh.declare("test.worldgen", OptionSpec::percent("relief", "Relief", Category::World, (25, 300, 25), 100));
         let loaded = Settings::load(&mut fresh);

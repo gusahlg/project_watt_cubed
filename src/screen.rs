@@ -10,7 +10,8 @@
 //!   a world (a start screen). It also draws the waiting page while the core connects or loads,
 //!   from [`ScreenFacts::phase`];
 //! - the **pause** slot ([`Mod::pause_screen`](crate::modding::Mod::pause_screen)): opened by Esc in a
-//!   world once text capture and every overlay declined it;
+//!   world once text capture and every overlay declined it. It draws over the running world, so a
+//!   pause screen paints a translucent backdrop of its own (`facts.in_world` says it is one);
 //! - **entries** ([`ModRegistrar::screen_entry`](crate::modding::ModRegistrar::screen_entry)): a
 //!   label and an `open` function, offered in [`Places::MAIN`] and/or [`Places::PAUSE`]. A root or
 //!   pause screen lists `facts.entries_for(place)` without knowing who registered them.

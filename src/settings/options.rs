@@ -417,9 +417,10 @@ impl Options {
     }
 
     /// Read the option lines of a `settings.cfg` text: `<package>.<key>=` lines (kept when no
-    /// declared option claims them), then the legacy keys of options the text has no line for.
+    /// declared option claims them), then the legacy keys of options the text has no line for,
+    /// from `text` first and then from `legacy` (old files flattened by [`flatten_mods_cfg`]).
     /// `core` claims the keys of the core's own table first.
-    pub(crate) fn read_text(&mut self, text: &str, core: impl Fn(&str) -> bool) {
+    pub(crate) fn read_text(&mut self, text: &str, legacy: &str, core: impl Fn(&str) -> bool) {
         let mut seen = vec![false; self.declared.len()];
         super::each_kv_line(text, |key, value| {
             if core(key) || !key.contains('.') {
@@ -436,13 +437,16 @@ impl Options {
                 },
             }
         });
-        super::each_kv_line(text, |key, value| {
-            for i in 0..self.declared.len() {
-                if !seen[i] && self.declared[i].spec.legacy_key == Some(key) {
-                    self.parse_stored(OptionId(i as u32), value);
+        for source in [text, legacy] {
+            super::each_kv_line(source, |key, value| {
+                for i in 0..self.declared.len() {
+                    if !seen[i] && self.declared[i].spec.legacy_key == Some(key) {
+                        self.parse_stored(OptionId(i as u32), value);
+                        seen[i] = true;
+                    }
                 }
-            }
-        });
+            });
+        }
         self.touch();
     }
 
@@ -460,6 +464,26 @@ impl Options {
         }
     }
 }
+
+/// The knob payloads of an old `mods.cfg` as legacy keys: each `<mod-id>.state=<k>=<v>,<k>=<v>`
+/// line becomes one `<mod-id>.state.<k>=<v>` line per pair; every other line is dropped. A
+/// package option names such a key with [`OptionSpec::legacy_key`] to carry a player's old knob
+/// value over once. The core reads `mods.cfg` only until `settings.cfg` records
+/// [`FORMAT_KEY`].
+pub(crate) fn flatten_mods_cfg(text: &str) -> String {
+    let mut out = String::new();
+    super::each_kv_line(text, |key, value| {
+        let Some(id) = key.strip_suffix(".state") else { return };
+        for (k, v) in value.split(',').filter_map(|pair| pair.split_once('=')) {
+            let _ = writeln!(out, "{id}.state.{}={}", k.trim(), v.trim());
+        }
+    });
+    out
+}
+
+/// The `settings.cfg` line that says the options format is in use, so an old `mods.cfg` has been
+/// read once and never needs reading again.
+pub(crate) const FORMAT_KEY: &str = "options_format";
 
 /// Whether `full` is `<owner>.<key>`.
 fn key_is(full: &str, owner: &str, key: &str) -> bool {
@@ -606,6 +630,32 @@ impl<'a> OptionsRef<'a> {
             .or_else(|| self.options.find(name).map(|id| SETTINGS.len() + id.index()))
     }
 
+    /// The name [`find`](Self::find) takes for entry `i`: a core key (`bloom`), or
+    /// `<package>.<key>`.
+    pub fn full_key(&self, i: usize) -> String {
+        match self.entry(i) {
+            Entry::Core(i) => SETTINGS[i].key().to_string(),
+            Entry::Mod(id) => format!("{}.{}", self.options.owner(id), self.options.spec(id).key),
+        }
+    }
+
+    /// The values entry `i` takes, for a command's usage line (`on|off`, `Mineral|Arcane`,
+    /// `25-200%`, `0.1-2.0`).
+    pub fn hint(&self, i: usize) -> String {
+        match self.entry(i) {
+            Entry::Core(i) => SETTINGS[i].usage().split_once(' ').map_or(String::new(), |(_, v)| v.to_string()),
+            Entry::Mod(id) => match self.options.spec(id).kind {
+                OptionKind::Toggle => "on|off".to_string(),
+                OptionKind::Choice(choices) => choices.join("|"),
+                OptionKind::Percent { min, max, step } => format!("{min}-{max}% (steps of {step})"),
+                OptionKind::Float { min, max, step } => {
+                    let d = decimals(step);
+                    format!("{min:.d$}-{max:.d$} (steps of {step:.d$})")
+                }
+            },
+        }
+    }
+
     /// Moves whenever a value changes through any view, or a package's option changes.
     pub fn revision(&self) -> u64 {
         self.options.revision()
@@ -674,6 +724,16 @@ impl<'a> OptionsView<'a> {
         self.read().find(name)
     }
 
+    /// See [`OptionsRef::full_key`].
+    pub fn full_key(&self, i: usize) -> String {
+        self.read().full_key(i)
+    }
+
+    /// See [`OptionsRef::hint`].
+    pub fn hint(&self, i: usize) -> String {
+        self.read().hint(i)
+    }
+
     /// See [`OptionsRef::revision`].
     pub fn revision(&self) -> u64 {
         self.options.revision()
@@ -736,7 +796,7 @@ mod tests {
             "pwc.worldgen.relief=125\npwc.textures.detail=1.1\npwc.names.style=arcane\npwc.voice.voice_enabled=false\n"
         );
         let (mut fresh, ids) = sample();
-        fresh.read_text(&format!("{text}gone.pkg.knob=7\nbloom=false\nnot a line\n"), |key| key == "bloom");
+        fresh.read_text(&format!("{text}gone.pkg.knob=7\nbloom=false\nnot a line\n"), "", |key| key == "bloom");
         assert_eq!(ids.map(|id| fresh.value(id)), [relief, detail, style, voice].map(|id| o.value(id)));
         let mut again = String::new();
         fresh.write_text(&mut again);
@@ -754,13 +814,14 @@ mod tests {
         let (mut o, [relief, detail, style, voice]) = sample();
         o.read_text(
             "pwc.worldgen.relief=137\npwc.textures.detail=9\npwc.names.style=sparkly\npwc.voice.voice_enabled=maybe\n",
+            "",
             |_| false,
         );
         assert_eq!(o.int(relief), 125, "snapped onto the stepper");
         assert_eq!(o.float(detail), 2.0, "clamped");
         assert_eq!(o.choice(style), 0, "an unknown label keeps the default");
         assert!(o.bool(voice), "an unparseable toggle keeps the default");
-        o.read_text("pwc.worldgen.relief=9000\npwc.textures.detail=-3\npwc.names.style=ARCANE\n", |_| false);
+        o.read_text("pwc.worldgen.relief=9000\npwc.textures.detail=-3\npwc.names.style=ARCANE\n", "", |_| false);
         assert_eq!((o.int(relief), o.float(detail), o.choice(style)), (300, 0.1, 1));
         for _ in 0..30 {
             o.step(relief, 1);
@@ -772,10 +833,10 @@ mod tests {
     #[test]
     fn a_legacy_key_is_read_only_when_the_option_has_no_line_of_its_own() {
         let (mut o, [.., voice]) = sample();
-        o.read_text("voice_enabled=false\n", |_| false);
+        o.read_text("voice_enabled=false\n", "", |_| false);
         assert!(!o.bool(voice), "the old core key carries the player's choice over");
         let (mut o, [.., voice]) = sample();
-        o.read_text("voice_enabled=false\npwc.voice.voice_enabled=true\n", |_| false);
+        o.read_text("voice_enabled=false\npwc.voice.voice_enabled=true\n", "", |_| false);
         assert!(o.bool(voice), "the option's own line wins");
         let mut text = String::new();
         o.write_text(&mut text);
@@ -835,6 +896,12 @@ mod tests {
         assert!(!view.parse(at, "lots"));
         let voice = view.find("pwc.voice.voice_enabled").unwrap();
         assert_eq!(view.toggled(voice), Some(true));
+        assert_eq!((view.full_key(voice), view.hint(voice)), ("pwc.voice.voice_enabled".to_string(), "on|off".to_string()));
+        assert_eq!(view.hint(at), "25-300% (steps of 25)");
+        assert_eq!(view.hint(view.find("pwc.textures.detail").unwrap()), "0.1-2.0 (steps of 0.1)");
+        assert_eq!(view.hint(view.find("pwc.names.style").unwrap()), "Mineral|Arcane");
+        let fps = view.find("fps").expect("an alias");
+        assert_eq!((view.full_key(fps), view.hint(fps)), ("max_fps".to_string(), "<10-1000>|off".to_string()));
         assert_eq!(view.show(view.find("pwc.textures.detail").unwrap()), "1.0");
         assert_eq!(view.show(view.find("pwc.names.style").unwrap()), "Mineral");
         assert_eq!(view.find("pwc.nothing.here"), None);

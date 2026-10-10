@@ -12,7 +12,8 @@
 //!   character. Escape always ends a capture: the holder sees `escape` once, then the core takes
 //!   the keyboard back, so Escape never leaves the world while a mod is typing.
 //! - **Game state.** [`GameContext`] is the whole-game state the core owns (player, world, sky,
-//!   settings) plus three out-queues: audio facts, chat lines to send, and notices. The core
+//!   settings and the packages' options) plus three out-queues: audio facts, chat lines to send,
+//!   and notices. The core
 //!   follows up on what a hook changed: it applies and saves changed settings, re-mixes the audio,
 //!   shares a changed clock with the server, keeps the server's day length, and streams a moved
 //!   player's surroundings at once and reports the move as a teleport.
@@ -23,7 +24,7 @@
 use crate::audio::GameEvent;
 use crate::input::intent::EditKey;
 use crate::player::Player;
-use crate::settings::Settings;
+use crate::settings::{Options, OptionsRef, OptionsView, Settings};
 use crate::sky::Sky;
 use crate::world::World;
 
@@ -83,6 +84,9 @@ pub struct GameContext<'a> {
     settings: &'a mut Settings,
     /// The settings as they were before the first [`settings_mut`](Self::settings_mut) this frame.
     before: Option<Box<Settings>>,
+    options: OptionsSlot<'a>,
+    /// [`Options::revision`] when the context was built.
+    options_revision: u64,
     chat_out: Vec<(Channel, String)>,
     notices: Notices,
 }
@@ -100,9 +104,28 @@ impl<'a> GameContext<'a> {
             events: Vec::new(),
             settings,
             before: None,
+            options: OptionsSlot::Owned(Options::new()),
+            options_revision: 0,
             chat_out: Vec::new(),
             notices: Notices::default(),
         }
+    }
+
+    /// This context over the packages' `options` (a fresh context has none).
+    pub fn with_options(mut self, options: &'a mut Options) -> Self {
+        self.options_revision = options.revision();
+        self.options = OptionsSlot::Borrowed(options);
+        self
+    }
+
+    /// Every tunable, the core's settings and the packages' options, read-only.
+    pub fn options(&self) -> OptionsRef<'_> {
+        OptionsRef::new(self.settings, self.options.get())
+    }
+
+    /// Every tunable, to change (`/set`). The core applies and saves what changed after the hook.
+    pub fn options_mut(&mut self) -> OptionsView<'_> {
+        OptionsView::new(self.settings, self.options.get_mut())
     }
 
     /// The player's settings.
@@ -120,9 +143,11 @@ impl<'a> GameContext<'a> {
     }
 
     /// Whether the settings differ from how they were before the first
-    /// [`settings_mut`](Self::settings_mut).
+    /// [`settings_mut`](Self::settings_mut), or a value changed through
+    /// [`options_mut`](Self::options_mut).
     pub fn settings_changed(&self) -> bool {
         self.before.as_deref().is_some_and(|before| before != self.settings)
+            || self.options.get().revision() != self.options_revision
     }
 
     /// Queue a chat line for the server. The core sends it after the hook (truncated to the
@@ -164,6 +189,28 @@ impl<'a> GameContext<'a> {
     pub(crate) fn into_queues(self) -> (Vec<GameEvent>, Vec<(Channel, String)>, Notices, bool) {
         let changed = self.settings_changed();
         (self.events, self.chat_out, self.notices, changed)
+    }
+}
+
+/// The options a [`GameContext`] reads: the core's (borrowed), or an empty set of its own.
+enum OptionsSlot<'a> {
+    Borrowed(&'a mut Options),
+    Owned(Options),
+}
+
+impl OptionsSlot<'_> {
+    fn get(&self) -> &Options {
+        match self {
+            OptionsSlot::Borrowed(options) => options,
+            OptionsSlot::Owned(options) => options,
+        }
+    }
+
+    fn get_mut(&mut self) -> &mut Options {
+        match self {
+            OptionsSlot::Borrowed(options) => options,
+            OptionsSlot::Owned(options) => options,
+        }
     }
 }
 
