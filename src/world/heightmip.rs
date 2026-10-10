@@ -397,7 +397,7 @@ pub(in crate::world) fn resample_cell<G: TerrainGenerator + ?Sized>(
 }
 
 /// [`resample_cell`] on a face, a chart or a raised datum: the extractor's window and sampler
-/// (`extract_section_mesh`), reduced to the topmost solid per column.
+/// (`extract_section_mesh_with`), reduced to the topmost solid per column.
 fn resample_face_cell<G: TerrainGenerator + ?Sized>(
     pos: SectionPos,
     terra: &G,

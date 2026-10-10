@@ -447,6 +447,7 @@ impl World {
         self.section_desired
             .iter()
             .all(|&s| !self.near_meets(center, s) || self.coverage_skips(center, s) || self.section_covered(s))
+            && self.clips_landed()
     }
 
     /// Whether far section `s` reaches over the near square around `center`. On a chart a section
@@ -538,7 +539,9 @@ impl World {
     }
 
     /// Drop the held sections whose ground has now settled from the frontier: the punch applies.
+    /// Clip columns whose chunks settled join their tiles' clips.
     pub(super) fn settle_held(&mut self) {
+        self.settle_clips();
         let mut settled: Vec<SectionPos> =
             self.section_held.iter().filter(|&(&s, &layers)| self.backing_settled(s, layers)).map(|(&s, _)| s).collect();
         if settled.is_empty() {
@@ -604,6 +607,7 @@ mod tests {
 
     use super::super::flight_bench::step;
     use crate::render_config::{RenderConfig, lod_for};
+    use crate::world::section::ColumnClip;
     use crate::world::generation::WorldgenKind;
     use std::time::{Duration, Instant};
 
@@ -666,26 +670,41 @@ mod tests {
         (s.min_x()..s.min_x() + span).contains(&x) && (s.min_z()..s.min_z() + span).contains(&z)
     }
 
+    /// A selection and the clip each of its tiles leaves to the window.
+    type Cut = (Vec<SectionPos>, FastMap<SectionPos, ColumnClip>);
+
+    /// The selection streaming holds now, with its tiles' current clips.
+    fn current_cut(world: &World) -> Cut {
+        let clips = world.section_desired.iter().map(|&s| (s, world.clip_target(s))).collect();
+        (world.section_desired.clone(), clips)
+    }
+
+    /// Whether a tile of `cut` draws column `(x, z)`.
+    fn cut_draws(cut: &Cut, x: i32, z: i32) -> bool {
+        let clipped = |s: SectionPos| cut.1.get(&s).is_some_and(|c| c.masks_point(s, i64::from(x), i64::from(z)));
+        cut.0.iter().any(|&s| in_rect(s, x, z) && !clipped(s))
+    }
+
     /// Columns a span-32 tile or more inside the near square (the tile across its edge draws the
-    /// sliver beside it by design) whose solid top the punch window holds and a section of
-    /// `desired` covers.
-    fn overlap(world: &World, center: Coord, desired: &[SectionPos], cols: &[(i32, i32, i32)]) -> usize {
+    /// sliver beside it by design) whose solid top the punch window holds and a tile of `cut`
+    /// draws.
+    fn overlap(world: &World, center: Coord, cut: &Cut, cols: &[(i32, i32, i32)]) -> usize {
         let (y0, y1) = world.near_y_range(center);
         let (x0, x1, z0, z1) = world.near_block_box(center);
         cols.iter()
             .filter(|&&(x, z, top)| {
                 let (bx, bz) = (i64::from(x), i64::from(z));
                 let deep = bx - x0 >= 32 && x1 - bx > 32 && bz - z0 >= 32 && z1 - bz > 32;
-                deep && (y0..y1).contains(&i64::from(top)) && desired.iter().any(|&s| in_rect(s, x, z))
+                deep && (y0..y1).contains(&i64::from(top)) && cut_draws(cut, x, z)
             })
             .count()
     }
 
-    /// A far section on screen draws column `(x, z)`.
+    /// A far section on screen draws column `(x, z)`: the engine draws a section's whole tile for
+    /// any quadrant, less the columns its mesh leaves to the window.
     fn far_drawn(world: &World, x: i32, z: i32) -> bool {
         world.section_visible.iter().any(|&(s, mask)| {
-            let half = s.span() / 2;
-            in_rect(s, x, z) && mask.iter().any(|q| (x - s.min_x()) / half == q.dx() && (z - s.min_z()) / half == q.dz())
+            !mask.is_empty() && in_rect(s, x, z) && !world.drawn_clip(s).masks_point(s, i64::from(x), i64::from(z))
         })
     }
 
@@ -756,8 +775,7 @@ mod tests {
             let (y0, y1) = world.near_y_range(far);
             let missed = cols.iter().filter(|c| !(y0..y1).contains(&i64::from(c.2))).count();
             assert_eq!(missed, 0, "+{above}: ground columns outside the window");
-            let desired = world.desired_sections(far);
-            assert_eq!(overlap(&world, center, &desired, &cols), 0, "+{above}: far sections over held ground");
+            assert_eq!(overlap(&world, center, &world.desired_and_clips(far), &cols), 0, "+{above}: far sections over held ground");
         }
     }
 
@@ -866,6 +884,56 @@ mod tests {
         }
     }
 
+    /// Walking eight chunks along x, then z, then the diagonal at render distance 8 (the window
+    /// clips its straddlers), every pass draws each near-square column by a settled chunk holding
+    /// its ground or a far section on screen that does not leave it out: a clip grows only over
+    /// settled chunks, gives a column back at once, and a column it leaves keeps its chunk until
+    /// the shrunk clip lands. Settled, every clip is the one its tile asks for, and no far section
+    /// draws over ground the window holds.
+    #[test]
+    fn window_partition_is_exact() {
+        let mut world = chart_world(8, 3);
+        let start = spawn_storage(&world);
+        let at = |world: &World, x: f64, z: f64| {
+            let ground = world.generator.surface(Face::PosY, x.floor() as i32, z.floor() as i32);
+            physical(world, DVec3::new(x, f64::from(ground) + 1.62, z))
+        };
+        let first = at(&world, start.x, start.z);
+        world.prepare_around(first);
+        world.drive_spawn_ready();
+        settle(&mut world, first, NONE, "start");
+        let quiet = |w: &World| w.clips_at_target();
+        let (mut x, mut z, mut clipped, mut slivers) = (start.x, start.z, 0usize, 0usize);
+        for (dx, dz) in [(1.0, 0.0), (0.0, 1.0), (1.0, 1.0)] {
+            for k in 0..8 {
+                x += 16.0 * dx;
+                z += 16.0 * dz;
+                let eye = at(&world, x, z);
+                walk(&mut world);
+                let name = format!("step ({dx}, {dz}) {k}");
+                let check = |w: &World| bare(w, &near_columns(w, w.center.expect("a centre")));
+                settle(&mut world, eye, &check, &name);
+                for pass in 0.. {
+                    if quiet(&world) {
+                        break;
+                    }
+                    assert!(pass < 20_000, "{name}: clips never landed");
+                    step(&mut world, eye);
+                    assert_eq!(check(&world), 0, "{name}: bare ground while clips land, pass {pass}");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                let center = world.center.expect("a centre");
+                let cols = near_columns(&world, center);
+                assert_eq!(overlap(&world, center, &current_cut(&world), &cols), 0, "{name}: far sections over held ground");
+                let finest = world.section_pyramid.finest;
+                slivers += world.section_visible.iter().filter(|(s, m)| !m.is_empty() && s.detail < finest).count();
+                clipped += world.section_visible.iter().filter(|(s, _)| !world.drawn_clip(*s).is_empty()).count();
+            }
+        }
+        assert!(clipped > 0, "the walk clipped no tile");
+        println!("{clipped} clipped tiles and {slivers} slivers drawn over 24 settled steps");
+    }
+
     /// A deep canyon 640 blocks from spawn on seed 42: the column at storage
     /// (1124117888, 120586336) has ground within the near radius rising over 300 blocks above it.
     /// Standing on its floor at the owner view the window holds every wall (full resolution), and
@@ -883,7 +951,7 @@ mod tests {
         let (y0, y1) = world.near_y_range(far);
         let missed = cols.iter().filter(|c| !(y0..y1).contains(&i64::from(c.2))).count();
         assert_eq!(missed, 0, "wall columns outside the window");
-        assert_eq!(overlap(&world, center, &world.desired_sections(far), &cols), 0, "far sections over held walls");
+        assert_eq!(overlap(&world, center, &world.desired_and_clips(far), &cols), 0, "far sections over held walls");
     }
 
     /// Hovering 320 over spawn at render distance 6 (past the window's reach) the far field draws
@@ -949,7 +1017,7 @@ mod tests {
         println!("settled {passes} passes after stopping, {} chunks", world.chunks.len());
         assert!(world.section_held.is_empty(), "held sections still waiting");
         assert_eq!(bare(&world, &cols), 0, "bare ground after settling");
-        assert_eq!(overlap(&world, center, &world.section_desired, &cols), 0, "far sections over held ground");
+        assert_eq!(overlap(&world, center, &current_cut(&world), &cols), 0, "far sections over held ground");
     }
 
     /// Near-square columns within its radius of the eye's column that a far section on screen draws.
@@ -1096,12 +1164,12 @@ mod tests {
         let cols = near_columns(&world, center);
         let (y0, y1) = world.near_y_range(far);
         assert_eq!(cols.iter().filter(|c| !(y0..y1).contains(&i64::from(c.2))).count(), 0, "ground outside the window");
-        let desired = world.desired_sections(far);
+        let cut = world.desired_and_clips(far);
         let r = f64::from(16 * world.view.horizontal);
         let (ex, ez) = (f64::from(center.x * 16 + 8), f64::from(center.z * 16 + 8));
         let drawn = cols
             .iter()
-            .filter(|&&(x, z, _)| (f64::from(x) - ex).hypot(f64::from(z) - ez) < r && desired.iter().any(|&s| in_rect(s, x, z)))
+            .filter(|&&(x, z, _)| (f64::from(x) - ex).hypot(f64::from(z) - ez) < r && cut_draws(&cut, x, z))
             .count();
         assert_eq!(drawn, 0, "far sections within the near radius");
     }
@@ -1194,21 +1262,33 @@ mod tests {
         assert!(lo <= (floor - 1).div_euclid(16), "the window floor {lo} misses the pit floor");
     }
 
-    /// A held section whose ground has settled but for one chunk parked by quarantine stops
-    /// waiting: the parked chunk is a bounded hole, not a far section held over it for good.
+    /// A held section, or a clip column, whose ground has settled but for one chunk parked by
+    /// quarantine stops waiting: the parked chunk is a bounded hole, not a far section held over it
+    /// for good. At render distance 6 the window clips its straddlers, so a column waits.
     #[test]
     fn quarantine_does_not_hold_a_section() {
         let mut world = chart_world(6, 3);
         let (center, far, _, _) = world.begin_stream(world.home_eye(spawn_dir(&world), 1.62), None);
         world.update_lod_face(far);
         world.refresh_frontier(far);
-        let (&s, &layers) = world.section_held.iter().min_by_key(|(s, _)| (s.span(), s.x, s.z)).expect("held sections wait");
+        let held = world.section_held.iter().min_by_key(|(s, _)| (s.span(), s.x, s.z)).map(|(&s, &l)| (s, l));
+        // The chunks a held section, or else one waiting clip column, waits on.
+        let (s, layers, column) = match held {
+            Some((s, layers)) => (s, layers, None),
+            None => {
+                let (s, want, layers) = world.clip_wait().expect("a held section or a clip waits");
+                let col = want.without(world.clip_target(s)).columns(s).next().expect("a waiting column");
+                (s, layers, Some(col))
+            }
+        };
         let n = 16;
         let mut chunks: Vec<Coord> = Vec::new();
         for y in layers[0]..=layers[1] {
             for z in s.min_z().div_euclid(n)..(s.min_z() + s.span()).div_euclid(n) {
                 for x in s.min_x().div_euclid(n)..(s.min_x() + s.span()).div_euclid(n) {
-                    chunks.push(Coord::new(x, y, z));
+                    if column.is_none_or(|c| c == (x, z)) {
+                        chunks.push(Coord::new(x, y, z));
+                    }
                 }
             }
         }
@@ -1221,13 +1301,20 @@ mod tests {
         }
         let parked = chunks[0];
         world.chunks.get_mut(&parked).expect("loaded").state = MeshState::needs_mesh();
+        let waits = |w: &World| match column {
+            None => w.section_held.contains_key(&s),
+            Some((x, z)) => !w.clip_target(s).masks_point(s, i64::from(x * n), i64::from(z * n)),
+        };
         world.held_recheck.set();
         world.refresh_frontier(far);
-        assert!(world.section_held.contains_key(&s), "an unsettled chunk keeps the section waiting");
+        assert!(waits(&world), "an unsettled chunk keeps the section waiting");
         world.quarantined.insert(FailKey::Mesh { coord: parked });
         world.held_recheck.set();
         world.refresh_frontier(far);
-        assert!(!world.section_held.contains_key(&s) && !world.section_desired.contains(&s), "quarantine held the section");
+        assert!(!waits(&world), "quarantine held the section");
+        if column.is_none() {
+            assert!(!world.section_desired.contains(&s), "quarantine kept the held section selected");
+        }
         assert_eq!(world.center, Some(center));
     }
 

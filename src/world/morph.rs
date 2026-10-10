@@ -7,8 +7,7 @@
 use voxel_engine::{DVec3, LodMorph};
 
 use super::chunk::CHUNK_SIZE;
-use super::quadtree::QuadrantMask;
-use super::section::{CHART_BODY_BASE, DOMAIN_H, LOD_CEIL_Y, LOD_FLOOR_Y, Quadrant, SectionPos, section_span};
+use super::section::{CHART_BODY_BASE, CLIP_MAX_SPAN, ColumnClip, DOMAIN_H, LOD_CEIL_Y, LOD_FLOOR_Y, SectionPos, section_span};
 use super::seam::{ChartSeat, SeamAcross};
 use super::terrain::{DIG, LOD_DRESS_CELL, PLANT_REACH};
 use super::{Coord, FastMap, World};
@@ -48,7 +47,7 @@ impl LevelReach {
     const OFF: Self = Self { near: f32::MAX, far: 0.0, on: false };
 }
 
-/// One edge of a drawn quadrant where its level meets a coarser drawn level (`coarse`), or the
+/// One edge of a drawn tile where its level meets a coarser drawn level (`coarse`), or the
 /// full-res window (`coarse: None`). The segment lies in `fine`'s frame, at the shared boundary.
 #[derive(Clone, Copy)]
 pub(in crate::world) struct Frontier {
@@ -215,37 +214,77 @@ impl ChartEyes {
     }
 }
 
-/// The drawn section whose drawn quadrant holds storage point `(x, z)`, at `s`'s detail or coarser,
-/// read in the chart that holds the point. `None` when nothing that coarse draws there.
-fn covering(
-    drawn: &FastMap<SectionPos, QuadrantMask>,
-    s: SectionPos,
-    x: i64,
-    z: i64,
-    chart: Option<&ChartEyes>,
-) -> Option<SectionPos> {
-    let (x, z) = match chart {
-        Some(c) => c.locate(s, x, z)?,
-        None => (x, z),
-    };
-    let coarsest = crate::render_config::LOD_COARSEST_DETAIL as i8;
-    for d in s.detail.0..=coarsest {
-        let span = i64::from(section_span(Detail(d)));
-        let half = span / 2;
-        let cell = SectionPos {
-            detail: Detail(d),
-            body: s.body,
-            face: s.face,
-            x: x.div_euclid(span) as i32,
-            z: z.div_euclid(span) as i32,
-        };
-        if let Some(&mask) = drawn.get(&cell)
-            && mask.contains(Quadrant::of_coords(x.div_euclid(half) as i32, z.div_euclid(half) as i32))
-        {
-            return Some(cell);
+/// The drawn sections and the chunk columns each leaves out. The engine draws a section's whole
+/// tile for any quadrant the cut gives it, so the trace does too. `layered`: some drawn tile lies
+/// over a drawn descendant (a stand-in while its children load).
+struct Drawn {
+    tiles: FastMap<SectionPos, ColumnClip>,
+    finest: i8,
+    coarsest: i8,
+    layered: bool,
+}
+
+impl Drawn {
+    fn new(cut: &[(SectionPos, super::quadtree::QuadrantMask)], clip: impl Fn(SectionPos) -> ColumnClip) -> Self {
+        let mut d = Drawn { tiles: FastMap::default(), finest: i8::MAX, coarsest: i8::MIN, layered: false };
+        for &(s, mask) in cut {
+            if !mask.is_empty() {
+                d.tiles.insert(s, clip(s));
+                d.finest = d.finest.min(s.detail.0);
+                d.coarsest = d.coarsest.max(s.detail.0);
+            }
         }
+        d.layered = d.tiles.keys().any(|&s| {
+            let mut a = s;
+            (s.detail.0..d.coarsest).any(|_| {
+                a = a.parent();
+                d.tiles.contains_key(&a)
+            })
+        });
+        d
     }
-    None
+
+    /// Calls `hit` with each drawn tile at detail `from` or coarser that draws storage point
+    /// `(x, z)` (read in the chart that holds it, from `s`'s frame): the first, unless tiles
+    /// overlap. Returns whether one did.
+    fn covering(&self, s: SectionPos, x: i64, z: i64, from: i8, chart: Option<&ChartEyes>, mut hit: impl FnMut(SectionPos)) -> bool {
+        let Some((x, z)) = (match chart {
+            Some(c) => c.locate(s, x, z),
+            None => Some((x, z)),
+        }) else {
+            return false;
+        };
+        let mut any = false;
+        for d in from.max(self.finest)..=self.coarsest {
+            let span = i64::from(section_span(Detail(d)));
+            let cell = SectionPos { detail: Detail(d), body: s.body, face: s.face, x: x.div_euclid(span) as i32, z: z.div_euclid(span) as i32 };
+            if let Some(clip) = self.tiles.get(&cell)
+                && !clip.masks_point(cell, x, z)
+            {
+                any = true;
+                hit(cell);
+                if !self.layered {
+                    break;
+                }
+            }
+        }
+        any
+    }
+}
+
+/// Add frontier edge `f` to `out`, extending a run from `start` on that it continues.
+fn push_run(out: &mut Vec<Frontier>, start: usize, f: Frontier) {
+    let joins = |e: &Frontier| {
+        e.coarse == f.coarse
+            && ((e.x0 == e.x1 && f.x0 == f.x1 && e.x0 == f.x0 && (e.z1 == f.z0 || f.z1 == e.z0))
+                || (e.z0 == e.z1 && f.z0 == f.z1 && e.z0 == f.z0 && (e.x1 == f.x0 || f.x1 == e.x0)))
+    };
+    match out[start..].iter_mut().rev().find(|e| joins(e)) {
+        Some(e) => {
+            (e.x0, e.x1, e.z0, e.z1) = (e.x0.min(f.x0), e.x1.max(f.x1), e.z0.min(f.z0), e.z1.max(f.z1));
+        }
+        None => out.push(f),
+    }
 }
 
 fn reach_box(ex: f64, ey: f64, ez: f64, s: SectionPos, y0: f64, y1: f64) -> (f32, f32) {
@@ -332,6 +371,9 @@ impl World {
             h = mix(h, s.x as u64);
             h = mix(h, s.z as u64);
             h = mix(h, mask.bits() as u64);
+            if s.span() <= CLIP_MAX_SPAN {
+                h = mix(h, self.drawn_clip(s).0);
+            }
             if let Some((lo, hi)) = self.cover_band(s, in_cube) {
                 h = mix(h, lo.to_bits() as u64);
                 h = mix(h, hi.to_bits() as u64);
@@ -340,57 +382,73 @@ impl World {
         h | 1
     }
 
-    /// Every edge where a drawn quadrant meets a coarser drawn level or the full-res window. Rebuilt
-    /// only when the cut changes. Across a chart seam the neighbour is found in its own storage.
+    /// Every edge where a drawn tile meets a coarser drawn tile or the full-res window, as runs of
+    /// collinear segments. Rebuilt only when the cut changes. Each tile counts whole, less the
+    /// columns it leaves to the window (whose edges meet the window), and a point drawn by several
+    /// coarser tiles meets each. Across a chart seam the neighbour is found in its own storage.
     fn trace_frontier(&mut self, center: Coord, chart: Option<&ChartEyes>) {
-        let mut drawn: FastMap<SectionPos, QuadrantMask> = FastMap::default();
-        for &(s, mask) in &self.section_visible {
-            if !mask.is_empty() {
-                let e = drawn.entry(s).or_insert(QuadrantMask::EMPTY);
-                *e = e.union(mask);
-            }
-        }
+        let drawn = Drawn::new(&self.section_visible, |s| self.drawn_clip(s));
         // The full-res window, in the home frame, where its contact can be traced.
         let near = (chart.is_some() || !self.lod_place(center).2).then(|| self.near_block_box(center));
+        let in_near = |x: i64, z: i64| near.is_some_and(|(x0, x1, z0, z1)| x >= x0 && x < x1 && z >= z0 && z < z1);
+        let cs = i64::from(CHUNK_SIZE as i32);
         let mut out = std::mem::take(&mut self.lod_frontier);
         out.clear();
-        for (&s, &mask) in &drawn {
-            let half = i64::from(s.span()) / 2;
-            let mid = half / 2;
+        for (&s, &clip) in &drawn.tiles {
+            let start = out.len();
             let home = chart.is_none_or(|c| c.home(s));
-            for q in mask.iter() {
-                let x0 = i64::from(s.min_x()) + i64::from(q.dx()) * half;
-                let z0 = i64::from(s.min_z()) + i64::from(q.dz()) * half;
-                let sides = [
-                    (x0 - 1, z0 + mid, x0, x0, z0, z0 + half),
-                    (x0 + half, z0 + mid, x0 + half, x0 + half, z0, z0 + half),
-                    (x0 + mid, z0 - 1, x0, x0 + half, z0, z0),
-                    (x0 + mid, z0 + half, x0, x0 + half, z0 + half, z0 + half),
-                ];
-                for (px, pz, ex0, ex1, ez0, ez1) in sides {
-                    let coarse = match covering(&drawn, s, px, pz, chart) {
-                        Some(c) if c.detail > s.detail => Some(c),
-                        Some(_) => continue,
-                        None => {
-                            let Some((nx0, nx1, nz0, nz1)) = near else { continue };
-                            if !(home && px >= nx0 && px < nx1 && pz >= nz0 && pz < nz1) {
-                                continue;
-                            }
-                            None
-                        }
-                    };
-                    out.push(Frontier {
-                        fine: s,
-                        coarse,
-                        x0: ex0 as f64,
-                        x1: ex1 as f64,
-                        z0: ez0 as f64,
-                        z1: ez1 as f64,
-                    });
+            let (span, x0, z0) = (i64::from(s.span()), i64::from(s.min_x()), i64::from(s.min_z()));
+            // Chunk-column steps where a tile can meet the window's columns: clipped, at the near
+            // square, or a fine one across a seam. Elsewhere every coarser tile aligns with a
+            // quadrant side.
+            let at_square = near.is_some_and(|(nx0, nx1, nz0, nz1)| x0 - cs < nx1 && x0 + span + cs > nx0 && z0 - cs < nz1 && z0 + span + cs > nz0);
+            let by_column = !clip.is_empty() || at_square || (s.span() <= CLIP_MAX_SPAN && !home);
+            let step = if by_column { cs } else { span / 2 };
+            let classify = |out: &mut Vec<Frontier>, px: i64, pz: i64, edge: (i64, i64, i64, i64), window: bool| {
+                let at = |coarse| Frontier { fine: s, coarse, x0: edge.0 as f64, x1: edge.1 as f64, z0: edge.2 as f64, z1: edge.3 as f64 };
+                let any = drawn.covering(s, px, pz, s.detail.0, chart, |c| {
+                    if c.detail > s.detail {
+                        push_run(out, start, at(Some(c)));
+                    }
+                });
+                // The window draws where no tile does, finer ones included.
+                if window || (!any && home && in_near(px, pz) && !drawn.covering(s, px, pz, drawn.finest, chart, |_| {})) {
+                    push_run(out, start, at(None));
                 }
+            };
+            // The border, segment by segment, where the column inside is drawn.
+            let mut a = 0;
+            while a < span {
+                let (m, b) = (a + step / 2, a + step);
+                for (ix, iz, px, pz, edge) in [
+                    (x0, z0 + m, x0 - 1, z0 + m, (x0, x0, z0 + a, z0 + b)),
+                    (x0 + span - 1, z0 + m, x0 + span, z0 + m, (x0 + span, x0 + span, z0 + a, z0 + b)),
+                    (x0 + m, z0, x0 + m, z0 - 1, (x0 + a, x0 + b, z0, z0)),
+                    (x0 + m, z0 + span - 1, x0 + m, z0 + span, (x0 + a, x0 + b, z0 + span, z0 + span)),
+                ] {
+                    if !clip.masks_point(s, ix, iz) {
+                        classify(&mut out, px, pz, edge, false);
+                    }
+                }
+                a = b;
+            }
+            // Edges between kept and clipped columns meet the window, and whatever else draws there.
+            for ((kx, kz), (mx, mz)) in clip.inner_edges(s) {
+                let (px, pz) = (x0 + i64::from(mx) * cs + cs / 2, z0 + i64::from(mz) * cs + cs / 2);
+                let (ex, ez) = (x0 + i64::from(kx.max(mx)) * cs, z0 + i64::from(kz.max(mz)) * cs);
+                let edge = if kx != mx { (ex, ex, z0 + i64::from(kz) * cs, z0 + i64::from(kz + 1) * cs) } else { (x0 + i64::from(kx) * cs, x0 + i64::from(kx + 1) * cs, ez, ez) };
+                classify(&mut out, px, pz, edge, true);
             }
         }
         self.lod_frontier = out;
+    }
+
+    /// The chunk columns Ready section `s`'s mesh leaves out.
+    pub(in crate::world) fn drawn_clip(&self, s: SectionPos) -> ColumnClip {
+        match self.sections.get(&s) {
+            Some(super::SectionState::Ready { clip, .. }) if s.span() <= CLIP_MAX_SPAN => clip.drawn,
+            _ => ColumnClip::NONE,
+        }
     }
 
     fn gather_reaches(&mut self, center: Coord, chart: Option<&ChartEyes>) -> ([LevelReach; 16], [Meets; 16], Option<f32>) {
@@ -666,12 +724,30 @@ fn lod_morph_bands_follow_synthetic_frontiers() {
     }
 }
 
-/// Select the frontier and draw every section the settled punch keeps.
-/// Held columns are dropped without generating their chunks: that is the cut
-/// `settle_held` leaves once the near window's ground is final. Returns how
+/// The owner's world and view: render distance 16, vertical 5.
+#[cfg(test)]
+pub(in crate::world) fn owner_world(seed: i64) -> World {
+    use crate::render_config::{RenderConfig, lod_for};
+    let (lod_levels, lod_detail) = lod_for(16);
+    let render = RenderConfig { lod2: true, occlusion: true, lod_levels, lod_detail, ..RenderConfig::default() };
+    let mut world = World::with_kind(seed, render, super::generation::WorldgenKind::Diffusion, false);
+    world.set_view_distances(16, 5);
+    world.section_pyramid.unit = world.view.lod_unit();
+    world
+}
+
+/// The owner's camera on the start world, and the seed he plays.
+#[cfg(test)]
+pub(in crate::world) const OWNER_EYE: DVec3 = DVec3::new(-19.1, 390.8, -0.6);
+#[cfg(test)]
+pub(in crate::world) const OWNER_SEED: i64 = 1_791_184_794_939_118_871;
+
+/// Select the frontier the settled punch keeps: held columns are dropped without
+/// generating their chunks, and clipped tiles take every column they want. That is
+/// the cut `settle_held` leaves once the near window's ground is final. Returns how
 /// many held sections were removed.
 #[cfg(test)]
-fn arm_drawn(world: &mut World, eye: DVec3) -> usize {
+fn select_settled(world: &mut World, eye: DVec3) -> usize {
     let (_, far, _, _) = world.begin_stream(eye, None);
     world.refresh_frontier(far);
     let held: std::collections::HashSet<SectionPos> = world.section_held.keys().copied().collect();
@@ -680,14 +756,38 @@ fn arm_drawn(world: &mut World, eye: DVec3) -> usize {
     if !held.is_empty() {
         world.section_desired.retain(|s| !held.contains(s));
     }
-    // Mesh each section on this thread for the altitudes its slabs span; the GPU meshes stay empty.
+    world.settle_clip_waits();
+    dropped
+}
+
+/// [`select_settled`] and draw it without meshing: every tile leaves out its clip and spans no
+/// known altitudes.
+#[cfg(test)]
+fn arm_cut(world: &mut World, eye: DVec3) {
+    select_settled(world, eye);
+    for s in world.section_desired.clone() {
+        let asked = world.clip_target(s);
+        let clip = super::SectionClip { asked, drawn: asked };
+        world.sections.insert(s, super::SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None, alt: None, clip });
+    }
+    world.rebuild_section_visible(None);
+}
+
+/// [`select_settled`] and draw every section of it.
+#[cfg(test)]
+fn arm_drawn(world: &mut World, eye: DVec3) -> usize {
+    let dropped = select_settled(world, eye);
+    // Mesh each section on this thread as a worker would, for the altitudes its slabs span; the
+    // GPU meshes stay empty.
     world.refresh_tables();
     let tables = world.tables.get();
     for s in world.section_desired.clone() {
-        let mesh = super::section::extract_section_mesh(s, world.generator.as_ref(), &[], &tables);
+        let asked = world.clip_target(s);
+        let mesh = super::section::extract_section_mesh_with(s, world.generator.as_ref(), &[], &tables, asked, true);
         let detail = crate::ident::Detail(s.detail.0.saturating_add(mesh.shift as i8));
         let alt = super::SectionState::slab_span(s, detail, mesh.altitude_floor, mesh.slabs.iter().map(|slab| slab.origin_y));
-        world.sections.insert(s, super::SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None, alt });
+        let clip = super::SectionClip { asked, drawn: mesh.clip_drawn };
+        world.sections.insert(s, super::SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None, alt, clip });
     }
     world.rebuild_section_visible(None);
     dropped
@@ -765,77 +865,87 @@ fn assert_lod_bands(world: &mut World, label: &str) {
             meets[d].coarser_near,
         );
     }
-    println!("{label}: empty {empty} of {shown}, {drawn} sections, {} frontier edges", frontier.len());
+    // Drawn whole over a drawn descendant: the engine has no per-quadrant draw.
+    let shown_set: std::collections::HashSet<SectionPos> = world.section_visible.iter().filter(|(_, m)| !m.is_empty()).map(|(s, _)| *s).collect();
+    let partial = world
+        .section_visible
+        .iter()
+        .filter(|(s, m)| !m.is_empty() && m.bits() != 0b1111 && shown_set.iter().any(|c| c.detail < s.detail && {
+            let mut a = *c;
+            while a.detail < s.detail {
+                a = a.parent();
+            }
+            a == *s
+        }))
+        .count();
+    let mut per = [0usize; 16];
+    for (s, _) in world.section_visible.iter().filter(|(_, m)| !m.is_empty()) {
+        per[s.detail.0 as usize] += 1;
+    }
+    println!("{label}: empty {empty} of {shown}, {drawn} sections {per:?}, {} frontier edges, {partial} partial parents drawn whole", frontier.len());
 }
 
 /// Probe: how many quads the morph's dy splits add, per detail, over the drawn cut at the owner site.
 #[test]
 #[ignore]
 fn morph_quad_overhead_probe() {
-    use crate::render_config::{RenderConfig, lod_for};
-    use super::generation::WorldgenKind;
-
-    let (lod_levels, lod_detail) = lod_for(16);
-    let render = RenderConfig { lod2: true, occlusion: true, lod_levels, lod_detail, ..RenderConfig::default() };
-    let mut world = World::with_kind(42, render, WorldgenKind::Diffusion, false);
-    world.set_view_distances(16, 5);
-    world.section_pyramid.unit = world.view.lod_unit();
-    arm_drawn(&mut world, DVec3::new(-19.1, 390.8, -0.6));
+    let mut world = owner_world(42);
+    arm_drawn(&mut world, OWNER_EYE);
     world.recompute_lod_morph();
     let tables = world.tables.get();
     let quads = |m: &super::section::SectionMeshData| -> u64 {
         m.slabs.iter().map(|slab| slab.data.iter().map(|(_, d)| d.quad_counts().iter().map(|&q| u64::from(q)).sum::<u64>()).sum::<u64>()).sum()
     };
+    let pct = |a: u64, b: u64| (a as f64 / b.max(1) as f64 - 1.0) * 100.0;
     let mut per = [(0u64, 0u64, 0usize); 16];
     for &(s, mask) in &world.section_visible {
         if mask.is_empty() {
             continue;
         }
-        let on = super::section::extract_section_mesh_with(s, world.generator.as_ref(), &[], &tables, super::section::ColumnClip::NONE, true);
-        let off = super::section::extract_section_mesh_with(s, world.generator.as_ref(), &[], &tables, super::section::ColumnClip::NONE, false);
+        let mesh = |morph| quads(&super::section::extract_section_mesh_with(s, world.generator.as_ref(), &[], &tables, world.clip_target(s), morph));
+        let (off, on) = (mesh(false), mesh(true));
         let e = &mut per[s.detail.0 as usize];
-        e.0 += quads(&off);
-        e.1 += quads(&on);
+        e.0 += off;
+        e.1 += on;
         e.2 += 1;
     }
     let (mut t0, mut t1) = (0u64, 0u64);
-    for (d, (off, on, n)) in per.iter().enumerate() {
-        if *n == 0 {
+    for (d, &(off, on, n)) in per.iter().enumerate() {
+        if n == 0 {
             continue;
         }
         let band = world.lod_morph[d + MESH_SHIFT];
-        t0 += off;
-        t1 += on;
-        println!(
-            "detail {d}: {n} sections, quads {off} -> {on} (+{:.1}%), band morphs {}",
-            (*on as f64 / (*off).max(1) as f64 - 1.0) * 100.0,
-            band.end > band.start
-        );
+        (t0, t1) = (t0 + off, t1 + on);
+        println!("detail {d}: {n} sections, quads {off} -> {on} (+{:.1}%), band morphs {}", pct(on, off), band.end > band.start);
     }
-    println!("total quads {t0} -> {t1} (+{:.1}%)", (t1 as f64 / t0.max(1) as f64 - 1.0) * 100.0);
+    println!("total quads {t0} -> {t1} (+{:.1}%)", pct(t1, t0));
 }
 
 /// Chart, RD16/V5, the drawn far field after the near window has taken its columns.
 #[test]
 fn lod_morph_bands_hold_on_charted_worlds() {
-    use crate::render_config::{RenderConfig, lod_for};
-    use super::generation::WorldgenKind;
-
-    let eye = DVec3::new(-19.1, 390.8, -0.6);
-    for seed in [42_i64, 1_791_184_794_939_118_871] {
-        let (lod_levels, lod_detail) = lod_for(16);
-        let render = RenderConfig { lod2: true, occlusion: true, lod_levels, lod_detail, ..RenderConfig::default() };
-        let mut world = World::with_kind(seed, render, WorldgenKind::Diffusion, false);
-        world.set_view_distances(16, 5);
-        world.section_pyramid.unit = world.view.lod_unit();
+    for seed in [42_i64, OWNER_SEED] {
+        let mut world = owner_world(seed);
+        // The game's budget at this view: the near field takes the rest of the cull knob.
+        world.slot_ceiling = super::SECTION_SLOT_FLOOR as u32;
         let label = format!("chart seed {seed}");
-        let dropped = arm_drawn(&mut world, eye);
+        let dropped = arm_drawn(&mut world, OWNER_EYE);
         println!("{label}: dropped {dropped} held sections");
         let center = world.section_center().expect("centre");
         assert!(world.section_on_chart(center), "seed {seed} is not charted at the owner site");
         assert!(world.section_held.is_empty(), "seed {seed} still holds a punched section");
         assert_lod_bands(&mut world, &label);
         time_recompute(&mut world, &label);
+        // The window clips the finest ring's straddlers: nothing finer is drawn, the cut fits the
+        // floor, and every drawn level but the coarsest morphs.
+        let drawn = |d: usize| world.section_visible.iter().any(|(s, m)| !m.is_empty() && s.detail.0 as usize == d);
+        assert!(!drawn(0) && !drawn(1), "{label}: slivers drawn beside the window");
+        assert!(world.section_desired.len() <= super::SECTION_SLOT_FLOOR, "{label}: over the section floor");
+        let coarsest = (0..16).rev().find(|&d| drawn(d)).expect("a drawn level");
+        for d in (2..coarsest).filter(|&d| drawn(d)) {
+            let b = world.lod_morph[d + MESH_SHIFT];
+            assert!(b.end > b.start, "{label}: detail {d} has no band {b:?}");
+        }
     }
 }
 
@@ -863,4 +973,63 @@ fn lod_morph_bands_hold_on_a_twin_and_a_flat_world() {
     assert!(!flat.section_on_chart(flat.section_center().expect("centre")), "flat is charted");
     assert_lod_bands(&mut flat, "flat");
     time_recompute(&mut flat, "flat");
+}
+
+/// Probe: the owner walks sixteen 16-block steps, then climbs from the ground to 900 blocks above
+/// it in 8-block steps. Prints each step's bands (`EMPTY` marks a level that can morph but has no
+/// band) and every finest tile that a coarser one replaced before it had fully morphed where it
+/// was nearest.
+#[test]
+#[ignore]
+fn lod_morph_walk_and_climb_probe() {
+    let mut world = owner_world(OWNER_SEED);
+    let ground = |world: &World| -> f64 {
+        let (ex, _, ez) = super::streaming::storage_eye_block(world.section_center().expect("centre"), world.section_eye_y, DVec3::ZERO);
+        f64::from(world.generator.surface(Face::PosY, ex as i32, ez as i32))
+    };
+    arm_cut(&mut world, OWNER_EYE);
+    let floor = OWNER_EYE.y - (world.section_eye_y - ground(&world));
+    let mut steps: Vec<DVec3> = (1..=16).map(|i| OWNER_EYE + DVec3::new(16.0 * f64::from(i), 0.0, 0.0)).collect();
+    steps.extend((0..=112).map(|i| DVec3::new(OWNER_EYE.x, floor + 2.0 + 8.0 * f64::from(i), OWNER_EYE.z)));
+    let mut prev: Option<([LodMorph; 16], FastMap<SectionPos, f32>)> = None;
+    let (mut early, mut empty) = (0usize, 0usize);
+    for eye in steps {
+        arm_cut(&mut world, eye);
+        let center = world.section_center().expect("centre");
+        let chart = world.chart_eyes(center);
+        let (levels, _, _) = world.gather_reaches(center, chart.as_ref());
+        let above = world.section_eye_y - ground(&world);
+        let coarsest = (0..16).rev().find(|&d| levels[d].on).expect("a drawn level");
+        let mut line = format!("above {above:.0}:");
+        for d in (0..coarsest).filter(|&d| levels[d].on) {
+            let b = world.lod_morph[d + MESH_SHIFT];
+            line.push_str(&format!(" d{d} {:.0}..{:.0}", b.start, b.end));
+            if b.end <= b.start {
+                line.push_str(" EMPTY");
+                empty += 1;
+            }
+        }
+        println!("{line}");
+        // Nearest distance of each finest tile drawn now.
+        let finest = world.section_pyramid.finest;
+        let pass = world.lod_relief_gen;
+        let in_cube = world.lod_place(center).2;
+        let drawn: std::collections::HashSet<SectionPos> = world.section_visible.iter().filter(|(_, m)| !m.is_empty()).map(|(s, _)| *s).collect();
+        let mut near = FastMap::default();
+        for &s in drawn.iter().filter(|s| s.detail == finest) {
+            near.insert(s, world.section_reach_cached(center, s, chart.as_ref(), in_cube, pass).0);
+        }
+        if let Some((bands, was)) = &prev {
+            let b = bands[finest.0 as usize + MESH_SHIFT];
+            for (s, &d) in was {
+                let coarser = std::iter::successors(Some(s.parent()), |a| (a.detail.0 < 16).then(|| a.parent())).take(8).any(|a| drawn.contains(&a));
+                if !near.contains_key(s) && coarser && morph_a(b.start, b.end, d) < 0.99 {
+                    early += 1;
+                    println!("  {s:?} replaced at {d:.0} under {:.0}..{:.0}", b.start, b.end);
+                }
+            }
+        }
+        prev = Some((world.lod_morph, near));
+    }
+    println!("{empty} empty bands, {early} finest tiles replaced before fully morphed");
 }

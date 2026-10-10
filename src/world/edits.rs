@@ -139,6 +139,7 @@ impl World {
         }
         self.meshing_sections = 0;
         self.section_upload_queue.clear();
+        self.clear_clips();
         self.pending_sections.take();
         self.dirty_sections.clear();
         self.section_desired.clear();

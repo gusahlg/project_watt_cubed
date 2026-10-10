@@ -33,7 +33,9 @@ use super::lod;
 /// Submodule keeps mesh representation and consumer together.
 mod mesh;
 pub(in crate::world) use mesh::face_edits;
-pub(in crate::world) use mesh::{SectionMeshData, chart_slab_corners, extract_section_mesh, extract_section_mesh_with, warp_slab_corners};
+#[cfg(test)]
+pub(in crate::world) use mesh::extract_section_mesh;
+pub(in crate::world) use mesh::{SectionMeshData, chart_slab_corners, extract_section_mesh_with, warp_slab_corners};
 
 /// 32 not 64: reduces remesh cost under frequent edits.
 pub(in crate::world) const SECTION_N: usize = 32;

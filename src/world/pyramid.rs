@@ -20,7 +20,9 @@ pub enum LodChoice {
 
 /// Finest-section spans the outer edges of the first rings move out by, where the near window
 /// clips the finest ring (charts): room for that ring's morph band past the window's corners.
-pub const RING_SHIFT_SPANS: f32 = 1.5;
+/// Kept under a span: a completed ring reaches a parent's diagonal past its edge, so a wider
+/// shift squeezes the next ring's band and grows the cut.
+pub const RING_SHIFT_SPANS: f32 = 0.75;
 
 /// Finest spans the shifted ring 1 keeps inside ring 2. 2:1 balance needs `2·√2`.
 pub const RING_BALANCE_SPANS: f32 = 3.0;

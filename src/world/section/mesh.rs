@@ -17,7 +17,7 @@
 //! so slab seams emit no faces. Two producers share one pooled native grid:
 //! - [`build_section_mesh`] decodes a stored [`Section`]'s brick stacks — the
 //!   reference path, kept as the byte-parity oracle;
-//! - [`extract_section_mesh`] samples the generator (and folds edits) straight
+//! - [`extract_section_mesh_with`] samples the generator (and folds edits) straight
 //!   into the grid — the production worker path, which never builds the RLE
 //!   brick storage only to decode it again.
 //!
@@ -574,7 +574,7 @@ fn emit(
 /// bit-identical output (fixed iteration order, dense-grid sampling, no floats).
 ///
 /// This is the REFERENCE path (stored bricks → dense grid → mesh); production
-/// far jobs take [`extract_section_mesh`], which the parity test pins against
+/// far jobs take [`extract_section_mesh_with`], which the parity test pins against
 /// this one byte for byte.
 #[cfg(test)]
 pub(in crate::world) fn build_section_mesh(section: &Section, tables: &HotTables, floor: Option<i32>) -> SectionMeshData {
@@ -611,11 +611,8 @@ pub(in crate::world) fn ring_floor<G: TerrainGenerator + ?Sized>(pos: SectionPos
     floor.max(0)
 }
 
-/// Extract AND mesh a section in one pass: sample the generator (folding the
-/// edit overlay) directly into the dense section grid, then mesh it — the
-/// production worker path. Skips the whole RLE brick round trip
-/// ([`Section::extract`]'s per-column run slicing plus this module's decode),
-/// which existed only because the temporary [`Section`] was built and dropped.
+/// [`extract_section_mesh_with`] unclipped, with `dy` on +Y.
+#[cfg(test)]
 pub(in crate::world) fn extract_section_mesh<G: TerrainGenerator + ?Sized>(
     pos: SectionPos,
     r#gen: &G,
@@ -625,8 +622,13 @@ pub(in crate::world) fn extract_section_mesh<G: TerrainGenerator + ?Sized>(
     extract_section_mesh_with(pos, r#gen, edits, tables, ColumnClip::NONE, true)
 }
 
-/// [`extract_section_mesh`] leaving `clip`'s chunk columns to the full-res window. Without
-/// `morph` (a level that never morphs) the faces carry no `dy` and merge as plain greedy quads.
+/// Extract AND mesh a section in one pass: sample the generator (folding the
+/// edit overlay) directly into the dense section grid, then mesh it — the
+/// production worker path. Skips the whole RLE brick round trip
+/// ([`Section::extract`]'s per-column run slicing plus this module's decode),
+/// which existed only because the temporary [`Section`] was built and dropped.
+/// `clip`'s chunk columns are left to the full-res window. Without `morph` (a
+/// level that never morphs) the faces carry no `dy` and merge as plain greedy quads.
 pub(in crate::world) fn extract_section_mesh_with<G: TerrainGenerator + ?Sized>(
     pos: SectionPos,
     r#gen: &G,
@@ -1753,6 +1755,8 @@ mod tests {
         z1: i32,
         tops: Vec<[i32; 5]>,
         walls: Vec<[i32; 6]>,
+        /// The columns left to the full-res window.
+        clip: ColumnClip,
     }
 
     fn place_tile(pos: SectionPos, mesh: &SectionMeshData) -> Tile {
@@ -1792,7 +1796,7 @@ mod tests {
                 }
             }
         }
-        Tile { pos, x0, x1, z0, z1, tops, walls }
+        Tile { pos, x0, x1, z0, z1, tops, walls, clip: mesh.clip_drawn }
     }
 
     fn top_at(tile: &Tile, x: i32, z: i32) -> Option<i32> {
@@ -1857,7 +1861,10 @@ mod tests {
                     ((s, edge + inset_a), (s, edge + inset_b))
                 };
                 let (ta, tb) = (top_at(a, pa.0, pa.1), top_at(b, pb.0, pb.1));
-                if let (Some(ta), Some(tb)) = (ta, tb) {
+                let window = |t: &Tile, (x, z): (i32, i32)| t.clip.masks_point(t.pos, i64::from(x), i64::from(z));
+                if window(a, pa) || window(b, pb) {
+                    // The full-res window draws that side.
+                } else if let (Some(ta), Some(tb)) = (ta, tb) {
                     let (lo_y, hi_y) = (ta.min(tb), ta.max(tb));
                     let gap = open_span(a, b, axis, edge, s, lo_y, hi_y);
                     if gap > 0 {
@@ -2204,7 +2211,7 @@ mod tests {
         // The window streaming places around this centre, from scratch.
         world.window = crate::world::streaming::Window::default();
         world.place_window(center, true);
-        let desired = world.desired_sections(center);
+        let (desired, clips) = world.desired_and_clips(center);
         let cut = quadtree::resolve_covering(&desired, Detail(9), &|_| true);
         let drawn: Vec<SectionPos> = cut.iter().map(|(p, _)| *p).collect();
         let tables = world.registry.hot_tables();
@@ -2217,7 +2224,9 @@ mod tests {
         let mut order: Vec<SectionPos> = drawn.clone();
         order.sort_by_key(|p| (p.detail, p.x, p.z));
         for pos in &order {
-            let mesh = extract_section_mesh(*pos, world.terrain(), &[], &tables);
+            // As the worker meshes it: the clip the window takes.
+            let clip = clips.get(pos).copied().unwrap_or_default();
+            let mesh = extract_section_mesh_with(*pos, world.terrain(), &[], &tables, clip, true);
             mix(&mut hash, mesh.shift);
             for b in mesh.altitude_floor.to_le_bytes() {
                 mix(&mut hash, b);
@@ -2258,7 +2267,8 @@ mod tests {
             while x < t.x1 {
                 let mut z = t.z0 + cell / 2;
                 while z < t.z1 {
-                    if top_at(t, x, z).is_none() {
+                    // A clipped column is the window's.
+                    if top_at(t, x, z).is_none() && !t.clip.masks_point(t.pos, i64::from(x), i64::from(z)) {
                         bare += 1;
                     }
                     z += cell;
@@ -2306,7 +2316,8 @@ mod tests {
         let eye = ((center.x * cs + cs / 2), (center.z * cs + cs / 2));
         let covered = desired.iter().any(|p| {
             let (a, b) = (p.min_x(), p.min_z());
-            eye.0 >= a && eye.0 < a + p.span() && eye.1 >= b && eye.1 < b + p.span()
+            let clipped = clips.get(p).is_some_and(|c| c.masks_point(*p, i64::from(eye.0), i64::from(eye.1)));
+            eye.0 >= a && eye.0 < a + p.span() && eye.1 >= b && eye.1 < b + p.span() && !clipped
         });
         ChartFrontier {
             bare,
@@ -2399,10 +2410,11 @@ mod tests {
     /// Start-world chart far field from altitude: the square under the eye is drawn, its columns
     /// have tops, and the seams around it are closed. Spawn ground level keeps the punch on the
     /// interior of the near box. The border, within one span-32 section, is drawn: that tile is
-    /// what covers the sliver outside the box. Bytes re-pinned to `0x8fb344b6`: a nested +Y
-    /// section stores a parent `dy` on each edge, so a merge stops where `dy` changes and
-    /// seam pairs add vertices. The hash covers positions, normals and layers, not morph
-    /// bits (seed 42, diffusion, default view). The window streaming places there is the eye band.
+    /// what covers the sliver outside the box. Bytes re-pinned to `0x0a2c44d4`: the window clips
+    /// the finest ring's straddlers (meshed without their clipped columns) instead of splitting
+    /// them, chart rings 0 and 1 shift out, and ring parents split into their children. The hash
+    /// covers positions, normals and layers, not morph bits (seed 42, diffusion, default view), of
+    /// each tile as the worker meshes it. The window streaming places there is the eye band.
     #[test]
     fn far_chart_altitude_frontier_is_closed() {
         use crate::render_config::RenderConfig;
@@ -2414,7 +2426,7 @@ mod tests {
         let (center, storage) = home_altitude_eye(&world, DVec3::new(0.0, 1.0, 0.0), 0.0);
         world.section_eye_y = storage.y;
         let spawn = frontier_counts(&mut world, center);
-        assert_eq!(spawn.hash, 0x8fb344b6, "spawn ground-level far-field bytes changed");
+        assert_eq!(spawn.hash, 0x0a2c44d4, "spawn ground-level far-field bytes changed");
         assert_eq!(spawn.bare, 0, "spawn ground-level bare columns");
         assert_eq!(spawn.gaps, 0, "spawn ground-level seam gaps");
         assert_eq!(spawn.missing, 0, "spawn ground-level missing tops");

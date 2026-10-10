@@ -96,18 +96,13 @@ fn fake_drain(w: &mut World) {
     // The section-upload loop: a section lands `Ready` with no slabs.
     let mut sections = 0;
     while sections < pacer.section_uploads() && bytes < budget {
-        let Some((pos, token, b, _)) = w.section_upload_queue.pop_front() else {
+        let Some(up) = w.section_upload_queue.pop_front() else {
             break;
         };
         sections += 1;
-        if let Some(state @ SectionState::Meshing { .. }) = w.sections.get_mut(&pos)
-            && matches!(state, SectionState::Meshing { token: t } if *t == token)
-        {
-            adjust_count(&mut w.meshing_sections, true, false);
+        let b = up.bytes;
+        if w.land_section(up, None) {
             bytes += b;
-            *state = SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None, alt: None };
-            w.pending_sections.set();
-            w.section_cover_dirty.set();
         }
     }
 }

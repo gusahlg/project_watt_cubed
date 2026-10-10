@@ -29,7 +29,9 @@ use super::{
     quadtree,
 };
 
+mod clip;
 mod window;
+pub(in crate::world) use clip::Clips;
 pub(in crate::world) use window::Window;
 
 /// Exact upload placement for a chunk mesh: integer chunk origin, full detail.
@@ -1103,22 +1105,26 @@ fn cover_chart(s: SectionPos, lo: [i64; 3], hi: [i64; 3], out: &mut Vec<SectionP
 
 /// Pieces of `s` against the full-res box. A tile that crosses the edge is replaced by the largest
 /// descendants that do not. Wholly outside pieces stay. Wholly inside pieces stay for the punch.
-/// Descent continues past the finest far level: that span is wider than the full-res box, so a tile
-/// kept there redraws the whole near field. It stops at detail 0 (span 32), the last grid coarser
-/// than a chunk. A tile still crossing the edge stays, so the sliver beside the box is drawn.
+/// A crossing tile at `clip_at` stays whole when `try_clip` gives the window some of its chunk
+/// columns. Otherwise descent continues past the finest far level: that span is wider than the
+/// full-res box, so a tile kept there redraws the whole near field. It stops at detail 0 (span
+/// 32), the last grid coarser than a chunk. A tile still crossing the edge stays, so the sliver
+/// beside the box is drawn.
 fn cover_near(
     s: SectionPos,
     near: (i64, i64, i64, i64),
     across: Option<&super::seam::SeamAcross>,
+    clip_at: Option<i8>,
+    try_clip: &mut impl FnMut(SectionPos) -> bool,
     out: &mut Vec<SectionPos>,
 ) {
     let crosses = covers_near(s, near, across) && !inside_near(s, near, across);
-    if !crosses || s.detail.0 <= 0 {
+    if !crosses || s.detail.0 <= 0 || (clip_at == Some(s.detail.0) && try_clip(s)) {
         out.push(s);
         return;
     }
     for q in super::section::Quadrant::ALL {
-        cover_near(s.child(q), near, across, out);
+        cover_near(s.child(q), near, across, clip_at, try_clip, out);
     }
 }
 
@@ -1132,6 +1138,12 @@ fn section_dist2(s: SectionPos, ex: f64, ez: f64) -> f64 {
 fn section_key(s: &SectionPos) -> (u16, u8, crate::ident::Detail, i32, i32) {
     (s.body, s.face as u8, s.detail, s.x, s.z)
 }
+
+/// A tile the near window clips: the columns it wants and their chunk layers.
+type Clip = (SectionPos, super::section::ColumnClip, [i32; 2]);
+
+/// Levels below an unready desired cell searched for Ready pieces to draw in its place.
+const STAND_IN_DEPTH: i8 = 2;
 
 impl World {
     /// Up face of the streaming centre. +Y until the first resolve, so
@@ -2082,14 +2094,15 @@ impl World {
         };
         if self.section_frontier_key != Some(frontier_key) || !self.dirty_sections.is_empty() {
             let mut memo = std::mem::take(&mut self.near_bounds);
-            let mut held = Vec::new();
-            self.section_desired = memo.sweep(|memo| self.desired_sections_with(center, memo, &mut held));
+            let (mut held, mut clips) = (Vec::new(), Vec::new());
+            self.section_desired = memo.sweep(|memo| self.desired_sections_with(center, memo, &mut held, &mut clips));
             self.near_bounds = memo;
             self.wait_held(held);
+            self.wait_clips(clips);
             self.held_recheck.take();
             self.section_frontier_key = Some(frontier_key);
             self.section_cover_dirty.set();
-        } else if self.held_recheck.take() && !self.section_held.is_empty() {
+        } else if self.held_recheck.take() && (!self.section_held.is_empty() || self.clips_waiting()) {
             self.settle_held();
         }
     }
@@ -2153,43 +2166,15 @@ impl World {
         // re-admission must not capture the replacement claim.
         let section_budget = pacer.section_uploads();
         let mut section_uploads = 0;
-        while section_uploads < section_budget {
-            let Some((_, _, _, _)) = self.section_upload_queue.front() else {
+        while section_uploads < section_budget && upload_bytes < upload_budget {
+            let Some(up) = self.section_upload_queue.pop_front() else {
                 break;
             };
-            if upload_bytes >= upload_budget {
-                break;
-            }
-            let (pos, token, bytes, meshes) = self
-                .section_upload_queue
-                .pop_front()
-                .expect("front was Some");
             section_uploads += 1;
-            // `section_material` borrows all of `self`, so it must run before
-            // `self.sections.get_mut` below takes an overlapping mutable borrow.
-            let (flat_color, flat_rgba) = self.section_material(pos);
-            let bend = self.chart_bend(pos);
-            if let Some(state @ SectionState::Meshing { .. }) = self.sections.get_mut(&pos)
-                && matches!(state, SectionState::Meshing { token: t } if *t == token)
-            {
-                super::adjust_count(&mut self.meshing_sections, true, false);
+            let bytes = up.bytes;
+            if self.land_section(up, Some(eng)) {
                 upload_bytes += bytes;
                 self.section_upload_bytes += bytes;
-                *state = SectionState::from_upload_payload(pos, meshes, eng, bend.as_ref());
-                // Slots are born visible (residency implies it for everything but the
-                // far field), so a section that Coverage does not draw — or draws only
-                // in part — must be corrected here, at the transition that gave it slots
-                // to correct. No frame intervenes: patches flush at submit.
-                state.set_visible(eng, self.section_fade.drawn_mask(pos));
-                // Push the section's far-material style so it doesn't draw one frame at
-                // the engine's post-upload default.
-                state.push_style(eng, FadeStyle { flat_color }, flat_rgba);
-                // A new Ready section moves the covering: re-arm the lane so
-                // any refinement it exposes loads immediately.
-                self.pending_sections.set();
-                self.section_cover_dirty.set();
-            } else {
-                meshes.release_staging(eng);
             }
         }
         self.drain_upload_bytes = upload_bytes;
@@ -2290,12 +2275,8 @@ impl World {
         if let Some((pos, epoch, token)) = section_audit {
             debug_assert!(
                 epoch != self.section_epoch
-                    || !matches!(self.sections.get(&pos),
-                        Some(SectionState::Meshing { token: t }) if *t == token)
-                    || self
-                        .section_upload_queue
-                        .iter()
-                        .any(|(p, t, _, _)| *p == pos && *t == token),
+                    || !self.section_claim_live(pos, token)
+                    || self.section_upload_queue.iter().any(|u| u.pos == pos && u.token == token),
                 "section Done for {pos:?} matched the live claim but was not transferred"
             );
         }
@@ -2909,6 +2890,9 @@ impl World {
                     super::adjust_count(&mut self.meshing_sections, true, false);
                     self.section_cover_dirty.set();
                 }
+                if epoch == self.section_epoch {
+                    self.release_reclip(pos, token);
+                }
                 if rearm {
                     self.pending_sections.set();
                 }
@@ -3314,7 +3298,7 @@ impl World {
     fn unload_far_with(
         &mut self,
         center: Coord,
-        mut free: impl FnMut(MeshState, Option<voxel_engine::CageHandle>),
+        free: impl FnMut(MeshState, Option<voxel_engine::CageHandle>),
     ) {
         let unload = self.unload_box(center);
         // Collect-then-remove instead of `retain`: freeing borrows the caller's
@@ -3323,10 +3307,16 @@ impl World {
         if let Some((kept, fold)) = self.retired {
             far.retain(|&c| !kept.contains(fold.fold(c)));
         }
+        self.retain_clipped(unload, &mut far);
         self.prev_unload_box = Some(unload);
+        self.drop_chunks(&far, free);
+    }
+
+    /// Remove the loaded chunks `far`; `free` gets each one's mesh state and cage.
+    fn drop_chunks(&mut self, far: &[Coord], mut free: impl FnMut(MeshState, Option<voxel_engine::CageHandle>)) {
         // A removed chunk changes what the BFS can reach — topology class.
         self.occlusion_topo_dirty.raise(!far.is_empty());
-        for &coord in &far {
+        for &coord in far {
             // Free the mesh handle (Ready or Dirty); Air/NeedsMesh own none.
             // `far` holds loaded chunks only (see `unload_leaving`).
             if let Some(loaded) = self.chunks.remove(&coord) {
@@ -4069,20 +4059,22 @@ impl World {
 
     /// Far sections of the home chart and, where the far field reaches a side, its neighbours.
     /// Storage +Y is the chart's up, so the sections are [`Face::PosY`] over storage `(x, z)`.
-    /// Sections the near window holds go to `held` instead, with the chunk layers of their ground.
-    fn chart_sections(&self, center: Coord, memo: &mut NearBounds, held: &mut Vec<(SectionPos, [i32; 2])>) -> Vec<SectionPos> {
+    /// Sections the near window holds go to `held` instead, with the chunk layers of their ground;
+    /// tiles it clips go to `clips` as well, with their columns and those columns' layers.
+    fn chart_sections(&self, center: Coord, memo: &mut NearBounds, held: &mut Vec<(SectionPos, [i32; 2])>, clips: &mut Vec<Clip>) -> Vec<SectionPos> {
         let Some(seat) = self.seams.chart_seat(center) else { return Vec::new() };
         let Some((cfg, max_d)) = self.chart_pyramid(seat.radius) else { return Vec::new() };
-        let base = self.chart_pick(center, DVec3::ZERO, &seat, &cfg, max_d, memo, held);
+        let base = self.chart_pick(center, DVec3::ZERO, &seat, &cfg, max_d, memo, held, clips);
         let delta = chart_delta(self.section_vel);
         if delta == DVec3::ZERO {
             return base;
         }
-        quadtree::union_frontiers(base, self.chart_pick(center, delta, &seat, &cfg, max_d, memo, held))
+        let predicted = self.chart_pick(center, delta, &seat, &cfg, max_d, memo, held, clips);
+        quadtree::complete_splits(quadtree::union_frontiers(base, predicted))
     }
 
     /// Pyramid stopped at the largest detail whose span still satisfies `L² ≤ 8R`, on the
-    /// altitude-scaled unit.
+    /// altitude-scaled unit, with the window clip's ring shift.
     fn chart_pyramid(&self, radius: i64) -> Option<(pyramid::PyramidCfg, i8)> {
         let src = self.far_pyramid();
         let mut levels = 0u8;
@@ -4096,7 +4088,7 @@ impl World {
             levels += 1;
             max_d = detail;
         }
-        (levels > 0).then(|| (pyramid::PyramidCfg::sections_with(src.unit, levels, src.finest.0 as u8), max_d))
+        (levels > 0).then(|| (pyramid::PyramidCfg::sections_with(src.unit, levels, src.finest.0 as u8).clipped(), max_d))
     }
 
     /// Eye metric in the storage frame. Altitude is height above the column under the eye, so
@@ -4118,6 +4110,7 @@ impl World {
         max_d: i8,
         memo: &mut NearBounds,
         held: &mut Vec<(SectionPos, [i32; 2])>,
+        clips: &mut Vec<Clip>,
     ) -> Vec<SectionPos> {
         let (ex, ey, ez) = storage_eye_block(center, self.section_eye_y, delta);
         let ground = self.generator.surface(Face::PosY, ex as i32, ez as i32);
@@ -4128,8 +4121,9 @@ impl World {
         let body = super::section::CHART_BODY_BASE + seat.index as u16;
         let (y0, y1) = self.near_y_range(center);
         let near = self.chart_near(center, body, y0);
+        let mut found = Vec::new();
         let mut tagged =
-            self.seat_sections(seat, ex as f64, ez as f64, rel, body, cfg, max_d, near, y0, y1, None, memo, held);
+            self.seat_sections(seat, ex as f64, ez as f64, rel, body, cfg, max_d, near, y0, y1, None, memo, held, &mut found);
         // The neighbour is visible as far as the coarsest ring's square reaches, not merely the
         // two finest sections. Its rings run on from the eye unfolded beyond its edge.
         let span = super::section::section_span(crate::ident::Detail(max_d)) as f64;
@@ -4150,6 +4144,7 @@ impl World {
                 Some(&across),
                 memo,
                 held,
+                &mut found,
             ));
         }
         let budget = self.sections_allowed();
@@ -4160,6 +4155,7 @@ impl World {
         }
         let mut out: Vec<_> = tagged.into_iter().map(|(s, _)| s).collect();
         out.sort_unstable_by_key(section_key);
+        clips.extend(found.into_iter().filter(|c| out.binary_search_by_key(&section_key(&c.0), section_key).is_ok()));
         out
     }
 
@@ -4178,6 +4174,7 @@ impl World {
         across: Option<&super::seam::SeamAcross>,
         memo: &mut NearBounds,
         held: &mut Vec<(SectionPos, [i32; 2])>,
+        clips: &mut Vec<Clip>,
     ) -> Vec<(SectionPos, f64)> {
         let env = HeightEnvelope::new(super::section::LOD_FLOOR_Y as f32, super::section::LOD_CEIL_Y as f32);
         let metric = EyeMetric::new(DVec3::new(ex, rel, ez), env, DyCap::new(cfg.outer_m(), cfg.base));
@@ -4190,21 +4187,41 @@ impl World {
         for s in radial {
             cover_chart(s, seat.lo, seat.hi, &mut clipped);
         }
-        // A straddler is replaced before the punch. Dropping it whole would leave the part
-        // outside the box — up to one ring of span — drawn by nothing.
+        // The engine draws a section whole for any quadrant: a ring's straddling parent would
+        // cover the children beside it, so it is split instead.
+        let clipped = quadtree::complete_splits(clipped);
+        // A straddler is clipped or replaced before the punch. Dropping it whole would leave the
+        // part outside the box — up to one ring of span — drawn by nothing.
+        let clip_at = cfg.clip_detail().map(|d| d.0);
+        let mut found = Vec::new();
+        let mut try_clip = |s: SectionPos| {
+            let Some((clip, layers)) = self.clip_columns(s, near, y0, y1, across, memo) else { return false };
+            found.push((s, clip, layers));
+            true
+        };
         let mut edged = Vec::new();
         for s in clipped {
-            cover_near(s, near, across, &mut edged);
+            cover_near(s, near, across, clip_at, &mut try_clip, &mut edged);
         }
         // Charts have no shader clip. A section wholly inside the near square is dropped only
         // when that square's surface sits inside the full-res window; a valley or a hilltop
         // outside it stays, so the far field draws what the window misses.
         let on_seat = |s: SectionPos| inside_xz(s, seat.lo, seat.hi) && super::section::section_fits(s.span(), seat.radius);
+        clips.extend(found.into_iter().filter(|c| on_seat(c.0)));
         let mut kept = Vec::with_capacity(edged.len());
         for s in edged.into_iter().filter(|&s| on_seat(s)) {
             match self.held_layers(s, near, y0, y1, across, memo) {
                 Some(layers) => held.push((s, layers)),
-                None => kept.push(s),
+                None => {
+                    // Inside the square, ground that fits only in part leaves the window those columns.
+                    if clip_at == Some(s.detail.0)
+                        && inside_near(s, near, across)
+                        && let Some((clip, layers)) = self.clip_columns(s, near, y0, y1, across, memo)
+                    {
+                        clips.push((s, clip, layers));
+                    }
+                    kept.push(s);
+                }
             }
         }
         // A straddling parent must not merge back: that tile is what the descent just replaced.
@@ -4237,11 +4254,7 @@ impl World {
             return None;
         }
         let (u0, v0, u1, v1) = overlap_storage(s, near, across)?;
-        let surface = || self.generator.surface_rect(s.body, Face::PosY, u0, v0, u1, v1);
-        let (lo, hi) = self.with_edits(memo.get((s.body, [u0, v0, u1, v1]), surface)?, [u0, v0, u1, v1]);
-        let (top_lo, top_hi) = (lo.saturating_sub(1), hi.saturating_sub(1));
-        let cs = CHUNK_SIZE as i32;
-        (i64::from(top_lo) >= y0 && i64::from(top_hi) < y1).then(|| [top_lo.div_euclid(cs), top_hi.div_euclid(cs)])
+        self.fit_layers(s.body, [u0, v0, u1, v1], y0, y1, memo)
     }
 
     /// The full-res square the punch tests chart sections against. Empty when the near window
@@ -4289,7 +4302,7 @@ impl World {
     /// selection once every held section's ground has settled.
     #[cfg(test)]
     pub(in crate::world) fn desired_sections(&self, center: Coord) -> Vec<SectionPos> {
-        self.desired_sections_with(center, &mut NearBounds::default(), &mut Vec::new())
+        self.desired_sections_with(center, &mut NearBounds::default(), &mut Vec::new(), &mut Vec::new())
     }
 
     /// Desired frontier: union of static eye and velocity-predicted eye position.
@@ -4297,15 +4310,17 @@ impl World {
     /// static frontier bit-for-bit. Open space and a round body seen from past the far reach
     /// select nothing; a far-field centre on a chart (in or above its box) selects that chart's
     /// sections, reading chart surfaces through `memo`; the sections its near window holds go to
-    /// `held`. On a warped cube, up-face tiles that cross the near disk are split to detail 0.
+    /// `held`, the tiles it clips to `clips`. On a warped cube, up-face tiles that cross the near
+    /// disk are split to detail 0.
     fn desired_sections_with(
         &self,
         center: Coord,
         memo: &mut NearBounds,
         held: &mut Vec<(SectionPos, [i32; 2])>,
+        clips: &mut Vec<Clip>,
     ) -> Vec<SectionPos> {
         if self.section_on_chart(center) {
-            return self.chart_sections(center, memo, held);
+            return self.chart_sections(center, memo, held, clips);
         }
         let focus = if self.section_face_set { self.section_lod_face } else { self.dominant_lod_face(center) };
         let Some((body, face)) = focus else { return Vec::new() };
@@ -4499,7 +4514,14 @@ impl World {
         let max = crate::ident::Detail(crate::render_config::LOD_COARSEST_DETAIL as i8);
         let ready = |p: SectionPos| self.sections.get(&p).is_some_and(|s| s.is_ready());
         // A cell the settled full-res chunks already draw hands over at once, ahead of the clip.
-        let drawn: Vec<SectionPos> = desired.iter().copied().filter(|&c| !self.full_res_covers(center, c)).collect();
+        let mut drawn: Vec<SectionPos> = desired.iter().copied().filter(|&c| !self.full_res_covers(center, c)).collect();
+        // A cell with nothing Ready over it keeps the finer pieces it replaced (a tile the window
+        // now clips, where slivers drew) until it lands.
+        for i in 0..drawn.len() {
+            if quadtree::drawable_cover(drawn[i], max, &ready).is_none() {
+                quadtree::ready_descendants(drawn[i], STAND_IN_DEPTH, &ready, &mut drawn);
+            }
+        }
         let cut = quadtree::resolve_covering(&drawn, max, &ready);
         let backlog = desired.iter().any(|&c| {
             !self.sections.contains_key(&c)
@@ -4687,13 +4709,18 @@ impl World {
             return;
         }
         let dirty: Vec<SectionPos> = self.dirty_sections.iter().copied().collect();
-        let mut freed = false;
+        let (mut freed, mut reclip) = (false, false);
         for s in dirty {
             // Re-extract only once the square's overlay is in: its upload reads the overlay colour.
             if self.section_overlay_dirty.contains(&s) {
                 continue;
             }
             match self.sections.get(&s) {
+                // A clipped tile in the cut re-extracts in place: freed first, its ancestor would
+                // stand in over the window.
+                Some(SectionState::Ready { clip, .. }) if !clip.asked.union(self.clip_target(s)).is_empty() && self.in_cut(s) => {
+                    reclip = true;
+                }
                 Some(SectionState::Ready { .. }) => {
                     if let Some(state) = self.sections.remove(&s) {
                         state.free(eng);
@@ -4707,10 +4734,8 @@ impl World {
                 }
             }
         }
-        if freed {
-            self.pending_sections.set();
-            self.section_cover_dirty.set();
-        }
+        self.pending_sections.raise(freed || reclip);
+        self.section_cover_dirty.raise(freed);
     }
 
     /// Every cell is opaque. A paletted chunk's entries are exactly the ids in
@@ -7232,17 +7257,19 @@ mod tests {
                 "{name}: the near square meets a seam"
             );
             let (y0, y1) = world.near_y_range(center);
-            let desired = world.desired_sections(center);
+            let (desired, clips) = world.desired_and_clips(center);
             let mut rects = Vec::new();
             for s in &desired {
                 let span = s.span() as i64;
                 let (x, z) = (s.min_x() as i64, s.min_z() as i64);
                 if inside_xz(*s, seat.lo, seat.hi) {
-                    rects.push((x, z, x + span, z + span));
+                    rects.push((*s, x, z, x + span, z + span));
                 }
             }
             let covered = |x: i64, z: i64| {
-                rects.iter().any(|&(x0, z0, x1, z1)| x >= x0 && x < x1 && z >= z0 && z < z1)
+                rects.iter().any(|&(s, x0, z0, x1, z1)| {
+                    x >= x0 && x < x1 && z >= z0 && z < z1 && !clips.get(&s).is_some_and(|c| c.masks_point(s, x, z))
+                })
             };
             let mut holes = 0i32;
             let mut outside = 0i32;
@@ -7361,7 +7388,7 @@ mod tests {
             world.section_eye_y = storage.y;
             world.adopt_fold(center);
             let seat = world.seams.chart_seat(center).unwrap_or_else(|| panic!("{name}: no chart seat"));
-            let desired = world.desired_sections(center);
+            let (desired, clips) = world.desired_and_clips(center);
             let (ex, _, ez) = storage_eye_block(center, storage.y, DVec3::ZERO);
             let across = world.seams.seam_across(seat, [ex, storage.y.round() as i64, ez], outer);
             let near = world.near_block_box(center);
@@ -7381,7 +7408,11 @@ mod tests {
                 };
                 rects.push((x0, x1, z0, z1));
             }
-            let covered = |x: i64, z: i64| rects.iter().any(|&(x0, x1, z0, z1)| x >= x0 && x < x1 && z >= z0 && z < z1);
+            // A home tile's clipped columns are the window's.
+            let clipped = |x: i64, z: i64| {
+                desired.iter().any(|s| inside_xz(*s, seat.lo, seat.hi) && clips.get(s).is_some_and(|c| c.masks_point(*s, x, z)))
+            };
+            let covered = |x: i64, z: i64| !clipped(x, z) && rects.iter().any(|&(x0, x1, z0, z1)| x >= x0 && x < x1 && z >= z0 && z < z1);
             let mut holes = 0i32;
             let mut hole_ex = String::new();
             let mut across_cols = 0i32;
@@ -7521,7 +7552,7 @@ mod tests {
             z: -3,
         };
         world.section_desired = vec![hole];
-        let empty = || SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None, alt: None };
+        let empty = || SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None, alt: None, clip: Default::default() };
         for i in 0..super::super::SECTION_SLOT_FLOOR {
             world.sections.insert(filler(i), empty());
         }
@@ -7701,7 +7732,7 @@ mod tests {
     }
 
     fn empty_ready() -> SectionState {
-        SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None, alt: None }
+        SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None, alt: None, clip: Default::default() }
     }
 
     /// Desired sections with no Ready self or ancestor.
@@ -7737,13 +7768,8 @@ mod tests {
             }
             world.integrate_worker_result(done);
         }
-        while let Some((pos, token, _, _)) = world.section_upload_queue.pop_front() {
-            if let Some(state @ SectionState::Meshing { .. }) = world.sections.get_mut(&pos)
-                && matches!(state, SectionState::Meshing { token: t } if *t == token)
-            {
-                world.meshing_sections = world.meshing_sections.saturating_sub(1);
-                *state = empty_ready();
-            }
+        while let Some(up) = world.section_upload_queue.pop_front() {
+            world.land_section(up, None);
         }
         got
     }

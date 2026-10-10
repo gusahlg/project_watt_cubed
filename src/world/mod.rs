@@ -84,8 +84,9 @@ use section::{SectionMeshData, SectionPos};
 /// `max(SECTION_SLOT_FLOOR, cpu_cull_max - near_chunk_slots)`.
 const CPU_CULL_MAX: u32 = 1024;
 /// Floor on the far lane's section-slot budget so a large near field cannot
-/// starve covering: chunks never count against sections.
-pub(in crate::world) const SECTION_SLOT_FLOOR: usize = 512;
+/// starve covering: chunks never count against sections. Room for render distance
+/// 16's chart cut with its splits completed and its first rings shifted (about 515).
+pub(in crate::world) const SECTION_SLOT_FLOOR: usize = 576;
 
 /// Default number of chunk rings meshed and drawn around the player.
 const DEFAULT_VIEW_RADIUS: i32 = 6;
@@ -627,6 +628,15 @@ impl ChunkMeshes {
 /// reduces bandwidth; nearer rings keep texture. Inert until the mip bake lands.
 const FLAT_DETAIL: Detail = Detail(section::FINEST_DETAIL.0 + 4);
 
+/// The window clip a Ready section was extracted for, and the one its mesh draws.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub(in crate::world) struct SectionClip {
+    /// The target the job was submitted with.
+    pub asked: section::ColumnClip,
+    /// The columns the mesh leaves out: `asked`, or none where it could not follow the clip.
+    pub drawn: section::ColumnClip,
+}
+
 /// A section is either meshing or ready. Blocks are pre-positioned at upload,
 /// so draw needs only camera-relative offset arithmetic.
 pub(in crate::world) enum SectionState {
@@ -650,6 +660,8 @@ pub(in crate::world) enum SectionState {
         /// Altitude span `[lo, hi)` in blocks that the uploaded slabs cover, in the section's
         /// frame (storage y on a chart). `None` for an empty section.
         alt: Option<(i32, i32)>,
+        /// The chunk columns this mesh leaves to the full-res window.
+        clip: SectionClip,
     },
 }
 
@@ -664,9 +676,11 @@ impl SectionState {
     fn from_upload(
         pos: SectionPos,
         mesh: SectionMeshData,
+        asked: section::ColumnClip,
         eng: &mut Engine,
         bend: Option<&ChartBend>,
     ) -> SectionState {
+        let clip = SectionClip { asked, drawn: mesh.clip_drawn };
         let detail = Detail(pos.detail.0.saturating_add(mesh.shift as i8));
         let alt = Self::slab_span(pos, detail, mesh.altitude_floor, mesh.slabs.iter().map(|slab| slab.origin_y));
         let mut cages = Vec::new();
@@ -684,7 +698,7 @@ impl SectionState {
                 }
             })
             .collect();
-        SectionState::Ready { meshes, cages, last_style: None, alt }
+        SectionState::Ready { meshes, cages, last_style: None, alt, clip }
     }
 
     /// Altitudes the slabs at `origins` span: the lowest slab's floor to the highest slab's top.
@@ -762,21 +776,24 @@ impl SectionState {
     fn from_upload_payload(
         pos: SectionPos,
         meshes: pipeline::SectionPayload,
+        asked: section::ColumnClip,
         eng: &mut Engine,
         bend: Option<&ChartBend>,
     ) -> SectionState {
         match meshes {
-            pipeline::SectionPayload::Cpu(data) => Self::from_upload(pos, *data, eng, bend),
-            pipeline::SectionPayload::Staged(staged) => Self::from_upload_staged(pos, *staged, eng, bend),
+            pipeline::SectionPayload::Cpu(data) => Self::from_upload(pos, *data, asked, eng, bend),
+            pipeline::SectionPayload::Staged(staged) => Self::from_upload_staged(pos, *staged, asked, eng, bend),
         }
     }
 
     fn from_upload_staged(
         pos: SectionPos,
         staged: pipeline::StagedSection,
+        asked: section::ColumnClip,
         eng: &mut Engine,
         bend: Option<&ChartBend>,
     ) -> SectionState {
+        let clip = SectionClip { asked, drawn: staged.clip_drawn };
         let detail = Detail(pos.detail.0.saturating_add(staged.shift as i8));
         let alt = Self::slab_span(pos, detail, staged.altitude_floor, staged.slabs.iter().map(|slab| slab.origin_y));
         let mut cages = Vec::new();
@@ -798,7 +815,7 @@ impl SectionState {
                 }
             })
             .collect();
-        SectionState::Ready { meshes, cages, last_style: None, alt }
+        SectionState::Ready { meshes, cages, last_style: None, alt, clip }
     }
 
     fn is_ready(&self) -> bool {
@@ -1355,8 +1372,7 @@ pub struct World {
     /// Finished section meshes awaiting budgeted upload, tagged with the claim
     /// token that produced them (re-validated at the moment of upload) and the
     /// vertex-byte charge computed at queue time.
-    section_upload_queue:
-        VecDeque<(SectionPos, pipeline::ClaimToken, usize, pipeline::SectionPayload)>,
+    section_upload_queue: VecDeque<pipeline::SectionUpload>,
     /// Last engine `mesh_stats().live_slots` sampled at `stream`. Zero until
     /// the first stream (tests without a GPU).
     gpu_live_slots: u32,
@@ -1463,6 +1479,8 @@ pub struct World {
     section_held: FastMap<SectionPos, [i32; 2]>,
     /// A chunk settled since the held sections were last checked.
     held_recheck: Sticky,
+    /// Finest-ring tiles clipped by the near window (see [`streaming::Clips`]).
+    clips: streaming::Clips,
     /// Far-lane configuration epoch: bumped by every live ladder change so an
     /// in-flight worker result from a retired configuration can never land.
     section_epoch: u32,
@@ -1713,6 +1731,7 @@ impl World {
             near_bounds: streaming::NearBounds::default(),
             section_held: FastMap::default(),
             held_recheck: Sticky::default(),
+            clips: streaming::Clips::default(),
             lod_clip_rings: 0,
             lod_clip_span: None,
             lod_clip_next: None,
@@ -2265,6 +2284,7 @@ impl World {
             || !self.upload_queue.is_empty()
             || !self.light_apply_queue.is_empty()
             || !self.section_upload_queue.is_empty()
+            || self.reclips_in_flight()
     }
 
     /// The registered stream-lane handles (panics if `stream` runs before
@@ -2996,6 +3016,8 @@ impl StreamLane for SectionLane {
             !world.sections.contains_key(s)
                 && !world.quarantined.contains(&streaming::FailKey::Section { pos: *s })
         };
+        // Drawn tiles whose clip moved, or that an edit dirtied, re-extract in place first.
+        world.for_each_reclip(&mut visit);
         // At rest every hole is a candidate. While moving, the deadline submits
         // only a few, so keep the nearest handful of holes. Residency is the
         // cheap filter and runs first: the nearest sections are almost always
@@ -3061,12 +3083,17 @@ impl StreamLane for SectionLane {
         ))
     }
     fn in_flight(world: &World, key: SectionPos) -> bool {
-        world.sections.contains_key(&key)
+        match world.sections.get(&key) {
+            None => false,
+            Some(SectionState::Meshing { .. }) => true,
+            Some(SectionState::Ready { .. }) => !world.needs_reclip(key),
+        }
     }
-    fn ready(world: &World, _key: SectionPos) -> bool {
+    fn ready(world: &World, key: SectionPos) -> bool {
         // Sections only. Near-field chunks never consume this budget; a large
-        // view must not starve covering. In-flight claims count now.
-        world.section_budget_used() < world.sections_allowed()
+        // view must not starve covering. In-flight claims count now. A re-extract
+        // in place adds no section.
+        world.sections.contains_key(&key) || world.section_budget_used() < world.sections_allowed()
     }
     fn submit(world: &mut World, key: SectionPos) -> Option<pipeline::Job> {
         world.refresh_tables();
@@ -3082,6 +3109,7 @@ impl StreamLane for SectionLane {
             generator: world.generator.clone(),
             edits: world.edits_for_section(key),
             tables: world.tables.get(),
+            clip: world.clip_target(key),
         })
     }
     fn claim(world: &mut World, key: SectionPos) {
@@ -3101,6 +3129,12 @@ impl StreamLane for SectionLane {
             }
         };
         world.dirty_sections.remove(&key);
+        // A Ready tile re-extracts in place: its mesh keeps drawing until the new one lands.
+        if world.sections.get(&key).is_some_and(SectionState::is_ready) {
+            world.claim_reclip(key, Some(token));
+            return;
+        }
+        world.claim_reclip(key, None);
         let prev = world.sections.insert(key, SectionState::Meshing { token });
         adjust_count(
             &mut world.meshing_sections,
@@ -3113,20 +3147,19 @@ impl StreamLane for SectionLane {
             pos,
             epoch,
             token,
+            clip,
             meshes,
         } = done
         {
             // A result from a retired ladder epoch, or for a claim replaced
             // after unload/re-admission, is dropped here — it must not queue an
             // upload that would capture a same-position replacement.
-            let live = epoch == world.section_epoch
-                && matches!(world.sections.get(&pos),
-                    Some(SectionState::Meshing { token: t }) if *t == token);
+            let live = epoch == world.section_epoch && world.section_claim_live(pos, token);
             if live {
                 let bytes = meshes.vertex_bytes();
                 world
                     .section_upload_queue
-                    .push_back((pos, token, bytes, meshes));
+                    .push_back(pipeline::SectionUpload { pos, token, bytes, clip, meshes });
             }
         }
     }

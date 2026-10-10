@@ -226,6 +226,41 @@ pub(in crate::world) fn coarsen_to_budget(
     out
 }
 
+/// Split every selected section that has a selected descendant into its four children, coarsest
+/// first, so the engine (which draws a section whole for any quadrant the cut gives it) does not
+/// draw a ring's straddling parent over the children beside it. A parent beside a coarser section
+/// stays whole: its children would meet a level two coarser.
+pub(in crate::world) fn complete_splits(sections: Vec<SectionPos>) -> Vec<SectionPos> {
+    let mut set: FastSet<SectionPos> = sections.into_iter().collect();
+    let above = with_drawn_below(&set.iter().map(|&s| (s, QuadrantMask::ALL)).collect());
+    let (Some(lo), Some(hi)) = (set.iter().map(|s| s.detail.0).min(), set.iter().map(|s| s.detail.0).max()) else {
+        return Vec::new();
+    };
+    // The selected section strictly coarser than `p` holding grid cell `(x, z)` of `p`'s level.
+    let coarser = |set: &FastSet<SectionPos>, p: SectionPos, x: i32, z: i32| {
+        let mut c = SectionPos { x, z, ..p };
+        (p.detail.0..hi).any(|_| {
+            c = c.parent();
+            set.contains(&c)
+        })
+    };
+    for d in ((lo + 1)..=hi).rev() {
+        let split: Vec<SectionPos> = set
+            .iter()
+            .filter(|s| s.detail.0 == d && above.contains(s))
+            .filter(|p| ![(1, 0), (-1, 0), (0, 1), (0, -1)].into_iter().any(|(dx, dz)| coarser(&set, **p, p.x + dx, p.z + dz)))
+            .copied()
+            .collect();
+        for p in split {
+            set.remove(&p);
+            set.extend(Quadrant::ALL.map(|q| p.child(q)));
+        }
+    }
+    let mut out: Vec<SectionPos> = set.into_iter().collect();
+    out.sort_unstable_by_key(|s| (s.body, s.face as u8, s.detail, s.x, s.z));
+    out
+}
+
 /// Merge two frontiers for velocity prediction (real eye + predicted eye).
 /// Result is a superset of each input, never dropping cells. Overlaps are pruned
 /// by [`resolve_covering`].
@@ -253,6 +288,23 @@ pub(in crate::world) fn drawable_cover(
             return None;
         }
         c = c.parent();
+    }
+}
+
+/// Ready descendants of `cell`, down `depth` levels, that tile what they can of it: each branch
+/// stops at its first Ready section. The stand-in for a cell with no Ready ancestor whose finer
+/// pieces (from the cut before) are still loaded.
+pub(in crate::world) fn ready_descendants(cell: SectionPos, depth: i8, ready: &impl Fn(SectionPos) -> bool, out: &mut Vec<SectionPos>) {
+    if depth <= 0 || cell.detail.0 <= 0 {
+        return;
+    }
+    for q in Quadrant::ALL {
+        let c = cell.child(q);
+        if ready(c) {
+            out.push(c);
+        } else {
+            ready_descendants(c, depth - 1, ready, out);
+        }
     }
 }
 
@@ -1027,8 +1079,8 @@ mod tests {
         })
     }
 
-    /// Where the window clips the finest ring, rings 0 and 1 end 1.5 finest spans further out
-    /// (704 and 1216 at render distance 16) and the rest stay. Without the clip (finest wider
+    /// Where the window clips the finest ring, rings 0 and 1 end three quarters of a finest span
+    /// further out (608 and 1120 at render distance 16) and the rest stay. Without the clip (finest wider
     /// than eight chunks) nothing moves.
     #[test]
     fn clipped_rings_shift_the_first_two_edges() {
@@ -1036,10 +1088,10 @@ mod tests {
         let (levels, detail) = lod_for(16);
         let cfg = PyramidCfg::sections_with(256.0, levels, detail).clipped();
         assert_eq!(cfg.clip_detail(), Some(FINEST_DETAIL));
-        assert_eq!(cfg.ring_shift, 192.0);
+        assert_eq!(cfg.ring_shift, 96.0);
         let rings = cfg.levels.get() as usize;
         let his: Vec<f32> = (0..rings - 1).map(|r| band_radii(r, &cfg).1).collect();
-        assert_eq!(his[..4], [704.0, 1216.0, 2048.0, 4096.0]);
+        assert_eq!(his[..4], [608.0, 1120.0, 2048.0, 4096.0]);
         assert!(his.windows(2).all(|w| w[0] < w[1]), "monotone {his:?}");
         for r in 1..rings {
             assert_eq!(band_radii(r, &cfg).0, band_radii(r - 1, &cfg).1, "ring {r} starts where {} ends", r - 1);
@@ -1052,7 +1104,8 @@ mod tests {
     }
 
     /// The shift keeps ring 1 three finest spans inside ring 2 at every render distance that
-    /// clips, and an all-ready cut never draws a quadrant beside one two levels coarser.
+    /// clips, and an all-ready cut of the completed selection never draws a section beside one two
+    /// levels coarser.
     #[test]
     fn clipped_rings_keep_two_to_one_balance() {
         use crate::render_config::lod_for;
@@ -1065,9 +1118,10 @@ mod tests {
             assert!(cfg.clip_detail().is_some(), "render distance {rd} clips");
             assert!(4.0 * unit - cfg.ring_shift >= RING_BALANCE_SPANS * span_f, "render distance {rd}: shift {}", cfg.ring_shift);
             let max = cfg.coarsest();
-            for i in 0..64 {
-                let (x, z) = (16 * (i % 8) + 8, 16 * (i / 8) + 8);
-                let desired = desired_sections(&eye(x, z, &cfg), &cfg);
+            for i in 0..128 {
+                let (x, z) = (16 * (i % 8) + 8, 16 * (i / 8 % 8) + 8);
+                let metric = if i < 64 { eye(x, z, &cfg) } else { eye_at(x, 390.0, z, &cfg) };
+                let desired = complete_splits(desired_sections(&metric, &cfg));
                 let draw: FastMap<SectionPos, QuadrantMask> = resolve_covering(&desired, max, &|_| true).iter().copied().collect();
                 for (&p, &mask) in &draw {
                     for q in mask.iter() {
@@ -1080,6 +1134,39 @@ mod tests {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// Completing the splits leaves a partition that tiles what the selection tiled: an all-ready
+    /// cut then draws every section with all four quadrants, so whole draws cover nothing twice.
+    #[test]
+    fn completed_splits_draw_whole_sections_only() {
+        let cfg = PyramidCfg::sections_with(256.0, 8, 2).clipped();
+        for (x, z) in [(8, 8), (-1000, 37), (5000, -3000)] {
+            for y in [0.0, 390.0] {
+                let desired = desired_sections(&eye_at(x, y, z, &cfg), &cfg);
+                let done = complete_splits(desired.clone());
+                let set: HashSet<SectionPos> = done.iter().copied().collect();
+                for &s in &done {
+                    let mut a = s;
+                    while a.detail < cfg.coarsest() {
+                        a = a.parent();
+                        assert!(!set.contains(&a), "{s:?} kept beside its ancestor {a:?}");
+                    }
+                }
+                for &s in &desired {
+                    assert!(done.iter().any(|c| c.detail <= s.detail && {
+                        let mut a = *c;
+                        while a.detail < s.detail {
+                            a = a.parent();
+                        }
+                        a == s
+                    }) || set.contains(&s), "{s:?} lost its area");
+                }
+                let cut = resolve_covering(&done, cfg.coarsest(), &|_| true);
+                assert!(cut.iter().all(|&(_, m)| m == QuadrantMask::ALL), "a partial draw at ({x}, {y}, {z})");
+                assert!(done.len() < desired.len() * 5 / 4, "completion more than a quarter larger at ({x}, {y}, {z})");
             }
         }
     }

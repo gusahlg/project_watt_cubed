@@ -168,7 +168,7 @@ fn far_lane_admits_when_near_slots_exceed_the_cpu_cull_ceiling() {
     let held = |i: usize| SectionPos { body: 0, face: Face::PosY, detail: section::FINEST_DETAIL, x: 1 + i as i32, z: 0 };
     for i in 0..SECTION_SLOT_FLOOR - 1 {
         let state = if i % 2 == 0 {
-            SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None, alt: None }
+            SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None, alt: None, clip: Default::default() }
         } else {
             SectionState::Meshing { token: pipeline::ClaimToken(i as u64) }
         };
@@ -234,7 +234,7 @@ fn section_lane_claim_and_integrate_parity() {
     assert!(<SectionLane as StreamLane>::in_flight(&world, pos), "claim marks in-flight");
     <SectionLane as StreamLane>::integrate(
         &mut world,
-        pipeline::Done::Section { pos, epoch: 0, token: pipeline::ClaimToken(7), meshes: Default::default() },
+        pipeline::Done::Section { pos, epoch: 0, token: pipeline::ClaimToken(7), clip: Default::default(), meshes: Default::default() },
     );
     assert_eq!(world.section_upload_queue.len(), 1, "landing queued for upload");
 
@@ -242,11 +242,11 @@ fn section_lane_claim_and_integrate_parity() {
     // must be dropped, never queued.
     <SectionLane as StreamLane>::integrate(
         &mut world,
-        pipeline::Done::Section { pos, epoch: 0, token: pipeline::ClaimToken(6), meshes: Default::default() },
+        pipeline::Done::Section { pos, epoch: 0, token: pipeline::ClaimToken(6), clip: Default::default(), meshes: Default::default() },
     );
     <SectionLane as StreamLane>::integrate(
         &mut world,
-        pipeline::Done::Section { pos, epoch: 1, token: pipeline::ClaimToken(7), meshes: Default::default() },
+        pipeline::Done::Section { pos, epoch: 1, token: pipeline::ClaimToken(7), clip: Default::default(), meshes: Default::default() },
     );
     assert_eq!(world.section_upload_queue.len(), 1, "stale results are dropped");
 }
@@ -258,7 +258,7 @@ fn section_covering_gates_on_a_ready_ancestor_or_self() {
     let center = stand_on_twin(&mut world);
     let cell = world.desired_sections(center)[0];
     assert!(!world.section_covered(cell), "nothing loaded means uncovered");
-    let empty_ready = || SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None, alt: None };
+    let empty_ready = || SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None, alt: None, clip: Default::default() };
     world.sections.insert(cell, empty_ready());
     assert!(world.section_covered(cell), "a Ready self covers");
     world.sections.remove(&cell);
@@ -294,7 +294,7 @@ fn section_lane_stays_armed_while_desired_cells_are_uncovered() {
     // Everything Ready: converged — still no re-arm.
     world.pending_sections.take();
     for &cell in &world.section_desired.clone() {
-        world.sections.insert(cell, SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None, alt: None });
+        world.sections.insert(cell, SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None, alt: None, clip: Default::default() });
     }
     world.section_desired = world.desired_sections(center);
     world.rebuild_section_visible(None);
@@ -317,7 +317,7 @@ fn moving_far_lane_admits_a_hole_past_the_resident_nearest() {
     let at = |x: i32| SectionPos { body: 0, face: Face::PosY, detail: section::FINEST_DETAIL, x, z: 0 };
     world.section_desired = (0..40).map(at).collect();
     for x in 0..32 {
-        world.sections.insert(at(x), SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None, alt: None });
+        world.sections.insert(at(x), SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None, alt: None, clip: Default::default() });
     }
     let mut rank = Vec::new();
     let mut visited = Vec::new();
@@ -1096,11 +1096,12 @@ fn section_upload_byte_accounting_matches_vertex_sizes() {
             pos,
             epoch: 0,
             token: pipeline::ClaimToken(7),
+            clip: Default::default(),
             meshes: meshes.into(),
         },
     );
     assert_eq!(world.section_upload_queue.len(), 1);
-    assert_eq!(world.section_upload_queue[0].2, expected);
+    assert_eq!(world.section_upload_queue[0].bytes, expected);
 }
 
 /// Empty pooled section output is a zero-byte charge (stale/default jobs).
@@ -1679,12 +1680,8 @@ fn lod2_far_field_drives_to_covering_complete() {
         if !got {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        while let Some((pos, token, _bytes, _meshes)) = world.section_upload_queue.pop_front() {
-            if let Some(s @ SectionState::Meshing { .. }) = world.sections.get_mut(&pos)
-                && matches!(s, SectionState::Meshing { token: t } if *t == token)
-            {
-                *s = SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None, alt: None };
-            }
+        while let Some(up) = world.section_upload_queue.pop_front() {
+            world.land_section(up, None);
         }
     }
     assert!(world.sections.values().any(|s| s.is_ready()), "at least one Ready section");
@@ -2201,6 +2198,7 @@ fn late_section_done_after_epoch_bump_does_not_reinsert() {
             pos,
             epoch: 0,
             token,
+            clip: Default::default(),
             meshes: Default::default(),
         },
     );
@@ -2507,6 +2505,7 @@ fn claim_sequence(seed: u64) {
                             pos,
                             epoch,
                             token,
+                            clip: Default::default(),
                             meshes: Default::default(),
                         },
                     );
@@ -2549,6 +2548,7 @@ fn claim_sequence(seed: u64) {
                 pos,
                 epoch: section_epoch,
                 token,
+                clip: Default::default(),
                 meshes: Default::default(),
             },
         );
@@ -2609,7 +2609,7 @@ fn assert_claim_invariants(
             let queued = world
                 .section_upload_queue
                 .iter()
-                .any(|(p, t, _, _)| p == pos && t == token);
+                .any(|u| u.pos == *pos && u.token == *token);
             assert!(
                 owed_section.get(pos) == Some(token) || queued,
                 "{pos:?} meshing with no owed Done and not queued"
@@ -3358,7 +3358,8 @@ fn verdance_column(world: &World, from_pos_x: Option<i64>) -> (usize, std::sync:
 
 /// A streaming centre on Verdance selects chart sections around the storage eye, bent through
 /// the chart. Re-pins `far_face_storage_selects_none`: a storage centre used to select nothing.
-/// A span-32 tile may cross the full-res edge; that tile draws the sliver beside the box.
+/// A finest tile crossing the full-res edge is clipped (leaves the window the columns it draws);
+/// where it cannot be, a span-32 tile draws the sliver beside the box.
 #[test]
 fn far_face_storage_selects_chart_sections() {
     use crate::space::atlas::Patch;
@@ -3373,7 +3374,7 @@ fn far_face_storage_selects_chart_sections() {
     assert!(world.adopt_fold(centre), "storage centre did not fold");
     assert!(!world.fold.is_identity());
     world.section_eye_y = ground as f64;
-    let desired = world.desired_sections(centre);
+    let (desired, clips) = world.desired_and_clips(centre);
     assert!(!desired.is_empty(), "Verdance selected no chart sections");
     let body = section::CHART_BODY_BASE + index as u16;
     assert!(desired.iter().all(|s| s.body == body && s.face == Face::PosY), "frontier left the chart: {desired:?}");
@@ -3390,12 +3391,12 @@ fn far_face_storage_selects_chart_sections() {
         let (x, z) = (s.min_x() as i64, s.min_z() as i64);
         assert!(section::section_fits(s.span(), atlas.radius), "section {s:?} exceeds the chord cap");
         assert!(x >= o[0] && x + span <= o[0] + size[0] && z >= o[2] && z + span <= o[2] + size[2], "{s:?} leaves the home chart");
-        // Overlap is only the span-32 border: it also extends outside, so the sliver beside the box is drawn.
+        // Overlap is a clipped finest tile or the span-32 border: it also extends outside, so the
+        // part beside the box is drawn.
         let overlaps = x < x1 && x + span > x0 && z < z1 && z + span > z0;
         if overlaps {
-            assert_eq!(
-                span,
-                section::section_span(Detail(0)) as i64,
+            assert!(
+                clips.contains_key(s) || span == section::section_span(Detail(0)) as i64,
                 "{s:?} covers the full-res box above the border grid"
             );
             assert!(
