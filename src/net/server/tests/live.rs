@@ -22,15 +22,16 @@ fn external_server_session() {
     let mut bob = Connection::connect("127.0.0.1", port, "bob", "").expect("bob joins");
     let (ada_id, bob_id) = (ada.player_id(), bob.player_id());
     println!("ada #{ada_id} at {:?}, bob #{bob_id} at {:?}", ada.spawn(), bob.spawn());
-    // A first move puts each in the other's interest set.
-    for conn in [&mut ada, &mut bob] {
+    // A move puts each in the other's interest set. The client paces its moves, so keep offering.
+    let stand = |conn: &mut Connection| {
         let spawn = conn.spawn();
         conn.send_move(spawn, 0.0, 0.0, DQuat::IDENTITY, Vec3::ZERO, Face::PosY, Stance::Standing);
-    }
+        conn.poll();
+    };
     assert!(
         eventually(ANSWER, || {
-            ada.poll();
-            bob.poll();
+            stand(&mut ada);
+            stand(&mut bob);
             ada.peer(bob_id).is_some_and(|p| p.visible()) && bob.peer(ada_id).is_some_and(|p| p.visible())
         }),
         "the two see each other"
@@ -105,10 +106,8 @@ fn external_server_session() {
     println!("chat: ok");
 
     // Mod data, once both stand in each other's interest set again.
-    let spawn = ada.spawn();
-    ada.send_move(spawn, 0.0, 0.0, DQuat::IDENTITY, Vec3::ZERO, Face::PosY, Stance::Standing);
     assert!(eventually(ANSWER, || {
-        ada.poll();
+        stand(&mut ada);
         bob.poll();
         bob.peer(ada_id).is_some_and(|p| p.visible())
     }));

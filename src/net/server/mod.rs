@@ -28,6 +28,13 @@
 //!
 //! **Server mods.** [`Config::hooks`] is a [`ServerMod`] table (plain-data
 //! arguments, no protocol change). Calls run outside the [`State`] lock.
+//!
+//! **Layout.** `state` holds what the lock guards (roster, ledger, interest grid,
+//! terrain cache); `join` takes a connection from accept to the roster and back out;
+//! `session` is its message loop with the chat and clock handlers; `movement`,
+//! `edit` and `fanout` handle moves, edits and getting frames out; `budget` rates
+//! each connection; `tick` is the 20 Hz thread; `save` is the world file. Tests sit
+//! in `tests/` by the same subjects, and `load` is the bot load test.
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::io;
