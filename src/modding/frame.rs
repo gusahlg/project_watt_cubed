@@ -203,7 +203,11 @@ impl<'a> FrameContext<'a> {
     }
 
     /// Whether the immediate action `id` fired this frame (any installed mod's action with that id).
+    /// A frame with no action fired answers without looking at a name.
     pub fn action(&self, id: &str) -> bool {
+        if self.fired.is_empty() {
+            return false;
+        }
         self.ids.iter().enumerate().any(|(i, name)| *name == id && self.fired.contains(i))
             || self.extra.iter().enumerate().any(|(i, name)| *name == id && self.fired.contains(self.ids.len() + i))
     }
