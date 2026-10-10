@@ -55,10 +55,10 @@ impl App {
     /// far position (`start`).
     fn enter_bench_world(&mut self, eng: &mut Engine, start: (Option<DVec3>, Option<(f32, f32)>, Option<f64>)) {
         let (pos, look, day) = start;
-        // Uncapped and unsynced, or the bench measures the throttle.
+        // Uncapped and unsynced, or the bench measures the throttle (the report states both).
+        // Entering the world pushes the graphics settings.
         self.settings.vsync = false;
         self.settings.max_fps = 0;
-        self.settings.apply(eng);
         self.start_new_world(eng);
         let Screen::Playing(game) = &mut self.screen else { return };
         game.set_input_locked(true);

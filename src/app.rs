@@ -24,12 +24,12 @@ use crate::menu::menus::{ModsMenu, SettingsHub};
 use crate::menu::start::{StartFacts, StartRoot, VERSION};
 use crate::menu::theme::{DefaultTheme, MenuTheme};
 use crate::menu::{AppEffect, Ctx, Framed, MenuStack, ModRow};
-use crate::modding::{ActionSet, ChoicesFlush, Debounce, GameBuild, ModDescriptor, Mods};
+use crate::modding::{ActionSet, ChoicesFlush, Debounce, GameBuild, ModDescriptor, Mods, VisualMask};
 use crate::ui::{self, Anchor};
 use crate::player::Player;
 use crate::save::{self, Autosaver, SaveMeta, Slot, SlotId, Tick};
 use crate::session::Session;
-use crate::settings::Settings;
+use crate::settings::{GfxEngine, Settings};
 use crate::world::terrain::TerrainCfg;
 use crate::world::World;
 use connect::ConnectJob;
@@ -101,7 +101,8 @@ pub struct App {
     last_stall_log: Option<Instant>,
     /// Debounces `mods.cfg` writes (held Left/Right would otherwise rewrite ~22×/s).
     choices_flush: ChoicesFlush,
-    /// In-game settings changes (HUD hotkey, console) wait here and save once they go quiet.
+    /// Settings changes (menu steps, the HUD hotkey, the console) wait here and save once they
+    /// go quiet, or on leaving a world and on quit.
     settings_flush: Debounce,
     clock: Instant,
     /// True while the Mods screen is on the menu stack.
@@ -122,6 +123,57 @@ struct GfxKey {
     scale_bits: u32,
     cull_faces: Option<bool>,
     flags: voxel_engine::RenderFlags,
+}
+
+impl GfxKey {
+    /// The stamp for `settings` with `mask`'s visual groups stripped, in a `w`×`h` window.
+    /// Built every frame, so it allocates nothing.
+    fn of(settings: &Settings, mask: VisualMask, (w, h): (u32, u32)) -> Self {
+        let (msaa, scale) = settings.session_msaa_scale(w, h);
+        Self {
+            w,
+            h,
+            fullscreen: settings.fullscreen,
+            msaa,
+            scale_bits: scale.to_bits(),
+            cull_faces: settings.cull_faces,
+            flags: mask.effective_render(settings).engine_flags(),
+        }
+    }
+}
+
+/// The one writer of the engine's graphics state: window mode, MSAA, render scale, face culling
+/// and the render-lane flags, masked by the visual mods. Pushes only when the stamp moves, so a
+/// quiet frame or an idle menu does not wake the render thread; a resize moves it, so a fallback
+/// cannot be overwritten. One push writes the flags once, so a lane a mod strips never turns on
+/// in between (each turn resets the engine's temporal state). True when it pushed.
+fn push_gfx(eng: &mut impl GfxEngine, settings: &mut Settings, mask: VisualMask, applied: &mut Option<GfxKey>) -> bool {
+    let extent = eng.window_extent();
+    if *applied == Some(GfxKey::of(settings, mask, extent)) {
+        return false;
+    }
+    // Applied MSAA/scale from engine create (and later recreates) before
+    // we push the session request, so a fallback cannot be overwritten.
+    settings.sync_engine_applied(eng);
+    settings.apply(eng);
+    // Stamped after the apply: it noted the render extent (Auto VRS and TAA read it) and any
+    // fallback, so the next frame's stamp matches and nothing is pushed twice.
+    let key = GfxKey::of(settings, mask, extent);
+    eng.set_flags(key.flags);
+    *applied = Some(key);
+    #[cfg(test)]
+    crate::alloc_count::note_engine(crate::alloc_count::EngineCall::SettingsApply);
+    true
+}
+
+/// Settings a frame changed are written once [`Debounce::IDLE_MS`] pass with no further change,
+/// so a held Left/Right on a settings row does not rewrite `settings.cfg` at key-repeat rate.
+/// True when the write is due now.
+fn settings_write_due(flush: &mut Debounce, changed: bool, now_ms: u64) -> bool {
+    if changed {
+        flush.mark(now_ms);
+    }
+    flush.poll(now_ms)
 }
 
 /// The save slot behind the open singleplayer world: identity, header
@@ -325,10 +377,14 @@ impl App {
             self.note_frame_stall(t0, update_dt);
             return false;
         }
-        // VRAM guard + live settings: push only when the stamp moves so a
-        // quiet frame or an idle menu does not wake the render thread. A
-        // resize changes the stamp, so a fallback cannot be overwritten.
+        // VRAM guard + live settings, then the game's half of a console change, which reads
+        // the render extent the push noted.
         self.push_gfx(eng);
+        if let Screen::Playing(game) = &mut self.screen
+            && game.take_settings_changed()
+        {
+            game.apply_settings(eng, &self.settings);
+        }
         // Apply only on change: a SetVsync every menu frame was waking the
         // render thread even when the mode was already correct.
         let in_world = matches!(self.screen, Screen::Playing(_));
@@ -378,34 +434,8 @@ impl App {
         eprintln!("{head} ({screen})");
     }
 
-    fn gfx_key(&self, w: u32, h: u32) -> GfxKey {
-        let session = self.settings.session_graphics(w, h);
-        GfxKey {
-            w,
-            h,
-            fullscreen: self.settings.fullscreen,
-            msaa: session.msaa,
-            scale_bits: session.render_scale.to_bits(),
-            cull_faces: self.settings.cull_faces,
-            flags: self.mods.effective_render(&self.settings).engine_flags(),
-        }
-    }
-
     fn push_gfx(&mut self, eng: &mut Engine) {
-        let w = eng.screen_width().max(1) as u32;
-        let h = eng.screen_height().max(1) as u32;
-        let key = self.gfx_key(w, h);
-        if self.gfx_applied.as_ref() == Some(&key) {
-            return;
-        }
-        // Applied MSAA/scale from engine create (and later recreates) before
-        // we push the session request, so a fallback cannot be overwritten.
-        self.settings.sync_engine_applied(eng);
-        self.settings.apply(eng);
-        eng.set_flags(key.flags);
-        self.gfx_applied = Some(key);
-        #[cfg(test)]
-        crate::alloc_count::note_engine(crate::alloc_count::EngineCall::SettingsApply);
+        push_gfx(eng, &mut self.settings, self.mods.visual_mask(), &mut self.gfx_applied);
     }
 
     /// Update the menu stack and apply settings live each frame.
@@ -445,10 +475,13 @@ impl App {
             };
             effect = stack.update(&intents, &mut ctx);
         }
-        // Persist whenever a step (or a hardware clamp) moved a value.
-        if self.settings != before {
-            self.settings.save();
+        // Persist whenever a step (or a hardware clamp) moved a value, once the steps go quiet.
+        let changed = self.settings != before;
+        if changed {
             self.sound.set_mix(self.settings.mix_change());
+        }
+        if settings_write_due(&mut self.settings_flush, changed, now_ms) {
+            self.settings.save();
         }
         if self.mods_open {
             let depth_after = match &self.screen {
@@ -767,7 +800,11 @@ impl App {
         game.set_visual_mask(self.mods.visual_mask());
         game.world_mut()
             .set_render_lanes(render.occlusion, render.lod2);
-        game.apply_settings(eng, &mut self.settings);
+        // Entry re-fits MSAA and scale to the VRAM free now, as it always has; the game then
+        // resolves its lanes against the extent that push noted.
+        self.gfx_applied = None;
+        self.push_gfx(eng);
+        game.apply_settings(eng, &self.settings);
         // Saves and servers can place the player far from the pre-generated
         // origin; request the collision slab (physics freezes until it lands).
         let pos = game.player().position;
@@ -795,10 +832,7 @@ impl App {
             &mut self.audio,
             &self.cues,
         );
-        if game.take_settings_dirty() {
-            self.settings_flush.mark(now_ms);
-        }
-        if self.settings_flush.poll(now_ms) && self.bench.is_none() {
+        if settings_write_due(&mut self.settings_flush, game.take_settings_dirty(), now_ms) && self.bench.is_none() {
             self.settings.save();
         }
         if let Signal::ExitToMenu = signal {
@@ -1206,6 +1240,158 @@ mod tests {
                 assert_eq!(p.up_axis, crate::coord::Face::PosY);
             }
         }
+    }
+
+    /// The engine as [`push_gfx`] sees it. It allocates MSAA up to `msaa_cap`, as a device short
+    /// of VRAM falls back, and counts every render-lane flag transition.
+    struct FakeGfx {
+        extent: (u32, u32),
+        flags: voxel_engine::RenderFlags,
+        transitions: u32,
+        bloom_ever_on: bool,
+        msaa: u32,
+        msaa_cap: u32,
+        scale: f32,
+    }
+
+    impl FakeGfx {
+        /// Created as `App::run` creates the engine: the masked flags of `settings`.
+        fn new(settings: &Settings, mask: VisualMask, msaa_cap: u32) -> Self {
+            let flags = mask.effective_render(settings).engine_flags();
+            Self { extent: (1280, 720), flags, transitions: 0, bloom_ever_on: flags.bloom, msaa: settings.msaa.min(msaa_cap), msaa_cap, scale: 1.0 }
+        }
+    }
+
+    impl GfxEngine for FakeGfx {
+        fn window_extent(&self) -> (u32, u32) {
+            self.extent
+        }
+        fn gpu_caps(&self) -> voxel_engine::GpuCaps {
+            voxel_engine::GpuCaps {
+                device_name: String::new(),
+                device_local_bytes: 0,
+                device_local_heap_size: 0,
+                device_local_budget: None,
+                device_local_usage: None,
+                max_texture_array_layers: 2048,
+                max_msaa: 8,
+                supports_vrs: false,
+                supports_pipeline_stats: false,
+            }
+        }
+        fn vrs_useful_above_pixels(&self) -> Option<u32> {
+            None
+        }
+        fn estimate_render_targets(&self, _: u32, _: u32, _: f32, _: u32, _: RenderConfig) -> u64 {
+            0
+        }
+        fn set_fullscreen(&mut self, _: bool) {}
+        fn set_msaa(&mut self, samples: u32) -> u32 {
+            self.msaa = samples.min(self.msaa_cap);
+            self.msaa
+        }
+        fn set_render_scale(&mut self, scale: f32) -> f32 {
+            self.scale = scale;
+            scale
+        }
+        fn set_cull_faces(&mut self, _: bool) {}
+        fn set_flags(&mut self, flags: voxel_engine::RenderFlags) {
+            if flags != self.flags {
+                self.transitions += 1;
+                self.bloom_ever_on |= flags.bloom;
+                self.flags = flags;
+            }
+        }
+        fn msaa(&self) -> u32 {
+            self.msaa
+        }
+        fn render_scale(&self) -> f32 {
+            self.scale
+        }
+    }
+
+    /// With the Post mod off, a push writes the masked flags once: one transition per change of
+    /// a live lane, none for a lane the mod strips, and bloom never turns on in between.
+    #[test]
+    fn with_a_visual_mod_off_each_apply_is_one_flag_transition() {
+        use crate::render_config::VisualGroup;
+        let mask = VisualMask::of([VisualGroup::Atmosphere, VisualGroup::Lighting]);
+        let mut settings = Settings::default();
+        settings.bloom = true;
+        let mut eng = FakeGfx::new(&settings, mask, 8);
+        let mut applied = None;
+        assert!(push_gfx(&mut eng, &mut settings, mask, &mut applied), "the first frame pushes");
+        assert_eq!(eng.transitions, 0, "the engine was created with these flags");
+        for frame in 0..5 {
+            assert!(!push_gfx(&mut eng, &mut settings, mask, &mut applied), "quiet frame {frame} pushes nothing");
+        }
+        for (lane, flip) in [("shadows", (|s: &mut Settings| s.shadows = !s.shadows) as fn(&mut Settings)), ("fog", |s| s.fog = !s.fog)] {
+            let before = eng.transitions;
+            flip(&mut settings);
+            assert!(push_gfx(&mut eng, &mut settings, mask, &mut applied), "{lane}");
+            assert_eq!(eng.transitions, before + 1, "{lane}: one transition");
+            assert!(!push_gfx(&mut eng, &mut settings, mask, &mut applied), "{lane}: settled");
+        }
+        let before = eng.transitions;
+        settings.godrays = !settings.godrays;
+        push_gfx(&mut eng, &mut settings, mask, &mut applied);
+        assert_eq!(eng.transitions, before, "a stripped lane moves nothing");
+        eng.extent = (2560, 1440);
+        assert!(push_gfx(&mut eng, &mut settings, mask, &mut applied), "a resize pushes");
+        assert!(eng.transitions <= before + 1);
+        assert!(!push_gfx(&mut eng, &mut settings, mask, &mut applied), "and settles in the same frame");
+        assert!(!eng.bloom_ever_on, "the Post mod's bloom never reached the engine");
+    }
+
+    /// A device that cannot allocate the MSAA asked for: the fallback is adopted once, and every
+    /// later frame compares stamps without a single allocation (the notice is not cloned).
+    #[test]
+    fn push_gfx_allocates_nothing_in_steady_state() {
+        let mask = VisualMask::default();
+        let mut settings = Settings::default();
+        settings.msaa = 4;
+        let mut eng = FakeGfx::new(&settings, mask, 1);
+        let mut applied = None;
+        assert!(push_gfx(&mut eng, &mut settings, mask, &mut applied));
+        assert!(settings.vram_notice.is_some(), "the fallback is noticed");
+        assert_eq!(settings.session_msaa_scale(1280, 720).0, 1, "the session runs at what the device gave");
+        assert!(!push_gfx(&mut eng, &mut settings, mask, &mut applied), "the fallback is not pushed again");
+        for frame in 0..8 {
+            crate::alloc_count::reset();
+            let pushed = push_gfx(&mut eng, &mut settings, mask, &mut applied);
+            assert_eq!((pushed, crate::alloc_count::alloc_count()), (false, 0), "steady frame {frame}");
+        }
+    }
+
+    /// Left held on a Video row at key-repeat rate for two seconds, frames 8 ms apart, the way
+    /// the menu screen runs them: nothing is written while the value moves, and one write lands
+    /// once it has been still for the debounce window.
+    #[test]
+    fn holding_left_writes_settings_at_most_once_per_debounce_window() {
+        use crate::menu::menus::SettingsPage;
+        use crate::menu::{Dir, Intent};
+        let mut settings = Settings::default();
+        let session = Session::default();
+        let mut stack = MenuStack::new(Framed::boxed(SettingsPage::new(crate::settings::Category::Video)));
+        let mut flush = Debounce::new();
+        let (mut writes, mut steps) = (Vec::new(), 0);
+        for frame in 0..400u64 {
+            let now_ms = frame * 8;
+            let held = now_ms < 2000 && frame % 4 == 0;
+            let intents = if held { vec![Intent::Adjust(Dir::Prev)] } else { Vec::new() };
+            let before = settings.clone();
+            let mut ctx = Ctx { settings: &mut settings, saves: &[], mods: &[], session: &session, mods_save_error: None };
+            stack.update(&intents, &mut ctx);
+            let changed = settings != before;
+            steps += changed as u32;
+            if settings_write_due(&mut flush, changed, now_ms) {
+                writes.push(now_ms);
+            }
+        }
+        assert!(steps > 40, "the held key moved the value ({steps} steps)");
+        assert_eq!(writes.len(), 1, "one write, after the release: {writes:?}");
+        assert!((2000..2000 + Debounce::IDLE_MS + 16).contains(&writes[0]), "written {}ms in", writes[0]);
+        assert!(!flush.take(), "nothing left pending");
     }
 
     #[test]

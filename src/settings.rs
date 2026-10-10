@@ -19,13 +19,70 @@ use std::fs;
 use std::ops::RangeInclusive;
 use std::path::PathBuf;
 
-use voxel_engine::Engine;
+use voxel_engine::{Engine, GpuCaps, RenderFlags};
 
 use crate::render_config::{
     DeviceCaps, RenderConfig, SessionGraphics, VRS_AUTO_MIN_PIXELS, VrsChoice,
     engine_applied_differs, engine_applied_notice, estimate_from_engine, fit_render_targets,
     lod_for, vrs_effective,
 };
+
+/// The engine calls graphics settings make: [`Settings::apply`], the probes it reads, and the
+/// render-lane flags `App::push_gfx` writes. [`Engine`] is the real one; tests drive a double.
+/// Callers stay generic, so dispatch is static.
+pub trait GfxEngine {
+    /// The window in pixels, at least 1×1.
+    fn window_extent(&self) -> (u32, u32);
+    fn gpu_caps(&self) -> GpuCaps;
+    fn vrs_useful_above_pixels(&self) -> Option<u32>;
+    /// Device-local bytes the render targets would take at this window, scale, MSAA and lanes.
+    fn estimate_render_targets(&self, width: u32, height: u32, scale: f32, msaa: u32, lanes: RenderConfig) -> u64;
+    fn set_fullscreen(&mut self, on: bool);
+    fn set_msaa(&mut self, samples: u32) -> u32;
+    fn set_render_scale(&mut self, scale: f32) -> f32;
+    fn set_cull_faces(&mut self, on: bool);
+    fn set_flags(&mut self, flags: RenderFlags);
+    /// The MSAA the engine actually allocated.
+    fn msaa(&self) -> u32;
+    /// The render scale the engine actually allocated.
+    fn render_scale(&self) -> f32;
+}
+
+impl GfxEngine for Engine {
+    fn window_extent(&self) -> (u32, u32) {
+        (self.screen_width().max(1) as u32, self.screen_height().max(1) as u32)
+    }
+    fn gpu_caps(&self) -> GpuCaps {
+        Engine::gpu_caps(self)
+    }
+    fn vrs_useful_above_pixels(&self) -> Option<u32> {
+        Engine::vrs_useful_above_pixels(self)
+    }
+    fn estimate_render_targets(&self, width: u32, height: u32, scale: f32, msaa: u32, lanes: RenderConfig) -> u64 {
+        estimate_from_engine(self, width, height, scale, msaa, lanes)
+    }
+    fn set_fullscreen(&mut self, on: bool) {
+        Engine::set_fullscreen(self, on);
+    }
+    fn set_msaa(&mut self, samples: u32) -> u32 {
+        Engine::set_msaa(self, samples)
+    }
+    fn set_render_scale(&mut self, scale: f32) -> f32 {
+        Engine::set_render_scale(self, scale)
+    }
+    fn set_cull_faces(&mut self, on: bool) {
+        Engine::set_cull_faces(self, on);
+    }
+    fn set_flags(&mut self, flags: RenderFlags) {
+        Engine::set_flags(self, flags);
+    }
+    fn msaa(&self) -> u32 {
+        Engine::msaa(self)
+    }
+    fn render_scale(&self) -> f32 {
+        Engine::render_scale(self)
+    }
+}
 use crate::ui::HudMode;
 
 pub use crate::world::{VERTICAL_RADIUS_RANGE as VERTICAL_DISTANCE_RANGE, VIEW_RADIUS_RANGE};
@@ -844,8 +901,8 @@ pub const SETTINGS: [Setting; 49] = [
         "camera shake",
         &["camerashake"]
     ),
-    // Render lanes (see [`Settings::render_config`]). Engine lanes apply live via
-    // `set_flags`; occlusion/lod2 apply on next world entry; clouds/weather per frame.
+    // Render lanes (see [`Settings::render_config`]). Engine lanes apply live through
+    // `App::push_gfx`; occlusion/lod2 apply on next world entry; clouds/weather per frame.
     video_toggle!(lod2, "lod2", "Distant LOD", &["lod"]),
     video_toggle!(occlusion, "occlusion", "Occlusion Culling", &["occ"]),
     video_toggle!(sky, "sky", "Procedural Sky"),
@@ -1071,7 +1128,7 @@ impl Settings {
     }
 
     /// Heap, live free VRAM, max MSAA, and VRS Auto threshold from the live engine.
-    pub fn adopt_gpu_caps(&mut self, eng: &Engine) {
+    pub fn adopt_gpu_caps(&mut self, eng: &impl GfxEngine) {
         let caps = eng.gpu_caps();
         self.device_max_msaa = caps.max_msaa.max(1);
         self.device_local_memory_bytes = (caps.device_local_bytes > 0).then_some(caps.device_local_bytes);
@@ -1115,13 +1172,7 @@ impl Settings {
         estimate: impl Fn(u32, u32, f32, u32, RenderConfig) -> u64,
     ) -> SessionGraphics {
         let mut g = self.fitted_session_graphics(width, height, estimate);
-        if self.render_target_fallback
-            && self.fallback_request_msaa == Some(g.msaa)
-            && self
-                .fallback_request_scale
-                .is_some_and(|s| (s - g.render_scale).abs() <= 1e-3)
-            && let (Some(msaa), Some(scale)) = (self.session_msaa, self.session_render_scale)
-        {
+        if let Some((msaa, scale)) = self.fallback_for(g.msaa, g.render_scale) {
             g.msaa = msaa;
             g.render_scale = scale;
             if let Some(notice) = self.vram_notice.clone() {
@@ -1129,6 +1180,24 @@ impl Settings {
             }
         }
         g
+    }
+
+    /// The session MSAA and scale of [`session_graphics`](Self::session_graphics), without its
+    /// notice: what a frame compares to decide whether to push, so it allocates nothing.
+    pub fn session_msaa_scale(&self, width: u32, height: u32) -> (u32, f32) {
+        let g = self.fitted_session_graphics(width, height, |_, _, _, _, _| 0);
+        self.fallback_for(g.msaa, g.render_scale).unwrap_or((g.msaa, g.render_scale))
+    }
+
+    /// The engine's allocation fallback, while the request it answered (`msaa`, `scale`) stands.
+    fn fallback_for(&self, msaa: u32, scale: f32) -> Option<(u32, f32)> {
+        let answers = self.render_target_fallback
+            && self.fallback_request_msaa == Some(msaa)
+            && self.fallback_request_scale.is_some_and(|s| (s - scale).abs() <= 1e-3);
+        match (answers, self.session_msaa, self.session_render_scale) {
+            (true, Some(msaa), Some(scale)) => Some((msaa, scale)),
+            _ => None,
+        }
     }
 
     /// VRAM-fitted request before any engine allocation fallback.
@@ -1190,12 +1259,11 @@ impl Settings {
     }
 
     /// Read [`Engine::msaa`] / [`Engine::render_scale`] after create or recreate.
-    pub fn sync_engine_applied(&mut self, eng: &Engine) {
-        let w = eng.screen_width().max(1) as u32;
-        let h = eng.screen_height().max(1) as u32;
+    pub fn sync_engine_applied(&mut self, eng: &impl GfxEngine) {
+        let (w, h) = eng.window_extent();
         self.adopt_gpu_caps(eng);
         let requested = self.fitted_session_graphics(w, h, |width, height, scale, msaa, lanes| {
-            estimate_from_engine(eng, width, height, scale, msaa, lanes)
+            eng.estimate_render_targets(width, height, scale, msaa, lanes)
         });
         self.adopt_engine_applied(
             &requested,
@@ -1227,22 +1295,21 @@ impl Settings {
         self.taa || (self.render_scale_auto() && scale < 1.0)
     }
 
-    /// Push the current values to the engine. Cheap to call every frame: the
-    /// engine ignores values that didn't change. Hardware MSAA support is
-    /// already snapped in [`Self::clamp`]; VRAM-budget MSAA/scale cuts are
-    /// applied here without writing them back (they are this session only).
-    pub fn apply(&mut self, eng: &mut Engine) {
+    /// Push the window mode, MSAA, render scale and face culling to the engine, and note
+    /// the render extent the lanes resolve against. The engine ignores values that didn't
+    /// change. Hardware MSAA support is already snapped in [`Self::clamp`]; VRAM-budget
+    /// MSAA/scale cuts are applied here without writing them back (they are this session
+    /// only). Render-lane flags are not pushed here: `App::push_gfx` writes them once, after
+    /// visual mods have masked them, so a stripped lane never flickers on.
+    pub fn apply(&mut self, eng: &mut impl GfxEngine) {
         eng.set_fullscreen(self.fullscreen);
         // Vsync and the fps cap are not pushed here: `App::frame` is the
         // single writer, because the effective values also depend on the
         // screen (menus cap the frame rate, vsync off) and the benchmark.
         self.adopt_gpu_caps(eng);
-        let w = eng.screen_width().max(1) as u32;
-        let h = eng.screen_height().max(1) as u32;
+        let (w, h) = eng.window_extent();
         let session = {
-            let estimate = |width, height, scale, msaa, lanes| {
-                estimate_from_engine(eng, width, height, scale, msaa, lanes)
-            };
+            let estimate = |width, height, scale, msaa, lanes| eng.estimate_render_targets(width, height, scale, msaa, lanes);
             let fitted = self.fitted_session_graphics(w, h, &estimate);
             if self.render_target_fallback
                 && (self.fallback_request_msaa != Some(fitted.msaa)
@@ -1267,9 +1334,6 @@ impl Settings {
         if let Some(on) = self.cull_faces {
             eng.set_cull_faces(on);
         }
-        // Engine render lanes live-swap on both threads; occlusion/lod2 are world
-        // inputs (applied on world entry) and aren't part of `engine_flags`.
-        eng.set_flags(self.render_config().engine_flags());
     }
 
     /// Record the live window and render extent so [`render_config`] can resolve
