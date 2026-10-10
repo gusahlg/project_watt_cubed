@@ -278,40 +278,76 @@ pub(super) fn admit_player(
     // directly and reliably.
     let (out, rx) = outbox(OUT_CAPACITY);
     let kick = Arc::new(Notify::new());
-
-    // One locked scope so the id, spawn, and roster snapshot are consistent.
-    let id;
-    let spawn;
-    let existing: Vec<(u32, Arc<str>)>;
-    let snapshot: Overlay;
-    {
-        let mut state = shared.lock_recover();
-        if reserved_name(name) {
-            drop(state);
-            reject(rt, send, conn, "the name 'server' is reserved");
+    let reserved = match reserve(shared, name) {
+        Ok(reserved) => reserved,
+        Err(reason) => {
+            reject(rt, send, conn, reason);
             return None;
         }
-        if state.players.values().any(|h| h.name.eq_ignore_ascii_case(name)) {
-            drop(state);
-            reject(rt, send, conn, "that name is already in use");
-            return None;
-        }
-        if state.players.len() >= MAX_PLAYERS {
-            drop(state);
-            reject(rt, send, conn, "server full");
-            return None;
-        }
-        id = state.next_id;
-        state.next_id += 1;
-        spawn = spawn_point(ctx.generator.as_ref(), id);
-        let (frame, up) = standing_pose(Field::new(ctx.generator.mass()).sample(spawn).accel);
-        let op = ctx.ops.iter().any(|op| op.eq_ignore_ascii_case(name));
-        (existing, snapshot) = state.admit(id, PlayerHandle::new(name.clone(), spawn, frame, up, op, out.clone(), kick.clone()));
-    }
+    };
+    let (id, spawn, existing, snapshot) = place(reserved, ctx, name, out.clone(), kick.clone());
     if let Some(hooks) = ctx.hooks.as_ref() {
         hooks.lock_recover().on_join(&JoinFacts::at(id, name.clone(), spawn));
     }
     Some((id, spawn, existing, snapshot, out, rx, kick))
+}
+
+/// A player id and name held between a join's checks and its roster insert, so the spawn
+/// search runs with the lock released. Dropped before [`place`] takes it, it gives both back.
+pub(super) struct Reserved<'a> {
+    shared: &'a Mutex<State>,
+    id: u32,
+    placed: bool,
+}
+
+impl Drop for Reserved<'_> {
+    fn drop(&mut self) {
+        if !self.placed {
+            let id = self.id;
+            self.shared.lock_recover().joining.retain(|&(held, _)| held != id);
+        }
+    }
+}
+
+/// Check the joiner's name and the room left, and hold an id. A name being joined under
+/// counts as taken, and a held id counts against [`MAX_PLAYERS`].
+pub(super) fn reserve<'a>(shared: &'a Mutex<State>, name: &Arc<str>) -> Result<Reserved<'a>, &'static str> {
+    if reserved_name(name) {
+        return Err("the name 'server' is reserved");
+    }
+    let mut state = shared.lock_recover();
+    let taken = state.players.values().map(|h| &h.name).chain(state.joining.iter().map(|(_, held)| held));
+    if taken.into_iter().any(|have| have.eq_ignore_ascii_case(name)) {
+        return Err("that name is already in use");
+    }
+    if state.players.len() + state.joining.len() >= MAX_PLAYERS {
+        return Err("server full");
+    }
+    let id = state.next_id;
+    state.next_id += 1;
+    state.joining.push((id, name.clone()));
+    Ok(Reserved { shared, id, placed: false })
+}
+
+/// Find the reserved joiner's spawn and the pose standing there with the lock released, then
+/// put them on the roster: their id, spawn, the roster they join and the overlay to send.
+pub(super) fn place(
+    mut reserved: Reserved<'_>,
+    ctx: &Ctx,
+    name: &Arc<str>,
+    out: Outbox,
+    kick: Arc<Notify>,
+) -> (u32, DVec3, Vec<(u32, Arc<str>)>, Overlay) {
+    let id = reserved.id;
+    let spawn = spawn_point(ctx.generator.as_ref(), id);
+    let (frame, up) = standing_pose(Field::new(ctx.generator.mass()).sample(spawn).accel);
+    let op = ctx.ops.iter().any(|op| op.eq_ignore_ascii_case(name));
+    let handle = PlayerHandle::new(name.clone(), spawn, frame, up, op, out, kick);
+    let mut state = reserved.shared.lock_recover();
+    state.joining.retain(|&(held, _)| held != id);
+    reserved.placed = true;
+    let (existing, overlay) = state.admit(id, handle);
+    (id, spawn, existing, overlay)
 }
 
 pub(super) fn depart(
@@ -451,30 +487,15 @@ fn refuse(rt: &Runtime, send: &mut SendStream, conn: &quinn::Connection, last: &
     });
 }
 
-/// Scattered a little per id so players don't stack on the exact same block; scans outward for
-/// the first level column (its four neighbours within one block), like the single-player spawn.
+/// The world's spawn column, the one single player starts on ([`spawn_column`]), scattered over
+/// a 5×5 patch by id so players don't stack on the exact same block.
+///
+/// [`spawn_column`]: crate::world::generation::spawn_column
 pub(super) fn spawn_point(generator: &dyn TerrainGenerator, id: u32) -> DVec3 {
-    if let Some(mut p) = generator.chart_spawn() {
-        p.x += (id % 5) as f64 - 2.0;
-        p.z += ((id / 5) % 5) as f64 - 2.0;
-        return p;
-    }
-    let sx = (id % 8) as i32 - 3;
-    let sz = ((id / 8) % 8) as i32 - 3;
-    for r in 0..64 {
-        for (dx, dz) in [(r, 0), (0, r), (-r, 0), (0, -r), (r, r), (-r, -r), (r, -r), (-r, r)] {
-            let (x, z) = (sx + dx * 8, sz + dz * 8);
-            let h = generator.height(x, z);
-            let flat = [(1, 0), (-1, 0), (0, 1), (0, -1)]
-                .iter()
-                .all(|&(ox, oz)| (generator.height(x + ox, z + oz) - h).abs() <= 1);
-            if flat {
-                return DVec3::new(x as f64 + 0.5, h as f64 + 3.0, z as f64 + 0.5);
-            }
-        }
-    }
-    let h = generator.height(sx, sz);
-    DVec3::new(sx as f64 + 0.5, h as f64 + 3.0, sz as f64 + 0.5)
+    let mut p = crate::world::generation::spawn_column(generator);
+    p.x += (id % 5) as f64 - 2.0;
+    p.z += ((id / 5) % 5) as f64 - 2.0;
+    p
 }
 
 pub(super) fn online(shared: &Arc<Mutex<State>>) -> usize {

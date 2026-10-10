@@ -557,49 +557,13 @@ fn cells_name_their_block_after_edits_tool_uses_and_reactions() {
     }
 }
 
-/// A generator that counts its reads, and the reads made while the state lock was held.
-struct Watched {
-    inner: crate::world::terrain::Generator,
-    state: OnceLock<std::sync::Weak<Mutex<State>>>,
-    reads: AtomicUsize,
-    locked: AtomicUsize,
-}
-
-impl TerrainGenerator for Watched {
-    fn height(&self, x: i32, z: i32) -> i32 {
-        self.inner.height(x, z)
-    }
-
-    fn surface_at(&self, x: i32, z: i32) -> BlockId {
-        self.inner.surface_at(x, z)
-    }
-
-    fn deep(&self) -> BlockId {
-        self.inner.deep()
-    }
-
-    fn voxel_at(&self, x: i32, y: i32, z: i32) -> BlockId {
-        self.reads.fetch_add(1, Ordering::Relaxed);
-        if self.state.get().and_then(std::sync::Weak::upgrade).is_some_and(|s| s.try_lock().is_err()) {
-            self.locked.fetch_add(1, Ordering::Relaxed);
-        }
-        self.inner.voxel_at(x, y, z)
-    }
-}
-
 /// A refused tool use names the cell as it is, but an edited cell is answered from the ledger
 /// and a generated one is read with the state lock released.
 #[test]
 fn a_refused_tool_use_reads_the_generator_only_outside_the_lock() {
     let (players, rx) = pose(DVec3::new(8.5, 20.0, 8.5));
     let (shared, ctx) = flat_shared(players, NoclipPolicy::All, &[]);
-    let watched = Arc::new(Watched {
-        inner: ctx.generator.clone(),
-        state: OnceLock::new(),
-        reads: AtomicUsize::new(0),
-        locked: AtomicUsize::new(0),
-    });
-    let _ = watched.state.set(Arc::downgrade(&shared));
+    let watched = Watched::new(ctx.generator.clone(), &shared);
     let generator: crate::world::terrain::Generator = watched.clone();
     let tool: Arc<str> = rock_spec().into();
     on_edit(&shared, None, &generator, 1, 1, 8, 21, 8, 0, "air");

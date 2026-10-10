@@ -176,6 +176,8 @@ pub(super) struct State {
     /// empty buckets are removed eagerly so churn can never leak keys.
     pub(super) grid: FastMap<(i32, i32, i32), Vec<u32>>,
     pub(super) next_id: u32,
+    /// Ids and names held by joins between their checks and their roster insert ([`reserve`]).
+    pub(super) joining: Vec<(u32, Arc<str>)>,
     /// The `[0,1)` day fraction current at `day_set`. The server advances it
     /// only when asked ([`State::day_now`]), so a late joiner receives the
     /// CURRENT phase rather than whatever `/time` last set.
@@ -210,6 +212,7 @@ impl State {
             players: FastMap::default(),
             grid: FastMap::default(),
             next_id: 1,
+            joining: Vec::new(),
             day,
             day_set: Instant::now(),
             reactions: ReactionScheduler::new(),

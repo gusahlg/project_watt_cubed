@@ -582,3 +582,48 @@ fn a_policy_reads_its_flag_and_decides_by_operator() {
     assert_eq!(Policy::parse("OPS"), None);
     assert_eq!([Policy::Off.allows(true), Policy::Ops.allows(true), Policy::Ops.allows(false), Policy::All.allows(false)], [false, true, false, true]);
 }
+
+/// A world with no chart scatters its joiners around the spawn column single player starts on.
+#[test]
+fn flat_spawn_points_scatter_around_the_single_player_spawn() {
+    let flat = chartless();
+    let centre = crate::world::generation::spawn_column(flat.as_ref());
+    let mut seen = HashSet::new();
+    for id in 0..25 {
+        let p = spawn_point(flat.as_ref(), id);
+        assert!((p.x - centre.x).abs() <= 2.0 && (p.z - centre.z).abs() <= 2.0, "id {id} at {p:?}");
+        assert_eq!(p.y, centre.y, "id {id}");
+        assert!(seen.insert((p.x.to_bits(), p.z.to_bits())), "id {id} shares a spot");
+    }
+    assert_eq!(spawn_point(flat.as_ref(), 12), centre, "id 12 is the centre");
+}
+
+/// The spawn search runs with the state lock released; meanwhile the held name is taken and
+/// the held id counts against the roster's room, and a join that gives up gives both back.
+#[test]
+fn a_join_searches_its_spawn_outside_the_lock() {
+    let shared = Arc::new(Mutex::new(test_state(HashMap::new())));
+    let watched = Watched::new(chartless().clone(), &shared);
+    let ctx = Ctx::new(Config { seed: 1, worldgen: WorldgenKind::Flat, ..Config::default() }, watched.clone(), server_content(), None);
+    let ada: Arc<str> = "Ada".into();
+    let held = reserve(&shared, &ada).unwrap();
+    assert_eq!(reserve(&shared, &"ada".into()).err(), Some("that name is already in use"));
+    shared.lock_recover().joining.extend((0..MAX_PLAYERS as u32 - 1).map(|i| (1000 + i, Arc::from(format!("j{i}")))));
+    assert_eq!(reserve(&shared, &"bob".into()).err(), Some("server full"), "held ids count against the room");
+    shared.lock_recover().joining.retain(|(id, _)| *id < 1000);
+
+    let (out, _rx) = outbox(8);
+    let (id, spawn, existing, _) = place(held, &ctx, &ada, out, test_kick());
+    assert!(watched.reads.load(Ordering::Relaxed) > 0, "the search read the terrain");
+    assert_eq!(watched.locked.load(Ordering::Relaxed), 0, "never under the state lock");
+    assert!(existing.is_empty());
+    let state = shared.lock_recover();
+    assert!(state.joining.is_empty(), "the hold is used up");
+    assert_eq!(state.players[&id].pose.pos, spawn);
+    drop(state);
+
+    let gone = reserve(&shared, &"cy".into()).unwrap();
+    drop(gone);
+    assert!(shared.lock_recover().joining.is_empty(), "a join that gives up gives its hold back");
+    assert!(reserve(&shared, &"cy".into()).is_ok());
+}

@@ -289,3 +289,49 @@ pub(super) fn await_event<T>(conn: &mut Connection, within: Duration, mut pick: 
     });
     found
 }
+
+/// A generator that counts its reads (cells and column heights), and the reads made while the
+/// state lock was held.
+pub(super) struct Watched {
+    inner: crate::world::terrain::Generator,
+    state: std::sync::Weak<Mutex<State>>,
+    pub(super) reads: AtomicUsize,
+    pub(super) locked: AtomicUsize,
+}
+
+impl Watched {
+    pub(super) fn new(inner: crate::world::terrain::Generator, state: &Arc<Mutex<State>>) -> Arc<Self> {
+        Arc::new(Self { inner, state: Arc::downgrade(state), reads: AtomicUsize::new(0), locked: AtomicUsize::new(0) })
+    }
+
+    fn read(&self) {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        if self.state.upgrade().is_some_and(|s| s.try_lock().is_err()) {
+            self.locked.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+impl TerrainGenerator for Watched {
+    fn chart_spawn(&self) -> Option<DVec3> {
+        self.inner.chart_spawn()
+    }
+
+    fn height(&self, x: i32, z: i32) -> i32 {
+        self.read();
+        self.inner.height(x, z)
+    }
+
+    fn surface_at(&self, x: i32, z: i32) -> BlockId {
+        self.inner.surface_at(x, z)
+    }
+
+    fn deep(&self) -> BlockId {
+        self.inner.deep()
+    }
+
+    fn voxel_at(&self, x: i32, y: i32, z: i32) -> BlockId {
+        self.read();
+        self.inner.voxel_at(x, y, z)
+    }
+}
