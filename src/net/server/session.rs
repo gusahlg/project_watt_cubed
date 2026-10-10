@@ -11,10 +11,9 @@ pub(super) fn client_loop(
     id: u32,
 ) {
     // Each kind has its own budget, so a swing flood cannot starve edits.
-    // Mod channels and tool uses keep a second, tighter window of their own.
+    // Mod channels keep a total window and one per channel name.
     let mut budgets = KindBudget::new();
     let mut channels = ChannelBudget::new();
-    let mut tool_rate = RateWindow::new(TOOL_RATE_LIMIT);
     // Frames a handler queues for after its lock hold, reused from message to message.
     let mut sends: Vec<PendingSend> = Vec::new();
     loop {
@@ -45,6 +44,9 @@ pub(super) fn client_loop(
                     ClientMessage::Edit { req, x, y, z, .. } => reject_edit(shared, id, *req, *x, *y, *z),
                     ClientMessage::Teleport { .. } => refuse_move(shared, id, &mut sends),
                     ClientMessage::SetTime { .. } => answer_time(shared, ctx, id),
+                    ClientMessage::ToolUse { req, x, y, z, tool_spec, .. } => {
+                        refuse_tool(shared.lock_recover(), shared, &ctx.generator, id, *req, (*x, *y, *z), tool_spec)
+                    }
                     _ => {}
                 }
                 continue;
@@ -83,11 +85,6 @@ pub(super) fn client_loop(
             ClientMessage::Hello { .. } => {} // Already authenticated; ignore repeats.
             ClientMessage::Cruise { speed } => on_cruise(shared, id, speed),
             ClientMessage::ToolUse { req, x, y, z, expect, tool_spec } => {
-                if !tool_rate.allow(now) {
-                    // Over the tool budget this second: refuse, so the client's swing resolves.
-                    refuse_tool(shared.lock_recover(), shared, &ctx.generator, id, req, (x, y, z), &tool_spec);
-                    continue;
-                }
                 on_tool_use(shared, &ctx.generator, id, req, x, y, z, expect, &tool_spec)
             }
         }

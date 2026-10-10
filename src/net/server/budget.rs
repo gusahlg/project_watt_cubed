@@ -34,30 +34,36 @@ impl ChannelBudget {
 
 /// Sliding 1-second window: a stamp ages out once a full second has passed, so
 /// dumping a full budget on both sides of a second boundary cannot double it.
+/// The stamps live in a fixed ring of `limit` slots, oldest at `head`.
 pub(super) struct RateWindow {
-    stamps: VecDeque<Instant>,
-    limit: u32,
+    stamps: Box<[Instant]>,
+    head: usize,
+    len: usize,
 }
 
 impl RateWindow {
     pub(super) fn new(limit: u32) -> Self {
-        Self { stamps: VecDeque::new(), limit }
+        Self { stamps: vec![Instant::now(); limit as usize].into_boxed_slice(), head: 0, len: 0 }
     }
 
     pub(super) fn allow(&mut self, now: Instant) -> bool {
         const PERIOD: Duration = Duration::from_secs(1);
-        while self.stamps.front().is_some_and(|t| now.saturating_duration_since(*t) >= PERIOD) {
-            self.stamps.pop_front();
+        let slots = self.stamps.len();
+        while self.len > 0 && now.saturating_duration_since(self.stamps[self.head]) >= PERIOD {
+            self.head = (self.head + 1) % slots;
+            self.len -= 1;
         }
-        if self.stamps.len() as u32 >= self.limit {
+        if self.len >= slots {
             return false;
         }
-        self.stamps.push_back(now);
+        self.stamps[(self.head + self.len) % slots] = now;
+        self.len += 1;
         true
     }
 }
 
-/// One window per message kind. Cruise, hello, tool use, and mod channels are not here.
+/// One window per message kind. Cruise, hello and mod channels are not here: cruise is a
+/// declared state, and mod channels have their own [`ChannelBudget`].
 pub(super) struct KindBudget {
     chat: RateWindow,
     swing: RateWindow,
@@ -66,6 +72,7 @@ pub(super) struct KindBudget {
     movement: RateWindow,
     ping: RateWindow,
     teleport: RateWindow,
+    tool: RateWindow,
 }
 
 impl KindBudget {
@@ -78,6 +85,7 @@ impl KindBudget {
             movement: RateWindow::new(MOVE_RATE),
             ping: RateWindow::new(PING_RATE),
             teleport: RateWindow::new(TELEPORT_RATE),
+            tool: RateWindow::new(TOOL_RATE_LIMIT),
         }
     }
 }
@@ -96,7 +104,6 @@ pub(super) fn charge(budgets: &mut KindBudget, msg: &ClientMessage, now: Instant
     let (window, answer) = match msg {
         ClientMessage::Cruise { .. }
         | ClientMessage::Hello { .. }
-        | ClientMessage::ToolUse { .. }
         | ClientMessage::ModData { .. } => return Charge::Pass,
         ClientMessage::Chat { .. } => (&mut budgets.chat, false),
         ClientMessage::Swing => (&mut budgets.swing, false),
@@ -105,6 +112,8 @@ pub(super) fn charge(budgets: &mut KindBudget, msg: &ClientMessage, now: Instant
         ClientMessage::Move { .. } => (&mut budgets.movement, false),
         ClientMessage::Ping { .. } => (&mut budgets.ping, false),
         ClientMessage::Teleport { .. } => (&mut budgets.teleport, true),
+        // A refused use is still answered, so the client's swing resolves.
+        ClientMessage::ToolUse { .. } => (&mut budgets.tool, true),
     };
     if window.allow(now) { Charge::Pass } else if answer { Charge::Answer } else { Charge::Drop }
 }

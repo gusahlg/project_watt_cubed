@@ -1,5 +1,6 @@
 //! Rate windows, per-kind budgets and the mod-channel budget.
 use super::super::*;
+use super::support::XorShift;
 
 /// 100 frames on one channel, then the next is dropped. A second channel still has its own budget.
 #[test]
@@ -91,6 +92,12 @@ fn each_message_kind_has_its_own_budget() {
     }
     assert!(matches!(charge(&mut budgets, &hop, now), Charge::Drop));
 
+    let tool = ClientMessage::ToolUse { req: 1, x: 0, y: 0, z: 0, expect: 0, tool_spec: "air".into() };
+    for _ in 0..TOOL_RATE_LIMIT {
+        assert!(matches!(charge(&mut budgets, &tool, now), Charge::Pass));
+    }
+    assert!(matches!(charge(&mut budgets, &tool, now), Charge::Answer), "an over-budget tool use is still answered");
+
     let cruise = ClientMessage::Cruise { speed: 1.0 };
     for _ in 0..8 {
         assert!(matches!(charge(&mut budgets, &cruise, now), Charge::Pass), "cruise spends no token");
@@ -111,4 +118,27 @@ fn mod_channels_share_one_budget_and_a_name_cap() {
     let mut flood = ChannelBudget::new();
     let passed = (0..4 * MOD_DATA_RATE as usize).filter(|&i| flood.allow(&channel(i % MAX_CHANNELS), now)).count();
     assert_eq!(passed, MOD_DATA_RATE as usize, "switching channels buys no extra rate");
+}
+
+/// The ring keeps the window's sliding behaviour when it wraps many times over.
+#[test]
+fn rate_window_ring_matches_a_sliding_window_over_many_wraps() {
+    let t0 = Instant::now();
+    let mut ring = RateWindow::new(5);
+    let mut kept: std::collections::VecDeque<Instant> = std::collections::VecDeque::new();
+    let mut rng = XorShift::new(0x5EED);
+    let mut at = t0;
+    for _ in 0..4000 {
+        at += Duration::from_millis(u64::from(rng.u32(400)));
+        while kept.front().is_some_and(|t| at.saturating_duration_since(*t) >= Duration::from_secs(1)) {
+            kept.pop_front();
+        }
+        let want = kept.len() < 5;
+        if want {
+            kept.push_back(at);
+        }
+        assert_eq!(ring.allow(at), want, "at {:?}", at - t0);
+    }
+    let mut none = RateWindow::new(0);
+    assert!(!none.allow(t0), "a zero budget allows nothing");
 }
