@@ -7,34 +7,32 @@
 //! The window itself belongs to the engine: [`App::run`] hands a per-frame
 //! closure to [`voxel_engine::run`], which is the moral equivalent of the old
 //! raylib `while !window_should_close()` loop.
+mod bench;
+mod connect;
 mod entry;
+mod host;
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-
-mod host;
 
 use voxel_engine::{Color, DVec3, Engine};
 
 use crate::audio::{AudioService, AudioView, CueSymbols, GameEvent, ModLink, PeerAudio, SoundConfig, SoundSystem};
-use crate::benchmark::{Benchmark, Step as BenchmarkStep};
+use crate::benchmark::Benchmark;
 use crate::game::{Game, Signal};
 use crate::input::router::{Context, Router, View};
 use crate::menu::menus::{ModsMenu, SettingsHub};
 use crate::menu::start::{StartFacts, StartRoot, VERSION};
 use crate::menu::theme::{DefaultTheme, MenuTheme};
-use crate::menu::{AppEffect, Ctx, Framed, HostInfo, JoinInfo, MenuStack, ModRow};
-use crate::modding::{ActionSet, ChoicesFlush, Debounce, GameBuild, ModDescriptor, Mods};
-#[cfg(test)]
-use crate::net::client::ConnectError;
-use crate::net::client::{Connection, PendingConnect};
-use crate::net::server::{Config, NoclipPolicy, TeleportPolicy};
+use crate::menu::{AppEffect, Ctx, Framed, MenuStack, ModRow};
+use crate::modding::{ActionSet, ChoicesFlush, Debounce, GameBuild, ModDescriptor, Mods, VisualMask};
 use crate::ui::{self, Anchor};
 use crate::player::Player;
 use crate::save::{self, Autosaver, SaveMeta, Slot, SlotId, Tick};
 use crate::session::Session;
-use crate::settings::Settings;
+use crate::settings::{GfxEngine, Settings};
 use crate::world::terrain::TerrainCfg;
 use crate::world::World;
+use connect::ConnectJob;
 use entry::{Loading, Recipe};
 use host::Host;
 
@@ -63,19 +61,6 @@ enum Screen {
     /// DNS, handshake, and Welcome, off the render thread.
     Connecting(ConnectJob),
     Playing(Box<Game>),
-}
-
-/// One join attempt. A mod refusal starts a second attempt and keeps `retried`.
-struct ConnectJob {
-    pending: PendingConnect,
-    hosted: bool,
-    retried: bool,
-    host: String,
-    port: u16,
-    name: String,
-    password: String,
-    /// Shown once the attempt joins: a skipped save, or mods held for the session.
-    notice: Option<String>,
 }
 
 /// The whole program: the installed mods (persist across worlds), the graphics
@@ -116,7 +101,8 @@ pub struct App {
     last_stall_log: Option<Instant>,
     /// Debounces `mods.cfg` writes (held Left/Right would otherwise rewrite ~22×/s).
     choices_flush: ChoicesFlush,
-    /// In-game settings changes (HUD hotkey, console) wait here and save once they go quiet.
+    /// Settings changes (menu steps, the HUD hotkey, the console) wait here and save once they
+    /// go quiet, or on leaving a world and on quit.
     settings_flush: Debounce,
     clock: Instant,
     /// True while the Mods screen is on the menu stack.
@@ -137,6 +123,57 @@ struct GfxKey {
     scale_bits: u32,
     cull_faces: Option<bool>,
     flags: voxel_engine::RenderFlags,
+}
+
+impl GfxKey {
+    /// The stamp for `settings` with `mask`'s visual groups stripped, in a `w`×`h` window.
+    /// Built every frame, so it allocates nothing.
+    fn of(settings: &Settings, mask: VisualMask, (w, h): (u32, u32)) -> Self {
+        let (msaa, scale) = settings.session_msaa_scale(w, h);
+        Self {
+            w,
+            h,
+            fullscreen: settings.fullscreen,
+            msaa,
+            scale_bits: scale.to_bits(),
+            cull_faces: settings.cull_faces,
+            flags: mask.effective_render(settings).engine_flags(),
+        }
+    }
+}
+
+/// The one writer of the engine's graphics state: window mode, MSAA, render scale, face culling
+/// and the render-lane flags, masked by the visual mods. Pushes only when the stamp moves, so a
+/// quiet frame or an idle menu does not wake the render thread; a resize moves it, so a fallback
+/// cannot be overwritten. One push writes the flags once, so a lane a mod strips never turns on
+/// in between (each turn resets the engine's temporal state). True when it pushed.
+fn push_gfx(eng: &mut impl GfxEngine, settings: &mut Settings, mask: VisualMask, applied: &mut Option<GfxKey>) -> bool {
+    let extent = eng.window_extent();
+    if *applied == Some(GfxKey::of(settings, mask, extent)) {
+        return false;
+    }
+    // Applied MSAA/scale from engine create (and later recreates) before
+    // we push the session request, so a fallback cannot be overwritten.
+    settings.sync_engine_applied(eng);
+    settings.apply(eng);
+    // Stamped after the apply: it noted the render extent (Auto VRS and TAA read it) and any
+    // fallback, so the next frame's stamp matches and nothing is pushed twice.
+    let key = GfxKey::of(settings, mask, extent);
+    eng.set_flags(key.flags);
+    *applied = Some(key);
+    #[cfg(test)]
+    crate::alloc_count::note_engine(crate::alloc_count::EngineCall::SettingsApply);
+    true
+}
+
+/// Settings a frame changed are written once [`Debounce::IDLE_MS`] pass with no further change,
+/// so a held Left/Right on a settings row does not rewrite `settings.cfg` at key-repeat rate.
+/// True when the write is due now.
+fn settings_write_due(flush: &mut Debounce, changed: bool, now_ms: u64) -> bool {
+    if changed {
+        flush.mark(now_ms);
+    }
+    flush.poll(now_ms)
 }
 
 /// The save slot behind the open singleplayer world: identity, header
@@ -340,10 +377,14 @@ impl App {
             self.note_frame_stall(t0, update_dt);
             return false;
         }
-        // VRAM guard + live settings: push only when the stamp moves so a
-        // quiet frame or an idle menu does not wake the render thread. A
-        // resize changes the stamp, so a fallback cannot be overwritten.
+        // VRAM guard + live settings, then the game's half of a console change, which reads
+        // the render extent the push noted.
         self.push_gfx(eng);
+        if let Screen::Playing(game) = &mut self.screen
+            && game.take_settings_changed()
+        {
+            game.apply_settings(eng, &self.settings);
+        }
         // Apply only on change: a SetVsync every menu frame was waking the
         // render thread even when the mode was already correct.
         let in_world = matches!(self.screen, Screen::Playing(_));
@@ -380,197 +421,21 @@ impl App {
         self.last_stall_log = Some(now);
         let draw_ms = dt.saturating_sub(update_dt).as_secs_f64() * 1000.0;
         let update_ms = update_dt.as_secs_f64() * 1000.0;
-        match &self.screen {
+        let head = format!("frame stall {}ms update={update_ms:.1}ms draw={draw_ms:.1}ms", dt.as_millis());
+        let screen = match &self.screen {
             Screen::Playing(game) => {
-                eprintln!(
-                    "frame stall {}ms update={update_ms:.1}ms draw={draw_ms:.1}ms\n  {}\n  {}",
-                    dt.as_millis(),
-                    game.world().entry_debug(),
-                    game.phase_debug()
-                );
+                eprintln!("{head}\n  {}\n  {}", game.world().entry_debug(), game.phase_debug());
+                return;
             }
-            Screen::Menus(_) => {
-                eprintln!(
-                    "frame stall {}ms update={update_ms:.1}ms draw={draw_ms:.1}ms ({})",
-                    dt.as_millis(),
-                    if self.loading.is_some() { "loading" } else { "menus" }
-                );
-            }
-            Screen::Connecting(_) => {
-                eprintln!(
-                    "frame stall {}ms update={update_ms:.1}ms draw={draw_ms:.1}ms (connecting)",
-                    dt.as_millis()
-                );
-            }
-        }
-    }
-
-    fn gfx_key(&self, w: u32, h: u32) -> GfxKey {
-        let session = self.settings.session_graphics(w, h);
-        GfxKey {
-            w,
-            h,
-            fullscreen: self.settings.fullscreen,
-            msaa: session.msaa,
-            scale_bits: session.render_scale.to_bits(),
-            cull_faces: self.settings.cull_faces,
-            flags: self.mods.effective_render(&self.settings).engine_flags(),
-        }
+            Screen::Menus(_) if self.loading.is_some() => "loading",
+            Screen::Menus(_) => "menus",
+            Screen::Connecting(_) => "connecting",
+        };
+        eprintln!("{head} ({screen})");
     }
 
     fn push_gfx(&mut self, eng: &mut Engine) {
-        let w = eng.screen_width().max(1) as u32;
-        let h = eng.screen_height().max(1) as u32;
-        let key = self.gfx_key(w, h);
-        if self.gfx_applied.as_ref() == Some(&key) {
-            return;
-        }
-        // Applied MSAA/scale from engine create (and later recreates) before
-        // we push the session request, so a fallback cannot be overwritten.
-        self.settings.sync_engine_applied(eng);
-        self.settings.apply(eng);
-        eng.set_flags(key.flags);
-        self.gfx_applied = Some(key);
-        #[cfg(test)]
-        crate::alloc_count::note_engine(crate::alloc_count::EngineCall::SettingsApply);
-    }
-
-    /// Drive one benchmark frame: enter a reproducible world, wait for both the
-    /// warmup floor and streaming readiness, rotate the camera, and hand every
-    /// measured frame to the self-describing recorder.
-    fn bench_frame(&mut self, eng: &mut Engine) -> bool {
-        let dt = eng.frame_time();
-
-        if !self
-            .bench
-            .as_ref()
-            .expect("bench_frame without bench")
-            .has_started()
-        {
-            let (pos, look, day) = {
-                let bench = self.bench.as_mut().expect("bench exists");
-                bench.begin();
-                (bench.position(), bench.look(), bench.day())
-            };
-            // Uncapped and unsynced, or the bench measures the throttle.
-            self.settings.vsync = false;
-            self.settings.max_fps = 0;
-            self.settings.apply(eng);
-            self.start_new_world(eng);
-            if let Screen::Playing(game) = &mut self.screen {
-                game.set_input_locked(true);
-                if let Some(day) = day {
-                    game.set_day(day);
-                }
-                // Far-coordinate bench: park the player at the requested position
-                // with the ground under them made real, and give streaming a
-                // little extra warmup to catch up before sampling starts.
-                if let Some((yaw, pitch)) = look {
-                    game.player_mut().orientation.yaw = yaw;
-                    game.player_mut().orientation.pitch = pitch;
-                }
-                if let Some(pos) = pos {
-                    game.player_mut().position = pos;
-                    game.player_mut().set_flying(true);
-                    game.world_mut().prepare_around(pos);
-                    // Stand up along the local pull there, as a teleport does (any face of any body).
-                    let weightless = 0.02 * crate::player::STANDARD_GRAVITY;
-                    let pull = game.world().gravity_at(pos);
-                    game.player_mut().gravity = pull.accel;
-                    if let Some(up) = pull.up(weightless) {
-                        game.player_mut().snap_up(up);
-                    }
-                    if let Some(bench) = &mut self.bench {
-                        bench.add_warmup(Duration::from_secs(2));
-                    }
-                }
-            }
-            return true;
-        }
-        // One unsampled frame after Complete has presented; capture that image
-        // (blocking) before the report so the readback is outside the samples.
-        if self
-            .bench
-            .as_ref()
-            .expect("bench exists")
-            .measurement_complete()
-        {
-            return self.finish_bench(eng);
-        }
-        {
-            let Screen::Playing(game) = &mut self.screen else {
-                return true;
-            };
-            // A slow spin (`WATT_BENCH_YAW`, default 0.4 rad/s; 0 = static) sweeps
-            // the frustum; an optional flight along +X (`WATT_BENCH_MOVE`)
-            // exercises paths a parked camera never touches.
-            let yaw_rate = self.bench.as_ref().expect("bench exists").yaw_rate() as f32;
-            game.player_mut().orientation.yaw += yaw_rate * dt;
-            self.bench
-                .as_ref()
-                .expect("bench exists")
-                .apply_move(game.player_mut(), dt);
-
-            let (ready, gauges) = {
-                let bench = self.bench.as_mut().expect("bench exists");
-                bench.poll_world(game.world())
-            };
-            let rendered = eng.frames_rendered();
-            let coalesced = eng.frames_coalesced();
-            let step = self
-                .bench
-                .as_mut()
-                .expect("bench exists")
-                .step(dt, ready, gauges, rendered, coalesced);
-            match step {
-                BenchmarkStep::ReadyTimeout => {
-                    eprintln!("{}", game.world().entry_debug());
-                    return true;
-                }
-                BenchmarkStep::Warming => {
-                    if !ready && self.bench.as_mut().expect("bench exists").wait_log_due()
-                    {
-                        eprintln!(
-                            "benchmark: waiting for world ({})",
-                            game.world().entry_debug()
-                        );
-                    }
-                    return true;
-                }
-                BenchmarkStep::Measuring => return true,
-                BenchmarkStep::Complete => {
-                    if self
-                        .bench
-                        .as_ref()
-                        .expect("bench exists")
-                        .screenshot_path()
-                        .is_some()
-                    {
-                        return true;
-                    }
-                }
-            }
-        }
-        self.finish_bench(eng)
-    }
-
-    /// Capture the last presented frame if requested, then emit the report.
-    fn finish_bench(&mut self, eng: &mut Engine) -> bool {
-        let Screen::Playing(game) = &self.screen else {
-            return true;
-        };
-        self.bench
-            .as_ref()
-            .expect("bench exists")
-            .capture_screenshot(eng);
-        let report = self.bench.as_mut().expect("bench exists").finish(
-            &self.settings,
-            eng,
-            game.world(),
-            game.player().position,
-        );
-        report.emit();
-        false
+        push_gfx(eng, &mut self.settings, self.mods.visual_mask(), &mut self.gfx_applied);
     }
 
     /// Update the menu stack and apply settings live each frame.
@@ -589,7 +454,7 @@ impl App {
         } else {
             None
         };
-        self.fan_menu_audio(dt, click);
+        self.fan_audio(dt, false, click);
         // A per-frame snapshot so a menu never holds a live `&Mods`.
         let mods = ModRow::snapshot(&self.mods);
         let mods_save_error = self.mods_save_error.clone();
@@ -610,10 +475,13 @@ impl App {
             };
             effect = stack.update(&intents, &mut ctx);
         }
-        // Persist whenever a step (or a hardware clamp) moved a value.
-        if self.settings != before {
-            self.settings.save();
+        // Persist whenever a step (or a hardware clamp) moved a value, once the steps go quiet.
+        let changed = self.settings != before;
+        if changed {
             self.sound.set_mix(self.settings.mix_change());
+        }
+        if settings_write_due(&mut self.settings_flush, changed, now_ms) {
+            self.settings.save();
         }
         if self.mods_open {
             let depth_after = match &self.screen {
@@ -655,14 +523,14 @@ impl App {
                 self.session.port = info.port.to_string();
                 self.session.name = info.name.clone();
                 self.session.save();
-                self.start_host(eng, info);
+                self.start_host(info);
             }
             AppEffect::Join(info) => {
                 self.session.address = info.host.clone();
                 self.session.port = info.port.to_string();
                 self.session.name = info.name.clone();
                 self.session.save();
-                self.start_join(eng, info);
+                self.start_join(info);
             }
             AppEffect::Settings => {
                 if let Screen::Menus(stack) = &mut self.screen {
@@ -722,15 +590,17 @@ impl App {
         MenuStack::new(StartRoot::wrap(inner, hosting))
     }
 
-    /// Menus have no world. The hook still runs, so a mod can play a UI cue.
-    fn fan_menu_audio(&mut self, dt: f32, event: Option<GameEvent>) {
+    /// Run the mods' audio hooks with no world under them: each menu frame (`dt`, and maybe a UI
+    /// click), so a mod can play a UI cue, and the edges into and out of a world, before the
+    /// service drops its sessions.
+    fn fan_audio(&mut self, dt: f32, in_world: bool, event: Option<GameEvent>) {
         const EMPTY: &[PeerAudio] = &[];
         const NO_IDS: &[&str] = &[];
         let view = AudioView {
             dt,
             pos: DVec3::ZERO,
             peers: EMPTY,
-            in_world: false,
+            in_world,
             voice_enabled: self.settings.voice_enabled,
             hear_voice: self.settings.voice_incoming,
             actions: ActionSet::NONE,
@@ -747,28 +617,10 @@ impl App {
         self.audio.settle_menu();
     }
 
-    /// Tell the mods the world is changing, before the service drops its sessions.
+    /// Tell the mods the world is changing.
     fn fan_world_edge(&mut self, event: GameEvent) {
-        const EMPTY: &[PeerAudio] = &[];
-        const NO_IDS: &[&str] = &[];
         let in_world = matches!(event, GameEvent::EnterWorld);
-        let view = AudioView {
-            dt: 0.0,
-            pos: DVec3::ZERO,
-            peers: EMPTY,
-            in_world,
-            voice_enabled: self.settings.voice_enabled,
-            hear_voice: self.settings.voice_incoming,
-            actions: ActionSet::NONE,
-            ids: NO_IDS,
-        };
-        let mut link = ModLink::idle();
-        {
-            let mut api = self.audio.api(&mut self.sound, &self.cues, None, None);
-            self.mods.on_game_event(&event, &mut api);
-            self.mods.on_audio(&view, &mut api, &mut link);
-        }
-        self.audio.settle_menu();
+        self.fan_audio(0.0, in_world, Some(event));
     }
 
     /// Return to the start menu with an optional notice (e.g. a failed connect).
@@ -788,117 +640,6 @@ impl App {
             notice.as_deref(),
             self.host.running(),
         ));
-    }
-
-    /// Spin up the integrated server on the newest save it can load and join it on
-    /// loopback. Any previous host is stopped first so its port is free. The host is
-    /// an operator and teleport stays open. A stored seed and generator win.
-    fn start_host(&mut self, _eng: &mut Engine, info: HostInfo) {
-        debug_assert!(self.active.is_none(), "hosting starts from the menu, never over an open world");
-        let worldgen = self.mods.worldgen_kind();
-        let terrain = terrain_cfg_from_mods(&self.mods);
-        let started = self.host.start(&self.saves, info.port, |world| Config {
-            password: info.password.clone(),
-            seed: fresh_seed(),
-            worldgen,
-            terrain,
-            teleport: TeleportPolicy::All,
-            noclip: NoclipPolicy::All,
-            world: Some(world),
-            ops: vec![info.name.clone()],
-            warn_world_overrides: false,
-            ..Config::default()
-        });
-        match started {
-            Ok((port, skipped)) => self.open_connect("127.0.0.1", port, &info.name, &info.password, true, skipped),
-            Err(e) => self.fail_to_menu(format!("could not host on port {}: {e}", info.port)),
-        }
-    }
-
-    /// Connect to a remote server. The attempt runs behind the connecting screen.
-    fn start_join(&mut self, _eng: &mut Engine, info: JoinInfo) {
-        self.open_connect(&info.host, info.port, &info.name, &info.password, false, None);
-    }
-
-    /// Start one attempt. The render thread polls it; Cancel calls [`PendingConnect::cancel`].
-    fn open_connect(&mut self, host: &str, port: u16, name: &str, password: &str, hosted: bool, notice: Option<String>) {
-        let reports = self.mods.enabled_package_reports(&self.packages);
-        let pending = Connection::begin_connect(host, port, name, password, &reports);
-        self.screen = Screen::Connecting(ConnectJob {
-            pending,
-            hosted,
-            retried: false,
-            host: host.to_string(),
-            port,
-            name: name.to_string(),
-            password: password.to_string(),
-            notice,
-        });
-    }
-
-    /// Poll the attempt. Cancel returns to the menu and stops a host we started.
-    /// A mod refusal retries once; any other failure leaves a spawned host running.
-    fn update_connecting(&mut self, eng: &mut Engine) {
-        if self.cancel_pressed(eng) {
-            self.cancel_connect();
-            return;
-        }
-        let outcome = match &mut self.screen {
-            Screen::Connecting(job) => job.pending.poll(),
-            _ => return,
-        };
-        let Some(result) = outcome else { return };
-        let standby = self.standby_menu();
-        let Screen::Connecting(job) = std::mem::replace(&mut self.screen, Screen::Menus(standby)) else {
-            return;
-        };
-        match result {
-            Ok(conn) => {
-                let render = self.mods.effective_render(&self.settings);
-                self.begin_loading(eng, Loading::join(conn, render, job.notice, job.hosted));
-            }
-            Err(err) if !err.mods_denied.is_empty() && !job.retried => {
-                let notice = mod_hold_notice(&self.packages, &err.mods_denied);
-                self.mods.hold_packages(&err.mods_denied);
-                let reports = self.mods.enabled_package_reports(&self.packages);
-                let pending = Connection::begin_connect(&job.host, job.port, &job.name, &job.password, &reports);
-                self.screen = Screen::Connecting(ConnectJob {
-                    pending,
-                    hosted: job.hosted,
-                    retried: true,
-                    host: job.host,
-                    port: job.port,
-                    name: job.name,
-                    password: job.password,
-                    notice: Some(notice),
-                });
-            }
-            Err(err) => {
-                if job.retried {
-                    self.mods.release_server();
-                }
-                let text = if job.hosted {
-                    format!("hosted, but could not connect: {err}")
-                } else {
-                    format!("could not join: {err}")
-                };
-                self.fail_to_menu(text);
-            }
-        }
-    }
-
-    fn cancel_connect(&mut self) {
-        let hosted = match &self.screen {
-            Screen::Connecting(job) => {
-                job.pending.cancel();
-                job.hosted
-            }
-            _ => false,
-        };
-        if hosted {
-            self.host.stop();
-        }
-        self.return_to_menu(None);
     }
 
     fn standby_menu(&self) -> MenuStack {
@@ -1059,7 +800,11 @@ impl App {
         game.set_visual_mask(self.mods.visual_mask());
         game.world_mut()
             .set_render_lanes(render.occlusion, render.lod2);
-        game.apply_settings(eng, &mut self.settings);
+        // Entry re-fits MSAA and scale to the VRAM free now, as it always has; the game then
+        // resolves its lanes against the extent that push noted.
+        self.gfx_applied = None;
+        self.push_gfx(eng);
+        game.apply_settings(eng, &self.settings);
         // Saves and servers can place the player far from the pre-generated
         // origin; request the collision slab (physics freezes until it lands).
         let pos = game.player().position;
@@ -1087,10 +832,7 @@ impl App {
             &mut self.audio,
             &self.cues,
         );
-        if game.take_settings_dirty() {
-            self.settings_flush.mark(now_ms);
-        }
-        if self.settings_flush.poll(now_ms) && self.bench.is_none() {
+        if settings_write_due(&mut self.settings_flush, game.take_settings_dirty(), now_ms) && self.bench.is_none() {
             self.settings.save();
         }
         if let Signal::ExitToMenu = signal {
@@ -1231,62 +973,6 @@ impl App {
 }
 
 
-/// Join `host:port` reporting no mods. Test clients use this. The game's own
-/// join is [`Connection::begin_connect`], off the render thread.
-#[cfg(test)]
-pub(crate) fn join_server(host: &str, port: u16, name: &str, password: &str) -> Result<Connection, ConnectError> {
-    Connection::connect(host, port, name, password)
-}
-
-/// Join, reporting the packages this client has enabled. The mod list is what
-/// an honest client says; a modified client can lie. One refusal turns those
-/// packages off for this session and retries once. A second failure restores
-/// them and returns the error. Nothing here writes `mods.cfg`. The menu uses
-/// [`App::update_connecting`]; this stays for the session-hold test.
-#[cfg(test)]
-fn connect_session(
-    mods: &mut Mods,
-    packages: &[ModDescriptor],
-    host: &str,
-    port: u16,
-    name: &str,
-    password: &str,
-) -> Result<(Connection, Option<String>), ConnectError> {
-    let reports = mods.enabled_package_reports(packages);
-    match Connection::begin_connect(host, port, name, password, &reports).wait() {
-        Ok(conn) => Ok((conn, None)),
-        Err(err) if err.mods_denied.is_empty() => Err(err),
-        Err(err) => {
-            let notice = mod_hold_notice(packages, &err.mods_denied);
-            mods.hold_packages(&err.mods_denied);
-            let reports = mods.enabled_package_reports(packages);
-            match Connection::begin_connect(host, port, name, password, &reports).wait() {
-                Ok(conn) => Ok((conn, Some(notice))),
-                Err(again) => {
-                    mods.release_server();
-                    Err(again)
-                }
-            }
-        }
-    }
-}
-
-/// "This server does not allow: Developer Toolkit; it is off while you are connected".
-/// Several names use "they are". Display names come from the build; an unknown
-/// id is shown as itself.
-fn mod_hold_notice(packages: &[ModDescriptor], ids: &[String]) -> String {
-    let names: Vec<&str> = ids
-        .iter()
-        .map(|id| packages.iter().find(|pkg| pkg.id == id).map(|pkg| pkg.name).unwrap_or(id.as_str()))
-        .collect();
-    let list = names.join("; ");
-    if names.len() == 1 {
-        format!("This server does not allow: {list}; it is off while you are connected")
-    } else {
-        format!("This server does not allow: {list}; they are off while you are connected")
-    }
-}
-
 /// Parse the winning worldgen payload as generator knobs.
 fn terrain_cfg_from_mods(mods: &Mods) -> TerrainCfg {
     mods.worldgen_config().as_deref().map(TerrainCfg::from_text).unwrap_or_default()
@@ -1300,58 +986,23 @@ fn fresh_seed() -> i64 {
         .unwrap_or(1)
 }
 
-/// Spawn the player just above level ground near the world origin, so they land on a meadow or a
-/// valley floor rather than a cliff edge. Spirals outward over whole 16×16 chunk columns
-/// ([`World::heights_16`], one batch each) for the first cell whose 3×3 neighbourhood is flat.
+/// The player on a new world, standing in the local pull at [`spawn_column`](crate::world::generation::spawn_column),
+/// the spawn the server gives the same seed.
 fn spawn_player(world: &World) -> Player {
-    if let Some(p) = world.chart_spawn() {
-        let mut player = Player::new(p);
-        player.stand_in(world.gravity_at(player.position).accel);
-        return player;
-    }
-    let mut seen = [(i32::MAX, i32::MAX); 32];
-    let mut n = 0usize;
-    for r in 0i32..8 {
-        for (dx, dz) in [(r, 0), (0, r), (-r, 0), (0, -r), (r, r), (-r, -r), (r, -r), (-r, r)] {
-            let (cx, cz) = ((dx * 8).div_euclid(16), (dz * 8).div_euclid(16));
-            if seen[..n].contains(&(cx, cz)) {
-                continue;
-            }
-            seen[n] = (cx, cz);
-            n += 1;
-            let heights = world.heights_16(cx, cz);
-            for lz in 1..15 {
-                for lx in 1..15 {
-                    let h = heights[lx + lz * 16];
-                    let flat = (0..9).all(|k| {
-                        let (ox, oz) = (lx + k % 3 - 1, lz + k / 3 - 1);
-                        (heights[ox + oz * 16] - h).abs() <= 1
-                    });
-                    if flat {
-                        let (x, z) = (cx * 16 + lx as i32, cz * 16 + lz as i32);
-                        let mut player = Player::new(DVec3::new(x as f64 + 0.5, h as f64 + 3.0, z as f64 + 0.5));
-                        player.stand_in(world.gravity_at(player.position).accel);
-                        return player;
-                    }
-                }
-            }
-        }
-    }
-    let h = world.surface_y(0, 0);
-    let mut player = Player::new(DVec3::new(0.5, h as f64 + 3.0, 0.5));
-    player.stand_in(world.gravity_at(player.position).accel);
-    player
+    let pos = crate::world::generation::spawn_column(world.terrain());
+    Player::standing(pos, world.gravity_at(pos).accel)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::net::server;
+    use crate::net::client::Connection;
+    use crate::net::server::{self, Config};
     use crate::render_config::RenderConfig;
     use crate::world::generation::WorldgenKind;
 
     #[test]
-    fn vanilla_client_joins_a_diffusion_server_through_join_server() {
+    fn vanilla_client_joins_a_diffusion_server() {
         assert_eq!(Mods::empty().worldgen_kind(), WorldgenKind::Flat);
         let terrain = TerrainCfg { relief: 150, caves: 25, ..TerrainCfg::default() }.clamp();
         let handle = server::spawn(
@@ -1364,117 +1015,10 @@ mod tests {
             },
         )
         .unwrap();
-        let conn = join_server("127.0.0.1", handle.addr().port(), "ada", "").expect("join");
+        let conn = Connection::connect("127.0.0.1", handle.addr().port(), "ada", "").expect("join");
         assert_eq!(conn.worldgen(), WorldgenKind::Diffusion);
         assert_eq!(conn.terrain(), terrain);
         assert_eq!(conn.seed(), 99);
-        handle.stop();
-    }
-
-    struct Named(&'static str, &'static str);
-
-    impl crate::modding::Mod for Named {
-        fn id(&self) -> &'static str {
-            self.0
-        }
-        fn name(&self) -> &str {
-            self.1
-        }
-    }
-
-    fn register_toolkit(reg: &mut crate::modding::ModRegistrar) {
-        reg.add(Named("dev-toolkit", "Developer Toolkit"));
-    }
-
-    fn register_hotbar(reg: &mut crate::modding::ModRegistrar) {
-        reg.add(Named("hotbar", "Hotbar"));
-    }
-
-    fn sample_packages() -> [ModDescriptor; 2] {
-        [
-            ModDescriptor {
-                id: "pwc.dev-toolkit",
-                name: "Developer Toolkit",
-                version: "1.0.0",
-                register: register_toolkit,
-            },
-            ModDescriptor {
-                id: "pwc.hotbar",
-                name: "Hotbar",
-                version: "0.1.0",
-                register: register_hotbar,
-            },
-        ]
-    }
-
-    #[test]
-    fn mod_hold_notice_names_one_and_several() {
-        let packages = sample_packages();
-        assert_eq!(
-            mod_hold_notice(&packages, &["pwc.dev-toolkit".into()]),
-            "This server does not allow: Developer Toolkit; it is off while you are connected"
-        );
-        assert_eq!(
-            mod_hold_notice(&packages, &["pwc.dev-toolkit".into(), "pwc.hotbar".into()]),
-            "This server does not allow: Developer Toolkit; Hotbar; they are off while you are connected"
-        );
-    }
-
-    /// The server refuses the toolkit, the client turns it off and joins once,
-    /// and the Mods menu will not turn it back on while that hold lasts.
-    #[test]
-    fn denied_mod_is_disabled_for_the_session_and_the_menu_cannot_reenable_it() {
-        use crate::menu::menus::ModsMenu;
-        use crate::menu::{Command, Menu, Msg, ValueView};
-        let packages = sample_packages();
-        let mut mods = GameBuild::new().with_mod(packages[0]).with_mod(packages[1]).mods();
-        let handle = server::spawn(
-            0,
-            Config {
-                seed: 1,
-                worldgen: WorldgenKind::Flat,
-                mods_deny: vec!["pwc.dev-toolkit".into()],
-                ..Config::default()
-            },
-        )
-        .unwrap();
-        let (conn, notice) = connect_session(&mut mods, &packages, "127.0.0.1", handle.addr().port(), "ada", "")
-            .expect("retry joins");
-        assert!(conn.is_alive());
-        assert_eq!(
-            notice.as_deref(),
-            Some("This server does not allow: Developer Toolkit; it is off while you are connected")
-        );
-        let index = (0..mods.len()).find(|&i| mods.id(i) == "dev-toolkit").expect("toolkit");
-        assert!(!mods.is_enabled(index));
-        assert!(mods.server_off(index));
-        assert!(!mods.toggle(index), "the menu's toggle is refused while connected");
-        let hotbar = (0..mods.len()).find(|&i| mods.id(i) == "hotbar").expect("hotbar");
-        assert!(mods.is_enabled(hotbar));
-        let snap = ModRow::snapshot(&mods);
-        let mut settings = Settings::default();
-        let session = Session::default();
-        let mut ctx = crate::menu::Ctx {
-            settings: &mut settings,
-            saves: &[],
-            mods: &snap,
-            session: &session,
-            mods_save_error: None,
-        };
-        let view = ModsMenu.view(&ctx);
-        let row = view.rows.iter().find(|row| row.label.contains("Developer Toolkit")).expect("row");
-        match &row.kind {
-            crate::menu::RowKind::Value(ValueView::Choice(value)) => assert_eq!(value, "off (server)"),
-            _ => panic!("expected off (server)"),
-        }
-        assert!(matches!(
-            ModsMenu.update(Msg::Pick(crate::menu::menus::ModsAction::ServerOff), &mut ctx),
-            Command::Stay
-        ));
-        drop(conn);
-        mods.release_server();
-        assert!(mods.is_enabled(index));
-        assert!(!mods.server_off(index));
         handle.stop();
     }
 
@@ -1487,6 +1031,36 @@ mod tests {
             crate::math::block_coord(p.position.z),
         );
         assert!(p.position.y > ground as f64);
+    }
+
+    /// The server builds its generator from the seed, kind and knobs alone (`server::spawn`), and
+    /// single player builds a world; both stand a fresh player on the same point.
+    #[test]
+    fn single_player_and_the_server_spawn_on_the_same_point() {
+        use crate::world::generation::{FlatTerrain, spawn_column};
+        let steep = TerrainCfg { relief: 200, space: 200, ..TerrainCfg::default() }.clamp();
+        let worlds = [
+            (WorldgenKind::Flat, TerrainCfg::default()),
+            (WorldgenKind::Diffusion, TerrainCfg::default()),
+            (WorldgenKind::Diffusion, steep),
+        ];
+        for seed in [1, 42, 7] {
+            for (kind, cfg) in worlds {
+                let mut registry = crate::block::BlockRegistry::with_builtins();
+                let server: crate::world::terrain::Generator = match kind {
+                    WorldgenKind::Flat => std::sync::Arc::new(FlatTerrain::new(&mut registry, seed)),
+                    WorldgenKind::Diffusion => crate::world::terrain::generator(&mut registry, seed, cfg),
+                };
+                let world = World::with_kind_cfg(seed, RenderConfig::default(), kind, cfg, false);
+                let player = spawn_player(&world);
+                let spawn = spawn_column(server.as_ref());
+                assert_eq!(player.position.to_array().map(f64::to_bits), spawn.to_array().map(f64::to_bits), "seed {seed} {kind:?}");
+                // The round start world names its spawn; a flat world spirals to level ground.
+                assert_eq!(server.chart_spawn().is_some(), kind == WorldgenKind::Diffusion, "seed {seed} {kind:?}");
+                let pull = world.gravity_at(spawn).accel;
+                assert_eq!(player.up_axis, crate::player::standing_pose(pull).1);
+            }
+        }
     }
 
     #[test]
@@ -1595,7 +1169,7 @@ mod tests {
             }
         }
         let handle = server::spawn(0, Config { seed: 1234, worldgen: WorldgenKind::Diffusion, ..Config::default() }).unwrap();
-        let conn = join_server("127.0.0.1", handle.addr().port(), "probe", "").expect("join");
+        let conn = Connection::connect("127.0.0.1", handle.addr().port(), "probe", "").expect("join");
         probe_entry("join", &mut mods, || Loading::join(conn, render, None, false));
         handle.stop();
     }
@@ -1610,7 +1184,7 @@ mod tests {
         let handle = server::spawn(0, config).unwrap();
         let port = handle.addr().port();
 
-        let mut conn = join_server("127.0.0.1", port, "each", "").expect("join");
+        let mut conn = Connection::connect("127.0.0.1", port, "each", "").expect("join");
         let mut world = World::with_kind_cfg(conn.seed(), render, conn.worldgen(), conn.terrain(), false);
         let (start, mut frames, mut worst, mut cells) = (Instant::now(), 0, 0.0f64, 0);
         while !conn.snapshot_ready() {
@@ -1629,7 +1203,7 @@ mod tests {
         let done = ms(start);
         println!("join 100k overlay, each cell: {cells} cells, {frames} frames, worst frame {worst:.1}ms, done after {done:.0}ms");
 
-        let conn = join_server("127.0.0.1", port, "bulk", "").expect("join");
+        let conn = Connection::connect("127.0.0.1", port, "bulk", "").expect("join");
         let Loading::Join { job, conn, .. } = Loading::join(conn, render, None, false) else { unreachable!() };
         let (world, player) = job.wait();
         mods.reset_state();
@@ -1666,6 +1240,158 @@ mod tests {
                 assert_eq!(p.up_axis, crate::coord::Face::PosY);
             }
         }
+    }
+
+    /// The engine as [`push_gfx`] sees it. It allocates MSAA up to `msaa_cap`, as a device short
+    /// of VRAM falls back, and counts every render-lane flag transition.
+    struct FakeGfx {
+        extent: (u32, u32),
+        flags: voxel_engine::RenderFlags,
+        transitions: u32,
+        bloom_ever_on: bool,
+        msaa: u32,
+        msaa_cap: u32,
+        scale: f32,
+    }
+
+    impl FakeGfx {
+        /// Created as `App::run` creates the engine: the masked flags of `settings`.
+        fn new(settings: &Settings, mask: VisualMask, msaa_cap: u32) -> Self {
+            let flags = mask.effective_render(settings).engine_flags();
+            Self { extent: (1280, 720), flags, transitions: 0, bloom_ever_on: flags.bloom, msaa: settings.msaa.min(msaa_cap), msaa_cap, scale: 1.0 }
+        }
+    }
+
+    impl GfxEngine for FakeGfx {
+        fn window_extent(&self) -> (u32, u32) {
+            self.extent
+        }
+        fn gpu_caps(&self) -> voxel_engine::GpuCaps {
+            voxel_engine::GpuCaps {
+                device_name: String::new(),
+                device_local_bytes: 0,
+                device_local_heap_size: 0,
+                device_local_budget: None,
+                device_local_usage: None,
+                max_texture_array_layers: 2048,
+                max_msaa: 8,
+                supports_vrs: false,
+                supports_pipeline_stats: false,
+            }
+        }
+        fn vrs_useful_above_pixels(&self) -> Option<u32> {
+            None
+        }
+        fn estimate_render_targets(&self, _: u32, _: u32, _: f32, _: u32, _: RenderConfig) -> u64 {
+            0
+        }
+        fn set_fullscreen(&mut self, _: bool) {}
+        fn set_msaa(&mut self, samples: u32) -> u32 {
+            self.msaa = samples.min(self.msaa_cap);
+            self.msaa
+        }
+        fn set_render_scale(&mut self, scale: f32) -> f32 {
+            self.scale = scale;
+            scale
+        }
+        fn set_cull_faces(&mut self, _: bool) {}
+        fn set_flags(&mut self, flags: voxel_engine::RenderFlags) {
+            if flags != self.flags {
+                self.transitions += 1;
+                self.bloom_ever_on |= flags.bloom;
+                self.flags = flags;
+            }
+        }
+        fn msaa(&self) -> u32 {
+            self.msaa
+        }
+        fn render_scale(&self) -> f32 {
+            self.scale
+        }
+    }
+
+    /// With the Post mod off, a push writes the masked flags once: one transition per change of
+    /// a live lane, none for a lane the mod strips, and bloom never turns on in between.
+    #[test]
+    fn with_a_visual_mod_off_each_apply_is_one_flag_transition() {
+        use crate::render_config::VisualGroup;
+        let mask = VisualMask::of([VisualGroup::Atmosphere, VisualGroup::Lighting]);
+        let mut settings = Settings::default();
+        settings.bloom = true;
+        let mut eng = FakeGfx::new(&settings, mask, 8);
+        let mut applied = None;
+        assert!(push_gfx(&mut eng, &mut settings, mask, &mut applied), "the first frame pushes");
+        assert_eq!(eng.transitions, 0, "the engine was created with these flags");
+        for frame in 0..5 {
+            assert!(!push_gfx(&mut eng, &mut settings, mask, &mut applied), "quiet frame {frame} pushes nothing");
+        }
+        for (lane, flip) in [("shadows", (|s: &mut Settings| s.shadows = !s.shadows) as fn(&mut Settings)), ("fog", |s| s.fog = !s.fog)] {
+            let before = eng.transitions;
+            flip(&mut settings);
+            assert!(push_gfx(&mut eng, &mut settings, mask, &mut applied), "{lane}");
+            assert_eq!(eng.transitions, before + 1, "{lane}: one transition");
+            assert!(!push_gfx(&mut eng, &mut settings, mask, &mut applied), "{lane}: settled");
+        }
+        let before = eng.transitions;
+        settings.godrays = !settings.godrays;
+        push_gfx(&mut eng, &mut settings, mask, &mut applied);
+        assert_eq!(eng.transitions, before, "a stripped lane moves nothing");
+        eng.extent = (2560, 1440);
+        assert!(push_gfx(&mut eng, &mut settings, mask, &mut applied), "a resize pushes");
+        assert!(eng.transitions <= before + 1);
+        assert!(!push_gfx(&mut eng, &mut settings, mask, &mut applied), "and settles in the same frame");
+        assert!(!eng.bloom_ever_on, "the Post mod's bloom never reached the engine");
+    }
+
+    /// A device that cannot allocate the MSAA asked for: the fallback is adopted once, and every
+    /// later frame compares stamps without a single allocation (the notice is not cloned).
+    #[test]
+    fn push_gfx_allocates_nothing_in_steady_state() {
+        let mask = VisualMask::default();
+        let mut settings = Settings::default();
+        settings.msaa = 4;
+        let mut eng = FakeGfx::new(&settings, mask, 1);
+        let mut applied = None;
+        assert!(push_gfx(&mut eng, &mut settings, mask, &mut applied));
+        assert!(settings.vram_notice.is_some(), "the fallback is noticed");
+        assert_eq!(settings.session_msaa_scale(1280, 720).0, 1, "the session runs at what the device gave");
+        assert!(!push_gfx(&mut eng, &mut settings, mask, &mut applied), "the fallback is not pushed again");
+        for frame in 0..8 {
+            crate::alloc_count::reset();
+            let pushed = push_gfx(&mut eng, &mut settings, mask, &mut applied);
+            assert_eq!((pushed, crate::alloc_count::alloc_count()), (false, 0), "steady frame {frame}");
+        }
+    }
+
+    /// Left held on a Video row at key-repeat rate for two seconds, frames 8 ms apart, the way
+    /// the menu screen runs them: nothing is written while the value moves, and one write lands
+    /// once it has been still for the debounce window.
+    #[test]
+    fn holding_left_writes_settings_at_most_once_per_debounce_window() {
+        use crate::menu::menus::SettingsPage;
+        use crate::menu::{Dir, Intent};
+        let mut settings = Settings::default();
+        let session = Session::default();
+        let mut stack = MenuStack::new(Framed::boxed(SettingsPage::new(crate::settings::Category::Video)));
+        let mut flush = Debounce::new();
+        let (mut writes, mut steps) = (Vec::new(), 0);
+        for frame in 0..400u64 {
+            let now_ms = frame * 8;
+            let held = now_ms < 2000 && frame % 4 == 0;
+            let intents = if held { vec![Intent::Adjust(Dir::Prev)] } else { Vec::new() };
+            let before = settings.clone();
+            let mut ctx = Ctx { settings: &mut settings, saves: &[], mods: &[], session: &session, mods_save_error: None };
+            stack.update(&intents, &mut ctx);
+            let changed = settings != before;
+            steps += changed as u32;
+            if settings_write_due(&mut flush, changed, now_ms) {
+                writes.push(now_ms);
+            }
+        }
+        assert!(steps > 40, "the held key moved the value ({steps} steps)");
+        assert_eq!(writes.len(), 1, "one write, after the release: {writes:?}");
+        assert!((2000..2000 + Debounce::IDLE_MS + 16).contains(&writes[0]), "written {}ms in", writes[0]);
+        assert!(!flush.take(), "nothing left pending");
     }
 
     #[test]

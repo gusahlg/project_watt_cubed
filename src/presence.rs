@@ -264,6 +264,23 @@ pub fn wrap_pi(a: f32) -> f32 {
     (a + PI).rem_euclid(TAU) - PI
 }
 
+/// A stable, cheerful colour for a player, hashed from their name so the same player
+/// keeps the same tint across clients.
+pub fn peer_color(name: &str) -> voxel_engine::Color {
+    use voxel_engine::Color;
+    const PALETTE: [Color; 6] = [
+        Color::new(230, 90, 90, 255),
+        Color::new(90, 170, 230, 255),
+        Color::new(110, 210, 120, 255),
+        Color::new(230, 190, 90, 255),
+        Color::new(200, 120, 220, 255),
+        Color::new(240, 150, 90, 255),
+    ];
+    // FNV-1a over the name, then index the palette.
+    let h = crate::hash::fnv1a_32(name.as_bytes());
+    PALETTE[h as usize % PALETTE.len()]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,6 +1,5 @@
 //! The console's submitted lines: chat in multiplayer, commands the mods handle, and the core's
 //! follow-up on what a command changed.
-use voxel_engine::Engine;
 
 use super::Game;
 use crate::audio::{GameEvent, SoundSystem};
@@ -11,19 +10,19 @@ use crate::settings::Settings;
 
 impl Game {
     /// Handle one submitted console line (see [`run_line`](Self::run_line)). A command that edits
-    /// settings (`/gfx`, the audio rows) goes through the one application path, is marked for
-    /// saving and re-mixes the audio, only when something actually changed.
+    /// settings (`/gfx`, the audio rows) is marked for the one application path (the app runs it
+    /// after pushing the engine's half) and for saving, and re-mixes the audio, only when
+    /// something actually changed.
     pub(super) fn submit_line(
         &mut self,
         line: String,
-        eng: &mut Engine,
         settings: &mut Settings,
         sound: &mut SoundSystem,
         events: &mut Vec<GameEvent>,
         mods: &mut Mods,
     ) {
         if self.run_line(line, settings, events, mods) {
-            self.apply_settings(eng, settings);
+            self.settings_changed = true;
             self.settings_dirty = true;
             sound.set_mix(settings.mix_change());
         }
@@ -173,6 +172,20 @@ mod tests {
         assert_eq!(game.player.position.x, 10.5);
         assert!(!changed);
         assert!(game.force_stream, "a moved player streams its destination at once (and is reported as a teleport)");
+    }
+
+    /// A command that changes settings leaves the application to the app, which runs it after
+    /// pushing the engine's half; one that changes nothing marks nothing.
+    #[test]
+    fn a_settings_command_is_marked_for_the_app_to_apply_and_save() {
+        let (mut game, mut mods, mut settings) = (game(), probe_mods(), Settings::default());
+        let (mut sound, _) = crate::audio::SoundSystem::mute();
+        let mut events = Vec::new();
+        game.submit_line("/probe intern".into(), &mut settings, &mut sound, &mut events, &mut mods);
+        assert!(!game.take_settings_changed() && !game.take_settings_dirty());
+        game.submit_line("/probe fov".into(), &mut settings, &mut sound, &mut events, &mut mods);
+        assert!(game.take_settings_changed() && game.take_settings_dirty());
+        assert!(!game.take_settings_changed(), "taken once");
     }
 
     #[test]

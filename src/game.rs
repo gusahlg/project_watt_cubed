@@ -180,7 +180,7 @@ pub struct Game {
     console: Console,
     /// The save slot this world belongs to.
     save_name: String,
-    /// Cached `peer_color(save_name)` — local third-person body tint.
+    /// Cached `presence::peer_color(save_name)` — local third-person body tint.
     local_color: Color,
     /// The live server connection when playing multiplayer; `None` in singleplayer.
     /// The player simulates locally and the server keeps everyone in sync.
@@ -299,6 +299,9 @@ pub struct Game {
     leave_notice: Option<String>,
     /// The game changed the settings (HUD hotkey, console); the app writes them off the frame.
     settings_dirty: bool,
+    /// A console command changed the settings: the app applies them after it has pushed the
+    /// engine's half, so this game sees the fresh render extent.
+    settings_changed: bool,
 }
 
 /// Durations of `Game::update` phases, sampled every watched frame for stall logs.
@@ -352,7 +355,7 @@ impl Game {
             player,
             camera: GameCamera::new(),
             console: Console::new(),
-            local_color: draw::peer_color(&save_name),
+            local_color: crate::presence::peer_color(&save_name),
             save_name,
             net: None,
             pending_edits: std::collections::HashMap::new(),
@@ -398,6 +401,7 @@ impl Game {
             hud_scratch: Vec::new(),
             leave_notice: None,
             settings_dirty: false,
+            settings_changed: false,
         }
     }
 
@@ -429,16 +433,16 @@ impl Game {
         self.content_rev.0 = self.content_rev.0.wrapping_add(1);
     }
 
-    /// Push every live-applicable setting into this game: engine values, the
-    /// world's view volume and meshing lanes, the per-frame look config, HUD
-    /// mode, lane gates, and the throttled clocks. THE one path — world entry
-    /// and in-game `/gfx` edits both come through here, so they can never
-    /// drift apart. (World-construction lanes — occlusion/lod2 — stay
-    /// entry-only by design; see `App::enter_game`.)
-    pub fn apply_settings(&mut self, eng: &mut Engine, settings: &mut Settings) {
-        settings.apply(eng);
+    /// Push every live-applicable setting into this game: the world's view
+    /// volume and meshing lanes, the per-frame look config, HUD mode, lane
+    /// gates, and the throttled clocks. THE one path — world entry and in-game
+    /// `/gfx` edits both come through here, so they can never drift apart.
+    /// The engine's half (window, MSAA, scale, lane flags) is `App::push_gfx`'s,
+    /// which runs first so the lanes resolve against the fresh render extent.
+    /// (World-construction lanes — occlusion/lod2 — stay entry-only by design;
+    /// see `App::enter_game`.)
+    pub fn apply_settings(&mut self, eng: &mut Engine, settings: &Settings) {
         let render = self.visual_mask.effective_render(settings);
-        eng.set_flags(render.engine_flags());
         // View volume BEFORE the render config: the far ladder's `unit`
         // tracks the full-res radius, so the transition detector must see the
         // new volume.
@@ -525,8 +529,7 @@ impl Game {
             let ground = world.surface_y(0, 0);
             DVec3::new(0.5, ground as f64 + 3.0, 0.5)
         });
-        let mut player = Player::new(pos);
-        player.stand_in(world.gravity_at(player.position).accel);
+        let player = Player::standing(pos, world.gravity_at(pos).accel);
         let mut g = Game::new(world, player, "scripted".to_string());
         g.scripted = true;
         g.render = render;
@@ -578,6 +581,12 @@ impl Game {
     /// Whether the game changed the settings since the last take, so the app should save them.
     pub fn take_settings_dirty(&mut self) -> bool {
         std::mem::take(&mut self.settings_dirty)
+    }
+
+    /// Whether a console command changed the settings since the last take, so the app should
+    /// [`apply_settings`](Self::apply_settings) once it has pushed the engine's half.
+    pub fn take_settings_changed(&mut self) -> bool {
+        std::mem::take(&mut self.settings_changed)
     }
 
     /// Why a network session left, for the menu. Cleared by the take.
@@ -840,7 +849,7 @@ impl Game {
                 .console
                 .handle_input(&input.text_chars, input.text_edit, mods.commands())
             {
-                self.submit_line(line, eng, settings, sound, events, mods);
+                self.submit_line(line, settings, sound, events, mods);
             }
             return Some(Signal::Continue);
         }
