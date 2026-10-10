@@ -5,13 +5,8 @@ pub(super) struct PlayerHandle {
     /// Interned once at join; every roster/join/chat broadcast that carries
     /// it is a refcount bump, never a per-recipient allocation.
     pub(super) name: Arc<str>,
-    pub(super) pos: DVec3,
-    pub(super) yaw: f32,
-    pub(super) pitch: f32,
-    pub(super) frame: DQuat,
-    pub(super) velocity: Vec3,
-    pub(super) up: Face,
-    pub(super) stance: Stance,
+    /// The last accepted pose: edit reach, interest and the envelope read it.
+    pub(super) pose: Pose,
     /// The movement envelope's time anchor.
     pub(super) last_move: Instant,
     /// Distance banked at `last_move`, spent by moves and refilled at the envelope speed.
@@ -64,21 +59,16 @@ impl PlayerHandle {
     /// A player admitted at `spawn`, standing still in the pose `frame` and `up`, and not
     /// ready until its bootstrap is queued.
     pub(super) fn new(name: Arc<str>, spawn: DVec3, frame: DQuat, up: Face, op: bool, out: Outbox, kick: Arc<Notify>) -> Self {
+        let pose = Pose::standing(spawn, frame, up);
         Self {
             name,
-            pos: spawn,
-            yaw: 0.0,
-            pitch: 0.0,
-            frame,
-            velocity: Vec3::ZERO,
-            up,
-            stance: Stance::Standing,
+            pose,
             last_move: Instant::now(),
             budget: MOVE_FLOOR,
             burst: MOVE_FLOOR,
             op,
             visible: FastSet::default(),
-            body: PoseBody::new(0.0, 0.0, frame, Vec3::ZERO, up, Stance::Standing),
+            body: pose.body(),
             moved: 0,
             out,
             kick,
@@ -247,7 +237,7 @@ impl State {
         // Coordinates, revisions and block ids only: specs are named once per
         // block, and the frames are sorted and encoded after the lock.
         let overlay = Overlay::of(self);
-        let spawn = handle.pos;
+        let spawn = handle.pose.pos;
         self.players.insert(id, handle);
         // Same lock hold as the roster insert, so the grid never lags the roster.
         self.grid_insert(id, spawn);
@@ -258,8 +248,8 @@ impl State {
     /// announcement sets, so nothing names a player who has gone.
     pub(super) fn remove_player(&mut self, id: u32) -> Option<PlayerHandle> {
         let h = self.players.remove(&id)?;
-        // h.pos is the last committed one, naming the bucket the grid holds it under.
-        self.grid_remove(id, h.pos);
+        // The last committed position names the bucket the grid holds it under.
+        self.grid_remove(id, h.pose.pos);
         for other in self.players.values_mut() {
             other.visible.remove(&id);
             other.announced.remove(&id);
@@ -298,7 +288,7 @@ impl State {
                             continue;
                         }
                         let Some(other) = self.players.get(&pid) else { continue };
-                        if other.ready && other.pos.distance_squared(pos) <= INTEREST_RADIUS_SQ {
+                        if other.ready && other.pose.pos.distance_squared(pos) <= INTEREST_RADIUS_SQ {
                             visible.insert(pid);
                         }
                     }

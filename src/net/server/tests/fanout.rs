@@ -108,7 +108,7 @@ fn visibility_changes_match_full_roster_distance_checks() {
         let expected: HashSet<u32> = state.players
             .iter()
             .filter(|&(&id, player)| {
-                id != 1 && player.ready && player.pos.distance_squared(pos) <= radius * radius
+                id != 1 && player.ready && player.pose.pos.distance_squared(pos) <= radius * radius
             })
             .map(|(&id, _)| id)
             .collect();
@@ -138,7 +138,7 @@ fn visibility_changes_match_full_roster_distance_checks() {
                     assert_eq!(poses.list.len(), 1);
                     let pose = poses.list[0];
                     let subject = &state.players[&pose.id];
-                    assert!(pose.pos.distance(subject.pos) < 0.01, "pose of {} at {pos:?}", pose.id);
+                    assert!(pose.pos.distance(subject.pose.pos) < 0.01, "pose of {} at {pos:?}", pose.id);
                     (to, pose.id, true)
                 }
                 other => panic!("unexpected {other:?}"),
@@ -251,7 +251,7 @@ fn interest_at_the_radius_bucket_edges_wrap_and_three_bucket_hops() {
 
     // Three buckets in one message (teleport-sized hop).
     let start = DVec3::new(10.0, 20.0, 10.0);
-    state.players.get_mut(&1).unwrap().pos = start;
+    state.players.get_mut(&1).unwrap().pose.pos = start;
     state.grid.clear();
     state.grid_insert(1, start);
     state.grid_insert(2, DVec3::new(INTEREST_RADIUS, 20.0, 0.0));
@@ -635,7 +635,7 @@ fn move_cluster(players: u32, rounds: u32, warm: u32, paced: bool) -> Moves {
     {
         let mut state = shared.lock_recover();
         for id in 1..=players {
-            let pos = state.players[&id].pos;
+            let pos = state.players[&id].pose.pos;
             state.grid_insert(id, pos);
         }
     }
@@ -652,7 +652,8 @@ fn move_cluster(players: u32, rounds: u32, warm: u32, paced: bool) -> Moves {
             let velocity = ((next - pos) / period.as_secs_f64()).as_vec3();
             crate::alloc_count::reset();
             let began = Instant::now();
-            on_move(&shared, &ctx, id, pos, 0.0, 0.0, DQuat::IDENTITY, velocity, Face::PosY, Stance::Standing, &mut sends);
+            let pose = Pose { velocity, ..Pose::standing(pos, DQuat::IDENTITY, Face::PosY) };
+            on_move(&shared, &ctx, id, pose, &mut sends);
             let took = began.elapsed();
             if round >= warm {
                 out.allocs += crate::alloc_count::alloc_count();

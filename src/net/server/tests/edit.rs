@@ -290,7 +290,7 @@ fn edit_at_exact_reach_is_accepted_and_extreme_coords_do_not_panic() {
     assert!(shared.lock_recover().edits.contains_key(&(8, 20, 8)), "exact REACH must land");
 
     let just_out = DVec3::new(center.x + EDIT_REACH * 1.001, center.y, center.z);
-    shared.lock_recover().players.get_mut(&1).unwrap().pos = just_out;
+    shared.lock_recover().players.get_mut(&1).unwrap().pose.pos = just_out;
     on_edit(&shared, None, chartless(), 1, 2, 8, 21, 8, 0, "air");
     assert!(!shared.lock_recover().edits.contains_key(&(8, 21, 8)));
 

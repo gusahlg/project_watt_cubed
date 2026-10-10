@@ -238,13 +238,69 @@ impl TryFrom<Vec<u8>> for ModBytes {
     }
 }
 
+/// A mod package id on the wire: 1..=[`MAX_MOD_ID`] bytes, which the decoder enforces.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ModId(Arc<str>);
+
+impl ModId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for ModId {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<str> for ModId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ModId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<&str> for ModId {
+    fn from(id: &str) -> Self {
+        Self(Arc::from(id))
+    }
+}
+
+impl From<Arc<str>> for ModId {
+    fn from(id: Arc<str>) -> Self {
+        Self(id)
+    }
+}
+
+impl PartialEq<Arc<str>> for ModId {
+    fn eq(&self, other: &Arc<str>) -> bool {
+        *self.0 == **other
+    }
+}
+
+impl Wire for ModId {
+    fn put(&self, w: &mut codec::Writer) {
+        w.str16(&self.0);
+    }
+    fn get(r: &mut codec::Reader) -> Option<Self> {
+        bounded_mod_str(r).map(Self)
+    }
+}
+
 /// One enabled mod an honest client reports at join: the build's package id
 /// and version. A modified client can put anything here. The server still
 /// enforces teleport, the speed cap, time permission, edit reach, and the
 /// movement envelope; this list is not a security boundary.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModOffer {
-    pub id: Arc<str>,
+    pub id: ModId,
     pub version: Arc<str>,
 }
 
@@ -255,13 +311,38 @@ const MAX_MOD_ID: usize = 64;
 
 impl Wire for ModOffer {
     fn put(&self, w: &mut codec::Writer) {
-        w.str16(&self.id);
+        self.id.put(w);
         w.str16(&self.version);
     }
     fn get(r: &mut codec::Reader) -> Option<Self> {
-        let id = bounded_mod_str(r)?;
+        let id = ModId::get(r)?;
         let version = bounded_mod_str(r)?;
         Some(Self { id, version })
+    }
+}
+
+/// An item of a mod list: a `u16` count, at most [`MAX_MOD_OFFERS`] items, then the items.
+trait ModListItem: Wire {}
+impl ModListItem for ModOffer {}
+impl ModListItem for ModId {}
+
+impl<T: ModListItem> Wire for Vec<T> {
+    fn put(&self, w: &mut codec::Writer) {
+        w.u16(self.len() as u16);
+        for item in self {
+            item.put(w);
+        }
+    }
+    fn get(r: &mut codec::Reader) -> Option<Self> {
+        let count = r.u16().ok()? as usize;
+        if count > MAX_MOD_OFFERS {
+            return None;
+        }
+        let mut items = Vec::with_capacity(count);
+        for _ in 0..count {
+            items.push(T::get(r)?);
+        }
+        Some(items)
     }
 }
 
@@ -288,46 +369,6 @@ fn bounded_mod_str(r: &mut codec::Reader) -> Option<Arc<str>> {
     Some(Arc::from(s))
 }
 
-impl Wire for Vec<ModOffer> {
-    fn put(&self, w: &mut codec::Writer) {
-        w.u16(self.len() as u16);
-        for offer in self {
-            offer.put(w);
-        }
-    }
-    fn get(r: &mut codec::Reader) -> Option<Self> {
-        let count = r.u16().ok()? as usize;
-        if count > MAX_MOD_OFFERS {
-            return None;
-        }
-        let mut offers = Vec::with_capacity(count);
-        for _ in 0..count {
-            offers.push(ModOffer::get(r)?);
-        }
-        Some(offers)
-    }
-}
-
-impl Wire for Vec<Arc<str>> {
-    fn put(&self, w: &mut codec::Writer) {
-        w.u16(self.len() as u16);
-        for s in self {
-            w.str16(s);
-        }
-    }
-    fn get(r: &mut codec::Reader) -> Option<Self> {
-        let count = r.u16().ok()? as usize;
-        if count > MAX_MOD_OFFERS {
-            return None;
-        }
-        let mut ids = Vec::with_capacity(count);
-        for _ in 0..count {
-            ids.push(bounded_mod_str(r)?);
-        }
-        Some(ids)
-    }
-}
-
 /// u16 length prefix, then the bytes. Decode rejects a length prefix past the
 /// cap before the bytes are trusted.
 impl Wire for ModBytes {
@@ -341,6 +382,64 @@ impl Wire for ModBytes {
             return None;
         }
         Some(Self(r.take(len).ok()?.to_vec()))
+    }
+}
+
+/// A player's pose as a [`ClientMessage::Move`] carries it, and as the server keeps it: the
+/// position, view angles, body frame, velocity, up face and stance, in that wire order.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Pose {
+    pub pos: DVec3,
+    pub yaw: f32,
+    pub pitch: f32,
+    pub frame: DQuat,
+    pub velocity: Vec3,
+    pub up: Face,
+    pub stance: Stance,
+}
+
+impl Pose {
+    /// Standing still at `pos` in the body frame `frame` with `up` as its up face.
+    pub fn standing(pos: DVec3, frame: DQuat, up: Face) -> Self {
+        Self { pos, yaw: 0.0, pitch: 0.0, frame, velocity: Vec3::ZERO, up, stance: Stance::Standing }
+    }
+
+    /// Every number is finite: a NaN would poison distance checks, grid keys, peer
+    /// interpolation and render matrices.
+    pub fn is_finite(&self) -> bool {
+        self.pos.is_finite()
+            && self.yaw.is_finite()
+            && self.pitch.is_finite()
+            && self.frame.is_finite()
+            && self.velocity.is_finite()
+    }
+
+    /// The pose without its position, in the wire form a [`ServerMessage::PeerPoses`] record carries.
+    pub(crate) fn body(&self) -> PoseBody {
+        PoseBody::new(self.yaw, self.pitch, self.frame, self.velocity, self.up, self.stance)
+    }
+}
+
+impl Wire for Pose {
+    fn put(&self, w: &mut codec::Writer) {
+        self.pos.put(w);
+        self.yaw.put(w);
+        self.pitch.put(w);
+        self.frame.put(w);
+        self.velocity.put(w);
+        self.up.put(w);
+        self.stance.put(w);
+    }
+    fn get(r: &mut codec::Reader) -> Option<Self> {
+        Some(Self {
+            pos: Wire::get(r)?,
+            yaw: Wire::get(r)?,
+            pitch: Wire::get(r)?,
+            frame: Wire::get(r)?,
+            velocity: Wire::get(r)?,
+            up: Wire::get(r)?,
+            stance: Wire::get(r)?,
+        })
     }
 }
 
@@ -949,7 +1048,7 @@ messages! {
         /// Client simulates its own player; server-side this is plausibility-checked
         /// (movement envelope + border) — discontinuities must go through
         /// [`Teleport`](Self::Teleport).
-        Move = tag::MOVE { pos: DVec3, yaw: f32, pitch: f32, frame: DQuat, velocity: Vec3, up: Face, stance: Stance },
+        Move = tag::MOVE { pose: Pose },
         /// Exempt from the movement envelope, but the server may refuse it
         /// (configuration) and answer with a [`ServerMessage::Position`] snap-back.
         Teleport = tag::TELEPORT { pos: DVec3 },
@@ -1032,7 +1131,7 @@ messages! {
         ToolResult = tag::TOOL_RESULT { req: u32, reacted: bool, rev: u32, cell_spec: Arc<str>, tool_spec: Arc<str> },
         /// The stream closes after this. `ids` are the enabled mods this server
         /// refuses. An honest client disables them for the session and joins once more.
-        ModsDenied = tag::MODS_DENIED { ids: Vec<Arc<str>> },
+        ModsDenied = tag::MODS_DENIED { ids: Vec<ModId> },
     }
 }
 
@@ -1157,7 +1256,7 @@ mod tests {
             },
             ClientMessage::Cruise { speed: 1.5e8 },
             ClientMessage::Cruise { speed: 0.0 },
-            ClientMessage::Move {
+            ClientMessage::Move { pose: Pose {
                 pos: DVec3::new(1.5, -2.0, 3.25),
                 yaw: 0.5,
                 pitch: -0.25,
@@ -1165,7 +1264,7 @@ mod tests {
                 velocity: Vec3::new(1.5, -2.25, 0.5),
                 up: Face::PosX,
                 stance: Stance::Sneaking,
-            },
+            } },
             ClientMessage::Teleport { pos: DVec3::new(1.0e8, -40.0, 3.5) },
             ClientMessage::Swing,
             ClientMessage::Ping { nonce: 7 },
@@ -1443,7 +1542,7 @@ mod tests {
         // part below survives exactly; an f32 wire would quantise it to a
         // multiple of 8. Round-trip both directions of the hot path.
         let pos = DVec3::new(1.0e8 + 0.123456789, -3_000.25, -(1.0e9 - 0.75));
-        let mv = ClientMessage::Move {
+        let mv = ClientMessage::Move { pose: Pose {
             pos,
             yaw: 1.0,
             pitch: -0.5,
@@ -1451,9 +1550,9 @@ mod tests {
             velocity: Vec3::ZERO,
             up: Face::PosY,
             stance: Stance::Standing,
-        };
+        } };
         match ClientMessage::decode(&mv.encode()) {
-            Some(ClientMessage::Move { pos: got, .. }) => {
+            Some(ClientMessage::Move { pose: Pose { pos: got, .. } }) => {
                 assert_eq!(got.x.to_bits(), pos.x.to_bits());
                 assert_eq!(got.y.to_bits(), pos.y.to_bits());
                 assert_eq!(got.z.to_bits(), pos.z.to_bits());
@@ -1523,7 +1622,7 @@ mod tests {
     fn protocol_12_body_frame_round_trips() {
         let frame = DQuat::from_xyzw(0.0, 1.0, 0.0, 0.0);
         let velocity = Vec3::new(1.5, -2.25, 0.5);
-        let mv = ClientMessage::Move {
+        let mv = ClientMessage::Move { pose: Pose {
             pos: DVec3::new(4.0, 5.0, 6.0),
             yaw: 0.25,
             pitch: -0.5,
@@ -1531,9 +1630,9 @@ mod tests {
             velocity,
             up: Face::PosX,
             stance: Stance::Standing,
-        };
+        } };
         match ClientMessage::decode(&mv.encode()) {
-            Some(ClientMessage::Move { frame: got_f, velocity: got_v, up, .. }) => {
+            Some(ClientMessage::Move { pose: Pose { frame: got_f, velocity: got_v, up, .. } }) => {
                 assert_eq!(got_f, frame);
                 assert_eq!(got_v, velocity);
                 assert_eq!(up, Face::PosX);
@@ -1548,7 +1647,7 @@ mod tests {
         let quat_at = 1 + 24 + 4 + 4;
         payload[quat_at..quat_at + 4].copy_from_slice(&f32::NAN.to_le_bytes());
         match ClientMessage::decode(&payload) {
-            Some(ClientMessage::Move { frame: got, up, .. }) => {
+            Some(ClientMessage::Move { pose: Pose { frame: got, up, .. } }) => {
                 assert_eq!(got, DQuat::IDENTITY);
                 assert_eq!(up, Face::PosX);
             }
@@ -2068,7 +2167,7 @@ mod golden {
     const DIGEST: u64 = 0x4935_facd_0ee5_2bd8;
 
     fn golden_move() -> ClientMessage {
-        ClientMessage::Move {
+        ClientMessage::Move { pose: Pose {
             pos: DVec3::new(-1234.5625, 98.25, 1.0e8 + 0.375),
             yaw: 2.5,
             pitch: -0.75,
@@ -2076,7 +2175,7 @@ mod golden {
             velocity: Vec3::new(3.5, -9.75, 0.125),
             up: Face::NegZ,
             stance: Stance::Sneaking,
-        }
+        } }
     }
 
     fn golden_poses() -> (DVec3, Vec<(u32, PoseBody, DVec3)>) {

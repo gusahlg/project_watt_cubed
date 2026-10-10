@@ -4,8 +4,8 @@ use super::*;
 impl PlayerHandle {
     pub(super) fn correct_position(&self, id: u32, sends: &mut Vec<PendingSend>) {
         if self.ready {
-            let frame = ServerMessage::Position { pos: self.pos, frame: self.frame, up: self.up }.frame();
-            sends.push((id, frame));
+            let Pose { pos, frame, up, .. } = self.pose;
+            sends.push((id, ServerMessage::Position { pos, frame, up }.frame()));
         }
     }
 }
@@ -21,48 +21,11 @@ impl PlayerHandle {
 /// Locked: commit the move, keep the grid current, diff visibility, and queue the
 /// enter/exit frames in order without waking anyone. Unlocked: wake the writers.
 /// Poses inside range go out on the pose tick ([`broadcast_poses`]).
-/// The orientation a [`ClientMessage::Move`] reports. A teleport passes `None`
-/// and keeps whatever the handle already stored.
-pub(super) struct ReportedPose {
-    yaw: f32,
-    pitch: f32,
-    frame: DQuat,
-    velocity: Vec3,
-    up: Face,
-    stance: Stance,
-}
-
-pub(super) fn quat_finite(q: DQuat) -> bool {
-    q.x.is_finite() && q.y.is_finite() && q.z.is_finite() && q.w.is_finite()
-}
-
-pub(super) fn on_move(
-    shared: &Arc<Mutex<State>>,
-    ctx: &Ctx,
-    id: u32,
-    pos: DVec3,
-    yaw: f32,
-    pitch: f32,
-    frame: DQuat,
-    velocity: Vec3,
-    up: Face,
-    stance: Stance,
-    sends: &mut Vec<PendingSend>,
-) {
-    // A NaN position poisons distance checks/grid keys; a NaN angle, frame, or
-    // velocity propagates into peer interpolation and render matrices.
-    if !pos.x.is_finite()
-        || !pos.y.is_finite()
-        || !pos.z.is_finite()
-        || !yaw.is_finite()
-        || !pitch.is_finite()
-        || !quat_finite(frame)
-        || !velocity.x.is_finite()
-        || !velocity.y.is_finite()
-        || !velocity.z.is_finite()
-    {
+pub(super) fn on_move(shared: &Arc<Mutex<State>>, ctx: &Ctx, id: u32, pose: Pose, sends: &mut Vec<PendingSend>) {
+    if !pose.is_finite() {
         return;
     }
+    let Pose { pos, velocity, up, stance, .. } = pose;
     let wake = {
         let mut state = shared.lock_recover();
         let max_speed = state.max_speed;
@@ -79,12 +42,12 @@ pub(super) fn on_move(
             let speed = envelope_speed(h, velocity, elapsed, max_speed);
             let burst = MOVE_FLOOR.max(speed * MOVE_SLACK_SECS);
             let available = move_allowance(h, velocity, elapsed, max_speed);
-            let distance = h.pos.distance(pos);
+            let distance = h.pose.pos.distance(pos);
             let too_far = outside_world(pos) || distance > available;
             let mut occupied = [(0i32, 0, 0); BODY_CELL_CAP];
             let occupied_n = h.occupied.len().min(BODY_CELL_CAP);
             occupied[..occupied_n].copy_from_slice(&h.occupied[..occupied_n]);
-            (free, too_far, available - distance, burst, h.pos, h.cruising, occupied, occupied_n)
+            (free, too_far, available - distance, burst, h.pose.pos, h.cruising, occupied, occupied_n)
         };
         let blocked = !free
             && !too_far
@@ -93,13 +56,7 @@ pub(super) fn on_move(
             let Some(h) = state.players.get(&id) else { return };
             h.correct_position(id, sends);
         } else {
-            commit_pose(
-                &mut state,
-                id,
-                pos,
-                Some(ReportedPose { yaw, pitch, frame, velocity, up, stance }),
-                sends,
-            );
+            commit_pose(&mut state, id, pos, Some(pose), sends);
             if let Some(h) = state.players.get_mut(&id) {
                 h.budget = left;
                 h.burst = burst;
@@ -270,7 +227,7 @@ pub(super) fn move_allowance(h: &PlayerHandle, reported: Vec3, elapsed: f64, max
 }
 
 pub(super) fn envelope_speed(h: &PlayerHandle, reported: Vec3, elapsed: f64, max_speed: f64) -> f64 {
-    move_cap(h, max_speed).min(speed_of(reported).max(speed_of(h.velocity)) + GRAVITY_BOUND * elapsed)
+    move_cap(h, max_speed).min(speed_of(reported).max(speed_of(h.pose.velocity)) + GRAVITY_BOUND * elapsed)
 }
 
 pub(super) fn clamp_velocity(v: Vec3, cap: f64) -> Vec3 {
@@ -333,7 +290,7 @@ pub(super) fn on_teleport(shared: &Arc<Mutex<State>>, ctx: &Ctx, id: u32, pos: D
             // The destination's cells are the held ones the next swept move starts from.
             if let Some(h) = state.players.get_mut(&id) {
                 h.correct_position(id, sends);
-                let (stance, up) = (h.stance, h.up);
+                let (stance, up) = (h.pose.stance, h.pose.up);
                 remember_occupied(h, pos, stance, up);
             }
         }
@@ -352,28 +309,23 @@ pub(super) fn commit_pose(
     state: &mut State,
     id: u32,
     pos: DVec3,
-    reported: Option<ReportedPose>,
+    reported: Option<Pose>,
     sends: &mut Vec<PendingSend>,
 ) {
     let max_speed = state.max_speed;
     let tick = state.tick;
     let Some(h) = state.players.get_mut(&id) else { return };
-    let old = h.pos;
-    let before = (h.pos, h.yaw, h.pitch, h.frame, h.velocity, h.up, h.stance);
-    h.pos = pos;
+    let old = h.pose.pos;
+    let before = h.pose;
+    // A move brings its whole pose, its velocity held to the cap; a teleport keeps the rest.
     if let Some(r) = reported {
-        let cap = move_cap(h, max_speed);
-        h.yaw = r.yaw;
-        h.pitch = r.pitch;
-        h.frame = r.frame;
-        h.velocity = clamp_velocity(r.velocity, cap);
-        h.up = r.up;
-        h.stance = r.stance;
+        h.pose = Pose { velocity: clamp_velocity(r.velocity, move_cap(h, max_speed)), ..r };
     }
+    h.pose.pos = pos;
     h.last_move = Instant::now();
-    if before != (h.pos, h.yaw, h.pitch, h.frame, h.velocity, h.up, h.stance) {
+    if before != h.pose {
         h.moved = tick;
-        h.body = PoseBody::new(h.yaw, h.pitch, h.frame, h.velocity, h.up, h.stance);
+        h.body = h.pose.body();
     }
     let body = h.body;
     let (from, to) = (bucket_of(old), bucket_of(pos));
@@ -404,8 +356,8 @@ pub(super) fn commit_pose(
         for &pid in &fresh {
             let Some(other) = state.players.get_mut(&pid) else { continue };
             other.visible.insert(id);
-            sends.push((pid, PosesWriter::single(other.pos, id, &body, pos)));
-            sends.push((id, PosesWriter::single(pos, pid, &other.body, other.pos)));
+            sends.push((pid, PosesWriter::single(other.pose.pos, id, &body, pos)));
+            sends.push((id, PosesWriter::single(pos, pid, &other.body, other.pose.pos)));
         }
     }
     if let Some(h) = state.players.get_mut(&id) {

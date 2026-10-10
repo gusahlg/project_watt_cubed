@@ -271,18 +271,6 @@ struct PendingReq {
 /// A world cell, as the wire names it.
 type Cell = (i32, i32, i32);
 
-/// What the last `Move` said. An unchanged pose waits for the heartbeat.
-#[derive(Clone, Copy, PartialEq)]
-struct MovePose {
-    pos: DVec3,
-    yaw: f32,
-    pitch: f32,
-    frame: DQuat,
-    velocity: Vec3,
-    up: Face,
-    stance: Stance,
-}
-
 /// Everything one joined session knows apart from the socket: the peers, the cells' confirmed
 /// revisions, the requests in flight, the ping and the link's health. [`Connection::poll`]
 /// feeds it the server's messages in order; tests build one directly.
@@ -340,7 +328,8 @@ pub struct Connection {
     session: Session,
     // Throttling state for outbound moves.
     last_move: Instant,
-    last_sent: Option<MovePose>,
+    /// What the last `Move` said. An unchanged pose waits for the heartbeat.
+    last_sent: Option<protocol::Pose>,
     /// Last cruise speed told to the server. `None` means "not cruising" was sent, or nothing yet.
     sent_cruise: Option<f64>,
     wanted_cruise: Option<f64>,
@@ -1146,7 +1135,7 @@ impl Connection {
         if !self.session.alive || teleport_hold_active(self.session.pending_teleport, Instant::now()) {
             return;
         }
-        let pose = MovePose { pos, yaw, pitch, frame, velocity, up, stance };
+        let pose = protocol::Pose { pos, yaw, pitch, frame, velocity, up, stance };
         let elapsed = self.last_move.elapsed();
         let changed = self.last_sent != Some(pose);
         let due = (changed && elapsed >= MOVE_INTERVAL) || elapsed >= HEARTBEAT;
@@ -1155,7 +1144,7 @@ impl Connection {
         }
         self.last_move = Instant::now();
         self.last_sent = Some(pose);
-        self.dispatch(&ClientMessage::Move { pos, yaw, pitch, frame, velocity, up, stance });
+        self.dispatch(&ClientMessage::Move { pose });
         // A lower declaration follows the last move under the old cap. Keep it until the
         // body's eased velocity fits the new cap, including the final buffered cruise step.
         if self.sent_cruise != self.wanted_cruise

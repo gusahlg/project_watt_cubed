@@ -54,9 +54,7 @@ pub(super) fn client_loop(
             Charge::Pass => {}
         }
         match msg {
-            ClientMessage::Move { pos, yaw, pitch, frame, velocity, up, stance } => {
-                on_move(shared, ctx, id, pos, yaw, pitch, frame, velocity, up, stance, &mut sends)
-            }
+            ClientMessage::Move { pose } => on_move(shared, ctx, id, pose, &mut sends),
             ClientMessage::Teleport { pos } => on_teleport(shared, ctx, id, pos, &mut sends),
             ClientMessage::Edit { req, x, y, z, expect, spec } => {
                 on_edit(shared, ctx.hooks.as_ref(), &ctx.generator, id, req, x, y, z, expect, &spec)
@@ -108,7 +106,7 @@ pub(super) fn on_chat(
     let mut state = shared.lock_recover();
     let Some(sender) = state.players.get(&id) else { return };
     let from_name = sender.name.clone();
-    let origin = sender.pos;
+    let origin = sender.pose.pos;
     let channel = if channel == chat::GLOBAL { chat::GLOBAL } else { chat::LOCAL };
     if let Some(hooks) = hooks {
         let facts = ChatFacts {
@@ -142,7 +140,7 @@ pub(super) fn on_chat(
     println!("<{from_name}> {text}");
     let msg = ServerMessage::Chat { from_id: id, from_name, channel, text };
     let wake = broadcast(&mut state, &msg, |_, h| {
-        channel == chat::GLOBAL || h.pos.distance(origin) <= chat::RADIUS
+        channel == chat::GLOBAL || h.pose.pos.distance(origin) <= chat::RADIUS
     });
     drop(state);
     drop(wake);

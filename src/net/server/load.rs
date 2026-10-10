@@ -383,7 +383,7 @@ async fn play(bot: &Bot, session: Session) {
         let pos = spawn + DVec3::new(RADIUS * cos, LIFT + layer.min(CLIMB * t), RADIUS * sin);
         let velocity = Vec3::new((-RADIUS * SPIN * sin) as f32, rise as f32, (RADIUS * SPIN * cos) as f32);
         let mut frames = vec![
-            ClientMessage::Move {
+            ClientMessage::Move { pose: protocol::Pose {
                 pos,
                 yaw: a as f32,
                 pitch: 0.0,
@@ -391,7 +391,7 @@ async fn play(bot: &Bot, session: Session) {
                 velocity,
                 up: Face::PosY,
                 stance: Stance::Standing,
-            },
+            } },
         ];
         if climbed && now >= next_edit && mine.acked.load(Ordering::Relaxed) == edits {
             let spec = if edits % 2 == 0 { bot.rock.clone() } else { Arc::from("air") };

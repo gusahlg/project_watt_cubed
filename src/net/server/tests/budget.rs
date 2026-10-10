@@ -78,7 +78,7 @@ fn each_message_kind_has_its_own_budget() {
     }
     assert!(matches!(charge(&mut budgets, &teleport, now), Charge::Answer));
 
-    let hop = ClientMessage::Move {
+    let hop = ClientMessage::Move { pose: Pose {
         pos: DVec3::ZERO,
         yaw: 0.0,
         pitch: 0.0,
@@ -86,7 +86,7 @@ fn each_message_kind_has_its_own_budget() {
         velocity: Vec3::ZERO,
         up: Face::PosY,
         stance: Stance::Standing,
-    };
+    } };
     for _ in 0..MOVE_RATE {
         assert!(matches!(charge(&mut budgets, &hop, now), Charge::Pass));
     }

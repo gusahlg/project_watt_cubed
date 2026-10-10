@@ -550,7 +550,7 @@ fn an_operator_secret_is_proved_with_op_and_never_relayed() {
     let deadline = Instant::now() + Duration::from_secs(3);
     let mut moved = false;
     while !moved && Instant::now() < deadline {
-        moved = handle.state.lock_recover().players.values().any(|h| &*h.name == "ada" && h.pos == far);
+        moved = handle.state.lock_recover().players.values().any(|h| &*h.name == "ada" && h.pose.pos == far);
         thread::sleep(Duration::from_millis(10));
     }
     assert!(moved, "a proved operator may teleport");

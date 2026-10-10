@@ -60,7 +60,7 @@ use crate::net::hooks;
 use crate::sim::reactions::{self, CellStore, Contact, Mutation, Pos, ReactionScheduler};
 pub(crate) use crate::net::hooks::{ChatFacts, EditIntent, JoinFacts, ServerMod, Verdict};
 use crate::net::persist::{self, Store};
-use crate::net::protocol::{self, ClientMessage, ModOffer, PoseBody, PosesWriter, ServerMessage, SnapshotWriter};
+use crate::net::protocol::{self, ClientMessage, ModId, ModOffer, Pose, PoseBody, PosesWriter, ServerMessage, SnapshotWriter};
 use crate::net::{MAX_CHAT, MAX_FRAME, MAX_NAME, MAX_SPEC, PROTOCOL_VERSION, chat, quic};
 use crate::presence::Stance;
 use crate::world::seam::Seams;

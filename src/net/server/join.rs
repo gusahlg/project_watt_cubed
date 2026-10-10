@@ -205,7 +205,7 @@ pub(super) fn handshake(
 
 pub(super) enum HelloFail {
     Reject(String),
-    Mods(Vec<Arc<str>>),
+    Mods(Vec<ModId>),
 }
 
 /// Protocol number first, then the content parts. A tag or version mismatch is
@@ -244,14 +244,14 @@ pub(super) fn hello_name(frame: &[u8], ctx: &Ctx) -> Result<Arc<str>, HelloFail>
 
 /// Allow list (when set) admits only those ids. Deny always refuses. An id in
 /// both is refused. Ids match the registered package id, case-sensitive.
-pub(super) fn refused_mods(ctx: &Ctx, mods: &[ModOffer]) -> Vec<Arc<str>> {
+pub(super) fn refused_mods(ctx: &Ctx, mods: &[ModOffer]) -> Vec<ModId> {
     let mut refused = Vec::new();
     for offer in mods {
-        let id = offer.id.as_ref();
+        let id = offer.id.as_str();
         let denied = ctx.mods_deny.iter().any(|d| d == id);
         let blocked = !ctx.mods_allow.is_empty() && !ctx.mods_allow.iter().any(|a| a == id);
-        if (denied || blocked) && !refused.iter().any(|have: &Arc<str>| have.as_ref() == id) {
-            refused.push(Arc::clone(&offer.id));
+        if (denied || blocked) && !refused.iter().any(|have: &ModId| have.as_str() == id) {
+            refused.push(offer.id.clone());
         }
     }
     refused
@@ -336,9 +336,9 @@ pub(super) fn depart(
             left = Some(JoinFacts {
                 player: id,
                 name: h.name.clone(),
-                x: block_coord(h.pos.x),
-                y: block_coord(h.pos.y),
-                z: block_coord(h.pos.z),
+                x: block_coord(h.pose.pos.x),
+                y: block_coord(h.pose.pos.y),
+                z: block_coord(h.pose.pos.z),
             });
         }
     }
@@ -455,7 +455,7 @@ pub(super) fn reject(rt: &Runtime, send: &mut SendStream, conn: &quinn::Connecti
     println!("[x] rejected a connection: {}", console_text(reason));
 }
 
-pub(super) fn deny_mods(rt: &Runtime, send: &mut SendStream, conn: &quinn::Connection, ids: Vec<Arc<str>>) {
+pub(super) fn deny_mods(rt: &Runtime, send: &mut SendStream, conn: &quinn::Connection, ids: Vec<ModId>) {
     let listed = ids.iter().map(|id| console_text(id)).collect::<Vec<_>>().join(", ");
     rt.block_on(async {
         let _ = protocol::write_frame_async(send, &ServerMessage::ModsDenied { ids }.encode()).await;

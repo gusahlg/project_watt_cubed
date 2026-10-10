@@ -102,16 +102,16 @@ pub(super) fn broadcast_poses(shared: &Arc<Mutex<State>>) {
             if !r.ready || r.visible.is_empty() {
                 continue;
             }
-            writer.begin(r.pos);
+            writer.begin(r.pose.pos);
             for &pid in &r.visible {
                 let Some(p) = state.players.get(&pid) else { continue };
-                let due = if p.pos.distance_squared(r.pos) <= NEAR_SQ {
+                let due = if p.pose.pos.distance_squared(r.pose.pos) <= NEAR_SQ {
                     p.moved == tick
                 } else {
                     p.moved + FAR_EVERY > tick && (tick + u64::from(pid)) % FAR_EVERY == 0
                 };
                 if due {
-                    writer.push(pid, &p.body, p.pos);
+                    writer.push(pid, &p.body, p.pose.pos);
                 }
             }
             if !writer.is_empty() {

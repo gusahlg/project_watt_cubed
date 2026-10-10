@@ -49,7 +49,7 @@ pub(super) fn move_once(
     up: Face,
     stance: Stance,
 ) {
-    on_move(shared, ctx, id, pos, yaw, pitch, frame, velocity, up, stance, &mut Vec::new());
+    on_move(shared, ctx, id, Pose { pos, yaw, pitch, frame, velocity, up, stance }, &mut Vec::new());
 }
 
 pub(super) fn walk(shared: &Arc<Mutex<State>>, id: u32, pos: DVec3, yaw: f32, pitch: f32, stance: Stance) {

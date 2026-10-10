@@ -104,7 +104,7 @@ pub(super) fn on_edit(
     // `as f64` so i32::MIN never hits signed-abs overflow; cells past the
     // playable border are still reach-checked (a player AT the border can
     // mine the slack column) but a forged i32::MAX coord is out of reach.
-    if spec.len() > MAX_SPEC || h.pos.distance(cell_centre(generator, at)) > EDIT_REACH {
+    if spec.len() > MAX_SPEC || h.pose.pos.distance(cell_centre(generator, at)) > EDIT_REACH {
         return reject(&state, ack_to.as_ref());
     }
     // Canonical form without touching the registry. Junk and `c:00` fail here,
@@ -239,7 +239,7 @@ pub(super) fn on_tool_use(
         return;
     }
     let current = state.rev(at);
-    if tool_spec.len() > MAX_SPEC || h.pos.distance(cell_centre(generator, at)) > EDIT_REACH || expect != current {
+    if tool_spec.len() > MAX_SPEC || h.pose.pos.distance(cell_centre(generator, at)) > EDIT_REACH || expect != current {
         return refuse_tool(state, shared, generator, id, req, at, tool_spec);
     }
     // Revision already matched, so a novel tool spends quota only for a live request.
