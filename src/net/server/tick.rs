@@ -118,7 +118,7 @@ pub(super) fn broadcast_poses(shared: &Arc<Mutex<State>>) {
                 sends.push((rid, writer.frame()));
             }
         }
-        queue(state, sends)
+        queue(state, &mut sends)
     };
     drop(wake);
 }

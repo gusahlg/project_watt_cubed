@@ -47,6 +47,7 @@ pub(super) fn on_move(
     velocity: Vec3,
     up: Face,
     stance: Stance,
+    sends: &mut Vec<PendingSend>,
 ) {
     // A NaN position poisons distance checks/grid keys; a NaN angle, frame, or
     // velocity propagates into peer interpolation and render matrices.
@@ -62,7 +63,6 @@ pub(super) fn on_move(
     {
         return;
     }
-    let mut sends = Vec::new();
     let wake = {
         let mut state = shared.lock_recover();
         let max_speed = state.max_speed;
@@ -91,14 +91,14 @@ pub(super) fn on_move(
             && move_blocked(&state, ctx, from, pos, cruising, stance, up, &occupied[..occupied_n]);
         if too_far || blocked {
             let Some(h) = state.players.get(&id) else { return };
-            h.correct_position(id, &mut sends);
+            h.correct_position(id, sends);
         } else {
             commit_pose(
                 &mut state,
                 id,
                 pos,
                 Some(ReportedPose { yaw, pitch, frame, velocity, up, stance }),
-                &mut sends,
+                sends,
             );
             if let Some(h) = state.players.get_mut(&id) {
                 h.budget = left;
@@ -116,7 +116,7 @@ pub(super) fn on_move(
 pub(super) fn noclip_allowed(ctx: &Ctx, h: &PlayerHandle) -> bool {
     match ctx.noclip {
         NoclipPolicy::All => true,
-        NoclipPolicy::Ops => is_operator(ctx, h),
+        NoclipPolicy::Ops => h.op,
         NoclipPolicy::Off => false,
     }
 }
@@ -222,12 +222,11 @@ pub(super) fn body_blocked(
 
 /// Snap to the last accepted pose without applying the request. Used when a
 /// teleport is over its budget: the client still gets an answer.
-pub(super) fn refuse_move(shared: &Arc<Mutex<State>>, id: u32) {
-    let mut sends = Vec::new();
+pub(super) fn refuse_move(shared: &Arc<Mutex<State>>, id: u32, sends: &mut Vec<PendingSend>) {
     let wake = {
         let state = shared.lock_recover();
         if let Some(h) = state.players.get(&id) {
-            h.correct_position(id, &mut sends);
+            h.correct_position(id, sends);
         }
         queue(&state, sends)
     };
@@ -305,36 +304,35 @@ pub(super) fn on_cruise(shared: &Arc<Mutex<State>>, id: u32, speed: f64) {
 /// An explicit `/tp` discontinuity: exempt from the movement envelope, still
 /// border-checked, and refused (Position, then a reason) when this player
 /// may not teleport.
-pub(super) fn on_teleport(shared: &Arc<Mutex<State>>, ctx: &Ctx, id: u32, pos: DVec3) {
+pub(super) fn on_teleport(shared: &Arc<Mutex<State>>, ctx: &Ctx, id: u32, pos: DVec3, sends: &mut Vec<PendingSend>) {
     if !pos.x.is_finite() || !pos.y.is_finite() || !pos.z.is_finite() {
         return;
     }
-    let mut sends = Vec::new();
     let wake = {
         let mut state = shared.lock_recover();
         let Some(h) = state.players.get(&id) else { return };
         let allowed = match ctx.teleport {
             TeleportPolicy::All => true,
-            TeleportPolicy::Ops => is_operator(ctx, h),
+            TeleportPolicy::Ops => h.op,
             TeleportPolicy::Off => false,
         };
         if outside_world(pos) || !allowed {
-            h.correct_position(id, &mut sends);
+            h.correct_position(id, sends);
             if !outside_world(pos) {
                 let reason = if ctx.teleport == TeleportPolicy::Off {
                     "teleport is not permitted"
                 } else {
                     "only an operator can teleport"
                 };
-                tell(h, id, reason, &mut sends);
+                tell(h, id, reason, sends);
             }
         } else {
-            commit_pose(&mut state, id, pos, None, &mut sends);
+            commit_pose(&mut state, id, pos, None, sends);
             // Echo so a client with an in-flight `/tp` can tell accept from a
             // stale movement snap-back: the last Position is the committed pose.
             // The destination's cells are the held ones the next swept move starts from.
             if let Some(h) = state.players.get_mut(&id) {
-                h.correct_position(id, &mut sends);
+                h.correct_position(id, sends);
                 let (stance, up) = (h.stance, h.up);
                 remember_occupied(h, pos, stance, up);
             }
@@ -383,7 +381,8 @@ pub(super) fn commit_pose(
         state.grid_remove(id, old);
         state.grid_insert(id, pos);
     }
-    // Set membership keeps the visibility diff linear in the nearby player count.
+    // Set membership keeps the visibility diff linear in the nearby player count. The new
+    // set then replaces the mover's whole, and the old one is the next move's scratch.
     let Scratch { mut near, mut gone, mut fresh } = std::mem::take(&mut state.scratch);
     state.visible_from(id, pos, &mut near);
     {
@@ -408,12 +407,9 @@ pub(super) fn commit_pose(
             sends.push((pid, PosesWriter::single(other.pos, id, &body, pos)));
             sends.push((id, PosesWriter::single(pos, pid, &other.body, other.pos)));
         }
-        if let Some(h) = state.players.get_mut(&id) {
-            for pid in &gone {
-                h.visible.remove(pid);
-            }
-            h.visible.extend(fresh.iter().copied());
-        }
+    }
+    if let Some(h) = state.players.get_mut(&id) {
+        std::mem::swap(&mut h.visible, &mut near);
     }
     state.scratch = Scratch { near, gone, fresh };
 }

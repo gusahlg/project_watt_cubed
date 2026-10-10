@@ -29,8 +29,7 @@
 //! **Server mods.** [`Config::hooks`] is a [`ServerMod`] table (plain-data
 //! arguments, no protocol change). Calls run outside the [`State`] lock.
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::hash::{BuildHasherDefault, Hasher};
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::SocketAddr;
 #[cfg(test)]
@@ -65,6 +64,7 @@ use crate::net::protocol::{self, ClientMessage, ModOffer, PoseBody, PosesWriter,
 use crate::net::{MAX_CHAT, MAX_FRAME, MAX_NAME, MAX_SPEC, PROTOCOL_VERSION, chat, quic};
 use crate::presence::Stance;
 use crate::world::seam::Seams;
+use crate::world::{FastMap, FastSet};
 use crate::world::terrain::TerrainCfg;
 use crate::world::generation::{TerrainGenerator, WorldgenKind};
 
@@ -553,9 +553,6 @@ fn canonical_name(raw: &str) -> String {
     clean_name(raw).to_ascii_lowercase()
 }
 
-fn is_operator(ctx: &Ctx, h: &PlayerHandle) -> bool {
-    h.op || ctx.ops.iter().any(|op| op.eq_ignore_ascii_case(&h.name))
-}
 
 /// The dedicated server binary's entry point. SIGINT and SIGTERM save and close.
 pub fn run(port: u16, config: Config) -> io::Result<()> {

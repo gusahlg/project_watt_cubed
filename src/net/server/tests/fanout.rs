@@ -593,6 +593,8 @@ fn move_cluster(players: u32, rounds: u32, warm: u32, paced: bool) -> Moves {
         }
     }
     let mut out = Moves { moves: 0, busy: Duration::ZERO, allocs: 0, corrections: 0 };
+    // The connection's reader reuses one buffer for the frames a handler queues.
+    let mut sends = Vec::new();
     let start = Instant::now();
     for round in 0..rounds {
         if round == warm {
@@ -603,7 +605,7 @@ fn move_cluster(players: u32, rounds: u32, warm: u32, paced: bool) -> Moves {
             let velocity = ((next - pos) / period.as_secs_f64()).as_vec3();
             crate::alloc_count::reset();
             let began = Instant::now();
-            on_move(&shared, &ctx, id, pos, 0.0, 0.0, DQuat::IDENTITY, velocity, Face::PosY, Stance::Standing);
+            on_move(&shared, &ctx, id, pos, 0.0, 0.0, DQuat::IDENTITY, velocity, Face::PosY, Stance::Standing, &mut sends);
             let took = began.elapsed();
             if round >= warm {
                 out.allocs += crate::alloc_count::alloc_count();

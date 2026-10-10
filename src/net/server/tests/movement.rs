@@ -71,14 +71,14 @@ fn teleport_is_permissioned() {
     players.insert(1u32, test_player(start, out, test_kick()));
     let shared = Arc::new(Mutex::new(test_state(players)));
 
-    on_teleport(&shared, &test_ctx(true), 1, far);
+    on_teleport(&shared, &test_ctx(true), 1, far, &mut Vec::new());
     assert_eq!(shared.lock_recover().players[&1].pos, far, "allowed teleport commits");
     match ServerMessage::decode(&rx.try_recv().expect("accepted teleport echoes Position")) {
         Some(ServerMessage::Position { pos, .. }) => assert_eq!(pos, far),
         other => panic!("expected a Position echo, got {other:?}"),
     }
 
-    on_teleport(&shared, &test_ctx(false), 1, start);
+    on_teleport(&shared, &test_ctx(false), 1, start, &mut Vec::new());
     assert_eq!(shared.lock_recover().players[&1].pos, far, "refused teleport is not committed");
     match ServerMessage::decode(&rx.try_recv().expect("a correction is sent")) {
         Some(ServerMessage::Position { pos, .. }) => assert_eq!(pos, far),
@@ -124,10 +124,10 @@ fn long_silence_then_a_legitimate_teleport_obeys_the_flag() {
     players.insert(1u32, test_player(start, out, test_kick()));
     let shared = Arc::new(Mutex::new(test_state(players)));
     age_move(&shared, 1);
-    on_teleport(&shared, &test_ctx(true), 1, dest);
+    on_teleport(&shared, &test_ctx(true), 1, dest, &mut Vec::new());
     assert_eq!(shared.lock_recover().players[&1].pos, dest);
     let _ = rx.try_recv();
-    on_teleport(&shared, &test_ctx(false), 1, start);
+    on_teleport(&shared, &test_ctx(false), 1, start, &mut Vec::new());
     assert_eq!(shared.lock_recover().players[&1].pos, dest);
     match ServerMessage::decode(&rx.try_recv().expect("refused /tp snaps back")) {
         Some(ServerMessage::Position { pos, .. }) => assert_eq!(pos, dest),
@@ -145,7 +145,7 @@ fn fall_flight_and_cruise_follow_the_reported_speed() {
     stamp_gap(&shared, 1);
 
     let fall = DVec3::new(start.x, start.y - 2_000.0, start.z);
-    on_move(
+    move_once(
         &shared,
         lax_ctx(),
         1,
@@ -164,14 +164,14 @@ fn fall_flight_and_cruise_follow_the_reported_speed() {
     shared.lock_recover().players.get_mut(&1).unwrap().velocity = Vec3::ZERO;
     stamp_gap(&shared, 1);
     let forged = DVec3::new(fall.x, fall.y - 2_000.0, fall.z);
-    on_move(&shared, lax_ctx(), 1, forged, 0.0, 0.0, DQuat::IDENTITY, Vec3::ZERO, Face::PosY, Stance::Standing);
+    move_once(&shared, lax_ctx(), 1, forged, 0.0, 0.0, DQuat::IDENTITY, Vec3::ZERO, Face::PosY, Stance::Standing);
     assert_eq!(shared.lock_recover().players[&1].pos, fall, "the same drop with no speed is a teleport");
 
     stamp_gap(&shared, 1);
     let flown = DVec3::new(start.x + 1_000.0, start.y, start.z);
     // Fly from `fall`, where the refused drop left the player.
     let speed = crate::player::MAX_SPEED as f32;
-    on_move(
+    move_once(
         &shared,
         lax_ctx(),
         1,
@@ -188,7 +188,7 @@ fn fall_flight_and_cruise_follow_the_reported_speed() {
 
     stamp_gap(&shared, 1);
     let too_far = DVec3::new(fall.x + crate::player::MAX_SPEED * 2.0, fall.y, fall.z);
-    on_move(
+    move_once(
         &shared,
         lax_ctx(),
         1,
@@ -208,7 +208,7 @@ fn fall_flight_and_cruise_follow_the_reported_speed() {
     on_cruise(&shared, 1, crate::player::CRUISE_MAX);
     stamp_gap(&shared, 1);
     let cruise_to = DVec3::new(fall.x + crate::player::MAX_SPEED * 2.0, fall.y, fall.z);
-    on_move(
+    move_once(
         &shared,
         lax_ctx(),
         1,
@@ -236,18 +236,21 @@ fn non_operator_time_and_teleport_are_refused_with_a_reason() {
     let mut ops = test_ctx(true);
     ops.teleport = TeleportPolicy::Ops;
     ops.ops = vec!["p".into()];
+    // Admitted under that list, the player is an operator.
+    shared.lock_recover().players.get_mut(&1).unwrap().op = true;
 
-    on_set_time(&shared, &ops, 1, 0.2);
+    on_set_time(&shared, &ops, 1, 0.2, &mut Vec::new());
     assert!((shared.lock_recover().day - 0.2).abs() < 1e-6);
     assert!(drain(&rx).iter().any(|m| matches!(m, ServerMessage::Time { day, .. } if (*day - 0.2).abs() < 1e-4)));
 
     let far = DVec3::new(80.5, 20.0, 8.5);
-    on_teleport(&shared, &ops, 1, far);
+    on_teleport(&shared, &ops, 1, far, &mut Vec::new());
     assert_eq!(shared.lock_recover().players[&1].pos, far);
 
     let mut guest = test_ctx(true);
     guest.teleport = TeleportPolicy::Ops;
-    on_set_time(&shared, &guest, 1, 0.9);
+    shared.lock_recover().players.get_mut(&1).unwrap().op = false;
+    on_set_time(&shared, &guest, 1, 0.9, &mut Vec::new());
     assert!((shared.lock_recover().day - 0.2).abs() < 1e-6, "a guest does not move the clock");
     assert!(
         drain(&rx).iter().any(|m| matches!(
@@ -256,7 +259,7 @@ fn non_operator_time_and_teleport_are_refused_with_a_reason() {
         ))
     );
 
-    on_teleport(&shared, &guest, 1, start);
+    on_teleport(&shared, &guest, 1, start, &mut Vec::new());
     assert_eq!(shared.lock_recover().players[&1].pos, far, "a guest teleport is not committed");
     let refused = drain(&rx);
     assert!(refused.iter().any(|m| matches!(m, ServerMessage::Position { pos, .. } if *pos == far)));
@@ -266,7 +269,7 @@ fn non_operator_time_and_teleport_are_refused_with_a_reason() {
     )));
 
     let off = test_ctx(false);
-    on_teleport(&shared, &off, 1, start);
+    on_teleport(&shared, &off, 1, start, &mut Vec::new());
     assert!(drain(&rx).iter().any(|m| matches!(
         m,
         ServerMessage::Chat { text, .. } if text.as_ref() == "teleport is not permitted"
@@ -286,7 +289,7 @@ fn flyspeed_above_the_server_cap_is_snapped() {
     shared.lock_recover().max_speed = cap;
 
     let near = DVec3::new(start.x + 10.0 * crate::math::PER_METER, start.y, start.z);
-    on_move(
+    move_once(
         &shared, lax_ctx(), 1, near, 0.0, 0.0, DQuat::IDENTITY,
         Vec3::new(cap as f32, 0.0, 0.0), Face::PosY, Stance::Standing,
     );
@@ -294,7 +297,7 @@ fn flyspeed_above_the_server_cap_is_snapped() {
 
     age_move(&shared, 1);
     let leap = DVec3::new(near.x + 500.0 * crate::math::PER_METER, near.y, near.z);
-    on_move(
+    move_once(
         &shared, lax_ctx(), 1, leap, 0.0, 0.0, DQuat::IDENTITY,
         Vec3::new(cap as f32, 0.0, 0.0), Face::PosY, Stance::Standing,
     );
@@ -304,13 +307,13 @@ fn flyspeed_above_the_server_cap_is_snapped() {
     on_cruise(&shared, 1, crate::player::CRUISE_MAX);
     assert!((shared.lock_recover().players[&1].cruise_speed - cap).abs() < 1e-6);
     age_move(&shared, 1);
-    on_move(
+    move_once(
         &shared, lax_ctx(), 1, leap, 0.0, 0.0, DQuat::IDENTITY,
         Vec3::new(crate::player::CRUISE_MAX as f32, 0.0, 0.0), Face::PosY, Stance::Standing,
     );
     assert_eq!(shared.lock_recover().players[&1].pos, near, "cruise cannot outrun a lower cap");
 
-    on_teleport(&shared, &test_ctx(false), 1, leap);
+    on_teleport(&shared, &test_ctx(false), 1, leap, &mut Vec::new());
     assert_eq!(shared.lock_recover().players[&1].pos, near);
 }
 
@@ -324,7 +327,7 @@ fn noclip_snaps_a_body_in_solid_ground() {
     );
     let buried = DVec3::new(0.5, crate::world::generation::FLAT_HEIGHT as f64, 0.5);
     let step = |shared: &Arc<Mutex<State>>, ctx: &Ctx, pos: DVec3| {
-        on_move(shared, ctx, 1, pos, 0.0, 0.0, DQuat::IDENTITY, Vec3::ZERO, Face::PosY, Stance::Standing);
+        move_once(shared, ctx, 1, pos, 0.0, 0.0, DQuat::IDENTITY, Vec3::ZERO, Face::PosY, Stance::Standing);
     };
 
     let (players, _rx) = pose(start);
@@ -347,9 +350,9 @@ fn noclip_snaps_a_body_in_solid_ground() {
     step(&shared, &ctx, buried);
     assert_eq!(shared.lock_recover().players[&1].pos, buried, "an operator may pass");
 
-    let (players, _rx) = pose(start);
+    let (mut players, _rx) = pose(start);
+    players.get_mut(&1).unwrap().name = "guest".into();
     let (shared, ctx) = flat_shared(players, NoclipPolicy::Ops, &["p"]);
-    shared.lock_recover().players.get_mut(&1).unwrap().name = "guest".into();
     step(&shared, &ctx, buried);
     assert_eq!(shared.lock_recover().players[&1].pos, start, "a guest under ops snaps back");
 
@@ -556,7 +559,7 @@ fn split_moves_gain_nothing_over_the_speed_cap() {
     for _ in 0..40 {
         let at = shared.lock_recover().players[&1].pos;
         let to = DVec3::new(at.x + 5.0, at.y, at.z);
-        on_move(&shared, lax_ctx(), 1, to, 0.0, 0.0, DQuat::IDENTITY, Vec3::new(cap as f32, 0.0, 0.0), Face::PosY, Stance::Standing);
+        move_once(&shared, lax_ctx(), 1, to, 0.0, 0.0, DQuat::IDENTITY, Vec3::new(cap as f32, 0.0, 0.0), Face::PosY, Stance::Standing);
     }
     let covered = shared.lock_recover().players[&1].pos.x - start.x;
     let bound = MOVE_FLOOR + cap * anchored.elapsed().as_secs_f64();
@@ -572,7 +575,7 @@ fn split_moves_gain_nothing_over_the_speed_cap() {
     let step = fast * 0.033;
     for i in 1..=4 {
         let to = DVec3::new(start.x + step * f64::from(i), start.y, start.z);
-        on_move(&shared, lax_ctx(), 1, to, 0.0, 0.0, DQuat::IDENTITY, Vec3::new(fast as f32, 0.0, 0.0), Face::PosY, Stance::Standing);
+        move_once(&shared, lax_ctx(), 1, to, 0.0, 0.0, DQuat::IDENTITY, Vec3::new(fast as f32, 0.0, 0.0), Face::PosY, Stance::Standing);
         assert_eq!(shared.lock_recover().players[&1].pos, to, "stalled move {i} at 1 km/s");
     }
     assert!(rx.try_recv().is_err(), "no snap-back");
@@ -588,7 +591,7 @@ fn a_move_cannot_pass_through_a_wall() {
     let surface = DVec3::new(0.5, f64::from(ground) + eye, 0.5);
     let beyond = DVec3::new(6.5, surface.y, 0.5);
     let step = |shared: &Arc<Mutex<State>>, ctx: &Ctx, pos: DVec3, speed: f32| {
-        on_move(shared, ctx, 1, pos, 0.0, 0.0, DQuat::IDENTITY, Vec3::new(speed, 0.0, 0.0), Face::PosY, Stance::Standing);
+        move_once(shared, ctx, 1, pos, 0.0, 0.0, DQuat::IDENTITY, Vec3::new(speed, 0.0, 0.0), Face::PosY, Stance::Standing);
     };
 
     let (players, _rx) = pose(surface);
@@ -616,7 +619,7 @@ fn a_move_cannot_pass_through_a_wall() {
     let buried = DVec3::new(0.5, f64::from(ground), 0.5);
     let (players, _rx) = pose(surface);
     let (shared, ctx) = flat_shared(players, NoclipPolicy::Off, &[]);
-    on_teleport(&shared, &ctx, 1, buried);
+    on_teleport(&shared, &ctx, 1, buried, &mut Vec::new());
     step(&shared, &ctx, surface, 0.0);
     assert_eq!(shared.lock_recover().players[&1].pos, surface, "a body teleported into ground walks out");
 

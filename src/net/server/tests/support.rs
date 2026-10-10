@@ -1,5 +1,6 @@
 //! Shared fixtures: hand-built players and states, contexts, raw handshakes and frame drains.
 use super::super::*;
+pub(super) use std::collections::HashSet;
 
 pub(super) fn test_generator() -> crate::world::terrain::Generator {
     crate::world::terrain::generator(&mut BlockRegistry::with_builtins(), 4242, Default::default())
@@ -56,8 +57,25 @@ pub(super) fn lax_ctx() -> &'static Ctx {
 
 /// A throwaway kick handle for state-only players (never notified).
 /// A move that leaves the body frame, velocity, and up axis at their defaults.
+/// One [`on_move`] with a buffer of its own for the frames it queues.
+#[allow(clippy::too_many_arguments)] // the fields of a Move, as the message carries them
+pub(super) fn move_once(
+    shared: &Arc<Mutex<State>>,
+    ctx: &Ctx,
+    id: u32,
+    pos: DVec3,
+    yaw: f32,
+    pitch: f32,
+    frame: DQuat,
+    velocity: Vec3,
+    up: Face,
+    stance: Stance,
+) {
+    on_move(shared, ctx, id, pos, yaw, pitch, frame, velocity, up, stance, &mut Vec::new());
+}
+
 pub(super) fn walk(shared: &Arc<Mutex<State>>, id: u32, pos: DVec3, yaw: f32, pitch: f32, stance: Stance) {
-    on_move(shared, lax_ctx(), id, pos, yaw, pitch, DQuat::IDENTITY, Vec3::ZERO, Face::PosY, stance);
+    move_once(shared, lax_ctx(), id, pos, yaw, pitch, DQuat::IDENTITY, Vec3::ZERO, Face::PosY, stance);
 }
 
 pub(super) fn test_kick() -> Arc<Notify> {
@@ -276,6 +294,10 @@ pub(super) fn flat_shared(
         let mut state = State::new(registry, 0.3, crate::player::MAX_SPEED);
         state.players = players.into_iter().collect();
         state.next_id = 2;
+        // Admission makes a player listed by name an operator.
+        for h in state.players.values_mut() {
+            h.op |= ops.iter().any(|op| op.eq_ignore_ascii_case(&h.name));
+        }
         state
     };
     let ctx = Ctx {

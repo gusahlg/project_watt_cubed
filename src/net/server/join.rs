@@ -310,7 +310,7 @@ pub(super) fn admit_player(
         // Roster only — poses flow through the visibility machinery once the
         // joiner reports their first move, so a far peer isn't a frozen ghost.
         existing = state.players.iter().map(|(&pid, h)| (pid, h.name.clone())).collect();
-        let announced: HashSet<u32, Ids> = existing.iter().map(|(pid, _)| *pid).collect();
+        let announced: FastSet<u32> = existing.iter().map(|(pid, _)| *pid).collect();
         // Coordinates, revisions and block ids only: specs are named once per
         // block, and the frames are sorted and encoded after the lock.
         snapshot = Overlay::of(&state);
@@ -329,8 +329,8 @@ pub(super) fn admit_player(
                 last_move: Instant::now(),
                 budget: MOVE_FLOOR,
                 burst: MOVE_FLOOR,
-                op: false,
-                visible: HashSet::default(),
+                op: ctx.ops.iter().any(|op| op.eq_ignore_ascii_case(name)),
+                visible: FastSet::default(),
                 body,
                 moved: 0,
                 out: out.clone(),

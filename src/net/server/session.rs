@@ -15,6 +15,8 @@ pub(super) fn client_loop(
     let mut budgets = KindBudget::new();
     let mut channels = ChannelBudget::new();
     let mut tool_rate = RateWindow::new(TOOL_RATE_LIMIT);
+    // Frames a handler queues for after its lock hold, reused from message to message.
+    let mut sends: Vec<PendingSend> = Vec::new();
     loop {
         // A kick (slow client) wakes this out of the blocking read so cleanup
         // runs; the read future is only ever dropped on that teardown path, so
@@ -41,7 +43,7 @@ pub(super) fn client_loop(
             Charge::Answer => {
                 match &msg {
                     ClientMessage::Edit { req, x, y, z, .. } => reject_edit(shared, id, *req, *x, *y, *z),
-                    ClientMessage::Teleport { .. } => refuse_move(shared, id),
+                    ClientMessage::Teleport { .. } => refuse_move(shared, id, &mut sends),
                     ClientMessage::SetTime { .. } => answer_time(shared, ctx, id),
                     _ => {}
                 }
@@ -51,17 +53,17 @@ pub(super) fn client_loop(
         }
         match msg {
             ClientMessage::Move { pos, yaw, pitch, frame, velocity, up, stance } => {
-                on_move(shared, ctx, id, pos, yaw, pitch, frame, velocity, up, stance)
+                on_move(shared, ctx, id, pos, yaw, pitch, frame, velocity, up, stance, &mut sends)
             }
-            ClientMessage::Teleport { pos } => on_teleport(shared, ctx, id, pos),
+            ClientMessage::Teleport { pos } => on_teleport(shared, ctx, id, pos, &mut sends),
             ClientMessage::Edit { req, x, y, z, expect, spec } => {
                 on_edit(shared, ctx.hooks.as_ref(), &ctx.generator, id, req, x, y, z, expect, &spec)
             }
             ClientMessage::Chat { channel, text } => match op_secret(&text) {
-                Some(secret) => on_op_login(shared, ctx, id, &secret),
+                Some(secret) => on_op_login(shared, ctx, id, &secret, &mut sends),
                 None => on_chat(shared, ctx.hooks.as_ref(), id, channel, &text),
             },
-            ClientMessage::SetTime { day } => on_set_time(shared, ctx, id, day),
+            ClientMessage::SetTime { day } => on_set_time(shared, ctx, id, day, &mut sends),
             ClientMessage::ModData { channel, seq, bytes } => {
                 if !channels.allow(&channel, now) {
                     continue; // Over this channel's budget this second — drop silently.
@@ -158,8 +160,7 @@ pub(super) fn op_secret(text: &str) -> Option<Arc<str>> {
 }
 
 /// An operator listed with a secret proves it. Either way only the sender hears the answer.
-pub(super) fn on_op_login(shared: &Arc<Mutex<State>>, ctx: &Ctx, id: u32, secret: &str) {
-    let mut sends = Vec::new();
+pub(super) fn on_op_login(shared: &Arc<Mutex<State>>, ctx: &Ctx, id: u32, secret: &str, sends: &mut Vec<PendingSend>) {
     let wake = {
         let mut state = shared.lock_recover();
         let Some(h) = state.players.get_mut(&id) else { return };
@@ -172,7 +173,7 @@ pub(super) fn on_op_login(shared: &Arc<Mutex<State>>, ctx: &Ctx, id: u32, secret
             ("operator secret refused", "sent a wrong operator secret")
         };
         println!("[op] {} (#{id}) {log}", h.name);
-        tell(h, id, reply, &mut sends);
+        tell(h, id, reply, sends);
         queue(&state, sends)
     };
     drop(wake);
@@ -181,17 +182,16 @@ pub(super) fn on_op_login(shared: &Arc<Mutex<State>>, ctx: &Ctx, id: u32, secret
 /// Anchors the shared clock so joiners inherit the CURRENT time. A non-finite
 /// value is ignored rather than poisoning the shared time. Only an operator
 /// may set it.
-pub(super) fn on_set_time(shared: &Arc<Mutex<State>>, ctx: &Ctx, id: u32, day: f32) {
+pub(super) fn on_set_time(shared: &Arc<Mutex<State>>, ctx: &Ctx, id: u32, day: f32, sends: &mut Vec<PendingSend>) {
     if !day.is_finite() {
         return;
     }
     let day = day.rem_euclid(1.0);
-    let mut sends = Vec::new();
     {
         let mut state = shared.lock_recover();
         let Some(h) = state.players.get(&id) else { return };
-        if !is_operator(ctx, h) {
-            tell(h, id, "only an operator can set the time", &mut sends);
+        if !h.op {
+            tell(h, id, "only an operator can set the time", sends);
             sends.push((id, ServerMessage::Time { day: state.day_now(ctx.day_secs), day_secs: ctx.day_secs }.encode().into()));
             let wake = queue(&state, sends);
             drop(state);

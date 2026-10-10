@@ -187,10 +187,10 @@ pub(super) fn tell(h: &PlayerHandle, id: u32, text: &str, sends: &mut Vec<Pendin
 /// Queue `sends` in order under the state lock, so no frame overtakes a state change
 /// queued before it. A full queue marks its owner for the kick pass. The returned
 /// [`Wake`] wakes the writers once the caller has dropped the guard.
-pub(super) fn queue(state: &State, sends: Vec<PendingSend>) -> Wake {
+pub(super) fn queue(state: &State, sends: &mut Vec<PendingSend>) -> Wake {
     let mut slow = Vec::new();
     let mut wake = Vec::with_capacity(sends.len());
-    for (pid, frame) in sends {
+    for (pid, frame) in sends.drain(..) {
         let Some(h) = state.players.get(&pid) else { continue };
         match h.out.push(frame) {
             Ok(()) => wake.push(h.out.writer.clone()),

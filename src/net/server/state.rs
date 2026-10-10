@@ -18,12 +18,12 @@ pub(super) struct PlayerHandle {
     pub(super) budget: f64,
     /// Burst capacity used to express banked credit as a fraction across speed changes.
     pub(super) burst: f64,
-    /// Proved an operator secret with `/op`.
+    /// An operator: listed by name when admitted, or proved a secret with `/op` since.
     pub(super) op: bool,
     /// Ids inside mutual interest range (`a.visible.contains(b) ==
     /// b.visible.contains(a)`). Maintained by [`on_move`]'s diff; drives
     /// PeerExited/re-entry pose events.
-    pub(super) visible: HashSet<u32, Ids>,
+    pub(super) visible: FastSet<u32>,
     /// The pose in wire form, refreshed when it changes.
     pub(super) body: PoseBody,
     /// The pose tick ([`State::tick`]) the pose last changed before.
@@ -55,36 +55,13 @@ pub(super) struct PlayerHandle {
     pub(super) novel: u32,
     /// Peer ids whose `PeerJoined` this client has already been queued. A join
     /// both snapshots the roster and may race another joiner's broadcast.
-    pub(super) announced: HashSet<u32, Ids>,
+    pub(super) announced: FastSet<u32>,
 }
-
-/// Hashes server-assigned player ids. No client picks them, so one multiply
-/// spreads them well and costs a fraction of SipHash on the per-move paths.
-#[derive(Default)]
-pub(super) struct IdHasher(u64);
-
-impl Hasher for IdHasher {
-    fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.write_u32(u32::from(b));
-        }
-    }
-
-    fn write_u32(&mut self, v: u32) {
-        self.0 = (self.0 ^ u64::from(v)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    }
-
-    fn finish(&self) -> u64 {
-        self.0
-    }
-}
-
-pub(super) type Ids = BuildHasherDefault<IdHasher>;
 
 /// Buffers [`commit_pose`] reuses so a move allocates nothing.
 #[derive(Default)]
 pub(super) struct Scratch {
-    pub(super) near: HashSet<u32, Ids>,
+    pub(super) near: FastSet<u32>,
     pub(super) gone: Vec<u32>,
     pub(super) fresh: Vec<u32>,
 }
@@ -161,7 +138,8 @@ pub(super) struct State {
     /// The same compiled palette clients build, so specs validate/canonicalize
     /// under EXACTLY the rules clients apply.
     pub(super) registry: BlockRegistry,
-    pub(super) players: HashMap<u32, PlayerHandle, Ids>,
+    /// Keyed by ids the server assigns, so a fast hash is safe.
+    pub(super) players: FastMap<u32, PlayerHandle>,
     /// Bucket key → ids standing in it, keyed by [`bucket_of`]. Buckets are
     /// exactly one [`INTEREST_RADIUS`] wide on each axis, so anyone in range of
     /// a mover lives in its 3×3×3 neighbourhood; [`on_move`] still applies the
@@ -169,7 +147,7 @@ pub(super) struct State {
     /// never the audience. Invariant: exactly one entry per connected player,
     /// updated under the same lock hold as the position change it mirrors;
     /// empty buckets are removed eagerly so churn can never leak keys.
-    pub(super) grid: HashMap<(i32, i32, i32), Vec<u32>>,
+    pub(super) grid: FastMap<(i32, i32, i32), Vec<u32>>,
     pub(super) next_id: u32,
     /// The `[0,1)` day fraction current at `day_set`. The server advances it
     /// only when asked ([`State::day_now`]), so a late joiner receives the
@@ -202,8 +180,8 @@ impl State {
             edits: HashMap::new(),
             spec_pool: SpecPool::default(),
             registry,
-            players: HashMap::default(),
-            grid: HashMap::new(),
+            players: FastMap::default(),
+            grid: FastMap::default(),
             next_id: 1,
             day,
             day_set: Instant::now(),
@@ -238,7 +216,7 @@ impl State {
     }
 
     /// The grid narrows candidates; exact distance and readiness decide visibility.
-    pub(super) fn visible_from(&self, id: u32, pos: DVec3, visible: &mut HashSet<u32, Ids>) {
+    pub(super) fn visible_from(&self, id: u32, pos: DVec3, visible: &mut FastSet<u32>) {
         let at = bucket_of(pos);
         visible.clear();
         for dx in -1..=1i32 {
