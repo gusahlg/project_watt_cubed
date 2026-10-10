@@ -25,6 +25,8 @@ const MIN_SPLIT: usize = 4096;
 pub trait Rule<C: Copy>: Sync {
     /// How many cells away one pass reads (1 for a rule that reads only `nb`).
     const RADIUS: u8;
+    /// Whether `apply` reads `nb` (a rule with its own neighbour lists leaves the copy out).
+    const NEIGHBOURS: bool = true;
     /// The next value of cell `i` from the previous pass `prev` and the cell's neighbours `nb`.
     fn apply(&self, prev: &[C], i: usize, nb: &[u32]) -> C;
 }
@@ -66,13 +68,50 @@ impl<C: Copy + Send + Sync> Field<C> {
             return;
         }
         let threads = threads.clamp(1, (self.cells.len() / MIN_SPLIT).max(1));
-        for _ in 0..passes {
-            pass(top, &self.cells, &mut self.spare, rule, threads);
-            std::mem::swap(&mut self.cells, &mut self.spare);
+        if threads == 1 || passes == 1 {
+            for _ in 0..passes {
+                pass(top, &self.cells, &mut self.spare, rule, threads);
+                std::mem::swap(&mut self.cells, &mut self.spare);
+            }
+        } else {
+            self.run_workers(top, rule, passes, threads);
         }
         for &(copy, owner) in top.glue() {
             self.cells[copy as usize] = self.cells[owner as usize];
         }
+    }
+
+    /// Several passes on persistent workers: each computes its index range into a local buffer
+    /// while every worker reads the shared previous buffer, then (after a barrier) copies it into the
+    /// shared next buffer, then waits again. No threads are spawned per pass.
+    fn run_workers<T: Topology, R: Rule<C>>(&mut self, top: &T, rule: &R, passes: u32, threads: usize) {
+        use std::sync::{Barrier, RwLock};
+        let len = self.cells.len();
+        let chunk = len.div_ceil(threads);
+        let bufs = [RwLock::new(std::mem::take(&mut self.cells)), RwLock::new(std::mem::take(&mut self.spare))];
+        let barrier = Barrier::new(threads);
+        let work = |t: usize| {
+            let range = t * chunk..((t + 1) * chunk).min(len);
+            let mut local = bufs[0].read().expect("field buffer")[range.clone()].to_vec();
+            for k in 0..passes as usize {
+                {
+                    let prev = bufs[k % 2].read().expect("field buffer");
+                    fill(top, &prev, &mut local, range.start, rule);
+                }
+                barrier.wait();
+                bufs[1 - k % 2].write().expect("field buffer")[range.clone()].copy_from_slice(&local);
+                barrier.wait();
+            }
+        };
+        std::thread::scope(|s| {
+            for t in 1..threads {
+                let work = &work;
+                s.spawn(move || work(t));
+            }
+            work(0);
+        });
+        let [a, b] = bufs.map(|l| l.into_inner().expect("field buffer"));
+        (self.cells, self.spare) = if passes % 2 == 1 { (b, a) } else { (a, b) };
     }
 }
 
@@ -147,7 +186,7 @@ where
     for (k, o) in out.iter_mut().enumerate() {
         let i = from + k;
         if top.owns(i) {
-            let n = top.neighbours(i, &mut nb);
+            let n = if R::NEIGHBOURS { top.neighbours(i, &mut nb) } else { 0 };
             *o = rule.apply(prev, i, &nb[..n]);
         }
     }
