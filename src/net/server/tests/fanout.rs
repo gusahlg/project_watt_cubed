@@ -403,10 +403,57 @@ fn peer_joined_is_delivered_once() {
     broadcast_all(&shared, &ServerMessage::PeerJoined { id: 2, name: "b".into() }, None);
     assert!(rx1.try_recv().is_err(), "player 1 was already told about 2");
     assert!(rx2.try_recv().is_ok(), "player 2 had not been told");
+    assert!(shared.lock_recover().players[&1].announced.is_empty(), "the broadcast used up the roster entry");
     broadcast_all(&shared, &ServerMessage::PeerJoined { id: 3, name: "c".into() }, None);
-    assert!(rx1.try_recv().is_ok());
-    broadcast_all(&shared, &ServerMessage::PeerJoined { id: 3, name: "c".into() }, None);
-    assert!(rx1.try_recv().is_err(), "the second announcement is dropped");
+    assert!(rx1.try_recv().is_ok(), "a later join is announced");
+}
+
+/// Joins and leaves through the real roster bookkeeping, around three players who stay: no
+/// handle ever names more peers than the roster holds, and the sets drain as peers go.
+#[test]
+fn announced_never_outgrows_the_roster_over_a_thousand_joins() {
+    let (out, _rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
+    let mut state = test_state(HashMap::new());
+    let join = |state: &mut State, id: u32| {
+        let pos = DVec3::new(f64::from(id % 7), 20.0, 0.0);
+        let mut h = test_player(pos, out.clone(), test_kick());
+        h.ready = false;
+        state.admit(id, h);
+    };
+    for id in 1..=3 {
+        join(&mut state, id);
+    }
+    let mut next = 4;
+    let mut live: VecDeque<u32> = VecDeque::new();
+    for cycle in 0..1000u32 {
+        // Two join together, so each is in the other's roster before either is announced.
+        for _ in 0..2 {
+            join(&mut state, next);
+            live.push_back(next);
+            next += 1;
+        }
+        // Only some go live and are announced; the rest leave during their bootstrap.
+        let id = live[live.len() - 2];
+        if cycle % 3 != 0 {
+            state.players.get_mut(&id).unwrap().ready = true;
+            let name = state.players[&id].name.clone();
+            drop(broadcast(&mut state, &ServerMessage::PeerJoined { id, name }, |pid, _| pid != id));
+        }
+        while live.len() > 4 {
+            let gone = live.pop_front().unwrap();
+            assert!(state.remove_player(gone).is_some());
+        }
+        let roster = state.players.len();
+        for (pid, h) in &state.players {
+            assert!(h.announced.len() < roster, "cycle {cycle}: #{pid} names {} peers, roster {roster}", h.announced.len());
+            assert!(h.announced.iter().all(|a| state.players.contains_key(a)), "cycle {cycle}: #{pid} names a player who left");
+        }
+    }
+    for gone in live {
+        state.remove_player(gone);
+    }
+    let left: usize = state.players.values().map(|h| h.announced.len()).sum();
+    assert!(left <= 6, "the three who stayed name at most each other: {left}");
 }
 
 #[test]

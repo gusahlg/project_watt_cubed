@@ -53,9 +53,46 @@ pub(super) struct PlayerHandle {
     pub(super) cruise_speed: f64,
     /// Novel configurations this client has interned. Capped at [`NOVEL_SPEC_QUOTA`].
     pub(super) novel: u32,
-    /// Peer ids whose `PeerJoined` this client has already been queued. A join
-    /// both snapshots the roster and may race another joiner's broadcast.
+    /// Peers named in this client's join roster whose own `PeerJoined` broadcast has not
+    /// come yet: that broadcast skips this client once and takes the id out. A peer that
+    /// leaves first is taken out by [`State::remove_player`], so the set never outgrows
+    /// the roster.
     pub(super) announced: FastSet<u32>,
+}
+
+impl PlayerHandle {
+    /// A player admitted at `spawn`, standing still in the pose `frame` and `up`, and not
+    /// ready until its bootstrap is queued.
+    pub(super) fn new(name: Arc<str>, spawn: DVec3, frame: DQuat, up: Face, op: bool, out: Outbox, kick: Arc<Notify>) -> Self {
+        Self {
+            name,
+            pos: spawn,
+            yaw: 0.0,
+            pitch: 0.0,
+            frame,
+            velocity: Vec3::ZERO,
+            up,
+            stance: Stance::Standing,
+            last_move: Instant::now(),
+            budget: MOVE_FLOOR,
+            burst: MOVE_FLOOR,
+            op,
+            visible: FastSet::default(),
+            body: PoseBody::new(0.0, 0.0, frame, Vec3::ZERO, up, Stance::Standing),
+            moved: 0,
+            out,
+            kick,
+            ready: false,
+            backlog: VecDeque::new(),
+            backlog_bytes: 0,
+            kicked: Arc::new(AtomicBool::new(false)),
+            occupied: Vec::new(),
+            cruising: false,
+            cruise_speed: 0.0,
+            novel: 0,
+            announced: FastSet::default(),
+        }
+    }
 }
 
 /// Buffers [`commit_pose`] reuses so a move allocates nothing.
@@ -196,6 +233,38 @@ impl State {
             #[cfg(test)]
             panic_tick: false,
         }
+    }
+
+    /// Put an admitted player on the roster and the grid, and return the roster it joins
+    /// (each peer's `PeerJoined` goes out in the bootstrap) and the overlay to send. One lock
+    /// hold, so the roster, the overlay and the grid agree.
+    pub(super) fn admit(&mut self, id: u32, mut handle: PlayerHandle) -> (Vec<(u32, Arc<str>)>, Overlay) {
+        // Roster only — poses flow through the visibility machinery once the
+        // joiner reports their first move, so a far peer isn't a frozen ghost.
+        let existing: Vec<(u32, Arc<str>)> = self.players.iter().map(|(&pid, h)| (pid, h.name.clone())).collect();
+        handle.announced.clear();
+        handle.announced.extend(existing.iter().map(|&(pid, _)| pid));
+        // Coordinates, revisions and block ids only: specs are named once per
+        // block, and the frames are sorted and encoded after the lock.
+        let overlay = Overlay::of(self);
+        let spawn = handle.pos;
+        self.players.insert(id, handle);
+        // Same lock hold as the roster insert, so the grid never lags the roster.
+        self.grid_insert(id, spawn);
+        (existing, overlay)
+    }
+
+    /// Take a player off the roster and the grid, and out of every peer's interest and
+    /// announcement sets, so nothing names a player who has gone.
+    pub(super) fn remove_player(&mut self, id: u32) -> Option<PlayerHandle> {
+        let h = self.players.remove(&id)?;
+        // h.pos is the last committed one, naming the bucket the grid holds it under.
+        self.grid_remove(id, h.pos);
+        for other in self.players.values_mut() {
+            other.visible.remove(&id);
+            other.announced.remove(&id);
+        }
+        Some(h)
     }
 
     /// Must run under the same lock hold as the roster/position change it

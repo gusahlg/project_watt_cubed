@@ -266,8 +266,8 @@ pub(super) fn broadcast_frame(
         if !want(pid, h) {
             continue;
         }
-        // Already queued for this peer (the join roster, or an earlier broadcast).
-        if let Some(jid) = joined && !h.announced.insert(jid) {
+        // Already queued for this peer in its join roster: skip it once.
+        if let Some(jid) = joined && h.announced.remove(&jid) {
             continue;
         }
         if !h.ready {
@@ -327,19 +327,20 @@ pub(super) fn enqueue_backlog(h: &mut PlayerHandle, frame: Arc<[u8]>, now: Insta
     true
 }
 
-/// Drop frames older than [`BACKLOG_AGE`]. The backlog is in time order, so only the front
-/// is read. False when an aged frame is essential: dropping it would desync the joiner.
+/// Drop frames older than [`BACKLOG_AGE`]. The backlog is in time order, so the aged frames
+/// are a prefix, dropped in one drain. False, dropping nothing, when an aged frame is
+/// essential: losing it would desync the joiner.
 pub(super) fn trim_aged(h: &mut PlayerHandle, now: Instant) -> bool {
-    while let Some(front) = h.backlog.front()
-        && now.saturating_duration_since(front.at) >= BACKLOG_AGE
-    {
-        if !protocol::is_cosmetic(&front.frame) {
+    let aged = h.backlog.iter().take_while(|q| now.saturating_duration_since(q.at) >= BACKLOG_AGE).count();
+    let mut bytes = 0;
+    for queued in h.backlog.range(..aged) {
+        if !protocol::is_cosmetic(&queued.frame) {
             return false;
         }
-        let len = front.frame.len();
-        h.backlog_bytes = h.backlog_bytes.saturating_sub(len);
-        h.backlog.pop_front();
+        bytes += queued.frame.len();
     }
+    h.backlog_bytes = h.backlog_bytes.saturating_sub(bytes);
+    h.backlog.drain(..aged);
     true
 }
 

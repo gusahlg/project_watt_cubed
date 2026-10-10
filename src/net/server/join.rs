@@ -305,49 +305,8 @@ pub(super) fn admit_player(
         state.next_id += 1;
         spawn = spawn_point(ctx.generator.as_ref(), id);
         let (frame, up) = standing_pose(Field::new(ctx.generator.mass()).sample(spawn).accel);
-        let body = PoseBody::new(0.0, 0.0, frame, Vec3::ZERO, up, Stance::Standing);
-
-        // Roster only — poses flow through the visibility machinery once the
-        // joiner reports their first move, so a far peer isn't a frozen ghost.
-        existing = state.players.iter().map(|(&pid, h)| (pid, h.name.clone())).collect();
-        let announced: FastSet<u32> = existing.iter().map(|(pid, _)| *pid).collect();
-        // Coordinates, revisions and block ids only: specs are named once per
-        // block, and the frames are sorted and encoded after the lock.
-        snapshot = Overlay::of(&state);
-
-        state.players.insert(
-            id,
-            PlayerHandle {
-                name: name.clone(),
-                pos: spawn,
-                yaw: 0.0,
-                pitch: 0.0,
-                frame,
-                velocity: Vec3::ZERO,
-                up,
-                stance: Stance::Standing,
-                last_move: Instant::now(),
-                budget: MOVE_FLOOR,
-                burst: MOVE_FLOOR,
-                op: ctx.ops.iter().any(|op| op.eq_ignore_ascii_case(name)),
-                visible: FastSet::default(),
-                body,
-                moved: 0,
-                out: out.clone(),
-                kick: kick.clone(),
-                ready: false,
-                backlog: VecDeque::new(),
-                backlog_bytes: 0,
-                kicked: Arc::new(AtomicBool::new(false)),
-                occupied: Vec::new(),
-                cruising: false,
-                cruise_speed: 0.0,
-                novel: 0,
-                announced,
-            },
-        );
-        // Same lock hold as the roster insert, so the grid never lags the roster.
-        state.grid_insert(id, spawn);
+        let op = ctx.ops.iter().any(|op| op.eq_ignore_ascii_case(name));
+        (existing, snapshot) = state.admit(id, PlayerHandle::new(name.clone(), spawn, frame, up, op, out.clone(), kick.clone()));
     }
     if let Some(hooks) = ctx.hooks.as_ref() {
         hooks.lock_recover().on_join(&JoinFacts {
@@ -373,7 +332,7 @@ pub(super) fn depart(
     let mut left: Option<JoinFacts> = None;
     {
         let mut state = shared.lock_recover();
-        if let Some(h) = state.players.remove(&id) {
+        if let Some(h) = state.remove_player(id) {
             left = Some(JoinFacts {
                 player: id,
                 name: h.name.clone(),
@@ -381,15 +340,6 @@ pub(super) fn depart(
                 y: block_coord(h.pos.y),
                 z: block_coord(h.pos.z),
             });
-            // h.pos is the last committed one, naming the bucket the grid holds it under.
-            state.grid_remove(id, h.pos);
-            // Everyone who could see the leaver holds a reciprocal entry that
-            // must not dangle.
-            for pid in h.visible {
-                if let Some(other) = state.players.get_mut(&pid) {
-                    other.visible.remove(&id);
-                }
-            }
         }
     }
     if let (Some(hooks), Some(facts)) = (ctx.hooks.as_ref(), left) {

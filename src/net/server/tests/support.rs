@@ -10,33 +10,11 @@ pub(super) fn test_generator() -> crate::world::terrain::Generator {
 /// past so the first envelope window is at its cap (a fresh anchor allows
 /// only ~30 world units); tests re-age it between deliberate big moves.
 pub(super) fn test_player(pos: DVec3, tx: SyncSender<Arc<[u8]>>, kick: Arc<Notify>) -> PlayerHandle {
+    let out = Outbox { tx: Some(tx), writer: Arc::default() };
     PlayerHandle {
-        name: "p".into(),
-        pos,
-        yaw: 0.0,
-        pitch: 0.0,
-        frame: DQuat::IDENTITY,
-        velocity: Vec3::ZERO,
-        up: Face::PosY,
-        stance: Stance::Standing,
         last_move: Instant::now() - Duration::from_secs(10),
-        budget: MOVE_FLOOR,
-            burst: MOVE_FLOOR,
-        op: false,
-        visible: HashSet::default(),
-        body: PoseBody::new(0.0, 0.0, DQuat::IDENTITY, Vec3::ZERO, Face::PosY, Stance::Standing),
-        moved: 0,
-        out: Outbox { tx: Some(tx), writer: Arc::default() },
-        kick,
         ready: true,
-        backlog: VecDeque::new(),
-        backlog_bytes: 0,
-        kicked: Arc::new(AtomicBool::new(false)),
-        occupied: Vec::new(),
-        cruising: false,
-        cruise_speed: 0.0,
-        novel: 0,
-        announced: HashSet::default(),
+        ..PlayerHandle::new("p".into(), pos, DQuat::IDENTITY, Face::PosY, false, out, kick)
     }
 }
 
