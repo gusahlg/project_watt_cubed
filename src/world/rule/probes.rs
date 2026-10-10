@@ -6,6 +6,7 @@
 
 use voxel_engine::DVec3;
 
+use super::select::Surface;
 use super::*;
 use crate::coord::{ChunkCoord as Coord, Face};
 use crate::render_config::{LOD_COARSEST_DETAIL, RenderConfig, lod_for};
@@ -326,4 +327,130 @@ fn lod_rule_symptom_c_far_tiles_are_never_finer() {
     }
     check("half a second after stopping", &world, eye);
     assert!(failures.is_empty(), "far tiles finer than their distance: {failures:?}");
+}
+
+/// The start world's band-0 charts as the rule's trees, measured where the rule would draw them:
+/// every chart's tiles of its chord-rule detail near the eye, a tile across a chart's edge cut to
+/// the part on the chart.
+struct Charts<'a> {
+    world: &'a World,
+    index: usize,
+    /// Each chart's patch, storage box and the eye's local position on it.
+    seats: Vec<(crate::space::atlas::Patch, [i64; 3], [i64; 3], (f64, f64))>,
+}
+
+impl<'a> Charts<'a> {
+    fn new(world: &'a World, eye: DVec3) -> Self {
+        use crate::space::atlas::Patch;
+        use crate::space::chart::{Map, basis};
+        let storage = world.chart_eye(eye).expect("a chart eye");
+        let seat = world.seams.chart_seat(World::chunk_of(storage.x.floor() as i32, storage.y.floor() as i32, storage.z.floor() as i32)).expect("a seat");
+        let atlas = &world.seams.atlases()[seat.index];
+        let n = atlas.bands[0].n;
+        let dir = (eye - atlas.centre).normalize();
+        let seats = Face::ALL
+            .into_iter()
+            .filter_map(|face| {
+                let (tu, nn, tv) = basis(face);
+                let d = DVec3::new(dir.dot(tu), dir.dot(nn), dir.dot(tv));
+                if d.y <= 0.05 {
+                    return None;
+                }
+                let (xi, eta) = Map::Equiangular.inverse(d);
+                let patch = Patch::Shell { band: 0, face };
+                let (o, size) = atlas.storage_box(patch);
+                let local = ((xi + 1.0) * 0.5 * n as f64, (eta + 1.0) * 0.5 * n as f64);
+                Some((patch, o, [o[0] + size[0], o[1] + size[1], o[2] + size[2]], local))
+            })
+            .collect();
+        Charts { world, index: seat.index, seats }
+    }
+
+    fn seat_of(&self, s: SectionPos) -> Option<&(crate::space::atlas::Patch, [i64; 3], [i64; 3], (f64, f64))> {
+        let (x, z, w) = (i64::from(s.min_x()), i64::from(s.min_z()), i64::from(s.span()));
+        self.seats.iter().find(|(_, lo, hi, _)| x < hi[0] && x + w > lo[0] && z < hi[2] && z + w > lo[2])
+    }
+}
+
+impl Surface for Charts<'_> {
+    fn roots(&self, rule: &Rule, _eye: DVec3, out: &mut Vec<SectionPos>) {
+        let body = crate::world::section::CHART_BODY_BASE + self.index as u16;
+        let span = i64::from(crate::world::section::section_span(crate::ident::Detail(rule.coarsest)));
+        let reach = (rule.horizon() * 1.5) as i64;
+        for (_, lo, hi, (lx, lz)) in &self.seats {
+            let (ex, ez) = (lo[0] + *lx as i64, lo[2] + *lz as i64);
+            let (x0, x1) = ((ex - reach).max(lo[0]), (ex + reach).min(hi[0]));
+            let (z0, z1) = ((ez - reach).max(lo[2]), (ez + reach).min(hi[2]));
+            if x0 >= x1 || z0 >= z1 {
+                continue;
+            }
+            for z in z0.div_euclid(span)..=(z1 - 1).div_euclid(span) {
+                for x in x0.div_euclid(span)..=(x1 - 1).div_euclid(span) {
+                    out.push(SectionPos { detail: crate::ident::Detail(rule.coarsest), body, face: Face::PosY, x: x as i32, z: z as i32 });
+                }
+            }
+        }
+    }
+
+    fn node_box(&self, s: SectionPos) -> Option<PhysBox> {
+        let (patch, lo, hi, _) = self.seat_of(s)?;
+        let w = i64::from(s.span());
+        let (x0, z0) = (i64::from(s.min_x()).max(lo[0]), i64::from(s.min_z()).max(lo[2]));
+        let (x1, z1) = ((i64::from(s.min_x()) + w).min(hi[0]), (i64::from(s.min_z()) + w).min(hi[2]));
+        let (a, b) = if (x1 - x0, z1 - z0) == (w, w) {
+            self.world.generator.surface_bounds(s.body, Face::PosY, x0 as i32, z0 as i32, w as i32)?
+        } else {
+            self.world.generator.surface_rect(s.body, Face::PosY, x0 as i32, z0 as i32, x1 as i32, z1 as i32)?
+        };
+        let atlas = &self.world.seams.atlases()[self.index];
+        let pts = (0..8).map(|c| {
+            DVec3::new(
+                if c & 1 == 0 { x0 } else { x1 } as f64,
+                f64::from(if c & 2 == 0 { a } else { b }),
+                if c & 4 == 0 { z0 } else { z1 } as f64,
+            )
+        });
+        let span = w as f64;
+        PhysBox::around(pts.map(|p| atlas.embed_storage(*patch, p)), span * span / (8.0 * atlas.radius as f64) + 1.0 + DRESS)
+    }
+}
+
+/// The rule's cut at the owner's site, in counts per detail, next to main's drawn cut there.
+#[test]
+#[ignore]
+fn lod_rule_cut_at_the_owner_site() {
+    for seed in [OWNER_SEED, 42] {
+        let mut world = owner_view(seed);
+        world.prepare_around(OWNER_EYE);
+        world.drive_spawn_ready();
+        settle(&mut world, OWNER_EYE);
+        let mut main_per = [0usize; 10];
+        for s in drawn(&world) {
+            main_per[s.detail.0 as usize] += 1;
+        }
+        let charts = Charts::new(&world, OWNER_EYE);
+        let rule = rule_of(&world, crate::world::section::CHART_BODY_BASE + charts.index as u16);
+        let (mut stack, mut leaves) = (Vec::new(), Vec::new());
+        let t = std::time::Instant::now();
+        rule.select(OWNER_EYE, &charts, &mut stack, &mut leaves);
+        let us = t.elapsed().as_micros();
+        let mut per = [0usize; 10];
+        for l in &leaves {
+            per[l.pos.detail.0 as usize] += 1;
+        }
+        let near = leaves.iter().filter(|l| l.dist < rule.r).count();
+        let cut = leaves.iter().filter(|l| charts.seat_of(l.pos).is_some_and(|(_, lo, hi, _)| {
+            let (x, z, w) = (i64::from(l.pos.min_x()), i64::from(l.pos.min_z()), i64::from(l.pos.span()));
+            x < lo[0] || z < lo[2] || x + w > hi[0] || z + w > hi[2]
+        })).count();
+        println!(
+            "seed {seed}: main draws {} tiles {main_per:?}; the rule {} tiles {per:?} ({near} within R, {cut} cut by a chart edge, {} charts) in {us} µs; horizon {} finest d{} coarsest d{}",
+            main_per.iter().sum::<usize>(),
+            leaves.len(),
+            charts.seats.len(),
+            rule.horizon(),
+            rule.finest,
+            rule.coarsest
+        );
+    }
 }

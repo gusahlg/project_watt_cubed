@@ -1,7 +1,9 @@
 //! The level-of-detail rule. The eye's physical distance to a node's physical box decides its
-//! detail: within the render distance `R` the full-res chunks draw, and beyond it detail `d`
-//! reaches out to `R·2^(d − finest)`, so every level is a shell around the eye. Charts, chart
-//! seams, cube faces, twins and flat worlds are one case: every box is measured where it really is.
+//! detail: within the render distance `R` the full-res chunks draw, and beyond it a tile of detail
+//! `d` (span `s = 32·2^d`) splits while the eye is within `2s`, so every level is a shell twice as
+//! far out and twice as coarse as the one inside it, and each shell holds the same count of tiles
+//! at every render distance. Charts, chart seams, cube faces, twins and flat worlds are one case:
+//! every box is measured where it really is.
 
 use voxel_engine::DVec3;
 
@@ -9,8 +11,11 @@ use super::World;
 use super::section::{CHART_BODY_BASE, SectionPos};
 use crate::space::FaceFrame;
 
-/// Render distance per finest cell edge: the finest far level is the one whose section span is
-/// `R / 2` to `R / 4` (`2^d_f ≤ R / 64`), so its tile count stays the same at every distance.
+/// Section spans a tile reaches before it splits: detail `d` holds out to `2·32·2^d` blocks.
+const SPLIT_SPANS: f64 = 2.0;
+
+/// The finest far level is the one whose span is `R / 4` to `R / 2`: it splits no further, and its
+/// parent's reach (`4` of its spans) clears the render distance.
 const FINEST_RATIO: f64 = 64.0;
 
 /// Blocks a node's terrain bounds are widened by below (digs) and above (plants) the sampled tops.
@@ -37,9 +42,9 @@ impl Rule {
         Rule { r, finest, coarsest }
     }
 
-    /// Distance out to which detail `d` stays split into detail `d − 1`.
+    /// Distance out to which detail `d` splits into detail `d − 1`.
     pub fn range(&self, d: i8) -> f64 {
-        self.r * 2f64.powi(i32::from(d) - i32::from(self.finest))
+        SPLIT_SPANS * 32.0 * 2f64.powi(i32::from(d))
     }
 
     /// Whether a node of detail `d` at distance `dist` splits.
@@ -123,6 +128,7 @@ impl World {
     }
 }
 
+mod select;
 #[cfg(test)]
 mod probes;
 
@@ -130,7 +136,8 @@ mod probes;
 mod tests {
     use super::*;
 
-    /// The finest far detail keeps two to four of its section spans inside the render distance.
+    /// The finest far detail keeps two to four of its section spans inside the render distance,
+    /// so its parent always splits inside it.
     #[test]
     fn finest_far_detail_follows_the_render_distance() {
         for (rd, finest) in [(2, 0), (4, 0), (6, 0), (8, 1), (12, 1), (16, 2), (24, 2), (32, 3)] {
@@ -138,6 +145,7 @@ mod tests {
             assert_eq!(rule.finest, finest, "render distance {rd}");
             let span = 32.0 * 2f64.powi(i32::from(finest));
             assert!(rule.r >= span && (rule.r < 4.0 * span || finest == 0), "render distance {rd}: span {span}");
+            assert!(rule.range(finest + 1) >= rule.r, "render distance {rd}: the finest level's parent splits short of R");
         }
         let rule = Rule::new(256.0, 8);
         assert_eq!((rule.range(2), rule.range(3), rule.range(8)), (256.0, 512.0, 16_384.0));
