@@ -490,12 +490,16 @@ fn leach(block: &mut Block, other: &Block) -> u16 {
 fn weather(block: &mut Block, other: &Block) -> u16 {
     let mut moved = 0;
     for _ in 0..WEATHER_STEPS {
-        if block.is_empty() || dormant(block, other) {
+        if block.is_empty() {
             break;
         }
+        // At rest when neither orientation moves.
         let (change, side) = match Contact::new(block, other).peek() {
             Some(op) => (op.change, 0),
-            None => (Contact::new(other, block).peek().expect("not dormant").change, 1),
+            None => match Contact::new(other, block).peek() {
+                Some(op) => (op.change, 1),
+                None => break,
+            },
         };
         let (lose, gain) = match change {
             Change::Transfer { from, element } if from == side => (Some(element), None),
@@ -531,41 +535,43 @@ pub fn suite(law: &Law, f: &Found, ground: Ground, p: &Params) -> Suite {
     let r = reference(law);
     let touch = &r.touch[p.bulk as usize][ground as usize];
     let mut leached = 0u16;
-    let mut minerals: Vec<Mineral> = Vec::with_capacity(f.minerals.len());
+    // Each mineral with whether a full weathering pass already found it at rest with every role.
+    let mut found: Vec<(Mineral, bool)> = Vec::with_capacity(f.minerals.len());
     for m in &f.minerals {
         let mut b = Block::of(&m.config);
+        let mut rested = false;
         // Leach (1) or weather (2) to rest against every role; a change can wake an earlier role,
         // so repeat.
-        for _ in 0..WEATHER_PASSES {
-            let mut moved = 0;
-            for u in touch {
-                moved += match p.leach {
-                    1 => leach(&mut b, u),
-                    2 => weather(&mut b, u),
-                    _ => 0,
-                };
-            }
-            leached += moved;
-            if moved == 0 || b.is_empty() {
-                break;
+        if p.leach != 0 {
+            for _ in 0..WEATHER_PASSES {
+                let mut moved = 0;
+                for u in touch {
+                    moved += if p.leach == 1 { leach(&mut b, u) } else { weather(&mut b, u) };
+                }
+                leached += moved;
+                rested = moved == 0;
+                if rested || b.is_empty() {
+                    break;
+                }
             }
         }
-        repair(&mut b);
+        rested &= repair(&mut b) == 0;
         if b.is_empty() {
             continue;
         }
         let m = mineral(law, &b, false);
-        if !minerals.iter().any(|x| x.config == m.config) {
-            minerals.push(m);
+        if !found.iter().any(|(x, _)| x.config == m.config) {
+            found.push((m, rested));
         }
     }
-    minerals.sort_by(|a, b| b.amount.cmp(&a.amount).then_with(|| a.config.cmp(&b.config)));
-    let distinct = minerals.len();
-    let blocks: Vec<Block> = minerals.iter().map(|m| Block::of(&m.config)).collect();
-    for i in 0..minerals.len() {
+    found.sort_by(|(a, _), (b, _)| b.amount.cmp(&a.amount).then_with(|| a.config.cmp(&b.config)));
+    let distinct = found.len();
+    let blocks: Vec<Block> = found.iter().map(|(m, _)| Block::of(&m.config)).collect();
+    let mut minerals: Vec<Mineral> = Vec::with_capacity(found.len());
+    for (i, (m, rested)) in found.into_iter().enumerate() {
         let beside = |j: usize| j < blocks.len() && j != i && !dormant(&blocks[i], &blocks[j]);
-        minerals[i].replaced =
-            beside(i.wrapping_sub(1)) || beside(i + 1) || touch.iter().any(|u| !dormant(&blocks[i], u));
+        let restless = !rested && touch.iter().any(|u| !dormant(&blocks[i], u));
+        minerals.push(Mineral { replaced: beside(i.wrapping_sub(1)) || beside(i + 1) || restless, ..m });
     }
     let mut layers: Vec<Mineral> = minerals
         .iter()

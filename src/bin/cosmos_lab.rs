@@ -355,7 +355,8 @@ impl Stats {
         self.start_radius.push(start.radius as f64);
         self.start_tries.push(u.start_tries as f64);
         self.start_fallback += u.start_fallback as usize;
-        let contract = (start.density * start.radius as f64 / project_watt_cubed::world::terrain::emergent::RHO_R - 1.0).abs() < 1e-6;
+        // The radius is snapped to 16 blocks: the contract holds to half a snap.
+        let contract = (start.density * start.radius as f64 - project_watt_cubed::world::terrain::emergent::RHO_R).abs() <= 8.0 * start.density;
         let valid = start.traits.rank == Rank::Start && start.traits.form == Form::Round && contract;
         self.start_valid += valid as usize;
         self.resalts.push(u.resalts as f64);

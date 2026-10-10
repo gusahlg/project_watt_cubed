@@ -153,8 +153,9 @@ params! {
     /// Before the rest check a restless mineral may leach (1: drop the occurrence the contact moves)
     /// or weather (2: trade occurrences with an endless bath of the role) until it rests; 0: neither.
     leach: u8 = 2,
-    /// Check suites only against what touches the bulk (P2), not the painter's whole ground.
-    bulk: bool = false,
+    /// Check suites against what touches the bulk they become in P2 (true), or against the
+    /// painter's whole ground vocabulary (false; slower, about 4 points more suites of their own).
+    bulk: bool = true,
     /// Differentiation sweeps at most.
     sweeps: u32 = 48,
     /// Least colour spread of a suite before it falls back to the palette.
