@@ -525,8 +525,7 @@ impl Game {
             let ground = world.surface_y(0, 0);
             DVec3::new(0.5, ground as f64 + 3.0, 0.5)
         });
-        let mut player = Player::new(pos);
-        player.stand_in(world.gravity_at(player.position).accel);
+        let player = Player::standing(pos, world.gravity_at(pos).accel);
         let mut g = Game::new(world, player, "scripted".to_string());
         g.scripted = true;
         g.render = render;

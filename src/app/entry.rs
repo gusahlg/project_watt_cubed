@@ -84,8 +84,7 @@ impl Loading {
         let spawn = conn.spawn();
         let job = Job::spawn(move || {
             let world = recipe.world();
-            let mut player = Player::new(spawn);
-            player.stand_in(world.gravity_at(player.position).accel);
+            let player = Player::standing(spawn, world.gravity_at(spawn).accel);
             (world, player)
         });
         Self::Join { job, conn, notice, hosted }
@@ -306,8 +305,7 @@ mod tests {
         let Loading::Join { job, conn, notice, hosted } = loading else { unreachable!() };
         let (world, player) = job.wait();
         assert_eq!((world.seed(), world.worldgen(), world.terrain_cfg()), (77, WorldgenKind::Diffusion, terrain));
-        let mut inline = Player::new(spawn);
-        inline.stand_in(recipe(77, WorldgenKind::Diffusion, terrain).world().gravity_at(spawn).accel);
+        let inline = Player::standing(spawn, recipe(77, WorldgenKind::Diffusion, terrain).world().gravity_at(spawn).accel);
         assert_eq!(pose(&player), pose(&inline));
         assert!(conn.is_alive());
         assert_eq!((notice.as_deref(), hosted), (Some("hi"), true));

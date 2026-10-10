@@ -1300,47 +1300,11 @@ fn fresh_seed() -> i64 {
         .unwrap_or(1)
 }
 
-/// Spawn the player just above level ground near the world origin, so they land on a meadow or a
-/// valley floor rather than a cliff edge. Spirals outward over whole 16×16 chunk columns
-/// ([`World::heights_16`], one batch each) for the first cell whose 3×3 neighbourhood is flat.
+/// The player on a new world, standing in the local pull at [`spawn_column`](crate::world::generation::spawn_column),
+/// the spawn the server gives the same seed.
 fn spawn_player(world: &World) -> Player {
-    if let Some(p) = world.chart_spawn() {
-        let mut player = Player::new(p);
-        player.stand_in(world.gravity_at(player.position).accel);
-        return player;
-    }
-    let mut seen = [(i32::MAX, i32::MAX); 32];
-    let mut n = 0usize;
-    for r in 0i32..8 {
-        for (dx, dz) in [(r, 0), (0, r), (-r, 0), (0, -r), (r, r), (-r, -r), (r, -r), (-r, r)] {
-            let (cx, cz) = ((dx * 8).div_euclid(16), (dz * 8).div_euclid(16));
-            if seen[..n].contains(&(cx, cz)) {
-                continue;
-            }
-            seen[n] = (cx, cz);
-            n += 1;
-            let heights = world.heights_16(cx, cz);
-            for lz in 1..15 {
-                for lx in 1..15 {
-                    let h = heights[lx + lz * 16];
-                    let flat = (0..9).all(|k| {
-                        let (ox, oz) = (lx + k % 3 - 1, lz + k / 3 - 1);
-                        (heights[ox + oz * 16] - h).abs() <= 1
-                    });
-                    if flat {
-                        let (x, z) = (cx * 16 + lx as i32, cz * 16 + lz as i32);
-                        let mut player = Player::new(DVec3::new(x as f64 + 0.5, h as f64 + 3.0, z as f64 + 0.5));
-                        player.stand_in(world.gravity_at(player.position).accel);
-                        return player;
-                    }
-                }
-            }
-        }
-    }
-    let h = world.surface_y(0, 0);
-    let mut player = Player::new(DVec3::new(0.5, h as f64 + 3.0, 0.5));
-    player.stand_in(world.gravity_at(player.position).accel);
-    player
+    let pos = crate::world::generation::spawn_column(world.terrain());
+    Player::standing(pos, world.gravity_at(pos).accel)
 }
 
 #[cfg(test)]
@@ -1487,6 +1451,36 @@ mod tests {
             crate::math::block_coord(p.position.z),
         );
         assert!(p.position.y > ground as f64);
+    }
+
+    /// The server builds its generator from the seed, kind and knobs alone (`server::spawn`), and
+    /// single player builds a world; both stand a fresh player on the same point.
+    #[test]
+    fn single_player_and_the_server_spawn_on_the_same_point() {
+        use crate::world::generation::{FlatTerrain, spawn_column};
+        let steep = TerrainCfg { relief: 200, space: 200, ..TerrainCfg::default() }.clamp();
+        let worlds = [
+            (WorldgenKind::Flat, TerrainCfg::default()),
+            (WorldgenKind::Diffusion, TerrainCfg::default()),
+            (WorldgenKind::Diffusion, steep),
+        ];
+        for seed in [1, 42, 7] {
+            for (kind, cfg) in worlds {
+                let mut registry = crate::block::BlockRegistry::with_builtins();
+                let server: crate::world::terrain::Generator = match kind {
+                    WorldgenKind::Flat => std::sync::Arc::new(FlatTerrain::new(&mut registry, seed)),
+                    WorldgenKind::Diffusion => crate::world::terrain::generator(&mut registry, seed, cfg),
+                };
+                let world = World::with_kind_cfg(seed, RenderConfig::default(), kind, cfg, false);
+                let player = spawn_player(&world);
+                let spawn = spawn_column(server.as_ref());
+                assert_eq!(player.position.to_array().map(f64::to_bits), spawn.to_array().map(f64::to_bits), "seed {seed} {kind:?}");
+                // The round start world names its spawn; a flat world spirals to level ground.
+                assert_eq!(server.chart_spawn().is_some(), kind == WorldgenKind::Diffusion, "seed {seed} {kind:?}");
+                let pull = world.gravity_at(spawn).accel;
+                assert_eq!(player.up_axis, crate::player::standing_pose(pull).1);
+            }
+        }
     }
 
     #[test]
