@@ -1,10 +1,10 @@
 //! World files, shutdown and the policy files beside the world.
 use super::super::*;
 use super::support::*;
+use crate::net::client::Incoming;
 
 #[test]
 fn restarted_server_serves_the_same_edits() {
-    use crate::net::client::{Connection, Incoming};
     let path = crate::save::store::test_temp_path("restart");
     let _ = std::fs::remove_file(&path);
     let handle = spawn(0, Config {
@@ -19,28 +19,13 @@ fn restarted_server_serves_the_same_edits() {
     // The grass under the spawn: breaking it changes the world, so the file keeps it.
     let (x, y, z) = (crate::math::block_coord(s.x), crate::world::generation::FLAT_HEIGHT - 1, crate::math::block_coord(s.z));
     let req = conn.send_edit(x, y, z, "air".into()).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(3);
-    let mut accepted = false;
-    while !accepted && Instant::now() < deadline {
-        accepted = conn.poll().into_iter().any(|e| matches!(e, Incoming::EditAccepted { req: r } if r == req));
-        if !accepted {
-            thread::sleep(Duration::from_millis(10));
-        }
-    }
-    assert!(accepted, "the edit is committed before shutdown");
+    let accepted = await_event(&mut conn, Duration::from_secs(3), |e| matches!(e, Incoming::EditAccepted { req: r } if r == req).then_some(()));
+    assert!(accepted.is_some(), "the edit is committed before shutdown");
     conn.send_set_time(0.2);
-    let deadline = Instant::now() + Duration::from_secs(3);
-    let mut day = None;
-    while day.is_none() && Instant::now() < deadline {
-        for event in conn.poll() {
-            if let Incoming::Time { day: d, .. } = event {
-                day = Some(d);
-            }
-        }
-        if day.is_none() {
-            thread::sleep(Duration::from_millis(10));
-        }
-    }
+    let day = await_event(&mut conn, Duration::from_secs(3), |e| match e {
+        Incoming::Time { day, .. } => Some(day),
+        _ => None,
+    });
     assert!((day.expect("time reply") - 0.2).abs() < 0.02);
     drop(conn);
     handle.stop();
@@ -55,10 +40,8 @@ fn restarted_server_serves_the_same_edits() {
     let mut bob = Connection::connect("127.0.0.1", again.addr().port(), "bob", "").unwrap();
     assert_eq!(bob.seed(), 42);
     assert_eq!(bob.worldgen(), WorldgenKind::Flat);
-    let deadline = Instant::now() + Duration::from_secs(3);
-    let mut saw_edit = false;
-    let mut saw_day = false;
-    while Instant::now() < deadline && !(saw_edit && saw_day) {
+    let (mut saw_edit, mut saw_day) = (false, false);
+    eventually(Duration::from_secs(3), || {
         for event in bob.poll() {
             match event {
                 Incoming::Mutation { x: mx, y: my, z: mz, spec } if (mx, my, mz) == (x, y, z) && spec.as_ref() == "air" => {
@@ -68,8 +51,8 @@ fn restarted_server_serves_the_same_edits() {
                 _ => {}
             }
         }
-        thread::sleep(Duration::from_millis(10));
-    }
+        saw_edit && saw_day
+    });
     assert!(saw_edit, "the restarted world still has the edit");
     assert!(saw_day, "the restarted world still has the clock");
     again.stop();
@@ -78,23 +61,14 @@ fn restarted_server_serves_the_same_edits() {
 
 #[test]
 fn stop_closes_connections_and_frees_the_port() {
-    use crate::net::client::{Connection, Incoming};
     let handle = flat(Config::default());
     let port = handle.addr().port();
     let mut conn = Connection::connect("127.0.0.1", port, "ada", "").unwrap();
     handle.stop();
-    let deadline = Instant::now() + Duration::from_secs(3);
-    let mut reason = None;
-    while reason.is_none() && Instant::now() < deadline {
-        for event in conn.poll() {
-            if let Incoming::Disconnected { reason: text } = event {
-                reason = Some(text);
-            }
-        }
-        if reason.is_none() {
-            thread::sleep(Duration::from_millis(20));
-        }
-    }
+    let reason = await_event(&mut conn, Duration::from_secs(3), |e| match e {
+        Incoming::Disconnected { reason } => Some(reason),
+        _ => None,
+    });
     let reason = reason.expect("the close arrives before the idle timeout");
     assert!(
         reason.to_ascii_lowercase().contains("shutting down"),
@@ -118,7 +92,6 @@ fn stop_closes_connections_and_frees_the_port() {
 #[cfg(unix)]
 #[test]
 fn sigterm_saves_the_world() {
-    use crate::net::client::Connection;
     let path = crate::save::store::test_temp_path("sigterm");
     let _ = std::fs::remove_file(&path);
     let port = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
@@ -133,17 +106,14 @@ fn sigterm_saves_the_world() {
         });
         let _ = tx.send(result);
     });
-    let deadline = Instant::now() + Duration::from_secs(8);
     let mut conn = None;
-    while conn.is_none() && Instant::now() < deadline {
+    eventually(Duration::from_secs(8), || {
         if let Ok(result) = rx.try_recv() {
             panic!("server exited before a client connected: {result:?}");
         }
-        match Connection::connect("127.0.0.1", port, "ada", "") {
-            Ok(c) => conn = Some(c),
-            Err(_) => thread::sleep(Duration::from_millis(30)),
-        }
-    }
+        conn = Connection::connect("127.0.0.1", port, "ada", "").ok();
+        conn.is_some()
+    });
     let _conn = conn.expect("server accepted a connection");
     assert!(!path.exists(), "nothing is written until a save");
     let _ = std::process::Command::new("kill")
@@ -228,21 +198,13 @@ fn save_world_exports_the_live_scheduler() {
 /// acknowledged after the save has read the ledger.
 #[test]
 fn stop_closes_connections_before_the_final_save() {
-    use crate::net::client::{Connection, Incoming};
     let path = crate::save::store::test_temp_path("stop-order");
     let handle = flat(Config { world: Some(path.clone()), ..Config::default() });
     let mut conn = Connection::connect("127.0.0.1", handle.addr().port(), "ada", "").unwrap();
     let gate = handle.save_gate.lock_recover();
     thread::scope(|scope| {
         let stopping = scope.spawn(|| handle.stop());
-        let deadline = Instant::now() + Duration::from_secs(3);
-        let mut closed = false;
-        while !closed && Instant::now() < deadline {
-            closed = conn.poll().into_iter().any(|e| matches!(e, Incoming::Disconnected { .. }));
-            if !closed {
-                thread::sleep(Duration::from_millis(20));
-            }
-        }
+        let closed = await_event(&mut conn, Duration::from_secs(3), |e| matches!(e, Incoming::Disconnected { .. }).then_some(())).is_some();
         assert!(!path.exists(), "the save is still waiting");
         drop(gate);
         stopping.join().unwrap();

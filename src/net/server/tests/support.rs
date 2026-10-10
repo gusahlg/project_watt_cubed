@@ -1,6 +1,10 @@
 //! Shared fixtures: hand-built players and states, contexts, raw handshakes and frame drains.
 use super::super::*;
+pub(super) use crate::net::client::Connection;
+use crate::net::client::Incoming;
+pub(super) use crate::net::test_util::eventually;
 pub(super) use std::collections::HashSet;
+pub(super) use std::sync::mpsc::Receiver;
 
 pub(super) fn test_generator() -> crate::world::terrain::Generator {
     crate::world::terrain::generator(&mut BlockRegistry::with_builtins(), 4242, Default::default())
@@ -33,8 +37,6 @@ pub(super) fn lax_ctx() -> &'static Ctx {
     CTX.get_or_init(|| test_ctx(true))
 }
 
-/// A throwaway kick handle for state-only players (never notified).
-/// A move that leaves the body frame, velocity, and up axis at their defaults.
 /// One [`on_move`] with a buffer of its own for the frames it queues.
 #[allow(clippy::too_many_arguments)] // the fields of a Move, as the message carries them
 pub(super) fn move_once(
@@ -52,10 +54,12 @@ pub(super) fn move_once(
     on_move(shared, ctx, id, Pose { pos, yaw, pitch, frame, velocity, up, stance }, &mut Vec::new());
 }
 
+/// A move that leaves the body frame, velocity, and up axis at their defaults.
 pub(super) fn walk(shared: &Arc<Mutex<State>>, id: u32, pos: DVec3, yaw: f32, pitch: f32, stance: Stance) {
     move_once(shared, lax_ctx(), id, pos, yaw, pitch, DQuat::IDENTITY, Vec3::ZERO, Face::PosY, stance);
 }
 
+/// A throwaway kick handle for state-only players (never notified).
 pub(super) fn test_kick() -> Arc<Notify> {
     Arc::new(Notify::new())
 }
@@ -73,9 +77,9 @@ pub(super) fn client_endpoint() -> (Runtime, Endpoint) {
     (rt, ep)
 }
 
-/// Dial, open the reliable stream, send one crafted message, and return the
+/// Dial, open the reliable stream, send one crafted payload, and return the
 /// server's first reply — the raw handshake path `Connection::connect` hides.
-pub(super) fn raw_reply(addr: SocketAddr, hello: &ClientMessage) -> ServerMessage {
+pub(super) fn raw_reply(addr: SocketAddr, payload: &[u8]) -> ServerMessage {
     // The server binds 0.0.0.0; quinn refuses to dial the unspecified address, so
     // reach it over loopback (`handle.addr()` carries only the resolved port).
     let target = SocketAddr::from((Ipv4Addr::LOCALHOST, addr.port()));
@@ -83,14 +87,23 @@ pub(super) fn raw_reply(addr: SocketAddr, hello: &ClientMessage) -> ServerMessag
     rt.block_on(async {
         let conn = ep.connect(target, "watt").unwrap().await.unwrap();
         let (mut s, mut r) = conn.open_bi().await.unwrap();
-        protocol::write_frame_async(&mut s, &hello.encode()).await.unwrap();
+        protocol::write_frame_async(&mut s, payload).await.unwrap();
         let mut buf = Vec::new();
         protocol::read_frame_async(&mut r, &mut buf).await.unwrap();
         ServerMessage::decode(&buf).unwrap()
     })
 }
 
-pub(super) fn hello(name: &str, password: &str, protocol: u32, content: crate::net::ContentId) -> ClientMessage {
+/// The reason the server refuses `payload` with.
+pub(super) fn reject_reason(addr: SocketAddr, payload: &[u8]) -> String {
+    match raw_reply(addr, payload) {
+        ServerMessage::Reject { reason } => reason.to_string(),
+        other => panic!("expected Reject, got {other:?}"),
+    }
+}
+
+/// A `Hello` from `name`, encoded for [`raw_reply`].
+pub(super) fn hello(name: &str, password: &str, protocol: u32, content: crate::net::ContentId) -> Vec<u8> {
     ClientMessage::Hello {
         protocol,
         worldgen: content.worldgen,
@@ -101,17 +114,11 @@ pub(super) fn hello(name: &str, password: &str, protocol: u32, content: crate::n
         password: password.into(),
         mods: vec![],
     }
+    .encode()
 }
 
 pub(super) fn server_content() -> crate::net::ContentId {
     crate::net::content_id(&BlockRegistry::with_builtins())
-}
-
-pub(super) fn reject_reason(addr: SocketAddr, msg: &ClientMessage) -> String {
-    match raw_reply(addr, msg) {
-        ServerMessage::Reject { reason } => reason.to_string(),
-        other => panic!("expected Reject, got {other:?}"),
-    }
 }
 
 pub(super) fn rock_spec() -> String {
@@ -126,41 +133,52 @@ pub(super) fn test_state(players: HashMap<u32, PlayerHandle>) -> State {
     // The palette first, exactly as `spawn` builds it, so generator ids mean the same here.
     let mut registry = BlockRegistry::with_builtins();
     crate::world::terrain::Materials::intern(&mut registry);
-    {
-        let mut state = State::new(registry, 0.3, crate::player::MAX_SPEED);
-        state.players = players.into_iter().collect();
-        state.next_id = 2;
-        state
+    let mut state = State::new(registry, 0.3, crate::player::MAX_SPEED);
+    state.players = players.into_iter().collect();
+    state.next_id = 2;
+    state
+}
+
+/// A [`test_state`] holding a ready [`test_player`] at each `(id, position)`, each with its own
+/// outbox, and the receiving ends in the same order.
+pub(super) fn roster<const N: usize>(at: [(u32, DVec3); N]) -> (State, [Receiver<Arc<[u8]>>; N]) {
+    let mut players = HashMap::new();
+    let inboxes = at.map(|(id, pos)| {
+        let (out, rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
+        players.insert(id, test_player(pos, out, test_kick()));
+        rx
+    });
+    (test_state(players), inboxes)
+}
+
+/// [`roster`] behind the lock the handlers take.
+pub(super) fn lobby<const N: usize>(at: [(u32, DVec3); N]) -> (Arc<Mutex<State>>, [Receiver<Arc<[u8]>>; N]) {
+    let (state, inboxes) = roster(at);
+    (Arc::new(Mutex::new(state)), inboxes)
+}
+
+/// Anchor the player's envelope `ago` in the past: the next move's budget refills for that long.
+pub(super) fn age_state(state: &mut State, id: u32, ago: Duration) {
+    if let Some(h) = state.players.get_mut(&id) {
+        h.last_move = Instant::now() - ago;
     }
 }
 
 /// Push the player's envelope anchor into the past, buying the next move
 /// the full (capped) displacement window.
 pub(super) fn age_move(shared: &Arc<Mutex<State>>, id: u32) {
-    if let Some(h) = shared.lock_recover().players.get_mut(&id) {
-        h.last_move = Instant::now() - Duration::from_secs(10);
-    }
+    age_state(&mut shared.lock_recover(), id, Duration::from_secs(10));
 }
 
+/// Anchor the envelope one realistic move gap ago: the next move's budget refills for that long.
+pub(super) fn stamp_gap(shared: &Arc<Mutex<State>>, id: u32) {
+    age_state(&mut shared.lock_recover(), id, Duration::from_millis(100));
+}
+
+/// The 4242 world, with noclip open and teleport allowed or not.
 pub(super) fn test_ctx(allow_teleport: bool) -> Ctx {
-    Ctx {
-        password: String::new(),
-        seed: 4242,
-        content: crate::net::content_id(&BlockRegistry::with_builtins()),
-        day_secs: 600.0,
-        teleport: if allow_teleport { TeleportPolicy::All } else { TeleportPolicy::Off },
-        noclip: NoclipPolicy::All,
-        worldgen: WorldgenKind::Diffusion,
-        terrain: TerrainCfg::default(),
-        seams: Seams::new(test_generator().atlases().to_vec()),
-        generator: test_generator(),
-        hooks: None,
-        ops: Vec::new(),
-        op_secrets: Vec::new(),
-        mods_allow: Vec::new(),
-        mods_deny: Vec::new(),
-        store: None,
-    }
+    let teleport = if allow_teleport { Policy::All } else { Policy::Off };
+    Ctx::new(Config { seed: 4242, teleport, ..Config::default() }, test_generator(), server_content(), None)
 }
 
 /// The reference destructive pair as specs, with the target written into the ledger at `cell`.
@@ -195,40 +213,6 @@ impl XorShift {
     }
 }
 
-pub(super) fn age_move_state(state: &mut State, id: u32) {
-    if let Some(h) = state.players.get_mut(&id) {
-        h.last_move = Instant::now() - Duration::from_secs(10);
-    }
-}
-
-pub(super) fn drain_msgs(rx: &std::sync::mpsc::Receiver<Arc<[u8]>>) -> Vec<ServerMessage> {
-    let mut out = Vec::new();
-    while let Ok(frame) = rx.try_recv() {
-        out.push(ServerMessage::decode(&frame).unwrap());
-    }
-    out
-}
-
-pub(super) fn raw_payload_reply(addr: SocketAddr, payload: &[u8]) -> ServerMessage {
-    let target = SocketAddr::from((Ipv4Addr::LOCALHOST, addr.port()));
-    let (rt, ep) = client_endpoint();
-    rt.block_on(async {
-        let conn = ep.connect(target, "watt").unwrap().await.unwrap();
-        let (mut s, mut r) = conn.open_bi().await.unwrap();
-        protocol::write_frame_async(&mut s, payload).await.unwrap();
-        let mut buf = Vec::new();
-        protocol::read_frame_async(&mut r, &mut buf).await.unwrap();
-        ServerMessage::decode(&buf).unwrap()
-    })
-}
-
-pub(super) fn reject_payload(addr: SocketAddr, payload: &[u8]) -> String {
-    match raw_payload_reply(addr, payload) {
-        ServerMessage::Reject { reason } => reason.to_string(),
-        other => panic!("expected Reject, got {other:?}"),
-    }
-}
-
 pub(super) fn numbered_spec(n: u8) -> String {
     let cfg = material::Configuration::single(material::Element::new([200, n, 17, 3]));
     let bytes = cfg.encode();
@@ -239,25 +223,13 @@ pub(super) fn numbered_spec(n: u8) -> String {
     s
 }
 
-/// Anchor the envelope one realistic move gap ago: the next move's budget refills for that long.
-pub(super) fn stamp_gap(shared: &Arc<Mutex<State>>, id: u32) {
-    if let Some(h) = shared.lock_recover().players.get_mut(&id) {
-        h.last_move = Instant::now() - Duration::from_millis(100);
-    }
-}
-
 pub(super) fn flat(config: Config) -> ServerHandle {
     spawn(0, Config { seed: 1, worldgen: WorldgenKind::Flat, ..config }).unwrap()
 }
 
-pub(super) fn drain(rx: &std::sync::mpsc::Receiver<Arc<[u8]>>) -> Vec<ServerMessage> {
-    let mut out = Vec::new();
-    while let Ok(frame) = rx.try_recv() {
-        if let Some(msg) = ServerMessage::decode(&frame) {
-            out.push(msg);
-        }
-    }
-    out
+/// Every frame waiting in an outbox, decoded. A frame that does not decode fails the test.
+pub(super) fn drain(rx: &Receiver<Arc<[u8]>>) -> Vec<ServerMessage> {
+    rx.try_iter().map(|frame| ServerMessage::decode(&frame).expect("the server sends frames that decode")).collect()
 }
 
 pub(super) fn flat_shared(
@@ -278,28 +250,12 @@ pub(super) fn flat_shared(
         }
         state
     };
-    let ctx = Ctx {
-        password: String::new(),
-        seed: 1,
-        content: crate::net::content_id(&BlockRegistry::with_builtins()),
-        day_secs: 600.0,
-        teleport: TeleportPolicy::All,
-        noclip,
-        worldgen: WorldgenKind::Flat,
-        terrain: TerrainCfg::default(),
-        seams: Seams::new(generator.atlases().to_vec()),
-        generator,
-        hooks: None,
-        ops: ops.iter().map(|name| (*name).to_ascii_lowercase()).collect(),
-        op_secrets: Vec::new(),
-        mods_allow: Vec::new(),
-        mods_deny: Vec::new(),
-        store: None,
-    };
-    (Arc::new(Mutex::new(state)), ctx)
+    let ops = ops.iter().map(|name| name.to_string()).collect();
+    let config = Config { seed: 1, worldgen: WorldgenKind::Flat, noclip, ops, ..Config::default() };
+    (Arc::new(Mutex::new(state)), Ctx::new(config, generator, server_content(), None))
 }
 
-pub(super) fn pose(pos: DVec3) -> (HashMap<u32, PlayerHandle>, std::sync::mpsc::Receiver<Arc<[u8]>>) {
+pub(super) fn pose(pos: DVec3) -> (HashMap<u32, PlayerHandle>, Receiver<Arc<[u8]>>) {
     let (out, rx) = sync_channel::<Arc<[u8]>>(8);
     let mut players = HashMap::new();
     players.insert(1u32, test_player(pos, out, test_kick()));
@@ -307,16 +263,29 @@ pub(super) fn pose(pos: DVec3) -> (HashMap<u32, PlayerHandle>, std::sync::mpsc::
 }
 
 /// Chat until a line containing `want` arrives, or three seconds pass.
-pub(super) fn chat_until(conn: &mut crate::net::client::Connection, want: &str) -> Vec<String> {
+pub(super) fn chat_until(conn: &mut Connection, want: &str) -> Vec<String> {
     let mut texts = Vec::new();
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while Instant::now() < deadline && !texts.iter().any(|t: &String| t.contains(want)) {
+    eventually(Duration::from_secs(3), || {
         for event in conn.poll() {
-            if let crate::net::client::Incoming::Chat { text, .. } = event {
+            if let Incoming::Chat { text, .. } = event {
                 texts.push(text.to_string());
             }
         }
-        thread::sleep(Duration::from_millis(10));
-    }
+        texts.iter().any(|t| t.contains(want))
+    });
     texts
+}
+
+/// Poll `conn` until `pick` takes an event, or `within` passes.
+pub(super) fn await_event<T>(conn: &mut Connection, within: Duration, mut pick: impl FnMut(Incoming) -> Option<T>) -> Option<T> {
+    let mut found = None;
+    eventually(within, || {
+        for event in conn.poll() {
+            if found.is_none() {
+                found = pick(event);
+            }
+        }
+        found.is_some()
+    });
+    found
 }

@@ -20,6 +20,8 @@ mod mp;
 mod pair;
 pub(crate) mod persist;
 pub(crate) mod protocol;
+#[cfg(test)]
+pub(crate) mod test_util;
 
 pub use pair::ChannelPair;
 

@@ -1,6 +1,7 @@
 //! Handshakes, admission, bootstrap, names, mod policy and operators.
 use super::super::*;
 use super::support::*;
+use crate::net::client::Incoming;
 
 #[test]
 fn names_are_capped_and_sanitised() {
@@ -120,8 +121,6 @@ fn welcome_carries_the_servers_worldgen_kind_and_cfg() {
 /// frees slots for a real join.
 #[test]
 fn silent_connections_beyond_the_handshake_cap_are_refused() {
-    use crate::net::client::Connection;
-
     let handle = spawn(0, Config { password: String::new(), seed: 1, ..Config::default() }).unwrap();
     let addr = handle.addr();
 
@@ -157,17 +156,15 @@ fn silent_connections_beyond_the_handshake_cap_are_refused() {
     drop(squatters);
     drop(squat_ep);
     drop(squat_rt);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        match Connection::connect("127.0.0.1", addr.port(), "late", "") {
-            Ok(_) => break,
-            Err(e) if Instant::now() < deadline => {
-                let _ = e;
-                thread::sleep(Duration::from_millis(100));
-            }
-            Err(e) => panic!("slots never freed after squatters left: {e}"),
+    let mut last = None;
+    let joined = eventually(Duration::from_secs(5), || match Connection::connect("127.0.0.1", addr.port(), "late", "") {
+        Ok(_) => true,
+        Err(e) => {
+            last = Some(e);
+            false
         }
-    }
+    });
+    assert!(joined, "slots never freed after squatters left: {last:?}");
 
     handle.stop();
 }
@@ -177,21 +174,6 @@ fn silent_connections_beyond_the_handshake_cap_are_refused() {
 /// buckets when everyone is gone: no leaked ids, no leaked keys.
 #[test]
 fn grid_never_leaks_entries_under_churn() {
-    use crate::net::client::Connection;
-
-    /// Poll `cond` for up to two seconds (server cleanup runs on its own
-    /// threads, so give it a moment rather than a fixed sleep).
-    fn eventually(mut cond: impl FnMut() -> bool) -> bool {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < deadline {
-            if cond() {
-                return true;
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-        false
-    }
-
     let handle = spawn(0, Config { password: String::new(), seed: 7, ..Config::default() }).unwrap();
     let port = handle.addr().port();
 
@@ -199,7 +181,7 @@ fn grid_never_leaks_entries_under_churn() {
         let mut a = Connection::connect("127.0.0.1", port, "a", "").unwrap();
         let mut b = Connection::connect("127.0.0.1", port, "b", "").unwrap();
         assert!(
-            eventually(|| handle.grid_entries() == 2),
+            eventually(Duration::from_secs(2), || handle.grid_entries() == 2),
             "round {round}: both joins should land in the grid"
         );
 
@@ -222,7 +204,7 @@ fn grid_never_leaks_entries_under_churn() {
         drop(a);
         drop(b);
         assert!(
-            eventually(|| handle.grid_entries() == 0 && handle.grid_buckets() == 0),
+            eventually(Duration::from_secs(2), || handle.grid_entries() == 0 && handle.grid_buckets() == 0),
             "round {round}: grid must drain to zero entries and zero buckets, got {} entries in {} buckets",
             handle.grid_entries(),
             handle.grid_buckets()
@@ -249,12 +231,7 @@ fn refused_joins_release_the_pre_auth_slot() {
     let drifted = crate::net::ContentId { law: id.law ^ 1, ..id };
     let reason = reject_reason(addr, &hello("eve", "pw", PROTOCOL_VERSION, drifted));
     assert!(reason.contains("content"), "{reason}");
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while handle.handshake_slots() != 0 && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(10));
-    }
-    assert_eq!(handle.handshake_slots(), 0, "refusals must release the pre-auth slot");
-    use crate::net::client::Connection;
+    assert!(eventually(Duration::from_secs(5), || handle.handshake_slots() == 0), "refusals must release the pre-auth slot");
     Connection::connect("127.0.0.1", addr.port(), "late", "pw").expect("refusals must free the slot");
     handle.stop();
 }
@@ -281,7 +258,6 @@ fn day_secs_clamps_zero_negative_and_huge() {
 
 #[test]
 fn join_leave_hooks_fire_in_order() {
-    use crate::net::client::Connection;
     use crate::net::hooks::Recorded;
 
     let (rec, log) = hooks::Recording::new("rec");
@@ -333,20 +309,19 @@ fn join_leave_hooks_fire_in_order() {
 /// whole, and the loading hold lifts only after the last cell.
 #[test]
 fn a_big_overlay_is_handed_to_the_game_over_several_polls() {
-    use crate::net::client::{APPLY_BUDGET, Connection, Incoming};
+    use crate::net::client::APPLY_BUDGET;
     let handle = flat(Config::default());
     let cells: Vec<_> = (0..(2 * APPLY_BUDGET + 100) as i32).map(|i| (i % 50, -5 - i / 2500, i / 50 % 50, "air".to_string())).collect();
     assert!(install_edits(&mut handle.state.lock_recover(), &cells).is_empty());
     let mut conn = Connection::connect("127.0.0.1", handle.addr().port(), "ada", "").unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
     let (mut got, mut polls) = (0, 0);
-    while !conn.snapshot_ready() && Instant::now() < deadline {
+    eventually(Duration::from_secs(10), || {
         let n = conn.poll().iter().filter(|e| matches!(e, Incoming::Mutation { .. })).count();
         assert!(n <= APPLY_BUDGET, "{n} cells in one poll");
         got += n;
         polls += usize::from(n > 0);
-        thread::sleep(Duration::from_millis(5));
-    }
+        conn.snapshot_ready()
+    });
     assert_eq!(got, cells.len(), "every cell, and only then the end of the overlay");
     assert!(polls >= 3);
     handle.stop();
@@ -356,18 +331,18 @@ fn a_big_overlay_is_handed_to_the_game_over_several_polls() {
 fn hello_rejections_name_the_protocol_before_a_full_decode() {
     let handle = spawn(0, Config { seed: 1, ..Config::default() }).unwrap();
     let addr = handle.addr();
-    let reason = reject_payload(addr, &[1, 0, 0, 0, 0]);
+    let reason = reject_reason(addr, &[1, 0, 0, 0, 0]);
     assert!(reason.contains("expected hello"), "{reason}");
     let mut old = vec![0u8];
     old.extend_from_slice(&12u32.to_le_bytes());
     old.extend_from_slice(&[0u8; 8]);
-    let reason = reject_payload(addr, &old);
+    let reason = reject_reason(addr, &old);
     assert!(reason.contains(&format!("server v{PROTOCOL_VERSION}")), "{reason}");
     assert!(reason.contains("client v12"), "{reason}");
     let mut trunc = vec![0u8];
     trunc.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
     trunc.extend_from_slice(&[0xff, 0x00]);
-    let reason = reject_payload(addr, &trunc);
+    let reason = reject_reason(addr, &trunc);
     assert!(reason.contains("malformed"), "{reason}");
     handle.stop();
 }
@@ -413,7 +388,6 @@ fn a_join_overlay_arrives_whole_and_grouped_by_chunk() {
 
 #[test]
 fn joiner_time_matches_the_clock_at_send() {
-    use crate::net::client::Connection;
     let handle = spawn(0, Config { seed: 1, day_secs: 600.0, ..Config::default() }).unwrap();
     {
         let mut state = handle.state.lock_recover();
@@ -421,17 +395,10 @@ fn joiner_time_matches_the_clock_at_send() {
         state.day_set = Instant::now() - Duration::from_secs(300);
     }
     let mut conn = Connection::connect("127.0.0.1", handle.addr().port(), "ada", "").unwrap();
-    let deadline = Instant::now() + Duration::from_secs(2);
-    let mut day = None;
-    while day.is_none() && Instant::now() < deadline {
-        day = conn.poll().into_iter().find_map(|e| match e {
-            crate::net::client::Incoming::Time { day, .. } => Some(day),
-            _ => None,
-        });
-        if day.is_none() {
-            thread::sleep(Duration::from_millis(10));
-        }
-    }
+    let day = await_event(&mut conn, Duration::from_secs(2), |e| match e {
+        Incoming::Time { day, .. } => Some(day),
+        _ => None,
+    });
     let day = day.expect("Welcome is consumed at connect; Time follows it");
     assert!((day - 0.5).abs() < 0.05, "live clock, got {day}");
     handle.stop();
@@ -439,7 +406,6 @@ fn joiner_time_matches_the_clock_at_send() {
 
 #[test]
 fn joins_over_ipv6_loopback_and_localhost() {
-    use crate::net::client::Connection;
     let handle = spawn(0, Config { seed: 1, ..Config::default() }).unwrap();
     let port = handle.addr().port();
     let v6 = Connection::connect("::1", port, "v6", "").expect("::1");
@@ -452,7 +418,6 @@ fn joins_over_ipv6_loopback_and_localhost() {
 
 #[test]
 fn duplicate_and_reserved_names_are_rejected() {
-    use crate::net::client::Connection;
     let handle = flat(Config::default());
     let port = handle.addr().port();
     let _ada = Connection::connect("127.0.0.1", port, "Ada", "").unwrap();
@@ -471,7 +436,6 @@ fn duplicate_and_reserved_names_are_rejected() {
 
 #[test]
 fn allow_list_admits_a_fully_listed_client() {
-    use crate::net::client::Connection;
     let handle = flat(Config {
         mods_allow: vec!["pwc.hotbar".into()],
         ..Config::default()
@@ -497,7 +461,6 @@ fn allow_list_admits_a_fully_listed_client() {
 
 #[test]
 fn denied_mod_is_refused_then_admitted_when_off() {
-    use crate::net::client::Connection;
     let handle = flat(Config {
         mods_deny: vec!["pwc.dev-toolkit".into()],
         ..Config::default()
@@ -516,7 +479,6 @@ fn denied_mod_is_refused_then_admitted_when_off() {
 
 #[test]
 fn no_mod_restriction_admits_everyone() {
-    use crate::net::client::Connection;
     let handle = flat(Config::default());
     let port = handle.addr().port();
     let mods = [("pwc.dev-toolkit".into(), "1.0.0".into()), ("pwc.hotbar".into(), "0.1.0".into())];
@@ -529,7 +491,6 @@ fn no_mod_restriction_admits_everyone() {
 /// that secret. The line is answered privately and reaches nobody else.
 #[test]
 fn an_operator_secret_is_proved_with_op_and_never_relayed() {
-    use crate::net::client::Connection;
     let handle = flat(Config {
         teleport: TeleportPolicy::Ops,
         ops: vec!["ada".into()],
@@ -547,12 +508,9 @@ fn an_operator_secret_is_proved_with_op_and_never_relayed() {
     ada.send_chat(chat::GLOBAL, "/op s3cret");
     assert!(chat_until(&mut ada, "operator").iter().any(|t| t == "you are now an operator"));
     ada.send_teleport(far);
-    let deadline = Instant::now() + Duration::from_secs(3);
-    let mut moved = false;
-    while !moved && Instant::now() < deadline {
-        moved = handle.state.lock_recover().players.values().any(|h| &*h.name == "ada" && h.pose.pos == far);
-        thread::sleep(Duration::from_millis(10));
-    }
+    let moved = eventually(Duration::from_secs(3), || {
+        handle.state.lock_recover().players.values().any(|h| &*h.name == "ada" && h.pose.pos == far)
+    });
     assert!(moved, "a proved operator may teleport");
     ada.send_chat(chat::GLOBAL, "hello");
     let heard = chat_until(&mut bob, "hello");
@@ -567,7 +525,6 @@ fn an_operator_secret_is_proved_with_op_and_never_relayed() {
 /// retry and take no handshake slot; a real client still joins through the retry.
 #[test]
 fn unvalidated_initials_take_no_handshake_slot() {
-    use crate::net::client::Connection;
     let handle = flat(Config::default());
     let server = SocketAddr::from((Ipv4Addr::LOCALHOST, handle.addr().port()));
     let relay = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();

@@ -14,23 +14,6 @@ pub(super) fn ack_reject(state: &State, out: &Outbox, req: u32, at: Pos) {
     let _ = out.try_send(ServerMessage::EditAck { req, accepted: false, rev: state.rev(at) }.frame());
 }
 
-/// Novel specs intern only while `block_count()` is below `limit`. A known spec resolves
-/// even at the line. `None` is malformed, or novel at/above the line.
-#[cfg(test)]
-pub(super) fn resolve_client_spec_within(
-    registry: &mut BlockRegistry,
-    spec: &str,
-    limit: usize,
-) -> Option<BlockId> {
-    if let Some(id) = registry.lookup_spec(spec) {
-        return Some(id);
-    }
-    if registry.block_count() >= limit {
-        return None;
-    }
-    registry.parse_spec(spec)
-}
-
 /// A known spec resolves with no quota spend. A novel one interns only while this
 /// client is under [`NOVEL_SPEC_QUOTA`] and the table stays under [`CLIENT_INTERN_LIMIT`].
 pub(super) fn take_novel_spec(state: &mut State, id: u32, spec: &str) -> Option<BlockId> {

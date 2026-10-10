@@ -335,6 +335,33 @@ struct Ctx {
     store: Option<Arc<Store>>,
 }
 
+impl Ctx {
+    /// The rules `config` sets for a world `generator` builds, whose content identity is `content`.
+    fn new(config: Config, generator: crate::world::terrain::Generator, content: crate::net::ContentId, store: Option<Arc<Store>>) -> Self {
+        let hooks = if config.hooks.is_empty() { None } else { Some(Mutex::new(hooks::Table::new(config.hooks))) };
+        let op_secrets: Vec<(String, String)> =
+            config.op_secrets.iter().map(|(name, secret)| (canonical_name(name), secret.clone())).collect();
+        Self {
+            password: config.password,
+            seed: config.seed,
+            content,
+            day_secs: clamp_day_secs(config.day_secs),
+            teleport: config.teleport,
+            noclip: config.noclip,
+            worldgen: config.worldgen,
+            terrain: config.terrain,
+            seams: Seams::new(generator.atlases().to_vec()),
+            generator,
+            hooks,
+            ops: canonical_ops(&config.ops, &op_secrets),
+            op_secrets,
+            mods_allow: config.mods_allow,
+            mods_deny: config.mods_deny,
+            store,
+        }
+    }
+}
+
 /// A joining client buffers broadcasts until Welcome and the overlay are queued.
 /// The bound is bytes and age, not a frame count: cosmetic frames are dropped
 /// first, and an essential frame that does not fit or outlives the age kicks.
@@ -480,31 +507,10 @@ pub(crate) fn spawn(port: u16, config: Config) -> io::Result<ServerHandle> {
     let shared = Arc::new(Mutex::new(state));
     debug_assert_ne!(WORLD_PLAYER, 1, "player ids start at 1; 0 is the world");
 
-    let hooks = if config.hooks.is_empty() {
-        None
-    } else {
-        Some(Mutex::new(hooks::Table::new(config.hooks)))
-    };
-    let op_secrets: Vec<(String, String)> =
-        config.op_secrets.iter().map(|(name, secret)| (canonical_name(name), secret.clone())).collect();
-    let ctx = Arc::new(Ctx {
-        password: config.password,
-        seed: loaded.seed,
-        content,
-        day_secs: clamp_day_secs(config.day_secs),
-        teleport: config.teleport,
-        noclip: config.noclip,
-        worldgen: loaded.worldgen,
-        terrain: loaded.terrain,
-        seams: Seams::new(generator.atlases().to_vec()),
-        generator,
-        hooks,
-        ops: canonical_ops(&config.ops, &op_secrets),
-        op_secrets,
-        mods_allow: config.mods_allow,
-        mods_deny: config.mods_deny,
-        store: loaded.store.map(Arc::new),
-    });
+    let autosave_every = config.autosave_every;
+    // The loaded world's seed and generator replace the flags'.
+    let config = Config { seed: loaded.seed, worldgen: loaded.worldgen, terrain: loaded.terrain, ..config };
+    let ctx = Arc::new(Ctx::new(config, generator, content, loaded.store.map(Arc::new)));
     if let Some(store) = &ctx.store {
         store.set_kept(kept);
         println!(
@@ -530,7 +536,7 @@ pub(crate) fn spawn(port: u16, config: Config) -> io::Result<ServerHandle> {
         let ctx = ctx.clone();
         let gate = save_gate.clone();
         let shutdown = shutdown.clone();
-        let every = config.autosave_every.max(Duration::from_secs(1));
+        let every = autosave_every.max(Duration::from_secs(1));
         thread::spawn(move || autosave_loop(shared, ctx, gate, shutdown, every))
     });
     let accept_shared = shared.clone();
@@ -566,10 +572,9 @@ fn canonical_ops(names: &[String], secrets: &[(String, String)]) -> Vec<String> 
     for name in names {
         let canon = canonical_name(name);
         let listed = ops.iter().any(|op: &String| op == &canon) || secrets.iter().any(|(have, _)| have == &canon);
-        if canon.is_empty() || listed {
-            continue;
+        if !listed {
+            ops.push(canon);
         }
-        ops.push(canon);
     }
     ops
 }

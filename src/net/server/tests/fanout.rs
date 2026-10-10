@@ -36,11 +36,8 @@ fn mod_data_relays_only_to_the_visible_set() {
 /// truncate) on negative coordinates.
 #[test]
 fn grid_membership_follows_movement_across_bucket_borders() {
-    let (out, _rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
     let start = DVec3::new(10.0, 20.0, 10.0);
-    let mut players = HashMap::new();
-    players.insert(1u32, test_player(start, out, test_kick()));
-    let mut state = test_state(players);
+    let (mut state, [_rx]) = roster([(1, start)]);
     state.grid_insert(1, start);
     assert_eq!(state.grid.get(&(0, 0, 0)).map(Vec::len), Some(1));
     let shared = Arc::new(Mutex::new(state));
@@ -157,8 +154,6 @@ fn visibility_changes_match_full_roster_distance_checks() {
 /// grid entries genuinely follow the players around.
 #[test]
 fn far_players_hear_no_moves_until_adjacent() {
-    use crate::net::client::Connection;
-
     let handle = spawn(0, Config { password: String::new(), seed: 4242, ..Config::default() }).unwrap();
     let port = handle.addr().port();
     let mut a = Connection::connect("127.0.0.1", port, "walnutty", "").unwrap();
@@ -232,7 +227,7 @@ fn interest_at_the_radius_bucket_edges_wrap_and_three_bucket_hops() {
     assert_eq!(bucket_of(just_inside), (0, 0, 0));
 
     // i32-wrap-like coordinates clamp through block_coord; membership stays 1:1.
-    age_move_state(&mut state, 1);
+    age_state(&mut state, 1, Duration::from_secs(10));
     let wrap = DVec3::new(crate::math::WORLD_BORDER, 20.0, crate::math::WORLD_BORDER);
     sends.clear();
     commit_pose(&mut state, 1, wrap, None, &mut sends);
@@ -329,12 +324,7 @@ fn bootstrap_backlog_overflow_kicks_without_poisoning_the_lock() {
 
 #[test]
 fn hook_denied_chat_reaches_only_the_sender() {
-    let (out1, rx1) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
-    let (out2, rx2) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
-    let mut players = HashMap::new();
-    players.insert(1u32, test_player(DVec3::new(8.5, 20.0, 8.5), out1, test_kick()));
-    players.insert(2u32, test_player(DVec3::new(9.5, 20.0, 8.5), out2, test_kick()));
-    let shared = Arc::new(Mutex::new(test_state(players)));
+    let (shared, [rx1, rx2]) = lobby([(1, DVec3::new(8.5, 20.0, 8.5)), (2, DVec3::new(9.5, 20.0, 8.5))]);
     let (mut rec, _) = hooks::Recording::new("mute");
     rec.deny_chat = true;
     rec.reason = Arc::from("no talking");
@@ -342,7 +332,7 @@ fn hook_denied_chat_reaches_only_the_sender() {
 
     on_chat(&shared, Some(&table), 1, chat::GLOBAL, "hello");
 
-    match &drain_msgs(&rx1)[..] {
+    match &drain(&rx1)[..] {
         [ServerMessage::Chat { from_id, from_name, text, .. }] => {
             assert_eq!(*from_id, 0);
             assert_eq!(&**from_name, "server");
@@ -350,7 +340,7 @@ fn hook_denied_chat_reaches_only_the_sender() {
         }
         other => panic!("sender should hear the deny reason, got {other:?}"),
     }
-    assert!(drain_msgs(&rx2).is_empty(), "denied chat must not reach peers");
+    assert!(drain(&rx2).is_empty(), "denied chat must not reach peers");
 }
 
 #[test]

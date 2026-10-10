@@ -30,11 +30,8 @@ fn nonfinite_angles_do_not_enter_authoritative_state() {
 /// client back with an authoritative `Position`.
 #[test]
 fn implausible_moves_are_rejected_and_corrected() {
-    let (out, rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
     let start = DVec3::new(8.5, 20.0, 8.5);
-    let mut players = HashMap::new();
-    players.insert(1u32, test_player(start, out, test_kick()));
-    let shared = Arc::new(Mutex::new(test_state(players)));
+    let (shared, [rx]) = lobby([(1, start)]);
 
     // A plausible walk step commits.
     let step = DVec3::new(10.5, 20.0, 8.5);
@@ -64,12 +61,9 @@ fn implausible_moves_are_rejected_and_corrected() {
 /// (envelope exempt), refused it snaps the client back.
 #[test]
 fn teleport_is_permissioned() {
-    let (out, rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
     let start = DVec3::new(8.5, 20.0, 8.5);
     let far = DVec3::new(50_000.5, 30.0, -2_000.5);
-    let mut players = HashMap::new();
-    players.insert(1u32, test_player(start, out, test_kick()));
-    let shared = Arc::new(Mutex::new(test_state(players)));
+    let (shared, [rx]) = lobby([(1, start)]);
 
     on_teleport(&shared, &test_ctx(true), 1, far, &mut Vec::new());
     assert_eq!(shared.lock_recover().players[&1].pose.pos, far, "allowed teleport commits");
@@ -88,11 +82,8 @@ fn teleport_is_permissioned() {
 
 #[test]
 fn burst_faster_than_cap_then_a_legal_move_corrects_once_then_accepts() {
-    let (out, rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
     let start = DVec3::new(8.5, 20.0, 8.5);
-    let mut players = HashMap::new();
-    players.insert(1u32, test_player(start, out, test_kick()));
-    let shared = Arc::new(Mutex::new(test_state(players)));
+    let (shared, [rx]) = lobby([(1, start)]);
     let forged = DVec3::new(4000.0, 20.0, 4000.0);
     for _ in 0..8 {
         walk(&shared, 1, forged, 0.0, 0.0, Stance::Standing);
@@ -117,12 +108,9 @@ fn burst_faster_than_cap_then_a_legal_move_corrects_once_then_accepts() {
 
 #[test]
 fn long_silence_then_a_legitimate_teleport_obeys_the_flag() {
-    let (out, rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
     let start = DVec3::new(8.5, 20.0, 8.5);
     let dest = DVec3::new(50_000.5, 30.0, -2_000.5);
-    let mut players = HashMap::new();
-    players.insert(1u32, test_player(start, out, test_kick()));
-    let shared = Arc::new(Mutex::new(test_state(players)));
+    let (shared, [rx]) = lobby([(1, start)]);
     age_move(&shared, 1);
     on_teleport(&shared, &test_ctx(true), 1, dest, &mut Vec::new());
     assert_eq!(shared.lock_recover().players[&1].pose.pos, dest);
@@ -228,11 +216,8 @@ fn fall_flight_and_cruise_follow_the_reported_speed() {
 /// whether or not the client claimed a mod.
 #[test]
 fn non_operator_time_and_teleport_are_refused_with_a_reason() {
-    let (out, rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
     let start = DVec3::new(8.5, 20.0, 8.5);
-    let mut players = HashMap::new();
-    players.insert(1u32, test_player(start, out, test_kick()));
-    let shared = Arc::new(Mutex::new(test_state(players)));
+    let (shared, [rx]) = lobby([(1, start)]);
     let mut ops = test_ctx(true);
     ops.teleport = TeleportPolicy::Ops;
     ops.ops = vec!["p".into()];
@@ -281,11 +266,8 @@ fn non_operator_time_and_teleport_are_refused_with_a_reason() {
 #[test]
 fn flyspeed_above_the_server_cap_is_snapped() {
     let cap = 30.0 * crate::math::PER_METER;
-    let (out, rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
     let start = DVec3::new(8.5, 40.0, 8.5);
-    let mut players = HashMap::new();
-    players.insert(1u32, test_player(start, out, test_kick()));
-    let shared = Arc::new(Mutex::new(test_state(players)));
+    let (shared, [rx]) = lobby([(1, start)]);
     shared.lock_recover().max_speed = cap;
 
     let near = DVec3::new(start.x + 10.0 * crate::math::PER_METER, start.y, start.z);
@@ -548,11 +530,8 @@ fn movement_credit_keeps_its_fraction_when_speed_changes() {
 #[test]
 fn split_moves_gain_nothing_over_the_speed_cap() {
     let cap = 30.0 * crate::math::PER_METER;
-    let (out, _rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
     let start = DVec3::new(8.5, 40.0, 8.5);
-    let mut players = HashMap::new();
-    players.insert(1u32, test_player(start, out, test_kick()));
-    let shared = Arc::new(Mutex::new(test_state(players)));
+    let (shared, [_rx]) = lobby([(1, start)]);
     shared.lock_recover().max_speed = cap;
     let anchored = Instant::now();
     shared.lock_recover().players.get_mut(&1).unwrap().last_move = anchored;
@@ -567,10 +546,7 @@ fn split_moves_gain_nothing_over_the_speed_cap() {
     assert!(covered >= MOVE_FLOOR - 5.0, "the burst is spendable, covered {covered}");
 
     let fast = 1000.0 * crate::math::PER_METER;
-    let (out, rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
-    let mut players = HashMap::new();
-    players.insert(1u32, test_player(start, out, test_kick()));
-    let shared = Arc::new(Mutex::new(test_state(players)));
+    let (shared, [rx]) = lobby([(1, start)]);
     shared.lock_recover().players.get_mut(&1).unwrap().last_move = Instant::now() - Duration::from_millis(133);
     let step = fast * 0.033;
     for i in 1..=4 {
