@@ -7,7 +7,7 @@
 use field::hash32_3;
 
 use super::nebula::{Nebula, System, CELL};
-use super::{cbrt, Params};
+use super::{cbrt, Params, M_HOME};
 use crate::gravity::G;
 
 /// Density sizes are measured with before any body has minerals.
@@ -67,11 +67,23 @@ fn unit(h: u32) -> f64 {
 }
 
 /// The system's parcels: `p.parcels` of them, a truncated α=2 power law of masses scaled to the
-/// system's mass (raw mass times `scale`), each on a cell picked by cell mass.
+/// system's mass (raw mass times `scale`). With `p.sink_spread` > 0 each sits near a basin's sink
+/// (picked by basin mass, an approximately normal scatter of `sink_spread` cells); otherwise on a
+/// cell picked by cell mass.
 fn parcels(neb: &Nebula, sys: &System, scale: f64, seed: u32, p: &Params) -> Vec<Proto> {
-    let mut cum = Vec::with_capacity(sys.cells.len());
+    let sinks = p.sink_spread > 0.0;
+    let mut merged: Vec<(u32, u64)> = Vec::new();
+    for &(cell, m) in &sys.sinks {
+        if merged.is_empty() || m as f64 >= p.sink_min * sys.mass {
+            merged.push((cell, m));
+        } else {
+            merged[0].1 += m;
+        }
+    }
+    let places = if sinks { &merged } else { &sys.cells };
+    let mut cum = Vec::with_capacity(places.len());
     let mut acc = 0u64;
-    for &(_, m) in &sys.cells {
+    for &(_, m) in places {
         acc += m;
         cum.push(acc);
     }
@@ -80,12 +92,20 @@ fn parcels(neb: &Nebula, sys: &System, scale: f64, seed: u32, p: &Params) -> Vec
         .map(|k| {
             let h = |salt: u32| hash32_3(seed, k, 0, 0, salt);
             let pick = ((h(1) as u128 * acc as u128) >> 32) as u64;
-            let cell = sys.cells[cum.partition_point(|&v| v <= pick)].0;
+            let cell = places[cum.partition_point(|&v| v <= pick)].0;
             let c = Nebula::cell_centre(cell);
             let comp = neb.cells[cell as usize].comp;
+            let scatter = |a: u32| {
+                if sinks {
+                    let u = unit(h(10 + 3 * a)) + unit(h(11 + 3 * a)) + unit(h(12 + 3 * a)) - 1.5;
+                    u * 2.0 * p.sink_spread * CELL
+                } else {
+                    (unit(h(2 + a)) - 0.5) * CELL
+                }
+            };
             Proto {
                 mass: lo / (1.0 - unit(h(5)) * (1.0 - lo / hi)),
-                pos: std::array::from_fn(|a| c[a] + (unit(h(2 + a as u32)) - 0.5) * CELL),
+                pos: std::array::from_fn(|a| c[a] + scatter(a as u32)),
                 comp: std::array::from_fn(|a| comp[a] as f64 + (unit(h(6 + a as u32)) - 0.5) * 2.0 * JITTER),
                 heat_in: 0.0,
                 impacts: Vec::new(),
@@ -192,7 +212,7 @@ pub fn accrete(
             let (big, small) = if a.mass >= b.mass { (&a, &b) } else { (&b, &a) };
             let r = half_of(a.mass, PROVISIONAL_DENSITY) + half_of(b.mass, PROVISIONAL_DENSITY);
             let per_mass = G * a.mass * b.mass / (r * (a.mass + b.mass));
-            let single = a.pair.is_none() && b.pair.is_none();
+            let single = a.pair.is_none() && b.pair.is_none() && small.mass >= p.bin_min * M_HOME;
             let next = if single && small.mass >= p.q_bin * big.mass && binds(&a, &b, per_mass) {
                 binaries += 1;
                 let d: [f64; 3] = std::array::from_fn(|k| b.pos[k] - a.pos[k]);

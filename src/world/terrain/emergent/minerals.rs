@@ -1,18 +1,20 @@
 //! Stage 4: a body's minerals, found by the law. A radial column of reservoirs is drawn around the
-//! body's composition and differentiates under the law's own contact process (even pairs, then odd
-//! pairs, until every contact rests). What survives repair (every pair of occurrences holds) and
-//! the rest check (dormant against its neighbours and against every universal material) is the
-//! body's suite, densest first: core to crust. A degenerate result falls back to a suite of
-//! palette roles.
+//! body's composition, every occurrence a palette gap away from every palette element and from the
+//! others (the palette search's own rule), and differentiates under the law's own contact process
+//! (even pairs, then odd pairs, until every contact rests). What survives repair (every pair of
+//! occurrences holds) is what the body is made of ([`Found`]). Its suite is then checked against the
+//! ground it will lie in: the layers beside each mineral and the palette roles its painter uses
+//! ([`Ground`]). Optionally a restless mineral first leaches: it loses the occurrence the contact
+//! would move, until it rests. A degenerate result falls back to a suite of palette roles.
 
 use std::sync::OnceLock;
 
 use field::hash32_3;
-use material::{observe, visual, Block, Configuration, Contact, Element, Law, CAPACITY};
+use material::{fit_raw, observe, visual, Block, Change, Configuration, Contact, Element, Law, CAPACITY};
 
 use super::Params;
 use crate::mechanics::material::{Params as Matter, YIELD_FLOOR};
-use crate::world::terrain::palette::{self, cohesive, dormant, Need};
+use crate::world::terrain::palette::{self, apart, by_axis0, cohesive, crowded, dormant, Need};
 
 /// Contact operations one pair may take per sweep.
 const MAX_OPS: u32 = 4 * CAPACITY as u32;
@@ -31,9 +33,73 @@ const CLASS_ROLES: [&[&str]; 4] = [
     &["ochre", "sandstone", "sandstone1", "sandstone2", "sandstone3", "clay", "rust"],
     &["ice", "snow", "salt", "frost", "regolith"],
 ];
-/// Universal materials besides the underground set that generated matter may touch: surface
-/// dressing and timber.
+/// Universal materials besides the underground set that the face painter puts in the ground.
 const SURFACE: &[&str] = &["grass", "meadow", "snow", "ice", "timber"];
+/// Ground roles of the round painters (`round.rs`: cover, sub-surface, strata, deep fill and heart).
+const VERDANT: &[&str] =
+    &["frost", "ice", "snow", "gravel", "rock", "rock1", "rock2", "rock3", "moss", "soil", "grass", "meadow", "deeprock", "magma"];
+const MOON: &[&str] = &[
+    "snow", "ice", "frost", "magma", "glowshroom", "basalt", "redsand", "ochre", "regolith", "gravel", "rock", "rock1", "rock2",
+    "rock3", "deeprock",
+];
+const EMBER: &[&str] = &["magma", "basalt", "deeprock"];
+/// What touches a body's bulk (the suite in P2) under each painter: the face painter's column
+/// bottom and interior features (`shape.rs` strata, `deep/`), the round painters' rock bands above
+/// their deep fill, and the Ember's basalt and magma.
+const FACE_BULK: &[&str] = &[
+    "abyss", "deeprock", "rock", "glowcap", "star", "glowshroom", "crystal", "magma", "marble", "lamp", "rail", "obsidian",
+    "limestone", "darkwood", "bark", "core", "stem", "soil", "moss", "lichen",
+];
+const ROUND_BULK: &[&str] = &["rock", "rock1", "rock2", "rock3"];
+const EMBER_BULK: &[&str] = &["basalt", "magma"];
+/// Steps one weathering contact may take.
+const WEATHER_STEPS: u32 = 64;
+/// Passes over a ground's roles while weathering has not settled.
+const WEATHER_PASSES: u32 = 8;
+/// Draws per occurrence before the gap rule gives up on it.
+const DRAW_TRIES: i32 = 64;
+
+/// The painter whose ground a body's minerals lie in (P2 picks painters by traits): the face
+/// painter (the start world and cubes), or the round painters' Verdant, Moon and Ember styles.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Ground {
+    Face,
+    Verdant,
+    Moon,
+    Ember,
+}
+
+impl Ground {
+    /// Every ground, in index order.
+    pub const ALL: [Ground; 4] = [Ground::Face, Ground::Verdant, Ground::Moon, Ground::Ember];
+
+    /// The roles a suite meets: the painter's whole ground vocabulary, or (`bulk`) only what
+    /// touches the bulk the suite becomes in P2.
+    fn roles(self, bulk: bool) -> Vec<&'static str> {
+        match (self, bulk) {
+            (Ground::Face, false) => palette::UNDERGROUND.iter().chain(SURFACE).copied().collect(),
+            (Ground::Verdant, false) => VERDANT.to_vec(),
+            (Ground::Moon, false) => MOON.to_vec(),
+            (Ground::Ember, false) => EMBER.to_vec(),
+            (Ground::Face, true) => FACE_BULK.to_vec(),
+            (Ground::Verdant | Ground::Moon, true) => ROUND_BULK.to_vec(),
+            (Ground::Ember, true) => EMBER_BULK.to_vec(),
+        }
+    }
+}
+
+/// What a body is made of before any ground is known: the law's minerals after differentiation and
+/// repair, densest first.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Found {
+    pub comp: [i8; 4],
+    pub seed: u32,
+    pub minerals: Vec<Mineral>,
+    pub dropped: u16,
+    pub sweeps: u8,
+    /// Occurrences the gap rule could not place.
+    pub skipped: u16,
+}
 
 /// One layer of a suite.
 #[derive(Clone, Debug, PartialEq)]
@@ -82,27 +148,34 @@ pub struct Suite {
     /// Why the suite fell back: 1 fewer than three distinct minerals, 2 too little colour spread,
     /// 4 the rest check replaced more than half.
     pub causes: u8,
-    /// The law's own minerals after repair, densest first; `replaced` marks the ones the rest check
-    /// rejected.
+    /// The law's own minerals after repair (and leaching), densest first; `replaced` marks the ones
+    /// the rest check rejected.
     pub own: Vec<Mineral>,
+    /// The ground it was checked against.
+    pub ground: Ground,
+    /// Occurrences leaching removed.
+    pub leached: u16,
 }
 
 /// Palette materials the suite is checked and repaired against, built once per process for the
 /// current law.
 struct Reference {
     palette: Vec<palette::Entry>,
-    /// Universal materials: anything generated matter may touch.
-    universal: Vec<Block>,
+    /// The roles each ground puts next to a body's minerals, by [`Ground`] index: the whole
+    /// vocabulary, then what touches the bulk.
+    touch: [[Vec<Block>; 4]; 2],
     /// Plain roles a failed mineral may be replaced by: (block, colour, configuration).
     plain: Vec<(Block, [u8; 3], Configuration)>,
     reagents: Vec<Block>,
+    /// Every palette element, grouped by axis 0 for the gap rule.
+    used: (Vec<Element>, [usize; 257]),
 }
 
 fn reference(law: &Law) -> &'static Reference {
     static REF: OnceLock<Reference> = OnceLock::new();
     REF.get_or_init(|| {
         let p = palette::of(law);
-        let universal = palette::UNDERGROUND.iter().chain(SURFACE).map(|l| role_block(&p, l)).collect();
+        let touch = [false, true].map(|bulk| Ground::ALL.map(|g| g.roles(bulk).iter().map(|l| role_block(&p, l)).collect()));
         let mut plain = Vec::new();
         let mut reagents = Vec::new();
         for (role, e) in palette::ROLES.iter().zip(&p) {
@@ -113,7 +186,8 @@ fn reference(law: &Law) -> &'static Reference {
                 _ => {}
             }
         }
-        Reference { palette: p, universal, plain, reagents }
+        let elements: Vec<Element> = p.iter().flat_map(|e| e.config.elements().iter().copied()).collect();
+        Reference { used: by_axis0(&elements), palette: p, touch, plain, reagents }
     })
 }
 
@@ -121,12 +195,24 @@ fn role_block(p: &[palette::Entry], label: &str) -> Block {
     Block::of(&p.iter().find(|e| e.label == label).expect("a palette role").config)
 }
 
-/// How many universal materials a mineral would react with, out of how many (a lab diagnostic of
-/// the rest check).
-pub fn restless_against(law: &Law, m: &Mineral) -> (usize, usize) {
+/// How a mineral meets a ground's roles (a lab diagnostic): how many it rests with, how many would
+/// first lose it an occurrence, and how many would first push one into it.
+pub fn reactions(law: &Law, m: &Mineral, ground: Ground, p: &Params) -> [usize; 3] {
     let r = reference(law);
     let b = Block::of(&m.config);
-    (r.universal.iter().filter(|u| !dormant(&b, u)).count(), r.universal.len())
+    let mut out = [0; 3];
+    for u in &r.touch[p.bulk as usize][ground as usize] {
+        let into = match (Contact::new(&b, u).peek(), Contact::new(u, &b).peek()) {
+            (None, None) => {
+                out[0] += 1;
+                continue;
+            }
+            (Some(op), _) => matches!(op.change, Change::Transfer { from: 1, .. }),
+            (None, Some(op)) => matches!(op.change, Change::Transfer { from: 0, .. }),
+        };
+        out[1 + into as usize] += 1;
+    }
+    out
 }
 
 /// Yield stress of matter of cohesion `cohesion` (Q8): the prototype response's four decades,
@@ -159,29 +245,40 @@ fn mineral(law: &Law, block: &Block, replaced: bool) -> Mineral {
     }
 }
 
-/// One occurrence within ring distance `spread` of `centre`, by rejection.
-fn draw(centre: Element, spread: u32, seed: u32, r: i32, k: i32) -> Element {
+/// One occurrence within ring distance `spread` of `centre` (try `t` of a rejection sequence).
+fn draw(centre: Element, spread: u32, seed: u32, r: i32, k: i32, t: i32) -> Option<Element> {
     let span = 2 * spread + 1;
-    for t in 0..64 {
-        let h = hash32_3(seed, r, k, t, 0x0CC0).to_le_bytes();
-        let off: [i32; 4] = std::array::from_fn(|a| (h[a] as u32 * span / 256) as i32 - spread as i32);
-        if off.iter().map(|v| v.unsigned_abs()).sum::<u32>() <= spread {
-            return Element::new(std::array::from_fn(|a| centre.0[a].wrapping_add(off[a] as u8)));
-        }
-    }
-    centre
+    let h = hash32_3(seed, r, k, t, 0x0CC0).to_le_bytes();
+    let off: [i32; 4] = std::array::from_fn(|a| (h[a] as u32 * span / 256) as i32 - spread as i32);
+    (off.iter().map(|v| v.unsigned_abs()).sum::<u32>() <= spread)
+        .then(|| Element::new(std::array::from_fn(|a| centre.0[a].wrapping_add(off[a] as u8))))
 }
 
-/// The reservoirs of the column, before differentiation.
-fn column(centre: Element, seed: u32, p: &Params) -> Vec<Block> {
-    (0..p.reservoirs as i32)
-        .map(|r| {
+/// The reservoirs of the column, before differentiation. With `p.gap` every occurrence keeps the
+/// palette's gap from every palette element and from the column's other occurrences. Returns the
+/// reservoirs and the occurrences that found no place.
+fn column(r: &Reference, centre: Element, seed: u32, p: &Params) -> (Vec<Block>, u16) {
+    let mut placed: Vec<Element> = Vec::new();
+    let mut skipped = 0u16;
+    let blocks = (0..p.reservoirs as i32)
+        .map(|res| {
             let span = p.occ_max.max(p.occ_min) - p.occ_min + 1;
-            let n = p.occ_min + hash32_3(seed, r, -1, 0, 0x5EED) % span;
-            let elems: Vec<Element> = (0..n.min(CAPACITY as u32) as i32).map(|k| draw(centre, p.spread, seed, r, k)).collect();
-            Block::new(&elems).expect("within capacity")
+            let n = (p.occ_min + hash32_3(seed, res, -1, 0, 0x5EED) % span).min(CAPACITY as u32) as i32;
+            let first = placed.len();
+            for k in 0..n {
+                let fits = |e: &Element| {
+                    !p.gap || (!crowded(&r.used.0, &r.used.1, *e) && placed.iter().all(|&u| apart(*e, u)))
+                };
+                let found = (0..DRAW_TRIES).filter_map(|t| draw(centre, p.spread, seed, res, k, t)).find(fits);
+                match found {
+                    Some(e) => placed.push(e),
+                    None => skipped += 1,
+                }
+            }
+            Block::new(&placed[first..]).expect("within capacity")
         })
-        .collect()
+        .collect();
+    (blocks, skipped)
 }
 
 /// Run the law between vertically adjacent reservoirs, even pairs then odd pairs, until every
@@ -295,6 +392,8 @@ fn finish(r: &Reference, minerals: Vec<Mineral>, fallback: bool) -> Suite {
         hosts: hosts.min(255) as u8,
         causes: 0,
         own: Vec::new(),
+        ground: Ground::Face,
+        leached: 0,
         minerals,
         fallback,
     }
@@ -328,11 +427,11 @@ pub fn role_suite(law: &Law, label: &str) -> Suite {
     finish(r, vec![mineral(law, &role_block(&r.palette, label), false)], true)
 }
 
-/// The suite of a body of composition `comp` (offsets from `base`).
-pub fn suite(law: &Law, base: Element, comp: [i8; 4], seed: u32, p: &Params) -> Suite {
+/// What a body of composition `comp` (offsets from `base`) is made of.
+pub fn found(law: &Law, base: Element, comp: [i8; 4], seed: u32, p: &Params) -> Found {
     let r = reference(law);
     let centre = Element::new(std::array::from_fn(|a| base.0[a].wrapping_add(comp[a] as u8)));
-    let mut blocks = column(centre, seed, p);
+    let (mut blocks, skipped) = column(r, centre, seed, p);
     let sweeps = differentiate(&mut blocks, p.sweeps);
     let mut dropped = 0u16;
     for b in &mut blocks {
@@ -347,14 +446,126 @@ pub fn suite(law: &Law, base: Element, comp: [i8; 4], seed: u32, p: &Params) -> 
         }
     }
     minerals.sort_by(|a, b| b.amount.cmp(&a.amount).then_with(|| a.config.cmp(&b.config)));
+    Found { comp, seed, minerals, dropped, sweeps: sweeps as u8, skipped }
+}
+
+/// The block's occurrence to drop for `change`, the block being side `side` of the contact: the
+/// one that leaves it, or the one that pulls hardest on the occurrence it would draw in.
+fn leaving(block: &Block, change: Change, side: u8) -> Element {
+    match change {
+        Change::Transfer { from, element } if from == side => element,
+        Change::Swap { from_a, from_b } => {
+            if side == 0 {
+                from_a
+            } else {
+                from_b
+            }
+        }
+        Change::Transfer { element, .. } => {
+            *block.elements().iter().max_by_key(|&&m| (fit_raw(m, element), std::cmp::Reverse(m))).expect("not empty")
+        }
+    }
+}
+
+/// Leach `block` against `other` until they rest, dropping one occurrence at a time (the block as
+/// the contact's A first, then as B). Returns the occurrences dropped.
+fn leach(block: &mut Block, other: &Block) -> u16 {
+    let mut dropped = 0;
+    while !block.is_empty() && !dormant(block, other) {
+        let drop = match Contact::new(block, other).peek() {
+            Some(op) => leaving(block, op.change, 0),
+            None => leaving(block, Contact::new(other, block).peek().expect("not dormant").change, 1),
+        };
+        let k = block.elements().iter().position(|&e| e == drop).expect("an occurrence of the block");
+        let rest: Vec<Element> = block.elements().iter().enumerate().filter(|&(i, _)| i != k).map(|(_, &e)| e).collect();
+        *block = Block::new(&rest).expect("smaller");
+        dropped += 1;
+    }
+    dropped
+}
+
+/// Weather `block` against an endless bath of `other` until they rest: the contact's own
+/// operation is applied to the block alone (an occurrence it loses goes to the bath, one it gains
+/// comes from it). Returns the occurrences that moved.
+fn weather(block: &mut Block, other: &Block) -> u16 {
+    let mut moved = 0;
+    for _ in 0..WEATHER_STEPS {
+        if block.is_empty() || dormant(block, other) {
+            break;
+        }
+        let (change, side) = match Contact::new(block, other).peek() {
+            Some(op) => (op.change, 0),
+            None => (Contact::new(other, block).peek().expect("not dormant").change, 1),
+        };
+        let (lose, gain) = match change {
+            Change::Transfer { from, element } if from == side => (Some(element), None),
+            Change::Transfer { element, .. } => (None, Some(element)),
+            Change::Swap { from_a, from_b } => {
+                if side == 0 {
+                    (Some(from_a), Some(from_b))
+                } else {
+                    (Some(from_b), Some(from_a))
+                }
+            }
+        };
+        let mut next: Vec<Element> = block.elements().to_vec();
+        if let Some(e) = lose {
+            next.remove(next.iter().position(|&x| x == e).expect("an occurrence of the block"));
+        }
+        if let Some(e) = gain {
+            if next.len() == CAPACITY {
+                break;
+            }
+            next.push(e);
+        }
+        *block = Block::new(&next).expect("within capacity");
+        moved += 1;
+    }
+    moved
+}
+
+/// The suite of `f` in `ground`: each mineral (leached first with `p.leach`) must rest against the
+/// layers beside it and every role of the ground; a restless one is replaced by the nearest plain
+/// palette role, and a degenerate result falls back to a palette suite.
+pub fn suite(law: &Law, f: &Found, ground: Ground, p: &Params) -> Suite {
+    let r = reference(law);
+    let touch = &r.touch[p.bulk as usize][ground as usize];
+    let mut leached = 0u16;
+    let mut minerals: Vec<Mineral> = Vec::with_capacity(f.minerals.len());
+    for m in &f.minerals {
+        let mut b = Block::of(&m.config);
+        // Leach (1) or weather (2) to rest against every role; a change can wake an earlier role,
+        // so repeat.
+        for _ in 0..WEATHER_PASSES {
+            let mut moved = 0;
+            for u in touch {
+                moved += match p.leach {
+                    1 => leach(&mut b, u),
+                    2 => weather(&mut b, u),
+                    _ => 0,
+                };
+            }
+            leached += moved;
+            if moved == 0 || b.is_empty() {
+                break;
+            }
+        }
+        repair(&mut b);
+        if b.is_empty() {
+            continue;
+        }
+        let m = mineral(law, &b, false);
+        if !minerals.iter().any(|x| x.config == m.config) {
+            minerals.push(m);
+        }
+    }
+    minerals.sort_by(|a, b| b.amount.cmp(&a.amount).then_with(|| a.config.cmp(&b.config)));
     let distinct = minerals.len();
-    // Rest check: dormant against the layers beside it and against every universal material.
-    // A restless layer is marked; the suite takes the nearest plain palette role in its place.
     let blocks: Vec<Block> = minerals.iter().map(|m| Block::of(&m.config)).collect();
     for i in 0..minerals.len() {
         let beside = |j: usize| j < blocks.len() && j != i && !dormant(&blocks[i], &blocks[j]);
         minerals[i].replaced =
-            beside(i.wrapping_sub(1)) || beside(i + 1) || r.universal.iter().any(|u| !dormant(&blocks[i], u));
+            beside(i.wrapping_sub(1)) || beside(i + 1) || touch.iter().any(|u| !dormant(&blocks[i], u));
     }
     let mut layers: Vec<Mineral> = minerals
         .iter()
@@ -365,8 +576,8 @@ pub fn suite(law: &Law, base: Element, comp: [i8; 4], seed: u32, p: &Params) -> 
     let causes = (distinct < 3) as u8
         | ((colour_spread(&layers) < p.colour_min) as u8) << 1
         | ((replaced * 2 > minerals.len()) as u8) << 2;
-    let mut s = if causes != 0 { palette_suite(law, comp, seed, 6) } else { finish(r, layers, false) };
-    (s.distinct, s.dropped, s.sweeps, s.causes) = (distinct as u8, dropped, sweeps as u8, causes);
-    s.own = minerals;
+    let mut s = if causes != 0 { palette_suite(law, f.comp, f.seed, 6) } else { finish(r, layers, false) };
+    (s.distinct, s.dropped, s.sweeps, s.causes) = (distinct as u8, f.dropped, f.sweeps, causes);
+    (s.own, s.ground, s.leached) = (minerals, ground, leached);
     s
 }

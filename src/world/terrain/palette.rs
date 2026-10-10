@@ -576,7 +576,7 @@ struct PlainBank {
 }
 
 /// `true` when the short ring distance is at least [`GAP`]. Stops at the first axis that settles it.
-fn apart(a: Element, b: Element) -> bool {
+pub(crate) fn apart(a: Element, b: Element) -> bool {
     let mut d = 0u32;
     for i in 0..4 {
         let s = a.0[i].wrapping_sub(b.0[i]);
@@ -589,7 +589,7 @@ fn apart(a: Element, b: Element) -> bool {
 }
 
 /// Used elements grouped by axis 0, so a gap test only looks at the coordinates within [`GAP`].
-fn by_axis0(used: &[Element]) -> (Vec<Element>, [usize; 257]) {
+pub(crate) fn by_axis0(used: &[Element]) -> (Vec<Element>, [usize; 257]) {
     let mut elems = used.to_vec();
     elems.sort_unstable_by_key(|e| e.0[0]);
     let mut start = [0usize; 257];
@@ -604,7 +604,7 @@ fn by_axis0(used: &[Element]) -> (Vec<Element>, [usize; 257]) {
     (elems, start)
 }
 
-fn crowded(elems: &[Element], start: &[usize; 257], e: Element) -> bool {
+pub(crate) fn crowded(elems: &[Element], start: &[usize; 257], e: Element) -> bool {
     let x = e.0[0];
     let hit = |u0: u8| {
         let i = u0 as usize;

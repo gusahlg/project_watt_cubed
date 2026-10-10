@@ -12,9 +12,9 @@ const SEEDS: [u64; 3] = [0xC0FFEE, 42, 1_791_184_794_939_118_871];
 
 /// `(nebula, catalog, suites, start globe at G=32)` per seed.
 const PINS: [[u64; 4]; 3] = [
-    [0xc9eb33927aa562fa, 0x6c5db792ae9566a5, 0x6be539fde95dd4b9, 0x726977802d6fa15e],
-    [0x14276b40ffcd9ae0, 0x806bbe3cd64b1881, 0xd8310f66ad9748b1, 0x1f5f7d9cf8a96de6],
-    [0xdcdcba074d536dbe, 0x62867b88201d6616, 0x819a57ae98ad0b70, 0x90085ff016e364f1],
+    [0xc9eb33927aa562fa, 0xa9c646b8600048f3, 0x35030234568378ff, 0xf8f4c0efafc69eaa],
+    [0x14276b40ffcd9ae0, 0xaf5fad62484a3c4f, 0x39cb4ccd89de0318, 0x19ba636d7038b7d2],
+    [0xdcdcba074d536dbe, 0x5b1321e5f8213d58, 0xb4e0f0f20c987807, 0x1cf06b56971c53a2],
 ];
 
 /// Calls whose results may differ between math libraries.
