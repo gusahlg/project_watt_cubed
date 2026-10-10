@@ -9,5 +9,6 @@ mod budget;
 mod edit;
 mod fanout;
 mod join;
+mod live;
 mod movement;
 mod save;

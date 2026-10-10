@@ -594,6 +594,10 @@ fn backlog_holds_a_full_frame_and_kicks_on_an_aged_essential_one() {
 struct Moves {
     moves: u64,
     busy: Duration,
+    /// This thread's CPU time in the moves, so time the scheduler gives other processes is left out.
+    cpu: Duration,
+    /// Each counted round's CPU time per move, in nanoseconds.
+    round_cpu: Vec<f64>,
     allocs: u64,
     corrections: usize,
 }
@@ -629,7 +633,7 @@ fn move_cluster(players: u32, rounds: u32, warm: u32, paced: bool) -> Moves {
             state.grid_insert(id, pos);
         }
     }
-    let mut out = Moves { moves: 0, busy: Duration::ZERO, allocs: 0, corrections: 0 };
+    let mut out = Moves { moves: 0, busy: Duration::ZERO, cpu: Duration::ZERO, round_cpu: Vec::new(), allocs: 0, corrections: 0 };
     // The connection's reader reuses one buffer for the frames a handler queues.
     let mut sends = Vec::new();
     let start = Instant::now();
@@ -637,19 +641,25 @@ fn move_cluster(players: u32, rounds: u32, warm: u32, paced: bool) -> Moves {
         if round == warm {
             load::LOCK_HOLD.reset();
         }
+        let mut round_cpu = Duration::ZERO;
         for id in 1..=players {
             let (pos, next) = (at(id, round + 1), at(id, round + 2));
             let velocity = ((next - pos) / period.as_secs_f64()).as_vec3();
             crate::alloc_count::reset();
-            let began = Instant::now();
+            let (began, began_cpu) = (Instant::now(), thread_cpu());
             let pose = Pose { velocity, ..Pose::standing(pos, DQuat::IDENTITY, Face::PosY) };
             on_move(&shared, &ctx, id, pose, &mut sends);
-            let took = began.elapsed();
+            let (took, took_cpu) = (began.elapsed(), thread_cpu().saturating_sub(began_cpu));
             if round >= warm {
+                out.cpu += took_cpu;
+                round_cpu += took_cpu;
                 out.allocs += crate::alloc_count::alloc_count();
                 out.busy += took;
                 out.moves += 1;
             }
+        }
+        if round >= warm {
+            out.round_cpu.push(round_cpu.as_nanos() as f64 / f64::from(players));
         }
         for rx in &inboxes {
             while let Ok(frame) = rx.try_recv() {
@@ -661,6 +671,14 @@ fn move_cluster(players: u32, rounds: u32, warm: u32, paced: bool) -> Moves {
         }
     }
     out
+}
+
+/// CPU time this thread has run.
+fn thread_cpu() -> Duration {
+    let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: `t` is a valid timespec for the call to fill.
+    unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut t) };
+    Duration::new(t.tv_sec as u64, t.tv_nsec as u32)
 }
 
 /// A move that leaves every interest set unchanged allocates nothing on the server.
@@ -678,10 +696,14 @@ fn steady_state_moves_allocate_nothing() {
 fn fanout_probe_64_players() {
     let moves = move_cluster(64, 240, 40, true);
     let lock = load::LOCK_HOLD.summary();
+    let mut rounds = moves.round_cpu.clone();
+    rounds.sort_by(f64::total_cmp);
     println!(
-        "fan-out probe: 64 players, {} moves: {:.3} µs/move; lock p50 {:.3} / p99 {:.3} / max {:.1} µs over {} holds; {:.3} allocs/move; {} corrections",
+        "fan-out probe: 64 players, {} moves: {:.3} µs/move, cpu {:.3} µs/move, median round cpu {:.3} µs/move; lock p50 {:.3} / p99 {:.3} / max {:.1} µs over {} holds; {:.3} allocs/move; {} corrections",
         moves.moves,
         moves.busy.as_secs_f64() * 1e6 / moves.moves as f64,
+        moves.cpu.as_secs_f64() * 1e6 / moves.moves as f64,
+        rounds[rounds.len() / 2] / 1e3,
         lock.p50 as f64 / 1e3,
         lock.p99 as f64 / 1e3,
         lock.max as f64 / 1e3,
