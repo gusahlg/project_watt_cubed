@@ -8,8 +8,8 @@ use crate::world::{light, mesh};
 pub(in crate::world) trait Landing {
     /// Put a live chunk mesh result on screen.
     fn chunk(&mut self, world: &mut World, coord: Coord, data: pipeline::MeshPayload);
-    /// The resident state a live section result becomes.
-    fn section(&mut self, world: &mut World, pos: SectionPos, data: pipeline::SectionPayload) -> SectionState;
+    /// The resident state a live section result asked for clip `asked` becomes.
+    fn section(&mut self, world: &mut World, pos: SectionPos, asked: ColumnClip, data: pipeline::SectionPayload) -> SectionState;
     /// Release a stale chunk result's staging.
     fn release_chunk(&mut self, data: pipeline::MeshPayload) {
         drop(data);
@@ -25,10 +25,10 @@ impl Landing for Engine {
         world.upload_chunk_payload(coord, data, self);
     }
 
-    fn section(&mut self, world: &mut World, pos: SectionPos, data: pipeline::SectionPayload) -> SectionState {
+    fn section(&mut self, world: &mut World, pos: SectionPos, asked: ColumnClip, data: pipeline::SectionPayload) -> SectionState {
         let (flat_color, flat_rgba) = world.section_material(pos);
         let bend = world.chart_bend(pos);
-        let mut state = SectionState::from_upload_payload(pos, data, self, bend.as_ref());
+        let mut state = SectionState::from_upload_payload(pos, data, asked, self, bend.as_ref());
         // Slots are born visible (residency implies it for everything but the
         // far field), so a section that Coverage does not draw — or draws only
         // in part — must be corrected here, at the transition that gave it slots
@@ -114,7 +114,7 @@ impl World {
         let section_budget = pacer.section_uploads();
         let mut section_uploads = 0;
         while section_uploads < section_budget && upload_bytes < upload_budget {
-            let Some((pos, token, bytes, meshes)) = self.section_upload_queue.pop_front() else {
+            let Some(pipeline::SectionUpload { pos, token, bytes, clip, meshes }) = self.section_upload_queue.pop_front() else {
                 break;
             };
             section_uploads += 1;
@@ -125,7 +125,7 @@ impl World {
             super::adjust_count(&mut self.meshing_sections, true, false);
             upload_bytes += bytes;
             self.counters.section_upload_bytes += bytes;
-            let state = landing.section(self, pos, meshes);
+            let state = landing.section(self, pos, clip, meshes);
             self.sections.insert(pos, state);
             // A new Ready section moves the covering: re-arm the lane so
             // any refinement it exposes loads immediately.
@@ -232,10 +232,7 @@ impl World {
                 epoch != self.section_epoch
                     || !matches!(self.sections.get(&pos),
                         Some(SectionState::Meshing { token: t }) if *t == token)
-                    || self
-                        .section_upload_queue
-                        .iter()
-                        .any(|(p, t, _, _)| *p == pos && *t == token),
+                    || self.section_upload_queue.iter().any(|u| u.pos == pos && u.token == token),
                 "section Done for {pos:?} matched the live claim but was not transferred"
             );
         }

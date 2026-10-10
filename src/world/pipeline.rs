@@ -140,6 +140,8 @@ pub(in crate::world) enum Job {
         generator: Generator,
         edits: Vec<(Coord, Vec<(usize, BlockId)>)>,
         tables: Arc<HotTables>,
+        /// Chunk columns the full-res chunks draw instead.
+        clip: section::ColumnClip,
     },
     /// Test-only: panics inside `run`, reporting the given claim — the injector
     /// for the worker-panic → `Done::Failed` → claim-release path.
@@ -239,6 +241,8 @@ pub(in crate::world) enum Done {
         pos: SectionPos,
         epoch: u32,
         token: ClaimToken,
+        /// The clip the job was asked for.
+        clip: section::ColumnClip,
         meshes: SectionPayload,
     },
     /// The job PANICKED. Carries its claim so `World::fail_job` can release it
@@ -379,6 +383,8 @@ pub(in crate::world) struct StagedSection {
     pub slabs: Vec<StagedSlab>,
     /// World altitude of native cell 0. `0` on the legacy window.
     pub altitude_floor: i32,
+    /// [`SectionMeshData::clip_drawn`].
+    pub clip_drawn: section::ColumnClip,
 }
 
 /// One staged slab of a [`StagedSection`].
@@ -395,6 +401,17 @@ impl StagedSection {
             .map(|(_, p)| p.as_ref().map_or(0, StagedPass::vertex_bytes))
             .sum()
     }
+}
+
+/// A finished section awaiting its budgeted upload: the claim that produced it (re-validated at
+/// the moment of upload), the vertex-byte charge computed at queue time, and the clip it was asked
+/// for.
+pub(in crate::world) struct SectionUpload {
+    pub pos: SectionPos,
+    pub token: ClaimToken,
+    pub bytes: usize,
+    pub clip: section::ColumnClip,
+    pub meshes: SectionPayload,
 }
 
 /// Worker section result: same per-job staged-or-cpu choice as [`MeshPayload`].
@@ -420,6 +437,14 @@ fn cpu_section_bytes(data: &SectionMeshData) -> usize {
 }
 
 impl SectionPayload {
+    /// The chunk columns the mesh leaves out.
+    pub(in crate::world) fn clip_drawn(&self) -> section::ColumnClip {
+        match self {
+            Self::Cpu(data) => data.clip_drawn,
+            Self::Staged(data) => data.clip_drawn,
+        }
+    }
+
     pub(in crate::world) fn vertex_bytes(&self) -> usize {
         match self {
             Self::Cpu(data) => cpu_section_bytes(data),
@@ -534,7 +559,7 @@ fn try_stage_section(
         }
         slabs.push(StagedSlab { origin_y: slab.origin_y, passes });
     }
-    Some(Box::new(StagedSection { shift: data.shift, slabs, altitude_floor: data.altitude_floor }))
+    Some(Box::new(StagedSection { shift: data.shift, slabs, altitude_floor: data.altitude_floor, clip_drawn: data.clip_drawn }))
 }
 
 fn mesh_payload_from_output(
@@ -1600,6 +1625,7 @@ fn run(job: Job, stager: Option<&MeshStager>, stats: &StagingStats) -> Done {
             generator,
             edits,
             tables,
+            clip,
             ..
         } => {
             // Fused extract+mesh on owned data: the generator samples straight
@@ -1607,11 +1633,12 @@ fn run(job: Job, stager: Option<&MeshStager>, stats: &StagingStats) -> Done {
             // a result whose Section would be dropped after meshing anyway.
             // Pinned byte-identical to the storage path by the parity test in
             // `section::mesh`.
-            let meshes = section::extract_section_mesh(pos, &*generator, &edits, &tables);
+            let meshes = section::extract_section_mesh_with(pos, &*generator, &edits, &tables, clip);
             Done::Section {
                 pos,
                 epoch,
                 token,
+                clip,
                 meshes: section_payload_from_output(stager, stats, meshes),
             }
         }
@@ -1644,6 +1671,7 @@ mod tests {
             generator: Arc::clone(terrain),
             edits: Vec::new(),
             tables: Arc::new(BlockRegistry::with_builtins().hot_tables()),
+            clip: section::ColumnClip::NONE,
         }
     }
     /// The `x` id a `section_job` was tagged with.
@@ -3124,6 +3152,7 @@ mod tests {
                             generator: terrain.clone(),
                             edits: Vec::new(),
                             tables: Arc::clone(&tables),
+                            clip: section::ColumnClip::NONE,
                         };
                         if next(4) == 0 {
                             assert!(new.push(job()));

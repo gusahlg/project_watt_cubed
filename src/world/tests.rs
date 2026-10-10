@@ -232,7 +232,7 @@ fn section_lane_claim_and_integrate_parity() {
     assert!(<SectionLane as StreamLane>::in_flight(&world, pos), "claim marks in-flight");
     <SectionLane as StreamLane>::integrate(
         &mut world,
-        pipeline::Done::Section { pos, epoch: 0, token: pipeline::ClaimToken(7), meshes: Default::default() },
+        pipeline::Done::Section { pos, epoch: 0, token: pipeline::ClaimToken(7), clip: section::ColumnClip::NONE, meshes: Default::default() },
     );
     assert_eq!(world.section_upload_queue.len(), 1, "landing queued for upload");
 
@@ -240,11 +240,11 @@ fn section_lane_claim_and_integrate_parity() {
     // must be dropped, never queued.
     <SectionLane as StreamLane>::integrate(
         &mut world,
-        pipeline::Done::Section { pos, epoch: 0, token: pipeline::ClaimToken(6), meshes: Default::default() },
+        pipeline::Done::Section { pos, epoch: 0, token: pipeline::ClaimToken(6), clip: section::ColumnClip::NONE, meshes: Default::default() },
     );
     <SectionLane as StreamLane>::integrate(
         &mut world,
-        pipeline::Done::Section { pos, epoch: 1, token: pipeline::ClaimToken(7), meshes: Default::default() },
+        pipeline::Done::Section { pos, epoch: 1, token: pipeline::ClaimToken(7), clip: section::ColumnClip::NONE, meshes: Default::default() },
     );
     assert_eq!(world.section_upload_queue.len(), 1, "stale results are dropped");
 }
@@ -1139,11 +1139,12 @@ fn section_upload_byte_accounting_matches_vertex_sizes() {
             pos,
             epoch: 0,
             token: pipeline::ClaimToken(7),
+            clip: section::ColumnClip::NONE,
             meshes: meshes.into(),
         },
     );
     assert_eq!(world.section_upload_queue.len(), 1);
-    assert_eq!(world.section_upload_queue[0].2, expected);
+    assert_eq!(world.section_upload_queue[0].bytes, expected);
 }
 
 /// Empty pooled section output is a zero-byte charge (stale/default jobs).
@@ -1722,7 +1723,7 @@ fn lod2_far_field_drives_to_covering_complete() {
         if !got {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        while let Some((pos, token, _bytes, _meshes)) = world.section_upload_queue.pop_front() {
+        while let Some(pipeline::SectionUpload { pos, token, .. }) = world.section_upload_queue.pop_front() {
             if let Some(s @ SectionState::Meshing { .. }) = world.sections.get_mut(&pos)
                 && matches!(s, SectionState::Meshing { token: t } if *t == token)
             {
@@ -2210,6 +2211,7 @@ fn late_section_done_after_epoch_bump_does_not_reinsert() {
             pos,
             epoch: 0,
             token,
+            clip: section::ColumnClip::NONE,
             meshes: Default::default(),
         },
     );
@@ -2512,6 +2514,7 @@ fn claim_sequence(seed: u64) {
                             pos,
                             epoch,
                             token,
+                            clip: section::ColumnClip::NONE,
                             meshes: Default::default(),
                         },
                     );
@@ -2554,6 +2557,7 @@ fn claim_sequence(seed: u64) {
                 pos,
                 epoch: section_epoch,
                 token,
+                clip: section::ColumnClip::NONE,
                 meshes: Default::default(),
             },
         );
@@ -2614,7 +2618,7 @@ fn assert_claim_invariants(
             let queued = world
                 .section_upload_queue
                 .iter()
-                .any(|(p, t, _, _)| p == pos && t == token);
+                .any(|u| u.pos == *pos && u.token == *token);
             assert!(
                 owed_section.get(pos) == Some(token) || queued,
                 "{pos:?} meshing with no owed Done and not queued"

@@ -627,8 +627,7 @@ pub struct World {
     /// Finished section meshes awaiting budgeted upload, tagged with the claim
     /// token that produced them (re-validated at the moment of upload) and the
     /// vertex-byte charge computed at queue time.
-    section_upload_queue:
-        VecDeque<(SectionPos, pipeline::ClaimToken, usize, pipeline::SectionPayload)>,
+    section_upload_queue: VecDeque<pipeline::SectionUpload>,
     /// Last engine `mesh_stats().live_slots` sampled at `stream`. Zero until
     /// the first stream (tests without a GPU).
     gpu_live_slots: u32,

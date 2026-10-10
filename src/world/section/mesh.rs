@@ -32,7 +32,8 @@ use crate::space::FaceFrame;
 
 use super::super::generation::TerrainGenerator;
 use super::super::mesh::{ChunkMeshData, new_chunk_mesh_data};
-use super::{ChunkCoord, FINEST_DETAIL, SECTION_N, SectionPos};
+use super::{ChunkCoord, ColumnClip, FINEST_DETAIL, SECTION_N, SectionPos};
+use crate::world::chunk::CHUNK_SIZE;
 #[cfg(test)]
 use super::{DOMAIN_H, Section};
 use crate::block::registry::{AIR, BlockId, HotTables};
@@ -47,6 +48,9 @@ pub(in crate::world) struct SectionMeshData {
     pub slabs: Vec<SlabMesh>,
     /// World altitude of native cell 0. `0` on the legacy `[0, 512)` window.
     pub altitude_floor: i32,
+    /// The chunk columns left out of the mesh: the asked clip, or none where a packed column is
+    /// wider than a chunk.
+    pub clip_drawn: ColumnClip,
     /// Shift the old per-section relief loop would have used. Nesting ignores it.
     #[cfg(test)]
     pub relief_shift: u8,
@@ -90,7 +94,8 @@ thread_local! {
 /// Packed section cells as a dense column-major grid: `nx × nz` columns of
 /// `ny` cells. Column-major keeps a column's vertical neighbours adjacent.
 /// Meshing emits only the slab `y_lo..y_hi`; the cells around it are context
-/// (covering faces and AO across the seam).
+/// (covering faces and AO across the seam). `clip` masks chunk columns
+/// ([`ColumnClip`] bits); packed column `x` lies in chunk column `x >> col_shift`.
 struct DenseGrid<'a> {
     cells: &'a [BlockId],
     nx: i32,
@@ -98,9 +103,17 @@ struct DenseGrid<'a> {
     nz: i32,
     y_lo: i32,
     y_hi: i32,
+    clip: u64,
+    col_shift: u32,
 }
 
 impl DenseGrid<'_> {
+    /// Whether in-range packed column `(x, z)` is left to the full-res chunks.
+    #[inline]
+    fn masked(&self, x: i32, z: i32) -> bool {
+        self.clip >> (((z >> self.col_shift) << 3) + (x >> self.col_shift)) & 1 != 0
+    }
+
     #[inline]
     fn at_flat(&self, i: usize) -> BlockId {
         self.cells[i]
@@ -147,27 +160,27 @@ const DIRS: [Dir; 6] = [
 ];
 
 /// Opaque-occupancy probe for AO sampling: below-floor reads solid (matches the
-/// cull rule's "solid ground"), above-ceiling and outside the section read air
-/// (matches the border-overdraw convention).
+/// cull rule's "solid ground"), above-ceiling, outside the section and in a clipped
+/// column read air (matches the border-overdraw convention).
 #[inline]
-fn occluder(grid: &DenseGrid<'_>, tables: &HotTables, idx: i32, x: i32, y: i32, z: i32) -> bool {
+fn occluder<const CLIP: bool>(grid: &DenseGrid<'_>, tables: &HotTables, idx: i32, x: i32, y: i32, z: i32) -> bool {
     if y < 0 {
         return true;
     }
-    if y >= grid.ny || x < 0 || x >= grid.nx || z < 0 || z >= grid.nz {
+    if y >= grid.ny || x < 0 || x >= grid.nx || z < 0 || z >= grid.nz || (CLIP && grid.masked(x, z)) {
         return false;
     }
     tables.opaque(grid.at_flat(idx as usize))
 }
 
-/// Sample a face: cull if covered by neighbor; overdraw section edges as air.
-/// Per-corner AO reads the two in-plane occluders plus the diagonal, in the
-/// layer the face opens into — same stencil `face_sample` in `world/mesh.rs`
+/// Sample a face: cull if covered by neighbor; overdraw section edges and clipped
+/// columns as air. Per-corner AO reads the two in-plane occluders plus the diagonal,
+/// in the layer the face opens into — same stencil `face_sample` in `world/mesh.rs`
 /// uses. `idx` is the cell's flat index; every probe is a stride add off it.
 #[inline]
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::needless_range_loop)] // 3×3 stencil: du/dv are both indices and signed offsets
-fn face_sample(
+fn face_sample<const CLIP: bool>(
     grid: &DenseGrid<'_>,
     tables: &HotTables,
     dir: &Dir,
@@ -184,7 +197,7 @@ fn face_sample(
         return None;
     }
     let me = grid.at_flat(idx as usize);
-    if me == AIR {
+    if me == AIR || (CLIP && grid.masked(x, z)) {
         return None;
     }
     let open = idx + dir.face.step * s_n;
@@ -201,8 +214,9 @@ fn face_sample(
     } else {
         let n = if dir.face.n_axis == 0 { x } else { z };
         let lim = if dir.face.n_axis == 0 { grid.nx } else { grid.nz };
-        if n + dir.face.step < 0 || n + dir.face.step >= lim {
-            // Section border: overdraw as air, nudge inward.
+        let (nx, nz) = if dir.face.n_axis == 0 { (x + dir.face.step, z) } else { (x, z + dir.face.step) };
+        if n + dir.face.step < 0 || n + dir.face.step >= lim || (CLIP && grid.masked(nx, nz)) {
+            // Section border or a clipped column: overdraw as air, nudge inward.
             micro = dir.micro;
             AIR
         } else {
@@ -224,9 +238,9 @@ fn face_sample(
             let eu = du as i32 - 1;
             let pidx = open + eu * s_u + ev * s_v;
             opaque[du][dv] = match dir.face.n_axis {
-                0 => occluder(grid, tables, pidx, ox, oy + ev, oz + eu),
-                1 => occluder(grid, tables, pidx, ox + eu, oy, oz + ev),
-                _ => occluder(grid, tables, pidx, ox + eu, oy + ev, oz),
+                0 => occluder::<CLIP>(grid, tables, pidx, ox, oy + ev, oz + eu),
+                1 => occluder::<CLIP>(grid, tables, pidx, ox + eu, oy, oz + ev),
+                _ => occluder::<CLIP>(grid, tables, pidx, ox + eu, oy + ev, oz),
             };
         }
     }
@@ -240,7 +254,8 @@ fn face_sample(
 
 /// Greedy-mesh one slab of the packed volume: merge adjacent quads with identical
 /// properties across it (one mesh, vertex coords `0..=16` relative to the slab).
-fn build_volume(grid: &DenseGrid<'_>, tables: &HotTables, out: &mut ChunkMeshData) -> bool {
+/// `CLIP` instances test the grid's column mask; the other compiles without it.
+fn build_volume<const CLIP: bool>(grid: &DenseGrid<'_>, tables: &HotTables, out: &mut ChunkMeshData) -> bool {
     let mut mask: [Option<FaceSample>; SLICE] = [None; SLICE];
     let mut emitted = false;
 
@@ -269,7 +284,7 @@ fn build_volume(grid: &DenseGrid<'_>, tables: &HotTables, out: &mut ChunkMeshDat
                         1 => (u, n + y_lo, v),
                         _ => (u, v + y_lo, n),
                     };
-                    let cell = face_sample(
+                    let cell = face_sample::<CLIP>(
                         grid, tables, dir, s_n, s_u, s_v, idx, x, y, z, &corner_uv,
                     );
                     mask[(u + v * n_u) as usize] = cell;
@@ -369,7 +384,7 @@ fn emit(
 #[cfg(test)]
 pub(in crate::world) fn build_section_mesh(section: &Section, tables: &HotTables, floor: Option<i32>) -> SectionMeshData {
     let n_cells = (DOMAIN_H / section.pos().cell_size()) as usize;
-    mesh_section_with(n_cells, tables, floor, 0, section.pos().cell_size(), |dense| fill_from_section(dense, n_cells, section))
+    mesh_section_with(n_cells, tables, floor, 0, section.pos().cell_size(), ColumnClip::NONE, |dense| fill_from_section(dense, n_cells, section))
 }
 
 /// Lowest native cell a section's border walls must reach so they meet the neighbour.
@@ -392,27 +407,40 @@ pub(in crate::world) fn ring_floor<G: TerrainGenerator + ?Sized>(pos: SectionPos
     floor.max(0)
 }
 
-/// Extract AND mesh a section in one pass: sample the generator (folding the
-/// edit overlay) directly into the dense section grid, then mesh it — the
-/// production worker path. Skips the whole RLE brick round trip
-/// ([`Section::extract`]'s per-column run slicing plus this module's decode),
-/// which existed only because the temporary [`Section`] was built and dropped.
+/// [`extract_section_mesh_with`] leaving no column out.
 pub(in crate::world) fn extract_section_mesh<G: TerrainGenerator + ?Sized>(
     pos: SectionPos,
     r#gen: &G,
     edits: &[(ChunkCoord, Vec<(usize, BlockId)>)],
     tables: &HotTables,
 ) -> SectionMeshData {
+    extract_section_mesh_with(pos, r#gen, edits, tables, ColumnClip::NONE)
+}
+
+/// Extract AND mesh a section in one pass: sample the generator (folding the
+/// edit overlay) directly into the dense section grid, then mesh it — the
+/// production worker path. Skips the whole RLE brick round trip
+/// ([`Section::extract`]'s per-column run slicing plus this module's decode),
+/// which existed only because the temporary [`Section`] was built and dropped.
+/// `clip`'s chunk columns are left to the full-res chunks.
+pub(in crate::world) fn extract_section_mesh_with<G: TerrainGenerator + ?Sized>(
+    pos: SectionPos,
+    r#gen: &G,
+    edits: &[(ChunkCoord, Vec<(usize, BlockId)>)],
+    tables: &HotTables,
+    clip: ColumnClip,
+) -> SectionMeshData {
     let Some((alo, ahi)) = section_window(pos, r#gen) else {
         return SectionMeshData::default();
     };
+    let clip = if pos.span() <= super::CLIP_MAX_SPAN { clip } else { ColumnClip::NONE };
     let cell = pos.cell_size();
     let n_cells = ((ahi - alo) / cell) as usize;
     // Home +Y keeps the legacy column and the `[0, 512]` floor. A chart is +Y in storage
     // but its surface sits far outside that window, so it takes the face sampler.
     let chart = pos.body >= super::CHART_BODY_BASE;
     let floor = if pos.face == Face::PosY && !chart { ring_floor(pos, r#gen) } else { ring_floor_face(pos, r#gen, alo) };
-    let mut mesh = mesh_section_with(n_cells, tables, Some(floor), alo, cell, |dense| {
+    let mut mesh = mesh_section_with(n_cells, tables, Some(floor), alo, cell, clip, |dense| {
         sample_columns(pos, r#gen, edits, alo, n_cells, dense);
     });
     mesh.altitude_floor = alo;
@@ -615,18 +643,24 @@ fn sample_columns<G: TerrainGenerator + ?Sized>(
 /// The one section-mesh driver both producers share: `fill` overwrites this
 /// worker's pooled native grid (every cell must be written), then the packer
 /// and mesher run over it. Producers differ ONLY in how the grid is filled.
+#[allow(clippy::too_many_arguments)]
 fn mesh_section_with(
     n_cells: usize,
     tables: &HotTables,
     floor: Option<i32>,
     alo: i32,
     cell: i32,
+    clip: ColumnClip,
     fill: impl FnOnce(&mut [BlockId]),
 ) -> SectionMeshData {
     DENSE_NATIVE.with_borrow_mut(|native| {
         native.resize(SECTION_N * SECTION_N * n_cells, AIR);
         fill(native);
-        mesh_packed(native, n_cells, tables, floor, alo, cell)
+        if clip.is_empty() {
+            mesh_packed::<false>(native, n_cells, tables, floor, alo, cell, clip)
+        } else {
+            mesh_packed::<true>(native, n_cells, tables, floor, alo, cell, clip)
+        }
     })
 }
 
@@ -785,13 +819,19 @@ fn pick_coarse(
 /// the relief inside the section costs slabs. The shift stays the one that packs the 32
 /// columns: raising it would move this level's edges off its parent's lattice. Tall relief
 /// stacks more slabs instead.
-fn mesh_packed(
+///
+/// `clip`'s chunk columns are left out after everything that shapes the mesh (floor, lattice)
+/// is taken from the full grid, so the kept columns match the unclipped mesh and the walls along
+/// the clip reach the lowest ground. A packed column wider than a chunk cannot follow the clip:
+/// the mesh is then whole and reports no clip.
+fn mesh_packed<const CLIP: bool>(
     native: &[BlockId],
     n_cells: usize,
     tables: &HotTables,
     floor: Option<i32>,
     alo: i32,
     cell: i32,
+    clip: ColumnClip,
 ) -> SectionMeshData {
     let ny_n = n_cells as i32;
     let (mut min_top, mut yhi) = (ny_n, 0);
@@ -839,14 +879,18 @@ fn mesh_packed(
                 }
             }
         }
+        let chunk = CHUNK_SIZE as i32;
+        let w = step * cell;
+        let clip = if CLIP && w <= chunk && chunk % w == 0 { clip } else { ColumnClip::NONE };
+        let col_shift = (chunk / w.clamp(1, chunk)).trailing_zeros();
         MESH_SCRATCH.with_borrow_mut(|scratch| {
             let mut slabs = Vec::new();
             for y_lo in (0..ny).step_by(BLOCK as usize) {
                 for (_, m) in scratch.iter_mut() {
                     m.clear();
                 }
-                let grid = DenseGrid { cells: coarse, nx, ny, nz, y_lo, y_hi: (y_lo + BLOCK).min(ny) };
-                if build_volume(&grid, tables, scratch) {
+                let grid = DenseGrid { cells: coarse, nx, ny, nz, y_lo, y_hi: (y_lo + BLOCK).min(ny), clip: clip.0, col_shift };
+                if build_volume::<CLIP>(&grid, tables, scratch) {
                     slabs.push(SlabMesh {
                         origin_y: (y0 + y_lo * step) as u32,
                         data: std::mem::replace(scratch, new_chunk_mesh_data()),
@@ -857,6 +901,7 @@ fn mesh_packed(
                 shift: if slabs.is_empty() { 0 } else { shift as u8 },
                 slabs,
                 altitude_floor: alo,
+                clip_drawn: clip,
                 #[cfg(test)]
                 relief_shift: natural as u8,
             }
@@ -1111,9 +1156,9 @@ mod tests {
         let grid = |tall: bool| -> Vec<BlockId> {
             (0..SECTION_N * SECTION_N).flat_map(|i| column(if tall && i % SECTION_N < 12 { 1_100 } else { 50 })).collect()
         };
-        let flat = mesh_packed(&grid(false), n_cells, &tables, None, 0, 4);
+        let flat = mesh_packed::<false>(&grid(false), n_cells, &tables, None, 0, 4, ColumnClip::NONE);
         assert_eq!((flat.shift, flat.slabs.len()), (1, 1), "flat ground");
-        let cliff = mesh_packed(&grid(true), n_cells, &tables, None, 0, 4);
+        let cliff = mesh_packed::<false>(&grid(true), n_cells, &tables, None, 0, 4, ColumnClip::NONE);
         assert!(cliff.shift > flat.shift, "a 4 km cliff coarsens instead of stacking");
         assert!(!cliff.slabs.is_empty() && cliff.slabs.len() <= MAX_SLABS as usize, "{} slabs", cliff.slabs.len());
     }
@@ -1326,8 +1371,8 @@ mod tests {
         }
         let mesh_of = |grid: &[BlockId]| {
             let mut out = new_chunk_mesh_data();
-            let g = DenseGrid { cells: grid, nx: n, ny: n, nz: n, y_lo: 0, y_hi: n };
-            assert!(build_volume(&g, &tables, &mut out), "the feature emits no faces");
+            let g = DenseGrid { cells: grid, nx: n, ny: n, nz: n, y_lo: 0, y_hi: n, clip: 0, col_shift: 0 };
+            assert!(build_volume::<false>(&g, &tables, &mut out), "the feature emits no faces");
             out
         };
         let key = |v: MeshVertex| {
@@ -2476,5 +2521,170 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Faces by the packed cell they cover: `(normal, x, native y, z)` to every layer drawn there.
+    /// AO and the border nudge are left out.
+    type UnitFaces = std::collections::HashMap<([i8; 3], i32, i32, i32), Vec<u16>>;
+
+    fn unit_faces(mesh: &SectionMeshData) -> UnitFaces {
+        let step = 1i32 << mesh.shift;
+        let mut out = UnitFaces::new();
+        for slab in &mesh.slabs {
+            for p in Pass::ALL {
+                for q in slab.data[p].vertices().chunks_exact(4) {
+                    let pos: Vec<[i32; 3]> = q.iter().map(|v| v.local_pos().map(|c| c as i32)).collect();
+                    let lo = |a: usize| pos.iter().map(|p| p[a]).min().unwrap();
+                    let hi = |a: usize| pos.iter().map(|p| p[a]).max().unwrap();
+                    let span = |a: usize| lo(a)..hi(a).max(lo(a) + 1);
+                    let dir = q[0].normal().direction();
+                    let axis = (0..3).find(|&a| dir[a] != 0).unwrap();
+                    let plane = pos[0][axis] - i32::from(dir[axis] > 0);
+                    let range = |a: usize| if a == axis { plane..plane + 1 } else { span(a) };
+                    for x in range(0) {
+                        for y in range(1) {
+                            for z in range(2) {
+                                out.entry((dir, x, slab.origin_y as i32 + y * step, z)).or_default().push(q[0].layer());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for v in out.values_mut() {
+            v.sort_unstable();
+        }
+        out
+    }
+
+    /// Clipped packed column test for a mesh of shift `shift` (32 columns packed).
+    fn clipped_at(clip: ColumnClip, shift: u8, col_shift: u32) -> impl Fn(i32, i32) -> bool {
+        let n = (SECTION_N as i32) >> shift;
+        move |x, z| (0..n).contains(&x) && (0..n).contains(&z) && clip.masks(x >> col_shift, z >> col_shift)
+    }
+
+    /// Outside the clip `cut` draws exactly what `whole` does; a clipped column draws nothing.
+    /// Faces of a kept column toward a clipped one (the clip's walls) are left out.
+    fn assert_same_outside(tag: &str, cut: &SectionMeshData, whole: &SectionMeshData, clip: ColumnClip, col_shift: u32) {
+        let masked = clipped_at(clip, whole.shift, col_shift);
+        let wall = |k: &([i8; 3], i32, i32, i32)| masked(k.1 + i32::from(k.0[0]), k.3 + i32::from(k.0[2]));
+        let (a, b) = (unit_faces(cut), unit_faces(whole));
+        for (k, v) in &a {
+            assert!(!masked(k.1, k.3), "{tag}: a face on clipped column {k:?}");
+            if !wall(k) {
+                assert_eq!(b.get(k), Some(v), "{tag}: face {k:?} differs from the whole mesh");
+            }
+        }
+        for (k, v) in &b {
+            if !masked(k.1, k.3) && !wall(k) {
+                assert_eq!(a.get(k), Some(v), "{tag}: the clip lost face {k:?}");
+            }
+        }
+    }
+
+    /// The generic clip instance with nothing clipped meshes byte for byte what the plain one does.
+    fn assert_clip_instance_parity(tag: &str, native: &[BlockId], n_cells: usize, tables: &HotTables, floor: Option<i32>, alo: i32, cell: i32) {
+        let plain = mesh_packed::<false>(native, n_cells, tables, floor, alo, cell, ColumnClip::NONE);
+        let generic = mesh_packed::<true>(native, n_cells, tables, floor, alo, cell, ColumnClip::NONE);
+        assert_eq!(flatten(&generic), flatten(&plain), "{tag}: the clip instance moved bytes");
+        assert_eq!(generic.clip_drawn, ColumnClip::NONE);
+    }
+
+    /// On ground without overhangs, a clipped finest section draws nothing on its clipped columns,
+    /// draws what the whole section does on the rest, and every kept column beside a clipped one
+    /// walls it off from its top down to the slab floor, so no ray past the clip's edge sees under
+    /// the far field.
+    #[test]
+    fn clipped_columns_are_walled_off_and_the_rest_is_unchanged() {
+        let (_r, tables, b) = setup();
+        let (stone, grass) = (b.stone, b.grass);
+        let height = |x: i32, z: i32| 150 + (x + 2 * z) / 6;
+        let r#gen = FnGen {
+            h: height,
+            b: move |x, y, z| if y < height(x, z) { stone } else { AIR },
+            surf: move |_, _| grass,
+            deep: stone,
+        };
+        let sec = extract(FINEST, &r#gen);
+        let n_cells = (super::super::DOMAIN_H / CELL) as usize;
+        let mut native = vec![AIR; SECTION_N * SECTION_N * n_cells];
+        fill_from_section(&mut native, n_cells, &sec);
+        assert_clip_instance_parity("slope", &native, n_cells, &tables, None, 0, CELL);
+        let whole = mesh_section_with(n_cells, &tables, None, 0, CELL, ColumnClip::NONE, |dense| fill_from_section(dense, n_cells, &sec));
+        let rect = (2..6).flat_map(|z| (1..4).map(move |x| ColumnClip::of_column(x, z))).fold(ColumnClip::NONE, ColumnClip::union);
+        for clip in [ColumnClip(0x0F0F_0F0F), ColumnClip(0xAA55_AA55_AA55_AA55), rect, ColumnClip(u64::MAX)] {
+            let mesh = mesh_section_with(n_cells, &tables, None, 0, CELL, clip, |dense| fill_from_section(dense, n_cells, &sec));
+            assert_eq!(mesh.clip_drawn, clip);
+            assert_same_outside(&format!("clip {:#x}", clip.0), &mesh, &whole, clip, 1);
+            let faces = unit_faces(&mesh);
+            let step = 1i32 << mesh.shift;
+            let Some(floor) = mesh.slabs.iter().map(|s| s.origin_y as i32).min() else {
+                assert_eq!(clip, ColumnClip(u64::MAX), "only a full clip draws nothing");
+                continue;
+            };
+            let n = (SECTION_N as i32) >> mesh.shift;
+            let masked = clipped_at(clip, mesh.shift, 1);
+            for z in 0..n {
+                for x in 0..n {
+                    let top = faces.keys().filter(|k| k.0 == [0, 1, 0] && k.1 == x && k.3 == z).map(|k| k.2 + step).max();
+                    if masked(x, z) {
+                        assert_eq!(top, None, "clipped column ({x}, {z}) has a top");
+                        continue;
+                    }
+                    let top = top.unwrap_or_else(|| panic!("column ({x}, {z}) has no top"));
+                    for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                        if !masked(x + dx, z + dz) {
+                            continue;
+                        }
+                        for y in (floor..top).step_by(step as usize) {
+                            assert!(faces.contains_key(&([dx as i8, 0, dz as i8], x, y, z)), "clip {:#x}: no wall at ({x}, {y}, {z}) toward ({dx}, {dz})", clip.0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A section whose packed columns are wider than a chunk (the relief shift) cannot follow a
+    /// clip: it meshes whole and reports none. Start-world chart sections around spawn take the
+    /// clip, and draw what the whole section does outside it.
+    #[test]
+    fn real_sections_take_a_clip_or_report_none() {
+        use crate::render_config::RenderConfig;
+        use crate::world::World;
+        use crate::world::generation::WorldgenKind;
+        let world = World::with_kind(42, RenderConfig::default(), WorldgenKind::Diffusion, false);
+        let (centre, storage) = home_altitude_eye(&world, voxel_engine::DVec3::new(0.3, 1.0, 0.2), 0.0);
+        let seat = world.seams.chart_seat(centre).expect("spawn is charted");
+        let body = super::super::CHART_BODY_BASE + seat.index as u16;
+        let terra = world.terrain();
+        let tables = world.registry.hot_tables();
+        let span = f64::from(super::super::section_span(FINEST_DETAIL));
+        let (sx, sz) = ((storage.x / span).floor() as i32, (storage.z / span).floor() as i32);
+        let mut checked = 0;
+        for (dx, dz) in [(0, 0), (3, -2), (-5, 1), (8, 8)] {
+            let pos = world.patch_tile(SectionPos { body, face: Face::PosY, detail: FINEST_DETAIL, x: sx + dx, z: sz + dz });
+            let Some((alo, ahi)) = super::section_window(pos, terra) else { continue };
+            let n_cells = ((ahi - alo) / pos.cell_size()) as usize;
+            let mut native = vec![AIR; SECTION_N * SECTION_N * n_cells];
+            super::sample_columns(pos, terra, &[], alo, n_cells, &mut native);
+            let floor = super::ring_floor_face(pos, terra, alo);
+            assert_clip_instance_parity(&format!("{pos:?}"), &native, n_cells, &tables, Some(floor), alo, pos.cell_size());
+            let whole = extract_section_mesh(pos, terra, &[], &tables);
+            for clip in [ColumnClip(0x00FF_00FF_00FF_00FF), ColumnClip::of_column(3, 4)] {
+                let cut = extract_section_mesh_with(pos, terra, &[], &tables, clip);
+                if u32::from(whole.shift) != super::pack_shift(SECTION_N as i32) {
+                    assert_eq!(cut.clip_drawn, ColumnClip::NONE, "{pos:?}: a relief-shift section clipped");
+                    assert_eq!(flatten(&cut), flatten(&whole));
+                    continue;
+                }
+                assert_eq!(cut.clip_drawn, clip);
+                assert_same_outside(&format!("{pos:?} {:#x}", clip.0), &cut, &whole, clip, 1);
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "no section took a clip");
+        let wide = world.patch_tile(SectionPos { body, face: Face::PosY, detail: crate::ident::Detail(FINEST_DETAIL.0 + 1), x: sx / 2, z: sz / 2 });
+        assert_eq!(extract_section_mesh_with(wide, terra, &[], &tables, ColumnClip(1)).clip_drawn, ColumnClip::NONE, "a tile wider than eight columns cannot clip");
     }
 }

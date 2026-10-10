@@ -33,7 +33,7 @@ use super::lod;
 /// Submodule keeps mesh representation and consumer together.
 mod mesh;
 pub(in crate::world) use mesh::face_edits;
-pub(in crate::world) use mesh::{SectionMeshData, chart_slab_corners, extract_section_mesh, warp_slab_corners};
+pub(in crate::world) use mesh::{SectionMeshData, chart_slab_corners, extract_section_mesh, extract_section_mesh_with, warp_slab_corners};
 
 /// 32 not 64: reduces remesh cost under frequent edits.
 pub(in crate::world) const SECTION_N: usize = 32;
@@ -186,6 +186,61 @@ impl SectionPos {
     #[cfg(test)]
     fn num_bricks(self) -> usize {
         (self.n_cells() as usize).div_ceil(BRICK_DIM).max(1)
+    }
+}
+
+// ColumnClip: the chunk columns a section leaves to the full-res chunks.
+
+/// Widest section that leaves chunk columns out: eight columns a side, one bit each.
+pub(in crate::world) const CLIP_MAX_SPAN: i32 = 8 * CS;
+
+/// Chunk columns a section leaves out of its mesh for the full-res chunks to draw. Bit
+/// `cz * 8 + cx` is the 16-block column `(cx, cz)` from the section's min corner, in its own frame.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug, Hash)]
+pub(in crate::world) struct ColumnClip(pub(in crate::world) u64);
+
+impl ColumnClip {
+    pub const NONE: Self = Self(0);
+
+    /// Columns of `s` a side, when it can leave columns out.
+    pub fn side(s: SectionPos) -> Option<i32> {
+        (s.span() <= CLIP_MAX_SPAN).then(|| (s.span() / CS).max(1))
+    }
+
+    /// Column `(cx, cz)` alone.
+    pub fn of_column(cx: i32, cz: i32) -> Self {
+        debug_assert!((0..8).contains(&cx) && (0..8).contains(&cz), "column ({cx}, {cz}) is outside a clip");
+        Self(1 << (cz * 8 + cx))
+    }
+
+    /// Whether column `(cx, cz)` is left out.
+    pub fn masks(self, cx: i32, cz: i32) -> bool {
+        (0..8).contains(&cx) && (0..8).contains(&cz) && self.0 >> (cz * 8 + cx) & 1 != 0
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    pub fn is_subset_of(self, other: Self) -> bool {
+        self.0 & !other.0 == 0
+    }
+
+    pub fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    pub fn intersect(self, other: Self) -> Self {
+        Self(self.0 & other.0)
+    }
+
+    pub fn without(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
+
+    /// The left-out columns as `(cx, cz)` from the section's min corner.
+    pub fn offsets(self) -> impl Iterator<Item = (i32, i32)> {
+        (0..64).filter(move |&b| self.0 >> b & 1 != 0).map(|b| (b % 8, b / 8))
     }
 }
 

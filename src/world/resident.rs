@@ -246,6 +246,15 @@ impl ChunkMeshes {
 /// reduces bandwidth; nearer rings keep texture. Inert until the mip bake lands.
 pub(super) const FLAT_DETAIL: Detail = Detail(section::FINEST_DETAIL.0 + 4);
 
+/// The clip a Ready section was extracted for, and the one its mesh draws.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub(in crate::world) struct SectionClip {
+    /// The target the job was submitted with.
+    pub asked: section::ColumnClip,
+    /// The columns the mesh leaves out: `asked`, or none where it could not follow the clip.
+    pub drawn: section::ColumnClip,
+}
+
 /// A section is either meshing or ready. Blocks are pre-positioned at upload,
 /// so draw needs only camera-relative offset arithmetic.
 pub(in crate::world) enum SectionState {
@@ -266,6 +275,8 @@ pub(in crate::world) enum SectionState {
         /// Last `(style, flat_rgba)` pushed via [`Self::push_style`], so a value
         /// re-observed next frame (the steady case) sends nothing.
         last_style: Option<(FadeStyle, u32)>,
+        /// The chunk columns this mesh leaves to the full-res chunks.
+        clip: SectionClip,
     },
 }
 
@@ -282,9 +293,11 @@ impl SectionState {
     fn from_upload(
         pos: SectionPos,
         mesh: SectionMeshData,
+        asked: section::ColumnClip,
         eng: &mut Engine,
         bend: Option<&ChartBend>,
     ) -> SectionState {
+        let clip = SectionClip { asked, drawn: mesh.clip_drawn };
         let detail = Detail(pos.detail.0.saturating_add(mesh.shift as i8));
         let mut cages = Vec::new();
         let meshes = mesh
@@ -301,7 +314,7 @@ impl SectionState {
                 }
             })
             .collect();
-        SectionState::Ready { meshes, cages, last_style: None }
+        SectionState::Ready { meshes, cages, last_style: None, clip }
     }
 
     /// Flat placement, or a cage through the slab's eight embedded corners. `None` skips the slab
@@ -367,21 +380,24 @@ impl SectionState {
     pub(super) fn from_upload_payload(
         pos: SectionPos,
         meshes: pipeline::SectionPayload,
+        asked: section::ColumnClip,
         eng: &mut Engine,
         bend: Option<&ChartBend>,
     ) -> SectionState {
         match meshes {
-            pipeline::SectionPayload::Cpu(data) => Self::from_upload(pos, *data, eng, bend),
-            pipeline::SectionPayload::Staged(staged) => Self::from_upload_staged(pos, *staged, eng, bend),
+            pipeline::SectionPayload::Cpu(data) => Self::from_upload(pos, *data, asked, eng, bend),
+            pipeline::SectionPayload::Staged(staged) => Self::from_upload_staged(pos, *staged, asked, eng, bend),
         }
     }
 
     fn from_upload_staged(
         pos: SectionPos,
         staged: pipeline::StagedSection,
+        asked: section::ColumnClip,
         eng: &mut Engine,
         bend: Option<&ChartBend>,
     ) -> SectionState {
+        let clip = SectionClip { asked, drawn: staged.clip_drawn };
         let detail = Detail(pos.detail.0.saturating_add(staged.shift as i8));
         let mut cages = Vec::new();
         let meshes = staged
@@ -402,7 +418,7 @@ impl SectionState {
                 }
             })
             .collect();
-        SectionState::Ready { meshes, cages, last_style: None }
+        SectionState::Ready { meshes, cages, last_style: None, clip }
     }
 
     pub(super) fn is_ready(&self) -> bool {

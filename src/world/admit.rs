@@ -630,6 +630,7 @@ impl StreamLane for SectionLane {
             generator: world.generator.clone(),
             edits: world.edits_for_section(key),
             tables: world.tables.get(),
+            clip: section::ColumnClip::NONE,
         };
         Some((job, token))
     }
@@ -647,6 +648,7 @@ impl StreamLane for SectionLane {
             pos,
             epoch,
             token,
+            clip,
             meshes,
         } = done
         {
@@ -658,9 +660,7 @@ impl StreamLane for SectionLane {
                     Some(SectionState::Meshing { token: t }) if *t == token);
             if live {
                 let bytes = meshes.vertex_bytes();
-                world
-                    .section_upload_queue
-                    .push_back((pos, token, bytes, meshes));
+                world.section_upload_queue.push_back(pipeline::SectionUpload { pos, token, bytes, clip, meshes });
             }
         }
     }

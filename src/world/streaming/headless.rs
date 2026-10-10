@@ -38,8 +38,9 @@ impl Landing for Headless {
         world.note_settled();
     }
 
-    fn section(&mut self, _world: &mut World, _pos: SectionPos, _data: pipeline::SectionPayload) -> SectionState {
-        crate::world::fixtures::ready_section()
+    fn section(&mut self, _world: &mut World, _pos: SectionPos, asked: ColumnClip, data: pipeline::SectionPayload) -> SectionState {
+        let clip = crate::world::resident::SectionClip { asked, drawn: data.clip_drawn() };
+        SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None, clip }
     }
 }
 

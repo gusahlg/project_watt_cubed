@@ -20,7 +20,7 @@ use crate::block::registry::{HotTables, AIR};
 use super::brick::ChunkPayload;
 use super::heightmip::{BakeExtent, HeightMip};
 use super::metric::{DyCap, EyeDist, EyeMetric, HeightEnvelope};
-use super::section::SectionPos;
+use super::section::{ColumnClip, SectionPos};
 use super::summary::{CellError, CellSummary, SseBudget};
 use super::{
     ColumnKey, Coord, DIRTY_BUDGET, FastMap, FastSet, LightLane, Loaded, MeshLane, MeshState,
