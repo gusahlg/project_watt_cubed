@@ -34,11 +34,11 @@ pub(super) struct Histogram {
 }
 
 #[derive(Clone, Copy, Default)]
-struct Summary {
-    count: u64,
-    p50: u64,
-    p99: u64,
-    max: u64,
+pub(super) struct Summary {
+    pub(super) count: u64,
+    pub(super) p50: u64,
+    pub(super) p99: u64,
+    pub(super) max: u64,
 }
 
 impl Histogram {
@@ -51,14 +51,14 @@ impl Histogram {
         self.max.fetch_max(v, Ordering::Relaxed);
     }
 
-    fn reset(&self) {
+    pub(super) fn reset(&self) {
         for b in &self.buckets {
             b.store(0, Ordering::Relaxed);
         }
         self.max.store(0, Ordering::Relaxed);
     }
 
-    fn summary(&self) -> Summary {
+    pub(super) fn summary(&self) -> Summary {
         let counts: Vec<u64> = self.buckets.iter().map(|b| b.load(Ordering::Relaxed)).collect();
         let count: u64 = counts.iter().sum();
         let max = self.max.load(Ordering::Relaxed);

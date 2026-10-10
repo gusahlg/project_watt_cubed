@@ -552,3 +552,102 @@ fn backlog_holds_a_full_frame_and_kicks_on_an_aged_essential_one() {
     assert!(!enqueue_backlog(&mut player, edit, now + BACKLOG_AGE), "an aged edit kicks");
     assert_eq!(player.backlog.len(), 2, "no essential frame was dropped");
 }
+
+/// What [`move_cluster`] measured over its steady-state rounds.
+struct Moves {
+    moves: u64,
+    busy: Duration,
+    allocs: u64,
+    corrections: usize,
+}
+
+/// `players` in one cluster, all inside each other's interest range, each moving `rounds` times
+/// around a ring through the real [`on_move`] under a dedicated server's noclip policy (operators
+/// only), so every move also runs the body check. Rounds before `warm` are not counted. `paced`
+/// spaces the rounds at [`MOVE_RATE`]; unpaced rounds take steps small enough for the envelope.
+fn move_cluster(players: u32, rounds: u32, warm: u32, paced: bool) -> Moves {
+    use std::f64::consts::TAU;
+    let air = f64::from(crate::world::generation::FLAT_HEIGHT) + 20.0;
+    let period = Duration::from_secs(1) / MOVE_RATE;
+    // Radians per round: about 6 blocks/s along the ring when paced, a sliver when not.
+    let spin = if paced { 0.5 / f64::from(MOVE_RATE) } else { 0.0005 };
+    let at = |id: u32, round: u32| {
+        let a = f64::from(id) * TAU / f64::from(players) + spin * f64::from(round);
+        DVec3::new(12.0 * a.cos() + 0.5, air + f64::from(id % 4) * 3.0, 12.0 * a.sin() + 0.5)
+    };
+    let mut roster = HashMap::new();
+    let mut inboxes = Vec::new();
+    for id in 1..=players {
+        let (out, rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
+        let mut p = test_player(at(id, 0), out, test_kick());
+        p.name = format!("p{id}").into();
+        roster.insert(id, p);
+        inboxes.push(rx);
+    }
+    let (shared, ctx) = flat_shared(roster, NoclipPolicy::Ops, &["admin"]);
+    {
+        let mut state = shared.lock_recover();
+        for id in 1..=players {
+            let pos = state.players[&id].pos;
+            state.grid_insert(id, pos);
+        }
+    }
+    let mut out = Moves { moves: 0, busy: Duration::ZERO, allocs: 0, corrections: 0 };
+    let start = Instant::now();
+    for round in 0..rounds {
+        if round == warm {
+            load::LOCK_HOLD.reset();
+        }
+        for id in 1..=players {
+            let (pos, next) = (at(id, round + 1), at(id, round + 2));
+            let velocity = ((next - pos) / period.as_secs_f64()).as_vec3();
+            crate::alloc_count::reset();
+            let began = Instant::now();
+            on_move(&shared, &ctx, id, pos, 0.0, 0.0, DQuat::IDENTITY, velocity, Face::PosY, Stance::Standing);
+            let took = began.elapsed();
+            if round >= warm {
+                out.allocs += crate::alloc_count::alloc_count();
+                out.busy += took;
+                out.moves += 1;
+            }
+        }
+        for rx in &inboxes {
+            while let Ok(frame) = rx.try_recv() {
+                out.corrections += usize::from(matches!(ServerMessage::decode(&frame), Some(ServerMessage::Position { .. })));
+            }
+        }
+        if paced && let Some(rest) = (start + period * (round + 1)).checked_duration_since(Instant::now()) {
+            thread::sleep(rest);
+        }
+    }
+    out
+}
+
+/// A move that leaves every interest set unchanged allocates nothing on the server.
+#[test]
+fn steady_state_moves_allocate_nothing() {
+    let moves = move_cluster(16, 24, 8, false);
+    assert_eq!(moves.corrections, 0, "honest moves are not corrected");
+    assert_eq!(moves.allocs, 0, "{} allocations over {} steady-state moves", moves.allocs, moves.moves);
+}
+
+/// 64 players in one cluster at [`MOVE_RATE`] through the real [`on_move`]: µs per move, the
+/// State lock hold, and allocations per steady-state move.
+#[test]
+#[ignore = "probe: cargo test --release --lib fanout_probe -- --ignored --nocapture"]
+fn fanout_probe_64_players() {
+    let moves = move_cluster(64, 240, 40, true);
+    let lock = load::LOCK_HOLD.summary();
+    println!(
+        "fan-out probe: 64 players, {} moves: {:.3} µs/move; lock p50 {:.3} / p99 {:.3} / max {:.1} µs over {} holds; {:.3} allocs/move; {} corrections",
+        moves.moves,
+        moves.busy.as_secs_f64() * 1e6 / moves.moves as f64,
+        lock.p50 as f64 / 1e3,
+        lock.p99 as f64 / 1e3,
+        lock.max as f64 / 1e3,
+        lock.count,
+        moves.allocs as f64 / moves.moves as f64,
+        moves.corrections,
+    );
+    assert_eq!(moves.corrections, 0, "honest moves are not corrected");
+}
