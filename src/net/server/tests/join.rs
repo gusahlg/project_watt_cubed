@@ -627,3 +627,52 @@ fn a_join_searches_its_spawn_outside_the_lock() {
     assert!(shared.lock_recover().joining.is_empty(), "a join that gives up gives its hold back");
     assert!(reserve(&shared, &"cy".into()).is_ok());
 }
+
+/// The server's side of joining a built-up world: the overlay copy under the lock, then the
+/// bootstrap frames through a writer that only counts bytes. No network, so it times the server.
+#[test]
+#[ignore = "probe: cargo test --release --lib join_overlay_probe -- --ignored --nocapture"]
+fn join_overlay_probe() {
+    let mut state = test_state(HashMap::new());
+    let mut specs = vec!["air".to_string()];
+    for i in 1..state.registry.block_count().min(16) {
+        specs.push(state.registry.spec(BlockId(i as u16)));
+    }
+    let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+    let mut cells = Vec::with_capacity(100_000);
+    for dx in 0..100 {
+        for dz in 0..50 {
+            for dy in 0..20 {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                let spec = if rng % 2 == 0 { &specs[0] } else { &specs[1 + (rng >> 8) as usize % (specs.len() - 1)] };
+                cells.push((dx - 50, -4 - dy, dz - 25, spec.clone()));
+            }
+        }
+    }
+    assert!(install_edits(&mut state, &cells).is_empty());
+    let shared = Arc::new(Mutex::new(state));
+    let mut times = Vec::new();
+    for _ in 0..15 {
+        let (out, rx) = outbox(OUT_CAPACITY);
+        let kick = Arc::new(Notify::new());
+        let writer = thread::spawn(move || {
+            let mut bytes = 0usize;
+            drain_writer(rx, &kick, |batch| {
+                bytes += batch.len();
+                Ok(())
+            });
+            bytes
+        });
+        let started = Instant::now();
+        let overlay = Overlay::of(&shared.lock_recover());
+        assert!(send_join(&out, &AtomicBool::new(false), &shared, lax_ctx(), 1, DVec3::ZERO, overlay, &[]));
+        drop(out);
+        let bytes = writer.join().unwrap();
+        times.push(started.elapsed().as_secs_f64() * 1e3);
+        assert!(bytes > 400_000);
+    }
+    times.sort_by(f64::total_cmp);
+    println!("join overlay probe: 100000 cells, median {:.2} ms, min {:.2} ms", times[times.len() / 2], times[0]);
+}
