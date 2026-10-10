@@ -426,7 +426,7 @@ fn faces_edges_bulk_twin_and_moon_match_the_voxel() {
     let (cx, cy, cz) = (sx.div_euclid(16), h.div_euclid(16), sz.div_euclid(16));
     assert_eq!(t.sky(ChunkCoord::new(cx, cy, cz)), Sky::Axis(Face::PosY));
     assert_chunk_matches(&t, cx, cy, cz);
-    let (_, hs) = t.generate_column(ColumnKey { face: Face::PosY, a: cx, b: cz }, 1..=0);
+    let (_, hs) = t.generate_column(ColumnKey { face: Face::PosY, a: cx, b: cz }, std::ops::RangeInclusive::new(1, 0));
     let lu = sx.rem_euclid(16) as usize;
     assert_eq!(hs[lu], t.height(sx, sz));
 

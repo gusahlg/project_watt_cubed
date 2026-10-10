@@ -16,6 +16,7 @@
 //! element. The arithmetic is bit-identical on every peer (see [`noise`]).
 
 pub mod cosmos;
+#[cfg(feature = "dev-tools")]
 pub mod emergent;
 pub mod noise;
 pub mod palette;

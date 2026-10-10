@@ -22,6 +22,8 @@ pub struct Warp {
     dims: [usize; 3],
     /// Displacement of every node, index [`Warp::node`].
     nodes: Vec<DVec3>,
+    /// Largest nodal displacement, in blocks.
+    max_disp: f64,
 }
 
 impl Warp {
@@ -48,12 +50,13 @@ impl Warp {
                 }
             }
         }
-        Self { origin, cell, dims, nodes }
+        let max_disp = nodes.iter().fold(0.0_f64, |m, u| m.max(u.length()));
+        Self { origin, cell, dims, nodes, max_disp }
     }
 
     /// Largest nodal displacement, in blocks.
     pub fn max_displacement(&self) -> f64 {
-        self.nodes.iter().fold(0.0_f64, |m, u| m.max(u.length()))
+        self.max_disp
     }
 
     #[inline]
@@ -74,7 +77,7 @@ impl Warp {
     /// `p` clamped just inside the box, or `None` when it is further than the field can reach.
     fn pull_inside(&self, p: DVec3) -> Option<DVec3> {
         let hi = self.hi();
-        let margin = self.max_displacement() + 1.0;
+        let margin = self.max_disp + 1.0;
         if (0..3).any(|a| p[a] < self.origin[a] - margin || p[a] > hi[a] + margin) {
             return None;
         }
@@ -258,6 +261,128 @@ mod tests {
                 assert!((fd - col).length() < 1e-6, "axis {axis}: fd {fd} jacobian {col}");
             }
         }
+    }
+
+    /// `invert` as it was before the warp kept its largest displacement: the margin is folded
+    /// over every node on each pull.
+    fn invert_folding(w: &Warp, p: DVec3) -> Option<DVec3> {
+        let pull = |p: DVec3| {
+            let hi = w.hi();
+            let margin = w.nodes.iter().fold(0.0_f64, |m, u| m.max(u.length())) + 1.0;
+            if (0..3).any(|a| p[a] < w.origin[a] - margin || p[a] > hi[a] + margin) {
+                return None;
+            }
+            let eps = (w.cell * 1e-12).max(1e-6);
+            let mut x = p;
+            for a in 0..3 {
+                x[a] = x[a].clamp(w.origin[a] + eps, hi[a] - eps);
+            }
+            Some(x)
+        };
+        let guess = p - w.displacement(p);
+        let mut x = if w.contains(guess) { guess } else { pull(p)? };
+        for _ in 0..12 {
+            let (ijk, _) = w.locate(x)?;
+            if let Some(hit) = w.element_inverse(ijk, p) {
+                let hr = (w.apply(hit) - p).length();
+                if hr <= 1e-6 {
+                    return Some(hit);
+                }
+                if hr < (w.apply(x) - p).length() {
+                    x = hit;
+                }
+            }
+            let f = w.apply(x) - p;
+            let residual = f.length();
+            if residual <= 1e-6 {
+                return Some(x);
+            }
+            let j = w.jacobian(x);
+            let det = j.determinant();
+            if !det.is_finite() || det.abs() < 1e-18 {
+                return None;
+            }
+            let step = j.inverse() * f;
+            if !step.is_finite() {
+                return None;
+            }
+            let mut alpha = 1.0;
+            let mut improved = false;
+            while alpha >= 1.0 / 1024.0 {
+                let next = x - step * alpha;
+                if !next.is_finite() {
+                    return None;
+                }
+                let Some(next) = w.contains(next).then_some(next).or_else(|| pull(next)) else {
+                    alpha *= 0.5;
+                    continue;
+                };
+                if (w.apply(next) - p).length() < residual {
+                    x = next;
+                    improved = true;
+                    break;
+                }
+                alpha *= 0.5;
+            }
+            if !improved {
+                break;
+            }
+        }
+        let f = w.apply(x) - p;
+        (f.length() <= 1e-6 && w.contains(x)).then_some(x)
+    }
+
+    #[test]
+    fn invert_matches_the_folding_margin_on_random_points() {
+        for half in [8_000.0, 6_000_000.0] {
+            let warp = warp_at(half);
+            assert_eq!(warp.max_displacement().to_bits(), warp.nodes.iter().fold(0.0_f64, |m, u| m.max(u.length())).to_bits());
+            let (lo, hi) = (warp.origin, warp.hi());
+            // The box, its images, and both far corners out past the pull margin.
+            let reach = DVec3::splat(warp.max_displacement() + 4.0);
+            let mut state = 0xD15C_u64;
+            let mut found = 0;
+            for i in 0..600 {
+                let u = DVec3::new(lcg(&mut state), lcg(&mut state), lcg(&mut state));
+                let p = match i % 4 {
+                    0 => lo + u * (hi - lo),
+                    1 => warp.apply(lo + u * (hi - lo)),
+                    2 => hi + (u - 0.5) * reach * 2.0,
+                    _ => lo + (u - 0.5) * reach * 2.0,
+                };
+                let (got, want) = (warp.invert(p), invert_folding(&warp, p));
+                assert_eq!(got.map(|x| x.to_array().map(f64::to_bits)), want.map(|x| x.to_array().map(f64::to_bits)), "at {p}");
+                found += usize::from(got.is_some());
+            }
+            assert!(found >= 150, "every image inverts: {found}");
+        }
+    }
+
+    /// `cargo test --release --lib warp_invert_cost -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn warp_invert_cost() {
+        use std::hint::black_box;
+        let warp = warp_at(6_000_000.0);
+        let hi = warp.hi();
+        let span = hi - warp.origin;
+        let mut state = 0x5EED_u64;
+        // Images of points inside the box, and points just past it that the solver pulls back in.
+        let points: Vec<DVec3> = (0..256)
+            .map(|i| {
+                let u = DVec3::new(lcg(&mut state), lcg(&mut state), lcg(&mut state));
+                if i % 2 == 0 { warp.apply(warp.origin + u * span * 0.999) } else { hi + u }
+            })
+            .collect();
+        const ROUNDS: u32 = 40;
+        let t0 = std::time::Instant::now();
+        for _ in 0..ROUNDS {
+            for &p in &points {
+                black_box(warp.invert(black_box(p)));
+            }
+        }
+        let calls = f64::from(ROUNDS) * points.len() as f64;
+        println!("warp_invert_cost: {:.1} ns per invert", t0.elapsed().as_nanos() as f64 / calls);
     }
 
     #[test]

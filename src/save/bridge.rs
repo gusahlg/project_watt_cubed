@@ -14,7 +14,7 @@ use crate::world::terrain::TerrainCfg;
 use crate::world::generation::WorldgenKind;
 use crate::world::{FastMap, World};
 
-use super::format::{self, Edit, PendingContact, PlayerState, SaveDoc, WorldgenStamp};
+use super::format::{self, Edit, PendingContact, PlayerState, SaveDoc, SpecTable, WorldgenStamp};
 use super::slot::{SaveError, SaveMeta, SlotId};
 use super::store::{self, Source};
 
@@ -109,14 +109,11 @@ impl SaveSnapshot {
         }
     }
 
-    fn block_spec(&self, id: BlockId) -> String {
+    fn block_spec(&self, id: BlockId) -> &str {
         if id == AIR {
-            return "air".to_string();
+            return "air";
         }
-        self.specs
-            .get(id.0 as usize)
-            .cloned()
-            .unwrap_or_else(|| "air".into())
+        self.specs.get(usize::from(id.0)).map_or("air", String::as_str)
     }
 
     fn edits(&self) -> impl Iterator<Item = ((i32, i32, i32), BlockId)> + '_ {
@@ -133,22 +130,21 @@ impl SaveSnapshot {
     /// Build the document the codec writes. Same spec-table order as walking
     /// `World::edits` on the cloned overlay.
     pub(crate) fn to_doc(&self) -> Result<SaveDoc, SaveError> {
-        let mut specs: Vec<String> = Vec::new();
-        let mut index_of: std::collections::HashMap<String, u16> = std::collections::HashMap::new();
-        let mut edits: Vec<Edit> = Vec::new();
+        let mut table = SpecTable::default();
+        // Each block's table index, so the spec text is looked up once per block, not per edit.
+        // `u16::MAX` is unset; a block that really sits at that index just takes the lookup again.
+        let mut index_of = vec![u16::MAX; self.specs.len()];
+        let mut edits = Vec::with_capacity(self.overlay.values().map(|cells| cells.len()).sum());
         for ((x, y, z), id) in self.edits() {
-            let spec = self.block_spec(id);
-            let index = match index_of.get(&spec) {
-                Some(&index) => index,
-                None => {
-                    let index = u16::try_from(specs.len())
-                        .map_err(|_| SaveError::Corrupt("too many distinct block specs to save"))?;
-                    index_of.insert(spec.clone(), index);
-                    specs.push(spec);
-                    index
+            let spec = match index_of.get_mut(usize::from(id.0)) {
+                Some(&mut at) if at != u16::MAX => at,
+                Some(at) => {
+                    *at = table.index(self.block_spec(id))?;
+                    *at
                 }
+                None => table.index(self.block_spec(id))?,
             };
-            edits.push(Edit { x, y, z, spec: index });
+            edits.push(Edit { x, y, z, spec });
         }
         let mut meta = self.meta.clone();
         meta.edit_count = u32::try_from(edits.len())
@@ -160,7 +156,7 @@ impl SaveSnapshot {
             worldgen: self.worldgen,
             law_stamp: self.law_stamp.clone(),
             player: self.player.clone(),
-            specs,
+            specs: table.specs,
             edits,
             mods: self.mods.clone(),
             pending: self.pending.clone(),
@@ -361,15 +357,15 @@ fn rebuild(
             _ => AIR,
         })
         .collect();
-    for edit in &doc.edits {
+    world.install_edits(doc.edits.iter().map(|edit| {
         match kinds[usize::from(edit.spec)] {
             SpecKind::Ok(_) => {}
             SpecKind::Legacy => unknown.legacy_edits += 1,
             SpecKind::Full => unknown.full_edits += 1,
             SpecKind::Bad => {}
         }
-        world.set_block(edit.x, edit.y, edit.z, block_ids[usize::from(edit.spec)]);
-    }
+        ((edit.x, edit.y, edit.z), block_ids[usize::from(edit.spec)])
+    }));
 
     let pending = doc
         .pending

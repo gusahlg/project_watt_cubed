@@ -687,7 +687,7 @@ mod tests {
         use super::super::chunk::CHUNK_SIZE;
         use super::super::light::LightGrid;
         use super::super::pipeline::Job;
-        use super::super::{LightLane, StreamLane, World};
+        use super::super::{LightLane, StreamLane, World, WorklistLane};
         use crate::coord::{ChunkBox, ChunkCoord};
         use crate::render_config::RenderConfig;
         use std::mem::size_of;
@@ -723,16 +723,12 @@ mod tests {
             // the streaming workers run, so mesh snapshots see settled shells.
             let mut settles = 0u32;
             loop {
-                let Some(coord) = LightLane::seed_set(&mut world)
-                    .and_then(|s| s.iter().copied().next())
-                else {
+                let Some(coord) = LightLane::worklist(&mut world).iter().copied().next() else {
                     break;
                 };
-                LightLane::seed_set(&mut world)
-                    .expect("worklist")
-                    .remove(&coord);
+                LightLane::worklist(&mut world).remove(&coord);
                 match LightLane::submit(&mut world, coord) {
-                    Some(Job::Light { snapshot, coord: c, .. }) => {
+                    Some((Job::Light { snapshot, coord: c, .. }, ())) => {
                         let mut grid = LightGrid::dark();
                         super::super::light::propagate(
                             &snapshot.chunk,

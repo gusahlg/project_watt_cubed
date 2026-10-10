@@ -1,8 +1,9 @@
 //! Filesystem layer: atomic writes, a one-deep backup, and the read ladder.
 //! Writes use .tmp + sync_all + rename so a crash mid-save can't corrupt the
-//! only copy; successful writes rotate the old file to .bak. Reads ladder down
-//! (live intact → backup intact → salvage) and report which rung succeeded.
-//! Deletes move to trash/ under the data root instead of unlinking for cheap undo.
+//! only copy; successful writes rotate the old file to .bak, and a failed swap
+//! puts it back. Reads ladder down (live intact → backup intact → salvage) and
+//! report which rung succeeded. Deletes move to trash/ under the data root
+//! instead of unlinking for cheap undo.
 
 use std::fs;
 use std::io::{self, Read, Write};
@@ -31,10 +32,6 @@ pub fn file_path(id: &SlotId) -> PathBuf {
 
 fn bak_path(id: &SlotId) -> PathBuf {
     saves_dir().join(format!("{id}.save.bak"))
-}
-
-fn tmp_path(id: &SlotId) -> PathBuf {
-    saves_dir().join(format!("{id}.save.tmp"))
 }
 
 /// Which rung of the read ladder produced the bytes.
@@ -99,35 +96,60 @@ pub fn read(id: &SlotId) -> Result<(Decoded, Source), SaveError> {
     }
 }
 
-fn sibling_tmp(path: &Path) -> PathBuf {
+/// `{path}{suffix}`: the `.tmp` and `.bak` files beside `path`.
+pub(crate) fn sibling(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.as_os_str().to_os_string();
-    name.push(".tmp");
+    name.push(suffix);
     PathBuf::from(name)
 }
 
-/// Write `bytes` to `path` via a sibling `.tmp`, `sync_all`, then rename.
-/// A crash mid-write leaves the previous file intact. Success leaves no `.tmp`.
-pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let tmp = sibling_tmp(path);
-    let result = (|| {
-        let mut f = fs::File::create(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-        fs::rename(&tmp, path)
-    })();
+/// Create parent directories, then write `bytes` to `path` via a sibling `.tmp`,
+/// `sync_all`, and a rename. With `rotate`, an existing `path` first becomes the
+/// `.bak`, and a failed final rename moves it back. A crash leaves the previous
+/// file (between the two renames, as the `.bak`). No failure leaves a `.tmp`.
+pub(crate) fn write_rotating(path: &Path, bytes: &[u8], rotate: bool) -> io::Result<()> {
+    write_rotating_with(path, bytes, rotate, |from, to| fs::rename(from, to))
+}
+
+/// [`write_rotating`] with the rename passed in, so a test can fail one.
+fn write_rotating_with(
+    path: &Path,
+    bytes: &[u8],
+    rotate: bool,
+    mut rename: impl FnMut(&Path, &Path) -> io::Result<()>,
+) -> io::Result<()> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let tmp = sibling(path, ".tmp");
+    let result = write_synced(&tmp, bytes).and_then(|()| {
+        if !(rotate && path.exists()) {
+            return rename(&tmp, path);
+        }
+        let bak = sibling(path, ".bak");
+        rename(path, &bak)?;
+        let swapped = rename(&tmp, path);
+        if swapped.is_err() {
+            let _ = rename(&bak, path);
+        }
+        swapped
+    });
     if result.is_err() {
         let _ = fs::remove_file(&tmp);
     }
     result
 }
 
-/// Create parent directories, then [`write_atomic`]. Settings, session, and
-/// mods.cfg persist through this.
+/// Create `path`, write `bytes`, and `sync_all`. The file is closed on return, before any rename.
+fn write_synced(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut f = fs::File::create(path)?;
+    f.write_all(bytes)?;
+    f.sync_all()
+}
+
+/// [`write_rotating`] without a backup. Settings, session, and mods.cfg persist through this.
 pub fn write_atomic_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
-    }
-    write_atomic(path, bytes)
+    write_rotating(path, bytes, false)
 }
 
 /// Log a filesystem error instead of `let _ =`. Callers stay best-effort.
@@ -147,18 +169,7 @@ pub(crate) fn test_temp_path(tag: &str) -> PathBuf {
 
 /// Atomically replace a slot's bytes, rotating the previous file to `.bak`.
 pub fn write(id: &SlotId, bytes: &[u8]) -> io::Result<()> {
-    fs::create_dir_all(saves_dir())?;
-    let tmp = tmp_path(id);
-    let live = live_path(id);
-    {
-        let mut f = fs::File::create(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-    }
-    if live.exists() {
-        fs::rename(&live, bak_path(id))?;
-    }
-    fs::rename(&tmp, &live)
+    write_rotating(&live_path(id), bytes, true)
 }
 
 /// Move a slot to a new id. The display name in the header is patched to
@@ -273,7 +284,7 @@ mod tests {
     fn cleanup(id: &SlotId) {
         let _ = fs::remove_file(live_path(id));
         let _ = fs::remove_file(bak_path(id));
-        let _ = fs::remove_file(tmp_path(id));
+        let _ = fs::remove_file(sibling(&live_path(id), ".tmp"));
     }
 
     fn edits_of(d: Decoded) -> Vec<Edit> {
@@ -456,10 +467,10 @@ mod tests {
     #[test]
     fn write_atomic_leaves_no_tmp_on_success() {
         let path = test_temp_path("atomic").with_extension("cfg");
-        let tmp = sibling_tmp(&path);
+        let tmp = sibling(&path, ".tmp");
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(&tmp);
-        write_atomic(&path, b"ok\n").unwrap();
+        write_atomic_file(&path, b"ok\n").unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"ok\n");
         assert!(!tmp.exists(), "successful write must consume the .tmp");
         let _ = fs::remove_file(&path);
@@ -472,8 +483,8 @@ mod tests {
         let _ = fs::remove_dir_all(&parent);
         fs::write(&parent, b"not a directory").unwrap();
         let path = parent.join("mods.cfg");
-        assert!(write_atomic(&path, b"nope").is_err());
-        assert!(!sibling_tmp(&path).exists(), "failed write must not leave a .tmp");
+        assert!(write_atomic_file(&path, b"nope").is_err());
+        assert!(!sibling(&path, ".tmp").exists(), "failed write must not leave a .tmp");
         let _ = fs::remove_file(&parent);
     }
 
@@ -483,7 +494,7 @@ mod tests {
         let _ = fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
         write_atomic_file(&path, b"nested\n").unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"nested\n");
-        assert!(!sibling_tmp(&path).exists());
+        assert!(!sibling(&path, ".tmp").exists());
         let _ = fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
     }
 
@@ -505,6 +516,51 @@ mod tests {
 
         cleanup(&good);
         cleanup(&bad);
+    }
+
+    /// A slot write whose rotation fails keeps the live file and leaves no `.tmp` behind.
+    #[test]
+    fn a_failed_slot_rotation_keeps_live_and_leaves_no_tmp() {
+        let id = SlotId::new("__store_rotate_fails__").unwrap();
+        cleanup(&id);
+        let _ = fs::remove_dir(bak_path(&id));
+        write(&id, b"old").unwrap();
+        fs::create_dir(bak_path(&id)).unwrap();
+
+        assert!(write(&id, b"new").is_err(), "a file cannot be renamed over a directory");
+        assert_eq!(fs::read(live_path(&id)).unwrap(), b"old");
+        assert!(!sibling(&live_path(&id), ".tmp").exists(), "a failed write must not leave a .tmp");
+
+        fs::remove_dir(bak_path(&id)).unwrap();
+        cleanup(&id);
+    }
+
+    /// When the rename that installs the new bytes fails, the backup goes back to being the live
+    /// file and the `.tmp` is removed.
+    #[test]
+    fn a_failing_second_rename_restores_live_and_leaves_no_tmp() {
+        let path = test_temp_path("swap").with_extension("save");
+        let tmp = sibling(&path, ".tmp");
+        let bak = sibling(&path, ".bak");
+        write_rotating(&path, b"old", true).unwrap();
+
+        let result = write_rotating_with(&path, b"new", true, |from, to| {
+            if from == tmp {
+                Err(io::Error::other("injected"))
+            } else {
+                fs::rename(from, to)
+            }
+        });
+        assert!(result.is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"old", "the live file is back");
+        assert!(!bak.exists(), "the backup became the live file again");
+        assert!(!tmp.exists(), "a failed swap must not leave a .tmp");
+
+        write_rotating(&path, b"new", true).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+        assert_eq!(fs::read(&bak).unwrap(), b"old");
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&bak);
     }
 
     #[test]

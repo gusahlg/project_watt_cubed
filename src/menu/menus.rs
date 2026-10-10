@@ -4,24 +4,11 @@ use crate::menu::{
     AppEffect, Command, Ctx, Dir, Framed, Menu, Msg, Notice, Row, Style, ValueView, View,
 };
 use crate::modding::{annotate_setting, VisualMask};
-use crate::render_config::VisualGroup;
 use crate::settings::{Category, MenuKind, SETTINGS};
 
-fn visual_mask_from_ctx(ctx: &Ctx) -> VisualMask {
-    let mut mask = VisualMask {
-        atmosphere: false,
-        post: false,
-        lighting: false,
-    };
-    for row in ctx.mods {
-        match row.visual_group {
-            Some(VisualGroup::Atmosphere) => mask.atmosphere = row.enabled,
-            Some(VisualGroup::Post) => mask.post = row.enabled,
-            Some(VisualGroup::Lighting) => mask.lighting = row.enabled,
-            None => {}
-        }
-    }
-    mask
+/// The renderer's mask ([`Mods::visual_mask`](crate::modding::Mods::visual_mask)) from the snapshot.
+fn visual_mask(ctx: &Ctx) -> VisualMask {
+    VisualMask::of(ctx.mods.iter().filter(|m| m.enabled).filter_map(|m| m.visual_group))
 }
 
 // Mods menu.
@@ -234,7 +221,7 @@ impl Menu for SettingsPage {
             .find(|(c, _)| *c == self.category)
             .map_or("SETTINGS", |(_, n)| n)
             .to_uppercase();
-        let mask = visual_mask_from_ctx(ctx);
+        let mask = visual_mask(ctx);
         let rows = SETTINGS
             .iter()
             .enumerate()
@@ -277,6 +264,7 @@ impl Menu for SettingsPage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::render_config::VisualGroup;
     use crate::session::Session;
     use crate::settings::Settings;
 
@@ -386,6 +374,42 @@ mod tests {
             }
             _ => panic!("expected annotated choice for a stripped bloom row"),
         }
+    }
+
+    /// Two mods own Post and the later one is off. The renderer keeps Post (one owner is on), so
+    /// no settings row may say a mod forced its lane off; every other row matches the renderer too.
+    #[test]
+    fn settings_rows_mark_exactly_the_lanes_the_renderer_strips() {
+        use crate::modding::testing::Stub;
+        let mut mods = crate::modding::Mods::empty();
+        mods.install(Box::new(Stub::new("post").visual(VisualGroup::Post)), true);
+        mods.install(Box::new(Stub::new("post_extra").visual(VisualGroup::Post)), false);
+        let mask = mods.visual_mask();
+        assert!(mask.post && !mask.atmosphere && !mask.lighting, "{mask:?}");
+        let snap = crate::menu::ModRow::snapshot(&mods);
+        let mut settings = Settings::default();
+        let session = Session::default();
+        let ctx = Ctx {
+            settings: &mut settings,
+            saves: &[],
+            mods: &snap,
+            session: &session,
+            mods_save_error: None,
+        };
+        let mut lanes = 0;
+        for (category, _) in Category::ALL {
+            for row in SettingsPage::new(category).view(&ctx).rows {
+                let key = SETTINGS[row.tag.expect("settings rows are selectable")].key();
+                let shown = match &row.kind {
+                    crate::menu::RowKind::Value(ValueView::Choice(s) | ValueView::Bar { label: s, .. }) => s.as_str(),
+                    _ => "",
+                };
+                let marked = shown.contains("(off: ");
+                assert_eq!(marked, mask.forced_off(key).is_some(), "{key}: {shown:?}");
+                lanes += crate::render_config::lane_group(key).is_some() as usize;
+            }
+        }
+        assert!(lanes > 0, "the settings pages list the visual lanes");
     }
 
     #[test]

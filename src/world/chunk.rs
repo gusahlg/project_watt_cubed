@@ -67,7 +67,6 @@ impl ChunkData {
     }
 
     /// The block at flat index `i` ([`Chunk::index`]).
-    #[cfg(test)]
     pub fn get(&self, i: usize) -> BlockId {
         match self {
             ChunkData::Uniform(id) => *id,

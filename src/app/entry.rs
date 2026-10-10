@@ -84,8 +84,7 @@ impl Loading {
         let spawn = conn.spawn();
         let job = Job::spawn(move || {
             let world = recipe.world();
-            let mut player = Player::new(spawn);
-            player.stand_in(world.gravity_at(player.position).accel);
+            let player = Player::standing(spawn, world.gravity_at(spawn).accel);
             (world, player)
         });
         Self::Join { job, conn, notice, hosted }
@@ -300,14 +299,13 @@ mod tests {
         let terrain = TerrainCfg { relief: 150, ..TerrainCfg::default() }.clamp();
         let config = Config { seed: 77, worldgen: WorldgenKind::Diffusion, terrain, ..Config::default() };
         let handle = server::spawn(0, config).unwrap();
-        let conn = crate::app::join_server("127.0.0.1", handle.addr().port(), "ada", "").expect("join");
+        let conn = Connection::connect("127.0.0.1", handle.addr().port(), "ada", "").expect("join");
         let spawn = conn.spawn();
         let loading = Loading::join(conn, RenderConfig::default(), Some("hi".into()), true);
         let Loading::Join { job, conn, notice, hosted } = loading else { unreachable!() };
         let (world, player) = job.wait();
         assert_eq!((world.seed(), world.worldgen(), world.terrain_cfg()), (77, WorldgenKind::Diffusion, terrain));
-        let mut inline = Player::new(spawn);
-        inline.stand_in(recipe(77, WorldgenKind::Diffusion, terrain).world().gravity_at(spawn).accel);
+        let inline = Player::standing(spawn, recipe(77, WorldgenKind::Diffusion, terrain).world().gravity_at(spawn).accel);
         assert_eq!(pose(&player), pose(&inline));
         assert!(conn.is_alive());
         assert_eq!((notice.as_deref(), hosted), (Some("hi"), true));

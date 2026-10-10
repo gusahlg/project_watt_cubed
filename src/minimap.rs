@@ -73,6 +73,12 @@ pub struct MapSample {
 }
 
 impl MapSample {
+    /// [`from_player`](Self::from_player) for `player`'s pose.
+    pub fn of(world: &World, player: &crate::player::Player) -> Self {
+        let o = &player.orientation;
+        Self::from_player(world, player.position, player.up_axis, o.frame, o.yaw)
+    }
+
     pub fn from_player(world: &World, eye: DVec3, up: Face, frame: DQuat, yaw: f32) -> Self {
         if let Some(storage) = world.chart_eye(eye) {
             let heading = chart_heading(world, eye, frame, yaw)
@@ -128,6 +134,8 @@ pub struct Minimap {
     center: Option<IVec2>,
     /// Face of `center`. A column from another face is not a shift of this one.
     face: Face,
+    /// [`World::surface_stamp`] of the area the raster last painted.
+    stamp: u64,
 }
 
 impl Minimap {
@@ -140,6 +148,7 @@ impl Minimap {
             top_y: vec![i32::MIN; texels],
             center: None,
             face: Face::PosY,
+            stamp: 0,
         }
     }
 
@@ -168,8 +177,9 @@ impl Minimap {
     /// Throttled + recenter-gated rescan: when [`Self::due`], rebuilds `rgba`
     /// from the world's top-solid columns (colour × slope-shade) and uploads it
     /// via [`Engine::update_minimap`]. `interval_elapsed` is the scheduler's
-    /// throttle decision. Returns `true` when it rebuilt, so the caller resets
-    /// the scheduler's interval gate on the attempt.
+    /// throttle decision. Returns `true` when the gate was due (painted or
+    /// found unchanged), so the caller resets the scheduler's interval gate on
+    /// the attempt.
     pub fn refresh(
         &mut self,
         eng: &mut Engine,
@@ -177,23 +187,28 @@ impl Minimap {
         sample: MapSample,
         interval_elapsed: bool,
     ) -> bool {
-        if !self.rebuild(world, sample.face, sample.col, interval_elapsed) {
+        let Some(painted) = self.rebuild(world, sample.face, sample.col, interval_elapsed) else {
             return false;
+        };
+        if painted {
+            eng.update_minimap(&self.rgba);
         }
-        eng.update_minimap(&self.rgba);
         true
     }
 
     /// CPU half of [`Self::refresh`]: full rebuild on the interval / first
     /// build / a face change / `d ≥ size`, otherwise shift the raster and
-    /// repaint exposed strips.
-    fn rebuild(&mut self, world: &World, face: Face, player_col: IVec2, interval_elapsed: bool) -> bool {
+    /// repaint exposed strips. An interval rebuild over an unchanged surface
+    /// under a still player is skipped. `None` when not due, else whether it
+    /// painted.
+    fn rebuild(&mut self, world: &World, face: Face, player_col: IVec2, interval_elapsed: bool) -> Option<bool> {
         if !self.due(face, player_col, interval_elapsed) {
-            return false;
+            return None;
         }
         let size = self.cfg.size as i32;
         let face_changed = self.center.is_some() && self.face != face;
         self.face = face;
+        let stamp = self.surface_stamp(world, player_col);
         match self.center {
             Some(prev) if !interval_elapsed && !face_changed => {
                 let dx = player_col.x - prev.x;
@@ -205,10 +220,24 @@ impl Minimap {
                     self.rebuild_full(world, player_col);
                 }
             }
+            Some(prev) if prev == player_col && !face_changed && stamp == self.stamp => return Some(false),
             _ => self.rebuild_full(world, player_col),
         }
         self.center = Some(player_col);
-        true
+        self.stamp = stamp;
+        Some(true)
+    }
+
+    /// [`World::surface_stamp`] over the chunk columns a raster centred on `player_col` covers.
+    fn surface_stamp(&self, world: &World, player_col: IVec2) -> u64 {
+        let size = self.cfg.size as i32;
+        let s = crate::world::chunk::CHUNK_SIZE as i32;
+        let (u0, v0) = (player_col.x - size / 2, player_col.y - size / 2);
+        world.surface_stamp(
+            self.face,
+            u0.div_euclid(s)..=(u0 + size - 1).div_euclid(s),
+            v0.div_euclid(s)..=(v0 + size - 1).div_euclid(s),
+        )
     }
 
     fn rebuild_full(&mut self, world: &World, player_col: IVec2) {
@@ -219,8 +248,8 @@ impl Minimap {
 
     fn rebuild_shift(&mut self, world: &World, player_col: IVec2, dx: i32, dz: i32) {
         let sz = self.cfg.size as usize;
-        shift_heights(&mut self.top_y, sz, dx, dz);
-        shift_rgba(&mut self.rgba, sz, dx, dz);
+        shift(&mut self.top_y, sz, 1, dx, dz);
+        shift(&mut self.rgba, sz, 4, dx, dz);
 
         if dx > 0 {
             self.paint_rect(world, player_col, sz - dx as usize, 0, sz, sz);
@@ -285,7 +314,7 @@ impl Minimap {
         let v1w = origin_v + v1 as i32 - 1;
         let s = crate::world::chunk::CHUNK_SIZE as i32;
         let void = self.cfg.void;
-        let face = self.face;
+        let mut tops = [[None; crate::world::chunk::CHUNK_SIZE]; crate::world::chunk::CHUNK_SIZE];
 
         for cu in u0w.div_euclid(s)..=u1w.div_euclid(s) {
             for cv in v0w.div_euclid(s)..=v1w.div_euclid(s) {
@@ -293,26 +322,18 @@ impl Minimap {
                 let us1 = u1w.min((cu + 1) * s - 1);
                 let vs0 = v0w.max(cv * s);
                 let vs1 = v1w.min((cv + 1) * s - 1);
-                let alts = world.column_alts(face, cu, cv);
+                let lus = us0.rem_euclid(s) as usize..us1.rem_euclid(s) as usize + 1;
+                let lvs = vs0.rem_euclid(s) as usize..vs1.rem_euclid(s) as usize + 1;
+                world.top_solids_on_face(self.face, (cu, cv), lus, lvs, &mut tops);
                 for u in us0..=us1 {
                     let lu = u.rem_euclid(s) as usize;
                     let tu = (u - origin_u) as usize;
                     for v in vs0..=vs1 {
                         let lv = v.rem_euclid(s) as usize;
-                        let tv = (v - origin_v) as usize;
-                        let idx = tv * sz + tu;
-                        match world.top_solid_on_face(face, cu, cv, alts, lu, lv) {
-                            Some((ty, color)) => {
-                                self.top_y[idx] = ty;
-                                self.rgba[idx * 4..idx * 4 + 4]
-                                    .copy_from_slice(&[color.r, color.g, color.b, color.a]);
-                            }
-                            None => {
-                                self.top_y[idx] = i32::MIN;
-                                self.rgba[idx * 4..idx * 4 + 4]
-                                    .copy_from_slice(&[void.r, void.g, void.b, void.a]);
-                            }
-                        }
+                        let idx = (v - origin_v) as usize * sz + tu;
+                        let (ty, color) = tops[lv][lu].unwrap_or((i32::MIN, void));
+                        self.top_y[idx] = ty;
+                        self.rgba[idx * 4..idx * 4 + 4].copy_from_slice(&[color.r, color.g, color.b, color.a]);
                     }
                 }
             }
@@ -413,62 +434,23 @@ fn kept_range(sz: usize, delta: i32) -> (usize, usize) {
     }
 }
 
-fn shift_heights(buf: &mut [i32], sz: usize, dx: i32, dz: i32) {
-    shift2d(sz, dx, dz, |u, v, su, sv| {
-        buf[v * sz + u] = buf[sv * sz + su];
-    });
-}
-
-fn shift_rgba(buf: &mut [u8], sz: usize, dx: i32, dz: i32) {
-    shift2d(sz, dx, dz, |u, v, su, sv| {
-        let dst = (v * sz + u) * 4;
-        let src = (sv * sz + su) * 4;
-        buf.copy_within(src..src + 4, dst);
-    });
-}
-
-fn shift2d(sz: usize, dx: i32, dz: i32, mut copy: impl FnMut(usize, usize, usize, usize)) {
-    if dz < 0 {
-        for v in (0..sz).rev() {
-            shift_row(sz, v, dx, dz, &mut copy);
-        }
+/// Move a `sz × sz` raster of `per` values a texel by `(dx, dz)`: texel `(u, v)` takes
+/// `(u + dx, v + dz)` wherever that lies inside, one row copy at a time; the rest keep their
+/// old values for the caller to repaint.
+fn shift<T: Copy>(buf: &mut [T], sz: usize, per: usize, dx: i32, dz: i32) {
+    debug_assert!(dx.unsigned_abs() < sz as u32 && dz.unsigned_abs() < sz as u32);
+    let len = (sz - dx.unsigned_abs() as usize) * per;
+    let (dst_u, src_u) = if dx < 0 { (dx.unsigned_abs() as usize, 0) } else { (0, dx as usize) };
+    let mut copy = |v: usize| {
+        let sv = (v as i32 + dz) as usize;
+        let src = (sv * sz + src_u) * per;
+        buf.copy_within(src..src + len, (v * sz + dst_u) * per);
+    };
+    // Read each source row before it is overwritten.
+    if dz > 0 {
+        (0..sz - dz as usize).for_each(&mut copy);
     } else {
-        for v in 0..sz {
-            shift_row(sz, v, dx, dz, &mut copy);
-        }
-    }
-}
-
-fn shift_row(
-    sz: usize,
-    v: usize,
-    dx: i32,
-    dz: i32,
-    copy: &mut impl FnMut(usize, usize, usize, usize),
-) {
-    if dx < 0 {
-        for u in (0..sz).rev() {
-            try_shift(sz, u, v, dx, dz, copy);
-        }
-    } else {
-        for u in 0..sz {
-            try_shift(sz, u, v, dx, dz, copy);
-        }
-    }
-}
-
-fn try_shift(
-    sz: usize,
-    u: usize,
-    v: usize,
-    dx: i32,
-    dz: i32,
-    copy: &mut impl FnMut(usize, usize, usize, usize),
-) {
-    let su = u as i32 + dx;
-    let sv = v as i32 + dz;
-    if su >= 0 && su < sz as i32 && sv >= 0 && sv < sz as i32 {
-        copy(u, v, su as usize, sv as usize);
+        (dz.unsigned_abs() as usize..sz).rev().for_each(&mut copy);
     }
 }
 
@@ -578,7 +560,7 @@ mod tests {
             let dest = IVec2::new(origin.x + delta.x, origin.y + delta.y);
 
             let mut shifted = Minimap::new(MinimapConfig::DEFAULT);
-            assert!(shifted.rebuild(&world, Face::PosY, origin, true));
+            assert_eq!(shifted.rebuild(&world, Face::PosY, origin, true), Some(true));
             let void = MinimapConfig::DEFAULT.void;
             let mid = (128 * 256 + 128) * 4;
             assert_ne!(
@@ -586,10 +568,10 @@ mod tests {
                 &[void.r, void.g, void.b, void.a],
                 "PosY origin still paints loaded ground"
             );
-            assert!(shifted.rebuild(&world, Face::PosY, dest, false));
+            assert_eq!(shifted.rebuild(&world, Face::PosY, dest, false), Some(true));
 
             let mut full = Minimap::new(MinimapConfig::DEFAULT);
-            assert!(full.rebuild(&world, Face::PosY, dest, true));
+            assert_eq!(full.rebuild(&world, Face::PosY, dest, true), Some(true));
 
             assert_eq!(
                 shifted.rgba, full.rgba,
@@ -600,6 +582,63 @@ mod tests {
                 "height mismatch for delta {delta:?}"
             );
         }
+    }
+
+    /// An interval refresh under a still player over an unchanged surface paints nothing; an edit,
+    /// a newly loaded chunk or a step repaints.
+    #[test]
+    fn an_idle_interval_refresh_is_skipped() {
+        use crate::world::chunk::Chunk;
+        let mut world = crate::world::World::new(73);
+        let origin = IVec2::new(0, 0);
+        let mut map = Minimap::new(MinimapConfig::DEFAULT);
+        assert_eq!(map.rebuild(&world, Face::PosY, origin, true), Some(true));
+        assert_eq!(map.rebuild(&world, Face::PosY, origin, false), None, "not due");
+        assert_eq!(map.rebuild(&world, Face::PosY, origin, true), Some(false), "idle");
+
+        let stone = world.registry().id_by_label("rock").unwrap();
+        world.set_block(3, 60, 3, stone);
+        assert_eq!(map.rebuild(&world, Face::PosY, origin, true), Some(true), "an edit repaints");
+        assert_eq!(map.rebuild(&world, Face::PosY, origin, true), Some(false));
+
+        let coord = crate::coord::ChunkCoord::new(-8, 9, 7);
+        world.store_column_chunk(Face::PosY, coord, Chunk::from_uniform(-8, 9, 7, stone));
+        assert_eq!(map.rebuild(&world, Face::PosY, origin, true), Some(true), "a loaded chunk repaints");
+        let mut full = Minimap::new(MinimapConfig::DEFAULT);
+        assert_eq!(full.rebuild(&world, Face::PosY, origin, true), Some(true));
+        assert!(map.rgba == full.rgba && map.top_y == full.top_y);
+
+        assert_eq!(map.rebuild(&world, Face::PosY, IVec2::new(1, 0), true), Some(true), "a step repaints");
+    }
+
+    /// Cost probe: a full rebuild, the idle interval check that replaces it, and a 16-texel shift.
+    #[test]
+    #[ignore]
+    fn minimap_rebuild_cost() {
+        use std::time::Instant;
+        let world = crate::world::World::new(73);
+        let origin = IVec2::new(0, 0);
+        let mut map = Minimap::new(MinimapConfig::DEFAULT);
+        const N: u32 = 50;
+        let us = |t: Instant| t.elapsed().as_secs_f64() * 1e6 / f64::from(N);
+        let t = Instant::now();
+        for _ in 0..N {
+            map.center = None;
+            assert_eq!(map.rebuild(&world, Face::PosY, origin, true), Some(true));
+        }
+        let full = us(t);
+        let t = Instant::now();
+        for _ in 0..N {
+            assert_eq!(map.rebuild(&world, Face::PosY, origin, true), Some(false), "the idle rebuild is skipped");
+        }
+        let idle = us(t);
+        let t = Instant::now();
+        for i in 0..N {
+            let col = if i % 2 == 0 { IVec2::new(16, 8) } else { origin };
+            assert_eq!(map.rebuild(&world, Face::PosY, col, false), Some(true));
+        }
+        let shift = us(t);
+        println!("minimap_rebuild_cost ({N} iters): full {full:.1} us, idle {idle:.1} us, shift {shift:.1} us");
     }
 
     /// A player standing on the +X face rasters that face's (u, v), and the height
@@ -623,7 +662,7 @@ mod tests {
         assert_ne!(sample.col.x, eye.x.floor() as i32, "the plane is not world XZ");
 
         let mut map = Minimap::new(MinimapConfig::DEFAULT);
-        assert!(map.rebuild(&world, sample.face, sample.col, true));
+        assert_eq!(map.rebuild(&world, sample.face, sample.col, true), Some(true));
         let idx = 128 * 256 + 128;
         let color = world.registry().color(stone);
         assert_eq!(
@@ -659,7 +698,7 @@ mod tests {
         assert_eq!(sample.col, IVec2::new(s[0] as i32, s[2] as i32));
 
         let mut map = Minimap::new(MinimapConfig::DEFAULT);
-        assert!(map.rebuild(&world, sample.face, sample.col, true));
+        assert_eq!(map.rebuild(&world, sample.face, sample.col, true), Some(true));
         let idx = 128 * 256 + 128;
         let color = world.registry().color(stone);
         assert_eq!(&map.rgba[idx * 4..idx * 4 + 4], &[color.r, color.g, color.b, color.a]);

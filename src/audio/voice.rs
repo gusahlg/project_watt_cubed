@@ -90,6 +90,8 @@ pub(crate) enum Session {
         last_at: Option<DVec3>,
         /// Per-session coordinate smoother: sessions smooth like clips/emitters.
         smooth: super::Smoothed,
+        /// Won a voice in this frame's ranking.
+        won: bool,
     },
     Tombstone {
         epoch: Epoch,

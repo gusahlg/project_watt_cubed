@@ -68,7 +68,7 @@ fn usage(reason: &str) -> ! {
 
 /// Deterministic white noise in [-1, 1] from a splitmix-style step (no rng dep).
 fn noise(state: &mut u64) -> f32 {
-    let z = project_watt_cubed::hash::splitmix_next(state);
+    let z = project_watt_cubed::splitmix_next(state);
     (z as u32 as f32 / u32::MAX as f32) * 2.0 - 1.0
 }
 

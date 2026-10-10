@@ -22,10 +22,12 @@
 use std::sync::OnceLock;
 
 use material::{
-    centroid_q8, colour_at, fit_raw, observe, Block, Configuration, Contact, Element, Law, QUANTUM,
+    centroid_q8, colour_at, fit_raw, observe, Block, Configuration, Contact, Element, Law, MAX_ENCODING, QUANTUM,
 };
 
 use super::noise::hash2;
+use crate::block::registry::read_hex;
+use crate::hash::Fnv64;
 
 /// What a role needs from its configuration besides its colour.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -295,25 +297,16 @@ fn baked(law: &Law) -> Option<Vec<Entry>> {
 }
 
 fn decode_hex(hex: &str) -> Option<Configuration> {
-    if hex.len() % 2 != 0 {
-        return None;
-    }
-    let bytes: Option<Vec<u8>> =
-        (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok()).collect();
-    Configuration::decode(&bytes?).ok()
+    let mut bytes = [0; MAX_ENCODING];
+    Configuration::decode(read_hex(hex, &mut bytes)?).ok()
 }
 
 /// FNV-1a over every input of [`search`] that is data: the roles, the underground set, and the
 /// search constants.
 fn roles_fingerprint() -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut h = Fnv64::new();
     let mut feed = |bytes: &[u8]| {
-        for &b in bytes {
-            h ^= u64::from(b);
-            h = h.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        h ^= 0xff;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        h.bytes(bytes).bytes(&[0xff]);
     };
     for r in ROLES {
         feed(r.label.as_bytes());
@@ -337,7 +330,7 @@ fn roles_fingerprint() -> u64 {
     for k in [GAP, MAX_REAGENT_SPILL as u32, NEAREST as u32, PANEL as u32, SHORTLIST as u32, BANK as u32, BANK_SCAN, BASES, PROBE_BASES, u32::from(STEP)] {
         feed(&k.to_le_bytes());
     }
-    h
+    h.finish()
 }
 
 /// The palette of `law`.
@@ -807,6 +800,15 @@ fn find_reagent(_law: &Law, taken: &[Block], neighbours: &[bool], target: usize,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::block::registry::hex_digits;
+
+    /// [`BAKED`] is keyed on these two fingerprints: a change re-runs the search at every start.
+    #[test]
+    fn the_palette_fingerprints_are_pinned() {
+        assert_eq!(roles_fingerprint(), 0x5ef1_889b_dc5b_5090);
+        assert_eq!(Law::current().fingerprint(), 0x04ce_0caa_d622_c6eb);
+        assert_eq!((BAKED.roles, BAKED.law), (roles_fingerprint(), Law::current().fingerprint()));
+    }
 
     /// The contact the kernel would actually run, both ways around.
     fn by_contact(a: &Block, b: &Block) -> bool {
@@ -930,7 +932,7 @@ mod tests {
         let fresh = Baked { law: law.fingerprint(), roles: roles_fingerprint(), configs: &[] };
         let hex: Vec<String> = searched
             .iter()
-            .map(|e| e.config.encode().as_bytes().iter().map(|b| format!("{b:02x}")).collect())
+            .map(|e| hex_digits(e.config.encode().as_bytes()).map(char::from).collect())
             .collect();
         let stale = BAKED.law != fresh.law
             || BAKED.roles != fresh.roles

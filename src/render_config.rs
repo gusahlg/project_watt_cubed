@@ -76,34 +76,74 @@ pub fn vrs_effective(choice: VrsChoice, render_w: u32, render_h: u32, min_pixels
     }
 }
 
-/// Fancy presentation groups owned by default-enabled visual mods.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum VisualGroup {
-    Atmosphere,
-    Post,
-    Lighting,
+/// The visual groups and their lanes, from the one table below. A lane is both its
+/// settings/`/gfx` key and its [`RenderConfig`] field, so [`lane_group`] and
+/// [`RenderConfig::strip_group`] cannot disagree.
+macro_rules! visual_groups {
+    ($($group:ident: $($lane:ident)+;)+) => {
+        /// Fancy presentation groups owned by default-enabled visual mods.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum VisualGroup {
+            $($group,)+
+        }
+
+        impl VisualGroup {
+            pub const ALL: [VisualGroup; [$(VisualGroup::$group),+].len()] = [$(VisualGroup::$group),+];
+
+            /// The visual mod that owns the group (the name the forced-off marker shows).
+            pub fn mod_name(self) -> &'static str {
+                match self {
+                    $(Self::$group => stringify!($group),)+
+                }
+            }
+        }
+
+        /// Which visual-mod group owns a settings/`/gfx` lane key, if any.
+        pub fn lane_group(key: &str) -> Option<VisualGroup> {
+            match key {
+                $($(stringify!($lane))|+ => Some(VisualGroup::$group),)+
+                _ => None,
+            }
+        }
+
+        impl RenderConfig {
+            /// Drop one visual group; used when that group's mod is disabled.
+            pub fn strip_group(&mut self, group: VisualGroup) {
+                match group {
+                    $(VisualGroup::$group => {
+                        $(self.$lane = false;)+
+                    })+
+                }
+            }
+        }
+
+        /// Every lane with its group, in table order.
+        #[cfg(test)]
+        const VISUAL_LANES: &[(&str, VisualGroup)] = &[$($((stringify!($lane), VisualGroup::$group),)+)+];
+
+        /// A lane's value by key.
+        #[cfg(test)]
+        fn lane(cfg: &RenderConfig, key: &str) -> bool {
+            match key {
+                $($(stringify!($lane) => cfg.$lane,)+)+
+                _ => panic!("{key} is not a visual lane"),
+            }
+        }
+
+        /// The default config with every lane set to `on`.
+        #[cfg(test)]
+        fn with_lanes(on: bool) -> RenderConfig {
+            let mut cfg = RenderConfig::default();
+            $($(cfg.$lane = on;)+)+
+            cfg
+        }
+    };
 }
 
-impl VisualGroup {
-    pub fn mod_name(self) -> &'static str {
-        match self {
-            Self::Atmosphere => "Atmosphere",
-            Self::Post => "Post",
-            Self::Lighting => "Lighting",
-        }
-    }
-}
-
-/// Which visual-mod group owns a settings/`/gfx` lane key, if any.
-pub fn lane_group(key: &str) -> Option<VisualGroup> {
-    match key {
-        "clouds" | "weather" | "stars" | "day_night" | "fog" | "sky" => {
-            Some(VisualGroup::Atmosphere)
-        }
-        "bloom" | "godrays" | "taa" | "exposure" | "vignette" | "vrs" => Some(VisualGroup::Post),
-        "shadows" | "ambient" | "blocklight" => Some(VisualGroup::Lighting),
-        _ => None,
-    }
+visual_groups! {
+    Atmosphere: clouds weather stars day_night fog sky;
+    Post: bloom godrays taa exposure vignette vrs;
+    Lighting: shadows ambient blocklight;
 }
 
 /// Render lane toggles. `Copy` to thread freely.
@@ -193,42 +233,15 @@ impl RenderConfig {
             lod_detail: 6,
             ..Self::default()
         };
-        cfg.strip_group(VisualGroup::Atmosphere);
-        cfg.strip_group(VisualGroup::Post);
-        cfg.strip_group(VisualGroup::Lighting);
+        for group in VisualGroup::ALL {
+            cfg.strip_group(group);
+        }
         cfg
     }
 
     /// Golden harness config: defaults with blocklight and exposure for proper lighting.
     pub fn golden() -> Self {
         Self { blocklight: true, exposure: true, ..Self::default() }
-    }
-
-    /// Drop one visual group; used when that group's mod is disabled.
-    pub fn strip_group(&mut self, group: VisualGroup) {
-        match group {
-            VisualGroup::Atmosphere => {
-                self.clouds = false;
-                self.weather = false;
-                self.stars = false;
-                self.day_night = false;
-                self.fog = false;
-                self.sky = false;
-            }
-            VisualGroup::Post => {
-                self.bloom = false;
-                self.godrays = false;
-                self.taa = false;
-                self.exposure = false;
-                self.vignette = false;
-                self.vrs = false;
-            }
-            VisualGroup::Lighting => {
-                self.shadows = false;
-                self.ambient = false;
-                self.blocklight = false;
-            }
-        }
     }
 
     /// Clamp the requested LOD ladder to the supported ranges and shorten it
@@ -596,9 +609,9 @@ mod tests {
             lod_detail: 6,
             ..RenderConfig::default()
         };
-        expected.strip_group(VisualGroup::Atmosphere);
-        expected.strip_group(VisualGroup::Post);
-        expected.strip_group(VisualGroup::Lighting);
+        for group in VisualGroup::ALL {
+            expected.strip_group(group);
+        }
         let core = RenderConfig::core();
         assert!(!core.bloom && !expected.bloom);
         assert!(!core.clouds && !expected.clouds);
@@ -609,6 +622,29 @@ mod tests {
         assert_eq!(core.normalized_lod(), expected.normalized_lod());
         assert_eq!(core.vrs, expected.vrs);
         assert_eq!(core.blocklight, expected.blocklight);
+    }
+
+    /// Each lane is a settings key that one group owns, and stripping a group turns off exactly
+    /// its own lanes.
+    #[test]
+    fn every_lane_belongs_to_exactly_one_group() {
+        for (i, &(key, group)) in VISUAL_LANES.iter().enumerate() {
+            assert!(VISUAL_LANES[..i].iter().all(|&(k, _)| k != key), "{key} is in two groups");
+            assert_eq!(lane_group(key), Some(group), "{key}");
+            assert!(crate::settings::SETTINGS.iter().any(|s| s.key() == key), "{key} is not a settings key");
+        }
+        for group in VisualGroup::ALL {
+            assert!(VISUAL_LANES.iter().any(|&(_, g)| g == group), "{group:?} owns no lane");
+            let mut cfg = with_lanes(true);
+            cfg.strip_group(group);
+            for &(key, owner) in VISUAL_LANES {
+                assert_eq!(lane(&cfg, key), owner != group, "{key} after stripping {group:?}");
+            }
+        }
+        assert_eq!(lane_group("sunlight"), None, "core lanes belong to no group");
+        assert_eq!(lane_group("occlusion"), None);
+        let all_off = with_lanes(false);
+        assert!(VISUAL_LANES.iter().all(|&(key, _)| !lane(&all_off, key)));
     }
 
     #[test]

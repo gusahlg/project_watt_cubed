@@ -90,6 +90,46 @@ pub(super) fn sample_column_heights(g: &(impl TerrainGenerator + ?Sized), cx: i3
     heights
 }
 
+/// Where a fresh player stands on a world: the charted start world's own spawn, else 3 blocks
+/// above the first level cell near the origin, so they land on a meadow or a valley floor rather
+/// than a cliff edge. The search spirals outward over whole 16×16 chunk columns (one
+/// [`TerrainGenerator::heights_16`] batch each) for the first cell whose 3×3 neighbourhood lies
+/// within one block of it; with none, it stands above the origin column. Single player and the
+/// server both start here, so one seed spawns in one place.
+pub fn spawn_column(g: &(impl TerrainGenerator + ?Sized)) -> voxel_engine::DVec3 {
+    if let Some(p) = g.chart_spawn() {
+        return p;
+    }
+    // Eight probes per ring, eight blocks apart, fold onto at most 34 distinct chunk columns.
+    let mut seen = [(i32::MAX, i32::MAX); 64];
+    let mut n = 0usize;
+    for r in 0i32..8 {
+        for (dx, dz) in [(r, 0), (0, r), (-r, 0), (0, -r), (r, r), (-r, -r), (r, -r), (-r, r)] {
+            let (cx, cz) = ((dx * 8).div_euclid(16), (dz * 8).div_euclid(16));
+            if seen[..n].contains(&(cx, cz)) {
+                continue;
+            }
+            seen[n] = (cx, cz);
+            n += 1;
+            let heights = g.heights_16(cx, cz);
+            for lz in 1..15 {
+                for lx in 1..15 {
+                    let h = heights[lx + lz * 16];
+                    let level = (0..9).all(|k| {
+                        let (ox, oz) = (lx + k % 3 - 1, lz + k / 3 - 1);
+                        (heights[ox + oz * 16] - h).abs() <= 1
+                    });
+                    if level {
+                        let (x, z) = (cx * 16 + lx as i32, cz * 16 + lz as i32);
+                        return voxel_engine::DVec3::new(x as f64 + 0.5, h as f64 + 3.0, z as f64 + 0.5);
+                    }
+                }
+            }
+        }
+    }
+    voxel_engine::DVec3::new(0.5, g.height(0, 0) as f64 + 3.0, 0.5)
+}
+
 /// Face-local altitudes for a non-PosY column, via [`TerrainGenerator::surface`].
 fn sample_face_heights(g: &(impl TerrainGenerator + ?Sized), key: ColumnKey) -> ColumnHeights {
     let mut heights = [0i32; CHUNK_SIZE * CHUNK_SIZE];
@@ -499,6 +539,39 @@ mod tests {
         assert_eq!(g.generate(FLAT_HALF / 16, 0, 0), ChunkData::Uniform(AIR));
         assert_eq!(g.block_at(0, g.floor - 1, 0, FLAT_HEIGHT), AIR);
         assert_eq!(g.block_at(0, g.floor, 0, FLAT_HEIGHT), g.rock);
+    }
+
+    /// Heights from a closure: a test world without blocks.
+    struct Relief<F>(F);
+
+    impl<F: Fn(i32, i32) -> i32 + Send + Sync> TerrainGenerator for Relief<F> {
+        fn height(&self, wx: i32, wz: i32) -> i32 {
+            (self.0)(wx, wz)
+        }
+        fn surface_at(&self, _wx: i32, _wz: i32) -> BlockId {
+            AIR
+        }
+        fn deep(&self) -> BlockId {
+            AIR
+        }
+    }
+
+    #[test]
+    fn spawn_column_takes_the_first_level_cell_of_the_spiral() {
+        let mut reg = BlockRegistry::with_builtins();
+        let flat = FlatTerrain::new(&mut reg, 3);
+        let at = |x: f64, h: i32, z: f64| voxel_engine::DVec3::new(x, h as f64 + 3.0, z);
+        assert_eq!(spawn_column(&flat), at(1.5, FLAT_HEIGHT, 1.5), "the first interior cell of the origin column");
+
+        // Neighbours differ by 4 or more everywhere except a 3×3 plateau in chunk column (1, 0),
+        // the spiral's fifth.
+        let steep = |x: i32, z: i32| (x * 7 + z * 13).rem_euclid(5) * 4;
+        let plateau = Relief(move |x: i32, z: i32| if (20..23).contains(&x) && (4..7).contains(&z) { 50 } else { steep(x, z) });
+        assert_eq!(spawn_column(&plateau), at(21.5, 50, 5.5));
+
+        // No level cell anywhere: all 34 columns of the spiral are searched, then the origin.
+        let steep = Relief(steep);
+        assert_eq!(spawn_column(&steep), at(0.5, steep.height(0, 0), 0.5));
     }
 
     #[test]

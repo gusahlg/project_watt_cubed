@@ -92,6 +92,12 @@ impl Field {
         }
     }
 
+    /// Whether `other` holds the same edit corrections, recorded as many times.
+    #[cfg(test)]
+    pub fn same_edits(&self, other: &Field) -> bool {
+        self.ledger == other.ledger && self.epoch == other.epoch
+    }
+
     /// The acceleration at `p` (the potential of distant summarised groups is left out: what motion
     /// needs, at the lowest cost).
     pub fn sample(&self, p: DVec3) -> Sample {

@@ -55,16 +55,22 @@ impl DrawState {
 struct Scene {
     pose: ViewPose,
     camera: Camera3D,
+    lighting: Lighting,
+    peers: Vec<PeerDraw>,
+    screen: (i32, i32),
+    dt: f32,
+}
+
+/// The frame's composed lighting truth: the source of the engine's per-frame
+/// UBO for sky/fog and avatar key lighting, and the clear.
+struct Lighting {
     /// The one clock sample every sun consumer shares this frame.
     sky_frame: SkyFrame,
     /// Body up and altitude above the local surface datum.
     sky_ctx: crate::frame_snapshot::SkyContext,
-    peers: Vec<PeerDraw>,
-    frame_uniforms: voxel_engine::skeleton::FrameUniformsGpu,
+    uniforms: voxel_engine::skeleton::FrameUniformsGpu,
     clear: voxel_engine::LinearRgb,
     debug_flat: Option<Color>,
-    screen: (i32, i32),
-    dt: f32,
 }
 
 /// Lighting/clear state for a profile whose sky and animation inputs are
@@ -90,19 +96,6 @@ fn sky_keys(eye: DVec3, up: DVec3) -> ([u32; 3], [f64; 2]) {
     (up_q, plane)
 }
 
-fn hud_label(
-    f: &mut voxel_engine::Frame,
-    theme: &crate::ui::Theme,
-    screen: (i32, i32),
-    at: Anchor,
-    off: (i32, i32),
-    base_fs: i32,
-    color: Color,
-    text: &str,
-) {
-    ui::label(f, theme, screen, at, off, base_fs, color, text);
-}
-
 impl Game {
     /// Render the world and HUD.
     ///
@@ -124,7 +117,7 @@ impl Game {
             self.sky.sync_far_map(eng, self.world.terrain());
         }
         let mut scene = self.compose_phase(eng, fov, shake);
-        let mut f = eng.begin_frame(scene.clear);
+        let mut f = eng.begin_frame(scene.lighting.clear);
         self.scene_phase(&mut f, &scene);
         self.hud_phase(&mut f, mods, &scene);
         // Reclaim peer capacity after both consumers finish with the immutable
@@ -162,12 +155,8 @@ impl Game {
 
         // `dt` steps each peer's animator (body-yaw follow, stance blend, swing).
         let want_tags = self.name_tags && self.theme.hud.shows_world_ui();
-        let peers = self.peer_draws(eng, &camera, &pose, dt, self.player_models, want_tags);
+        let peers = self.peer_draws(screen, &camera, &pose, dt, self.player_models, want_tags);
 
-        // Compose the single per-frame lighting truth: the source for the
-        // engine's per-frame UBO for sky/fog and avatar key lighting. The UBO is
-        // the only path; legacy push lanes have been retired.
-        //
         // Exposure is the render thread's latest metered+smoothed value,
         // sourced through `Engine::exposure_for_compose`; temporal smoothing
         // already happened render-side, so frame delta is passed only for
@@ -182,7 +171,22 @@ impl Game {
         } else {
             voxel_engine::skeleton::Exposure::DEFAULT
         };
+        let lighting = self.compose_lighting(&pose, exposure);
 
+        Scene {
+            pose,
+            camera,
+            lighting,
+            peers,
+            screen,
+            dt,
+        }
+    }
+
+    /// Compose the single per-frame lighting truth for `pose`: the source for
+    /// the engine's per-frame UBO for sky/fog and avatar key lighting. The UBO
+    /// is the only path; legacy push lanes have been retired.
+    fn compose_lighting(&mut self, pose: &ViewPose, exposure: voxel_engine::skeleton::Exposure) -> Lighting {
         // ONE clock sample for lighting, clear colour, and sky geometry,
         // cached by the quantised day and body up. Day/night off renders fixed
         // noon (cheap, readable stripped-profile lighting) while the
@@ -219,7 +223,7 @@ impl Game {
         // patch only the camera-anchored UV lanes.
         // Minimum/Fast ride this path.
         let cacheable_frame = !self.render.weather && !self.render.clouds && !self.render.exposure;
-        let (mut frame_uniforms, cached_clear) = if cacheable_frame {
+        let (mut uniforms, cached_clear) = if cacheable_frame {
             let render = &self.render;
             // (day, content_rev, altitude's space fade, body up): any render/palette
             // change bumps the stamp, so the freeze predicate's own inputs invalidate
@@ -254,11 +258,11 @@ impl Game {
             // The camera-anchored UV lanes are the only inputs that can differ
             // while lighting is frozen; exposure and jitter are fixed by the
             // cache predicate.
-            frame_uniforms.anim[1] = anim_uv[0];
-            frame_uniforms.anim[2] = anim_uv[1];
+            uniforms.anim[1] = anim_uv[0];
+            uniforms.anim[2] = anim_uv[1];
         }
-        if self.drawing.last_uniforms != Some(frame_uniforms) {
-            self.drawing.last_uniforms = Some(frame_uniforms);
+        if self.drawing.last_uniforms != Some(uniforms) {
+            self.drawing.last_uniforms = Some(uniforms);
             #[cfg(test)]
             crate::alloc_count::note_engine(crate::alloc_count::EngineCall::FrameUniforms);
         }
@@ -277,18 +281,12 @@ impl Game {
                 Some(TERRAIN_KEY),
             ),
         };
-
-        Scene {
-            pose,
-            camera,
+        Lighting {
             sky_frame,
             sky_ctx,
-            peers,
-            frame_uniforms,
+            uniforms,
             clear,
             debug_flat,
-            screen,
-            dt,
         }
     }
 
@@ -325,7 +323,7 @@ impl Game {
                 .get_or(fps, || format!("{fps:2} FPS"));
         }
         if let Some(net) = &self.net {
-            let count = net.peers().count() + 1;
+            let count = net.peer_count() + 1;
             let ping = net.ping_ms();
             self.drawing
                 .online_cache
@@ -351,20 +349,21 @@ impl Game {
             // Lighting is decided when the 3D scope opens (no post-hoc setter):
             // the composed per-frame UBO carries the lighting truth in every mode
             // (the renderer overlays the debug-flat reserved key for TerrainKey).
+            let lit = &scene.lighting;
             let mut f3 = f.begin_3d(
                 camera,
                 pose.eye,
-                voxel_engine::Lighting::Composed(scene.frame_uniforms),
+                voxel_engine::Lighting::Composed(lit.uniforms),
             );
-            f3.set_debug_flat(scene.debug_flat);
+            f3.set_debug_flat(lit.debug_flat);
             // Fog and water read the same basis as the sky, including debug-flat frames.
-            f3.set_local_frame(scene.sky_ctx.up.as_vec3(), scene.sky_ctx.altitude as f32);
+            f3.set_local_frame(lit.sky_ctx.up.as_vec3(), lit.sky_ctx.altitude as f32);
             if matches!(self.debug_view, DebugView::Normal) {
                 let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::ListSky);
                 let view_blocks = crate::sky::chunk_view_blocks(self.world.view_radius());
                 self.sky.draw(
                     &mut f3,
-                    scene.sky_frame,
+                    lit.sky_frame,
                     pose.eye,
                     self.world.terrain(),
                     view_blocks,
@@ -409,6 +408,7 @@ impl Game {
     /// mods' HUD data (rendered by the core — mods never touch the frame), and
     /// the console on top.
     fn hud_phase(&mut self, f: &mut voxel_engine::Frame, mods: &mut Mods, scene: &Scene) {
+        let map_sample = self.map_sample.take();
         // HUD Off records nothing at all — unless the console is open, which
         // must stay reachable in every mode.
         if matches!(self.theme.hud, HudMode::Off) && !self.console.is_open() {
@@ -422,13 +422,7 @@ impl Game {
         if theme.hud.shows_minimap()
             && let Some(minimap) = &self.minimap
         {
-            let sample = crate::minimap::MapSample::from_player(
-                &self.world,
-                self.player.position,
-                self.player.up_axis,
-                self.player.orientation.frame,
-                self.player.orientation.yaw,
-            );
+            let sample = map_sample.unwrap_or_else(|| crate::minimap::MapSample::of(&self.world, &self.player));
             minimap.draw(f, screen, sample);
         }
 
@@ -493,12 +487,12 @@ impl Game {
                 ui::label_fit(f, theme, screen, Anchor::Top, (0, 12), 26, screen.0 - 2 * side, color, coord_text);
             }
             if let Some(fps_text) = self.drawing.fps_cache.get() {
-                hud_label(f, theme, screen, Anchor::TopLeft, (10, 12), 20, ui::Role::Positive.color(), fps_text);
+                ui::label(f, theme, screen, Anchor::TopLeft, (10, 12), 20, ui::Role::Positive.color(), fps_text);
             }
             if self.net.is_some()
                 && let Some(online_text) = self.drawing.online_cache.get()
             {
-                hud_label(f, theme, screen, Anchor::TopRight, (-12, 180), 20, ui::Role::Positive.color(), online_text);
+                ui::label(f, theme, screen, Anchor::TopRight, (-12, 180), 20, ui::Role::Positive.color(), online_text);
             }
         }
 
@@ -536,60 +530,7 @@ impl Game {
         const DT: f32 = 1.0 / 60.0;
         self.refresh_hud_text(0, DT);
         let pose = self.camera.pose(&self.player, &self.world, 90.0, 0.0);
-        let sky_day = if self.render.day_night {
-            (self.sky.clock.day() * 4096.0).round() / 4096.0
-        } else {
-            0.5
-        };
-        let sky_ctx = crate::frame_snapshot::SkyContext {
-            up: pose.up(),
-            altitude: self.sky_altitude(pose.eye),
-            fade: self.space_fade(),
-        };
-        let (up_q, plane) = sky_keys(pose.eye, sky_ctx.up);
-        let up = sky_ctx.up.as_vec3();
-        let sky_frame = {
-            let sky = &self.sky;
-            *self
-                .drawing
-                .sky_frame_cache
-                .get_or((sky_day.to_bits(), up_q), || sky.frame_at_day(sky_day, up))
-        };
-        let uv_key = [plane[0].to_bits(), plane[1].to_bits()];
-        let anim_uv = *self.drawing.anim_uv_cache.get_or(uv_key, || {
-            crate::frame_snapshot::wrap_plane(plane[0], plane[1])
-        });
-        let cacheable = !self.render.weather && !self.render.clouds && !self.render.exposure;
-        if cacheable {
-            let space = crate::frame_snapshot::space_factor(sky_ctx.altitude, sky_ctx.fade).to_bits();
-            let key = (sky_day.to_bits(), self.content_rev.0, space, up_q);
-            let uniforms = {
-                let sky = &self.sky;
-                let render = &self.render;
-                let cached = self.drawing.static_frame_cache.get_or(key, || {
-                    let snapshot = crate::frame_snapshot::compose_at(
-                        sky,
-                        sky_frame,
-                        sky_ctx,
-                        anim_uv,
-                        voxel_engine::skeleton::Exposure::DEFAULT,
-                        render,
-                    );
-                    StaticFrame {
-                        uniforms: voxel_engine::skeleton::FrameUniformsGpu::from(&snapshot),
-                        clear: sky.clear_at(sky_frame, up),
-                    }
-                });
-                let mut uniforms = cached.uniforms;
-                uniforms.anim[1] = anim_uv[0];
-                uniforms.anim[2] = anim_uv[1];
-                uniforms
-            };
-            if self.drawing.last_uniforms != Some(uniforms) {
-                self.drawing.last_uniforms = Some(uniforms);
-                crate::alloc_count::note_engine(crate::alloc_count::EngineCall::FrameUniforms);
-            }
-        }
+        self.compose_lighting(&pose, voxel_engine::skeleton::Exposure::DEFAULT);
         if self.mod_hud && self.theme.hud.shows_mod_hud() {
             self.hud_scratch.clear();
             mods.hud(
@@ -607,7 +548,7 @@ impl Game {
     /// raycasts, and name cloning — each stops at its owning boundary.
     fn peer_draws(
         &mut self,
-        eng: &Engine,
+        screen: (i32, i32),
         camera: &Camera3D,
         pose: &ViewPose,
         dt: f32,
@@ -625,15 +566,18 @@ impl Game {
         let world = &self.world;
         let eye = pose.eye;
         let forward = pose.forward();
-        let now = crate::sched::now();
-        let screen_w = eng.screen_width() as f32;
-        let screen_h = eng.screen_height() as f32;
-        // Outside interest range there is no live pose: drawing the last
-        // heard one would freeze a ghost in place.
-        for peer in net.peers_mut().filter(|peer| peer.visible()) {
-            let r = peer.sample(now);
+        let (screen_w, screen_h) = (screen.0 as f32, screen.1 as f32);
+        // The frame's poses were sampled in this same order. Outside interest
+        // range there is no live pose: drawing the last heard one would freeze
+        // a ghost in place.
+        for (peer, frame) in net.peers_mut().zip(&self.peer_frames) {
+            debug_assert_eq!(peer.id(), frame.id);
+            if !frame.visible {
+                continue;
+            }
+            let r = &frame.rendered;
             let feet = r.pos.feet(r.stance, r.up);
-            let color = peer_color(&peer.name);
+            let color = peer.color();
             let model = want_models.then(|| {
                 let rp = RenderPose::new(
                     feet,
@@ -745,25 +689,61 @@ fn tag_visibility(
     TagVisibility::of(distance, occluded(distance))
 }
 
-/// A stable, cheerful colour for a player, hashed from their name so the same player
-/// keeps the same tint across clients.
-pub(super) fn peer_color(name: &str) -> Color {
-    const PALETTE: [Color; 6] = [
-        Color::new(230, 90, 90, 255),
-        Color::new(90, 170, 230, 255),
-        Color::new(110, 210, 120, 255),
-        Color::new(230, 190, 90, 255),
-        Color::new(200, 120, 220, 255),
-        Color::new(240, 150, 90, 255),
-    ];
-    // FNV-1a over the name, then index the palette.
-    let h = crate::hash::fnv1a_32(name.as_bytes());
-    PALETTE[h as usize % PALETTE.len()]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A steady multiplayer frame with a visible peer: the one pose sampled per peer feeds both
+    /// the audio and the draw records, and the frame allocates nothing.
+    #[test]
+    fn a_steady_frame_with_peers_allocates_nothing() {
+        use crate::alloc_count;
+        use crate::audio::{AudioService, SoundSystem};
+        use crate::input::router::Router;
+        use crate::net::client::Connection;
+        use crate::net::server::{self, Config};
+        use std::time::{Duration, Instant};
+
+        let server = server::spawn(0, Config { seed: 1, ..Config::default() }).expect("loopback server");
+        let port = server.addr().port();
+        let mut conn = Connection::connect("127.0.0.1", port, "a", "").expect("client a");
+        let mut other = Connection::connect("127.0.0.1", port, "b", "").expect("client b");
+        conn.send_teleport(DVec3::new(8.0, 40.0, 8.0));
+        other.send_teleport(DVec3::new(10.0, 40.0, 8.0));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !conn.peers().any(|peer| peer.visible()) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+            conn.poll();
+            other.poll();
+        }
+        assert!(conn.peers().any(|peer| peer.visible()), "the peer is in range");
+
+        let (game, settings) = crate::game::tests::quiet_minimum_game();
+        let mut game = game.with_net(conn);
+        let (mut sound, symbols) = SoundSystem::mute();
+        let mut audio = AudioService::new();
+        let mut router = Router::new();
+        let mut mods = crate::modding::testing::standard();
+        const DT: f32 = 1.0 / 60.0;
+        for i in 0..10 {
+            alloc_count::reset();
+            game.tick_quiet(DT, &mut router, &mut sound, &mut audio, &symbols, &settings, &mut mods);
+            let pose = game.camera.pose(&game.player, &game.world, 90.0, 0.0);
+            let draws = game.peer_draws((1280, 720), &pose.camera3d(), &pose, DT, true, true);
+            assert_eq!(draws.len(), 1, "the visible peer is drawn");
+            game.drawing.peer_scratch = draws;
+            if i >= 5 {
+                assert_eq!(
+                    alloc_count::alloc_bytes(),
+                    0,
+                    "frame {i} with a peer allocated {} times",
+                    alloc_count::alloc_count()
+                );
+            }
+        }
+        assert_eq!(game.peer_frames.len(), 1, "one sample per peer");
+        server.stop();
+    }
 
     #[test]
     fn hidden_tags_never_query_terrain() {
