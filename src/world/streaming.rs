@@ -331,7 +331,7 @@ impl World {
     }
 
     /// The loading window is the whole view (rest, walking, or not yet streamed).
-    fn loading_full(&self) -> bool {
+    pub(in crate::world) fn loading_full(&self) -> bool {
         self.load_h < 0
             || (self.load_h >= self.view.horizontal && self.load_v >= self.view.vertical)
     }

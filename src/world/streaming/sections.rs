@@ -134,7 +134,7 @@ impl World {
 
     /// The atlas patch a chart section is bent through. `None` for a cube section or a square
     /// that is not inside a storage box.
-    pub(super) fn chart_bend(&self, pos: SectionPos) -> Option<super::ChartBend> {
+    pub(in crate::world) fn chart_bend(&self, pos: SectionPos) -> Option<super::ChartBend> {
         if pos.body < super::section::CHART_BODY_BASE {
             let atlas = self.seams.atlases().iter().find(|a| {
                 a.grid.as_ref().is_some_and(|g| g.body == pos.body) && a.warp.is_some()

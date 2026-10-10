@@ -67,6 +67,8 @@ mod occlusion;
 mod quadtree;
 mod query;
 mod resident;
+#[cfg(test)]
+mod rule;
 pub(crate) mod seam;
 mod settings;
 mod streaming;
