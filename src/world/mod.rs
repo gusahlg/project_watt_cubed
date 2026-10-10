@@ -57,8 +57,10 @@ mod census;
 mod clip;
 mod coverage;
 mod edits;
+#[cfg(test)]
+mod fixtures;
 mod heightmip;
-pub(crate) mod lanes;
+mod lanes;
 mod ledger;
 mod metric;
 mod occlusion;
@@ -205,13 +207,13 @@ impl LightSeedSplit {
 
 pub use census::MemoryCensus;
 pub use ledger::Ledger;
-pub use streaming::StreamGauges;
+pub use streaming::{RemeshDistribution, StreamGauges};
 use admit::{
     AdmitScratch, LightLane, MeshLane, SectionLane, StreamLane, admission_exhausted, admit, bias_order,
     motion_biased_dist2,
 };
 #[cfg(test)]
-use admit::player_dist2;
+use admit::{WorklistLane, player_dist2};
 use resident::{ChartBend, Loaded, MeshState, SectionState, adjust_count};
 #[cfg(test)]
 use resident::{ChunkMeshes, mesh_free_log, vis_log};
@@ -395,6 +397,10 @@ pub struct World {
     /// Chunk-y extent of the edits in each chunk column `(x, z)`, never shrunk. The generator's
     /// surface bounds miss a pit dug below them or a tower built above.
     edit_columns: FastMap<(i32, i32), [i32; 2]>,
+    /// Edited altitude chunks of each [`ColumnKey`], entered on a chunk's first edit and never
+    /// removed, so a ceiling reads its column's roofs without scanning every edit. A chunk whose
+    /// edits compacted away is skipped at the lookup. `Open` chunks are not entered.
+    edit_column_chunks: FastMap<ColumnKey, Vec<i32>>,
     /// The far field's chunk centre: the chart column under the eye, which outlasts the near
     /// window's chart reach; the streaming centre elsewhere. Set by [`stream`](Self::stream).
     far_center: Option<Coord>,
@@ -499,9 +505,6 @@ pub struct World {
     /// Chunks whose missing neighbour light will never arrive, so a mesh
     /// snapshot must read missing planes as settled dark (not open-sky).
     light_terminal: FastSet<Coord>,
-    /// Degraded-snapshot flag carried from mesh submit to claim, so a rejected
-    /// submit does not mutate the degraded or terminal sets.
-    mesh_pending_degraded: Option<(Coord, bool)>,
     /// Skylight ceiling per [`ColumnKey`] — the surface heightmap the settle
     /// pass seeds skylight from. A pure generator function (independent of
     /// altitude and of edits), so it is computed once per column and reused
@@ -567,10 +570,6 @@ pub struct World {
     occlusion_active: bool,
     /// Manual occlusion override (from [`RenderConfig::occlusion`]), on by default when GPU-bound signal unavailable.
     occlusion_forced: bool,
-    /// Scheduler handles for the `stream` call-point CPU lanes, set by
-    /// `Game::new` after it registers them. `None` only before
-    /// that wiring (a bare `World` with no scheduler never calls `stream`).
-    stream_lanes: Option<lanes::StreamLanes>,
     /// Cross-chunk lighting enable flag. Driven by the `lighting` graphics
     /// setting via [`set_lighting`](World::set_lighting); the initial value only
     /// governs pre-`enter_game` generation and is overridden on world entry.
@@ -719,10 +718,8 @@ pub struct World {
     /// in-flight worker result from a retired configuration can never land.
     section_epoch: u32,
     /// Monotone claim-token source for section jobs (see
-    /// [`pipeline::ClaimToken`]); `section_pending_claim` carries the
-    /// freshly minted token from the lane's `submit` to its `claim`.
+    /// [`pipeline::ClaimToken`]).
     section_claim_seq: u64,
-    section_pending_claim: Option<(SectionPos, pipeline::ClaimToken)>,
     /// Gameplay reaction events. Ticked by the sim `reactions` system when this
     /// instance is the authority (single-player or the dedicated server).
     reactions: crate::sim::reactions::ReactionScheduler,
@@ -836,6 +833,7 @@ impl World {
             window_ground: streaming::NearBounds::default(),
             retired: None,
             edit_columns: FastMap::default(),
+            edit_column_chunks: FastMap::default(),
             far_center: None,
             far_fold: seam::Unfold::IDENTITY,
             far_atlas: None,
@@ -880,7 +878,6 @@ impl World {
             light_gate: streaming::LightGate::default(),
             remesh_stats: streaming::RemeshStats::default(),
             light_terminal: FastSet::default(),
-            mesh_pending_degraded: None,
             job_strikes: FastMap::default(),
             quarantined: FastSet::default(),
             textures: textures::BlockTextures::new(),
@@ -898,7 +895,6 @@ impl World {
             column_chunks: FastMap::default(),
             occlusion_active: false,
             occlusion_forced: render.occlusion,
-            stream_lanes: None,
             lighting: true,
             light_epoch: 0,
             light_claim_seq: 0,
@@ -942,7 +938,6 @@ impl World {
             lod_clip_shrunk: Sticky::raised(),
             section_epoch: 0,
             section_claim_seq: 0,
-            section_pending_claim: None,
             reactions: crate::sim::reactions::ReactionScheduler::new(),
             reactions_authority: true,
         };
@@ -1003,21 +998,12 @@ impl World {
         // A queued settled grid is a TRANSFERRED light claim: the in-flight
         // entry must be held until `settle_light` releases it, or `light_ready`
         // would admit a mesh against a grid that is about to change.
-        // (`section_pending_claim` is deliberately NOT asserted `None` here: a
-        // far-cap-rejected submit leaves it set until the next submit
-        // overwrites it — a benign leftover, not a stranded claim.)
         for (coord, _) in &self.light_apply_queue {
             debug_assert!(
                 self.light_inflight.contains(coord),
                 "queued light grid for {coord:?} without its in-flight claim"
             );
         }
-    }
-
-    /// Wire the scheduler handles for the `stream` CPU lanes.
-    /// Called once by `Game::new` after registering the producers.
-    pub fn set_stream_lanes(&mut self, lanes: lanes::StreamLanes) {
-        self.stream_lanes = Some(lanes);
     }
 
     /// Any generate/mesh/light/section claim or upload still outstanding.
@@ -1030,13 +1016,6 @@ impl World {
             || !self.upload_queue.is_empty()
             || !self.light_apply_queue.is_empty()
             || !self.section_upload_queue.is_empty()
-    }
-
-    /// The registered stream-lane handles (panics if `stream` runs before
-    /// `Game::new` wired them — see [`World::stream_lanes`]).
-    fn lanes(&self) -> lanes::StreamLanes {
-        self.stream_lanes
-            .expect("stream lanes registered by Game::new")
     }
 }
 

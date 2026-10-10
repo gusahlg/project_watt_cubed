@@ -1,4 +1,4 @@
-//! Chunk meshing on the main thread: the edit remesh, mesh snapshots and captures, and mesh seeds.
+//! Chunk meshing on the main thread: the edit remesh, mesh snapshots, and mesh seeds.
 
 use super::*;
 use crate::world::{light, mesh};
@@ -101,36 +101,8 @@ impl World {
         nhood
     }
 
-    /// Settled light shell for chunk and 26 neighbours (18³). A missing grid reads
-    /// dark for a normal mesh; for a `degraded` mesh it stands in as fully-lit
-    /// open-sky, so an unsettled neighbourhood fails toward visible-and-plausible.
-    /// Only called with lighting enabled (the disabled path captures nothing).
-    fn capture_padded_light(&self, coord: Coord, degraded: bool) -> light::PaddedLight {
-        debug_assert!(self.lighting, "unlit meshes take the no-shell path");
-        let fallback = degraded.then(light::LightGrid::open_sky);
-        let mut shell = light::PaddedLight::capture(|dx, dy, dz| {
-            self.chunks
-                .get(&Coord::new(coord.x + dx, coord.y + dy, coord.z + dz))
-                .and_then(|l| l.light.as_ref())
-                .or(fallback.as_ref())
-        });
-        self.seam_light_halo(coord, &mut shell, fallback.as_ref());
-        shell
-    }
-
     fn nhood_at<'a>(nhood: &[Option<&'a Loaded>; 27], dx: i32, dy: i32, dz: i32) -> Option<&'a Loaded> {
         nhood[((dz + 1) * 9 + (dy + 1) * 3 + (dx + 1)) as usize]
-    }
-
-    /// Chunk + 1-voxel neighbour shell for mesh build (shared by worker and sync paths).
-    fn capture_padded(&self, coord: Coord) -> mesh::Padded {
-        let mut padded = mesh::Padded::capture(|dx, dy, dz| {
-            self.chunks
-                .get(&Coord::new(coord.x + dx, coord.y + dy, coord.z + dz))
-                .map(|l| &*l.chunk)
-        });
-        self.seam_halo(coord, &mut padded);
-        padded
     }
 
     /// Every cell is opaque. A paletted chunk's entries are exactly the ids in
@@ -239,30 +211,34 @@ impl World {
 
     /// Build chunk GPU mesh (sync dirty-remesh). Frees old handle exactly once.
     fn mesh_chunk(&mut self, coord: Coord, eng: &mut Engine) {
-        self.refresh_tables();
-        // Move the scratch out so the build can borrow `self.chunks` shared
-        // (for cross-chunk neighbour culling) while filling it. `MeshData` has no
-        // `Default` (it carries a `Pass`), so swap in a fresh opaque scratch
-        // rather than `mem::take`; `build_chunk_mesh` clears it first anyway.
+        // Move the scratch out so the build can borrow `self` while filling it.
+        // `MeshData` has no `Default` (it carries a `Pass`), so swap in a fresh
+        // opaque scratch rather than `mem::take`; the build clears it first anyway.
         let mut scratch = std::mem::replace(&mut self.scratch, mesh::new_chunk_mesh_data());
-        let tables = self.tables.get();
-        let uniform = self.chunks[&coord].chunk.uniform();
-        let padded = self.capture_padded(coord);
-        // Use currently-published light (may be stale after edits). Geometry updates
-        // this frame for responsiveness; relit result lands later when light reconverges.
-        let degraded = !self.light_ready(coord);
-        self.mark_degraded(coord, degraded);
-        let light = self.capture_padded_light(coord, degraded);
-        mesh::build_chunk_mesh(&padded, uniform, &tables, &light, &mut scratch);
-        debug_assert!(
-            self.chunks.get(&coord).is_some_and(|l| l.state.is_dirty()),
-            "sync remesh of non-Dirty {coord:?}"
-        );
+        self.build_dirty_mesh(coord, &mut scratch);
         // `upload_chunk`'s retire frees the edited-Ready chunk's old mesh
         // (`Dirty.prev`) exactly once and installs the fresh `Ready`/`Air`.
         let hash = mesh::content_hash(&scratch);
         self.upload_chunk(coord, &scratch, Some(hash), eng);
         self.scratch = scratch;
+    }
+
+    /// The edit remesh's mesh of `coord`, built into `out` from the snapshot a mesh job carries.
+    /// Uses the published light, which may be stale after an edit: geometry updates this frame,
+    /// the relit mesh lands once light reconverges.
+    pub(in crate::world) fn build_dirty_mesh(&mut self, coord: Coord, out: &mut mesh::ChunkMeshData) {
+        self.refresh_tables();
+        let degraded = !self.light_ready(coord);
+        self.mark_degraded(coord, degraded);
+        let (_, snap) = self.snapshot(coord, degraded);
+        match &snap.light {
+            Some(light) => mesh::build_chunk_mesh(&snap.padded, snap.uniform, &snap.tables, light, out),
+            None => mesh::build_chunk_mesh_unlit(&snap.padded, snap.uniform, &snap.tables, out),
+        }
+        debug_assert!(
+            self.chunks.get(&coord).is_some_and(|l| l.state.is_dirty()),
+            "sync remesh of non-Dirty {coord:?}"
+        );
     }
 
     /// Re-snapshot hot solidity array if palette grew (append-only, new Arc, old jobs unaffected)
@@ -282,5 +258,100 @@ impl World {
             tables.ao = ao;
             tables
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Breaks one surface block of the flat world and returns its chunk, now `Dirty`.
+    fn edit_surface(world: &mut World) -> Coord {
+        let (x, z) = (5, 9);
+        let h = (0..64).rev().find(|&y| world.is_solid(x, y, z)).expect("ground");
+        world.set_block(x, h, z, AIR);
+        let coord = World::chunk_of(x, h, z);
+        assert!(world.chunks[&coord].state.is_dirty());
+        coord
+    }
+
+    /// The content hash of the mesh a worker builds for `coord`'s mesh job.
+    fn worker_mesh(world: &mut World, coord: Coord, degraded: bool) -> u64 {
+        let (rev, snapshot) = world.snapshot(coord, degraded);
+        assert!(world.worker_pool().submit(pipeline::Job::Mesh { coord, rev, snapshot }));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match world.workers.as_ref().and_then(pipeline::Workers::try_recv) {
+                Some(pipeline::Done::Mesh { coord: c, data: pipeline::MeshPayload::Cpu(out), .. }) if c == coord => {
+                    return mesh::content_hash(&out);
+                }
+                Some(pipeline::Done::Cancelled(_) | pipeline::Done::Failed(_)) => panic!("the mesh job did not run"),
+                Some(_) => {}
+                None => {
+                    assert!(Instant::now() < deadline, "the mesh job never landed");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+    }
+
+    /// The content hash of the edit remesh's old build: the voxel shell and the light shell
+    /// captured by two separate neighbourhood walks.
+    fn captured_mesh(world: &World, coord: Coord, degraded: bool) -> u64 {
+        let at = |dx: i32, dy: i32, dz: i32| world.chunks.get(&Coord::new(coord.x + dx, coord.y + dy, coord.z + dz));
+        let mut padded = mesh::Padded::capture(|dx, dy, dz| at(dx, dy, dz).map(|l| &*l.chunk));
+        world.seam_halo(coord, &mut padded);
+        let fallback = degraded.then(light::LightGrid::open_sky);
+        let mut shell =
+            light::PaddedLight::capture(|dx, dy, dz| at(dx, dy, dz).and_then(|l| l.light.as_ref()).or(fallback.as_ref()));
+        world.seam_light_halo(coord, &mut shell, fallback.as_ref());
+        let mut out = mesh::new_chunk_mesh_data();
+        let uniform = world.chunks[&coord].chunk.uniform();
+        mesh::build_chunk_mesh(&padded, uniform, &world.tables.get(), &shell, &mut out);
+        mesh::content_hash(&out)
+    }
+
+    /// With lighting off an edit remeshes full-bright, exactly as a mesh job does.
+    #[test]
+    fn unlit_edit_remesh_matches_the_worker_mesh() {
+        let mut world = World::generate();
+        assert!(world.transition_lighting(false));
+        let coord = edit_surface(&mut world);
+        let mut out = mesh::new_chunk_mesh_data();
+        world.build_dirty_mesh(coord, &mut out);
+        assert!(out.iter().any(|(_, m)| !m.is_empty()), "the edited surface draws");
+        assert_eq!(mesh::content_hash(&out), worker_mesh(&mut world, coord, false));
+    }
+
+    /// With lighting on the edit remesh is the old two-walk capture, degraded and settled.
+    #[test]
+    fn lit_edit_remesh_matches_the_capture() {
+        let mut world = World::generate();
+        let coord = edit_surface(&mut world);
+        let mut out = mesh::new_chunk_mesh_data();
+        assert!(!world.light_ready(coord), "the edit re-seeded its light");
+        let expect = captured_mesh(&world, coord, true);
+        world.build_dirty_mesh(coord, &mut out);
+        assert_eq!(mesh::content_hash(&out), expect, "degraded");
+        assert!(world.light_gate.degraded.contains(&coord));
+
+        world.light_worklist.clear();
+        world.light_inflight.clear();
+        let mut i = 0;
+        for dz in -1..=1 {
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    if let Some(l) = world.chunks.get_mut(&Coord::new(coord.x + dx, coord.y + dy, coord.z + dz)) {
+                        l.light = Some(if i % 3 == 0 { light::LightGrid::dark() } else { light::LightGrid::open_sky() });
+                    }
+                    i += 1;
+                }
+            }
+        }
+        assert!(world.light_ready(coord));
+        let expect = captured_mesh(&world, coord, false);
+        world.build_dirty_mesh(coord, &mut out);
+        assert_eq!(mesh::content_hash(&out), expect, "settled");
+        assert!(!world.light_gate.degraded.contains(&coord));
     }
 }

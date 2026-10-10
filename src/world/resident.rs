@@ -62,6 +62,23 @@ pub(in crate::world) fn adjust_count(count: &mut usize, was: bool, now: bool) {
 }
 
 impl Loaded {
+    /// A just-stored chunk in `state`: mesh revision 0, nothing settled or hashed yet.
+    #[cfg(test)]
+    pub(super) fn new(chunk: Arc<Chunk>, state: MeshState, light_gen: u32) -> Self {
+        Self {
+            chunk,
+            state,
+            rev: 0,
+            connectivity: None,
+            visible: true,
+            light: None,
+            has_blocklight: false,
+            light_reseed: false,
+            light_gen,
+            mesh_hash: None,
+        }
+    }
+
     /// Transition to `next`, freeing the mesh this chunk was drawing unless
     /// that mesh is carried into `next`. This is the single place that frees a
     /// chunk's mesh: every GPU-freeing transition — unload, radius shrink, sync
@@ -610,6 +627,11 @@ impl MeshState {
     }
     pub(super) fn is_dirty(&self) -> bool {
         matches!(self, MeshState::Dirty { .. })
+    }
+    /// The chunk's final mesh is in: `Ready`, or `Air` with nothing to draw.
+    #[cfg(test)]
+    pub(super) fn is_final(&self) -> bool {
+        matches!(self, MeshState::Air | MeshState::Ready(_))
     }
     /// Live GPU handles this state currently carries (at most one `ChunkMeshes`).
     #[cfg(test)]

@@ -13,15 +13,16 @@
 //! the server must not replace it with a fresh world. When a file loads, its seed
 //! and generator win.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs;
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::save::format::{self, Decoded, Edit, PendingContact, PlayerState, SaveDoc, WorldgenStamp};
-use crate::save::slot::SaveMeta;
+use crate::save::format::{self, Decoded, Edit, PendingContact, PlayerState, SaveDoc, SpecTable, WorldgenStamp};
+use crate::save::slot::{SaveError, SaveMeta};
+use crate::save::store::{sibling, write_rotating};
 use crate::save;
 use crate::world::generation::WorldgenKind;
 use crate::world::terrain::{TerrainCfg, WORLDGEN_VERSION};
@@ -137,48 +138,6 @@ impl Store {
     }
 }
 
-/// `{path}.bak` / `{path}.tmp`, matching [`save::store`]'s slot names (`id.save.bak`).
-fn suffixed(path: &Path, suffix: &str) -> PathBuf {
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(suffix);
-    path.with_file_name(name)
-}
-
-/// Write `bytes` via a sibling `.tmp`, then rename the live file to `.bak` (when
-/// `rotate`) and the temp file into place. A failed second rename puts the backup back.
-fn write_rotating(path: &Path, bytes: &[u8], rotate: bool) -> io::Result<()> {
-    if let Some(dir) = path.parent() {
-        if !dir.as_os_str().is_empty() {
-            fs::create_dir_all(dir)?;
-        }
-    }
-    let tmp = suffixed(path, ".tmp");
-    let bak = suffixed(path, ".bak");
-    let wrote = (|| {
-        let mut file = fs::File::create(&tmp)?;
-        std::io::Write::write_all(&mut file, bytes)?;
-        file.sync_all()?;
-        Ok(())
-    })();
-    if let Err(err) = wrote {
-        let _ = fs::remove_file(&tmp);
-        return Err(err);
-    }
-    let had_live = rotate && path.exists();
-    if had_live && let Err(err) = fs::rename(path, &bak) {
-        let _ = fs::remove_file(&tmp);
-        return Err(err);
-    }
-    if let Err(err) = fs::rename(&tmp, path) {
-        if had_live {
-            let _ = fs::rename(&bak, path);
-        }
-        let _ = fs::remove_file(&tmp);
-        return Err(err);
-    }
-    Ok(())
-}
-
 /// No file: the flags are the world, and nothing is saved.
 pub(crate) fn fresh(flags: &Flags) -> Loaded {
     Loaded {
@@ -214,7 +173,7 @@ fn read_file(path: &Path) -> Result<OnDisk, LoadError> {
 /// neither exists. Prefers: intact live > intact backup > salvaged live > salvaged
 /// backup in place of a missing live file.
 pub(crate) fn load(path: &Path, flags: &Flags) -> Result<Loaded, LoadError> {
-    let bak = suffixed(path, ".bak");
+    let bak = sibling(path, ".bak");
     let live = read_file(path)?;
     let backup = match live {
         OnDisk::Doc(Decoded::Intact(_)) => OnDisk::Missing,
@@ -244,18 +203,13 @@ pub(crate) fn load(path: &Path, flags: &Flags) -> Result<Loaded, LoadError> {
             open(path, doc, flags, false)
         }
         (OnDisk::Missing, OnDisk::Missing) => Ok(Loaded {
-            seed: flags.seed,
-            worldgen: flags.worldgen,
-            terrain: flags.terrain,
-            day: DEFAULT_DAY,
-            edits: Vec::new(),
-            pending: Vec::new(),
             store: Some(Store {
                 path: path.to_path_buf(),
                 doc: Mutex::new(blank_doc(flags)),
                 kept: Mutex::new(Vec::new()),
                 rotate: AtomicBool::new(true),
             }),
+            ..fresh(flags)
         }),
         (OnDisk::Missing, OnDisk::Corrupt(e)) => {
             Err(LoadError::new(path, format!("missing, and its backup does not load: {}", e.reason())))
@@ -355,13 +309,13 @@ fn blank_doc(flags: &Flags) -> SaveDoc {
 }
 
 /// Encode `snap` plus the cells kept from the file, at most `cap` of them, in one linear pass:
-/// the spec table is filled in cell order through a map from spec to index.
+/// the spec table is filled in cell order.
 fn encode_snapshot(
     doc: &mut SaveDoc,
     snap: &Snapshot,
     kept: &mut Vec<(i32, i32, i32, String)>,
     cap: usize,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, SaveError> {
     let mut cells: Vec<(i32, i32, i32, &str)> = snap.edits.iter().map(|(x, y, z, spec)| (*x, *y, *z, spec.as_ref())).collect();
     // A live edit replaces an unparsed one at the same cell. The unparsed text stays only while
     // this build still has no opinion about that cell.
@@ -377,33 +331,23 @@ fn encode_snapshot(
         eprintln!("warning: {} edits do not fit a world file; saving the first {cap}", cells.len());
         cells.truncate(cap);
     }
-    let mut specs: Vec<String> = Vec::new();
-    let mut index: HashMap<&str, u16> = HashMap::new();
+    let mut table = SpecTable::default();
     let mut records = Vec::with_capacity(cells.len());
     for (x, y, z, spec) in cells {
-        let at = match index.get(spec) {
-            Some(&at) => at,
-            None => {
-                let at = u16::try_from(specs.len()).map_err(|_| "too many distinct block specs to save".to_string())?;
-                specs.push(spec.to_string());
-                index.insert(spec, at);
-                at
-            }
-        };
-        records.push(Edit { x, y, z, spec: at });
+        records.push(Edit { x, y, z, spec: table.index(spec)? });
     }
     doc.meta.seed = snap.seed;
     doc.meta.last_played = save::unix_now();
     doc.meta.edit_count = u32::try_from(records.len()).unwrap_or(u32::MAX);
     doc.worldgen = WorldgenStamp { kind: snap.worldgen.wire(), knobs: snap.terrain.to_wire() };
     doc.law_stamp = material::Law::current().stamp();
-    doc.specs = specs;
+    doc.specs = table.specs;
     doc.edits = records;
     doc.pending = snap.pending.clone();
     doc.mods.retain(|(name, _)| name != CLOCK_MOD);
     let day = if snap.day.is_finite() { snap.day.rem_euclid(1.0) } else { DEFAULT_DAY };
     doc.mods.push((CLOCK_MOD.to_string(), format!("{:08x}", day.to_bits())));
-    format::encode(doc).map_err(|e| e.to_string())
+    format::encode(doc)
 }
 
 fn clock_of(mods: &[(String, String)]) -> f32 {
@@ -439,6 +383,8 @@ fn read_ops(path: &Path) -> Result<Ops, String> {
 }
 
 /// One operator a line: `name`, or `name secret` where the last word is the secret.
+/// Quote a name containing spaces: `"Big Ada"` or `"Big Ada" secret`. Malformed quotes
+/// grant nothing; unquoted `name secret` keeps its existing authentication meaning.
 /// Names are lowercased; the first line for a name wins.
 pub(crate) fn parse_ops(text: &str) -> Ops {
     let clean = |part: &str| part.chars().filter(|c| !c.is_control()).collect::<String>();
@@ -449,9 +395,17 @@ pub(crate) fn parse_ops(text: &str) -> Ops {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let (name, secret) = match line.rsplit_once(char::is_whitespace) {
-            Some((name, secret)) => (name, Some(clean(secret))),
-            None => (line, None),
+        let (name, secret) = if let Some(quoted) = line.strip_prefix('"') {
+            let Some((name, tail)) = quoted.split_once('"') else { continue };
+            if !tail.is_empty() && !tail.starts_with(char::is_whitespace) { continue; }
+            let secret = tail.trim();
+            if secret.chars().any(char::is_whitespace) { continue; }
+            (name, (!secret.is_empty()).then(|| clean(secret)))
+        } else {
+            match line.rsplit_once(char::is_whitespace) {
+                Some((name, secret)) => (name, Some(clean(secret))),
+                None => (line, None),
+            }
         };
         let name: String = clean(name).chars().take(super::MAX_NAME).collect();
         let name = name.trim().to_ascii_lowercase();
@@ -573,7 +527,7 @@ mod tests {
         assert_eq!(saved.pending, pending);
         assert!(saved.mods.iter().any(|(n, d)| n == "inventory" && d == "Stone"));
         let _ = fs::remove_file(&path);
-        let _ = fs::remove_file(suffixed(&path, ".bak"));
+        let _ = fs::remove_file(sibling(&path, ".bak"));
     }
 
     #[test]
@@ -606,6 +560,14 @@ mod tests {
     }
 
     #[test]
+    fn quoted_operator_names_keep_secrets_and_malformed_names_grant_nothing() {
+        let input = "Ada\n\"Big Ada\"\n\"Big Bob\" s3cret\ncara secret\n\"unterminated\n\"Eve\"secret\n\"Eve\" too many words";
+        let (operators, secrets) = parse_ops(input);
+        assert_eq!(operators, vec!["ada", "big ada"]);
+        assert_eq!(secrets, vec![("big bob".to_string(), "s3cret".to_string()), ("cara".to_string(), "secret".to_string())]);
+    }
+
+    #[test]
     fn side_files_union_ops_and_mod_lists() {
         let dir = crate::save::store::test_temp_path("side");
         fs::create_dir_all(&dir).unwrap();
@@ -628,7 +590,7 @@ mod tests {
         let id = crate::save::SlotId::new("__pwc_g25_rotate__").unwrap();
         let path = crate::save::store::file_path(&id);
         let _ = fs::remove_file(&path);
-        let _ = fs::remove_file(suffixed(&path, ".bak"));
+        let _ = fs::remove_file(sibling(&path, ".bak"));
         let loaded = load(&path, &flags(1)).unwrap();
         let store = loaded.store.unwrap();
         let pending = vec![PendingContact { x: 4, y: 5, z: 6, axis: 1, age: 2 }];
@@ -662,7 +624,7 @@ mod tests {
         assert_eq!(doc.meta.seed, 1);
         assert_eq!(doc.pending, pending);
         let _ = fs::remove_file(&path);
-        let _ = fs::remove_file(suffixed(&path, ".bak"));
+        let _ = fs::remove_file(sibling(&path, ".bak"));
     }
 
     #[test]
@@ -717,7 +679,7 @@ mod tests {
         let replaced = load(&path, &flags(1)).unwrap();
         assert!(replaced.edits.iter().all(|edit| edit.3 == "air"));
         let _ = fs::remove_file(&path);
-        let _ = fs::remove_file(suffixed(&path, ".bak"));
+        let _ = fs::remove_file(sibling(&path, ".bak"));
     }
 
     fn snapshot(seed: i64, edits: Vec<(i32, i32, i32, Arc<str>)>) -> Snapshot {
@@ -736,7 +698,7 @@ mod tests {
     #[test]
     fn a_missing_live_file_loads_the_backup() {
         let path = crate::save::store::test_temp_path("bak-only");
-        let bak = suffixed(&path, ".bak");
+        let bak = sibling(&path, ".bak");
         let stone = vec![Edit { x: 1, y: 2, z: 3, spec: 0 }];
         write_atomic_file(&bak, &format::encode(&doc_with(42, 0.5f32.to_bits(), stone, vec!["air".into()])).unwrap()).unwrap();
         let loaded = load(&path, &flags(1)).unwrap();
@@ -758,7 +720,7 @@ mod tests {
     fn a_damaged_live_file_loads_the_intact_backup_and_keeps_it() {
         for damage in ["truncated", "garbage"] {
             let path = crate::save::store::test_temp_path(damage);
-            let bak = suffixed(&path, ".bak");
+            let bak = sibling(&path, ".bak");
             let one = vec![Edit { x: 1, y: 2, z: 3, spec: 0 }];
             write_atomic_file(&bak, &format::encode(&doc_with(42, 0.5f32.to_bits(), one, vec!["air".into()])).unwrap()).unwrap();
             let five = (0..5).map(|x| Edit { x, y: 0, z: 0, spec: 0 }).collect();

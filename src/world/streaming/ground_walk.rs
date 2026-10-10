@@ -13,7 +13,8 @@ use std::io::Write;
 
 use voxel_engine::DVec3;
 
-use super::flight_bench::step;
+use super::headless::step;
+use crate::world::fixtures::{env_or, pace, round_world};
 use crate::coord::{BlockCoord, ChunkCoord, Face};
 use crate::input::movement::{update_player, update_player_in, MoveInput};
 use crate::math::{block_coord, Aabb, Bounded};
@@ -29,10 +30,6 @@ const SPAWN_SEED: i64 = 42;
 fn stamp(msg: &str) {
     println!("WALK {msg}");
     let _ = std::io::stdout().flush();
-}
-
-fn env_f64(name: &str, default: f64) -> f64 {
-    std::env::var(name).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
 }
 
 fn env_flag(name: &str, default: bool) -> bool {
@@ -501,12 +498,6 @@ impl Watch {
     }
 }
 
-fn pace(start: std::time::Instant, period: std::time::Duration) {
-    if let Some(rest) = period.checked_sub(start.elapsed()) {
-        std::thread::sleep(rest);
-    }
-}
-
 /// Random headings, jumps, sprints, sneaks, stops and turn-backs. `stream` runs [`step`] after physics,
 /// paced so the loader's wall-clock speed stays a walk.
 fn walk(world: &mut World, player: &mut Player, secs: f64, hz: f64, stream: bool, tag: &str) -> Report {
@@ -582,7 +573,7 @@ fn render(lod2: bool) -> RenderConfig {
 }
 
 fn chart_world(seed: i64, lod2: bool) -> World {
-    World::with_kind(seed, render(lod2), WorldgenKind::Diffusion, false)
+    round_world(seed, render(lod2))
 }
 
 fn flat_world(lod2: bool) -> World {
@@ -873,8 +864,8 @@ fn parse_views() -> Vec<(i32, i32)> {
 #[test]
 #[ignore]
 fn walking_on_the_ground_never_gets_stuck() {
-    let secs = env_f64("WALK_SECS", 180.0);
-    let hz = env_f64("WALK_HZ", 60.0);
+    let secs = env_or("WALK_SECS", 180.0);
+    let hz = env_or("WALK_HZ", 60.0);
     let lod = env_flag("WALK_LOD", true);
     let strict = env_flag("WALK_STRICT", true);
     let mut bad = Vec::new();

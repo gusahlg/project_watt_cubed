@@ -249,12 +249,16 @@ const PENDING_TTL: Duration = Duration::from_secs(3);
 enum PendingKind {
     Edit,
     Tool,
+    /// Wait for later requests on this cell before unwinding predictions in reverse order.
+    Rejected,
 }
 
 struct PendingReq {
     req: u32,
     cell: (i32, i32, i32),
     expect: u32,
+    /// Authoritative revision when the prediction was made; `expect` can include earlier requests.
+    base: u32,
     sent: Instant,
     kind: PendingKind,
 }
@@ -299,6 +303,7 @@ pub struct Connection {
     next_req: u32,
     /// Last cruise speed told to the server. `None` means "not cruising" was sent, or nothing yet.
     sent_cruise: Option<f64>,
+    wanted_cruise: Option<f64>,
     /// Instant an in-flight `/tp` was sent. Movement is held until a `Position`
     /// verdict lands, or one heartbeat elapses with no reply, so a dropped echo
     /// cannot freeze the client.
@@ -484,6 +489,13 @@ fn connect_one(
     mods: &[(String, String)],
     stop: &Stop,
 ) -> Result<Connection, ConnectError> {
+    let (offers, dropped) = protocol::hello_offers(mods);
+    if dropped > 0 {
+        let omitted = mods.iter().filter(|(id, version)| !offers.iter().any(|o| o.id.as_ref() == id && o.version.as_ref() == version))
+            .map(|(id, _)| id.as_str()).collect::<Vec<_>>().join(", ");
+        return Err(ConnectError::plain(format!("enabled mods cannot fit the join request: {omitted}")));
+    }
+    let mods = offers;
     let bind = if addr.is_ipv4() {
         SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
     } else {
@@ -505,10 +517,6 @@ fn connect_one(
     })?;
 
     let id = crate::net::content_id(&crate::block::BlockRegistry::with_builtins());
-    let (mods, dropped) = protocol::hello_offers(mods);
-    if dropped > 0 {
-        eprintln!("warning: {dropped} enabled mods are not reported to the server (past the join's count or length limits)");
-    }
     let hello = ClientMessage::Hello {
         protocol: PROTOCOL_VERSION,
         worldgen: id.worldgen,
@@ -612,6 +620,7 @@ fn connect_one(
             pending_edits: Vec::new(),
             next_req: 0,
             sent_cruise: None,
+            wanted_cruise: None,
             pending_teleport: None,
             disconnect_emitted: false,
             close_reason,
@@ -631,6 +640,7 @@ fn connection_close_text(conn: &quinn::Connection) -> String {
                 quinn::ConnectionError::ApplicationClosed(frame) => {
                     String::from_utf8_lossy(&frame.reason).into_owned()
                 }
+                quinn::ConnectionError::TimedOut => INTERRUPTED.to_string(),
                 other => other.to_string(),
             };
         }
@@ -699,6 +709,8 @@ impl Connection {
         while self.held.is_empty() {
             match self.inbox.try_recv() {
                 Ok(ServerMessage::Snapshot { edits }) => {
+                    self.last_heard = Instant::now();
+                    self.warned = false;
                     self.held.extend(edits);
                     release_held(&mut self.held, &mut self.cell_revs, &mut budget, &mut out);
                 }
@@ -709,6 +721,11 @@ impl Connection {
                     break;
                 }
             }
+        }
+        // A budgeted overlay is still being consumed even if its batch arrived earlier.
+        if !out.is_empty() {
+            self.last_heard = Instant::now();
+            self.warned = false;
         }
         expire_pending(&mut self.pending_edits, &self.cell_revs, Instant::now(), &mut out);
         {
@@ -762,8 +779,11 @@ fn snapshot_cell(
     cell_revs: &mut HashMap<(i32, i32, i32), u32>,
     out: &mut Vec<Incoming>,
 ) {
-    cell_revs.insert((x, y, z), rev);
-    out.push(Incoming::Mutation { x, y, z, spec });
+    let cell = (x, y, z);
+    if rev >= cell_revs.get(&cell).copied().unwrap_or(0) {
+        cell_revs.insert(cell, rev);
+        out.push(Incoming::Mutation { x, y, z, spec });
+    }
 }
 
 fn welcome_from(
@@ -781,6 +801,13 @@ fn welcome_from(
     }
 }
 
+/// A content confirmation may precede its verdict. Already-confirmed predictions must not
+/// be counted twice when calculating the next speculative revision.
+fn next_cell_revision(pending: &[PendingReq], cell: (i32, i32, i32), confirmed: u32) -> u32 {
+    pending.iter().filter(|p| p.cell == cell && !matches!(p.kind, PendingKind::Rejected))
+        .map(|p| p.expect.saturating_add(1)).max().unwrap_or(confirmed).max(confirmed)
+}
+
 fn expire_pending(
     pending: &mut Vec<PendingReq>,
     cell_revs: &HashMap<(i32, i32, i32), u32>,
@@ -793,20 +820,54 @@ fn expire_pending(
             i += 1;
             continue;
         }
-        let expired = pending.remove(i);
-        match expired.kind {
+        match pending[i].kind {
             PendingKind::Edit => {
-                let confirmed = cell_revs.get(&expired.cell).copied().unwrap_or(0);
-                out.push(Incoming::EditRejected { req: expired.req, restore: confirmed <= expired.expect });
+                pending[i].kind = PendingKind::Rejected;
+                i += 1;
             }
-            PendingKind::Tool => out.push(Incoming::ToolResult {
-                req: expired.req,
-                reacted: false,
-                cell: expired.cell,
-                cell_spec: Arc::from(""),
-                tool_spec: Arc::from(""),
-            }),
+            PendingKind::Tool => {
+                let expired = pending.remove(i);
+                out.push(Incoming::ToolResult {
+                    req: expired.req,
+                    reacted: false,
+                    cell: expired.cell,
+                    cell_spec: Arc::from(""),
+                    tool_spec: Arc::from(""),
+                });
+            }
+            PendingKind::Rejected => i += 1,
         }
+    }
+    flush_rejections(pending, cell_revs, out);
+}
+
+/// A rejected chain restores its oldest pre-prediction value: unwind newest first. Any newer
+/// authoritative content supersedes the entire chain, including its speculative revisions.
+fn flush_rejections(
+    pending: &mut Vec<PendingReq>,
+    cell_revs: &HashMap<(i32, i32, i32), u32>,
+    out: &mut Vec<Incoming>,
+) {
+    let mut i = pending.len();
+    while i > 0 {
+        i -= 1;
+        if !matches!(pending[i].kind, PendingKind::Rejected) {
+            continue;
+        }
+        let cell = pending[i].cell;
+        if pending.iter().any(|p| p.cell == cell && !matches!(p.kind, PendingKind::Rejected)) {
+            continue;
+        }
+        let base = pending.iter().filter(|p| p.cell == cell).map(|p| p.base).min().unwrap();
+        let restore = cell_revs.get(&cell).copied().unwrap_or(0) <= base;
+        // Remove every member together so they share the same authoritative revision floor.
+        for at in (0..=i).rev() {
+            if pending[at].cell == cell {
+                let rejected = pending.remove(at);
+                out.push(Incoming::EditRejected { req: rejected.req, restore });
+            }
+        }
+        i = i.min(pending.len());
     }
 }
 
@@ -923,9 +984,9 @@ fn apply_server_message(
                 let Some(at) = pending_edits.iter().position(|p| p.req == req) else {
                     return;
                 };
-                let pending = pending_edits.remove(at);
-                let (cell, expect) = (pending.cell, pending.expect);
+                let cell = pending_edits[at].cell;
                 if accepted {
+                    pending_edits.remove(at);
                     let known = cell_revs.entry(cell).or_insert(0);
                     *known = (*known).max(rev);
                     out.push(Incoming::EditAccepted { req });
@@ -933,9 +994,9 @@ fn apply_server_message(
                     // Restore our optimistic apply only if nothing newer has
                     // confirmed on the cell meanwhile (the race winner's Edit
                     // broadcast may land before or after this ack).
-                    let confirmed = cell_revs.get(&cell).copied().unwrap_or(0);
-                    out.push(Incoming::EditRejected { req, restore: confirmed <= expect });
+                    pending_edits[at].kind = PendingKind::Rejected;
                 }
+                flush_rejections(pending_edits, cell_revs, out);
             }
             ServerMessage::Position { pos, frame, up } => {
                 *pending_teleport = None;
@@ -1079,6 +1140,14 @@ impl Connection {
         self.last_move = Instant::now();
         self.last_sent = Some((pos, yaw, pitch, frame, velocity, up, stance));
         self.dispatch(&ClientMessage::Move { pos, yaw, pitch, frame, velocity, up, stance });
+        // A lower declaration follows the last move under the old cap. Keep it until the
+        // body's eased velocity fits the new cap, including the final buffered cruise step.
+        if self.sent_cruise != self.wanted_cruise
+            && self.wanted_cruise.is_none_or(|cap| velocity.as_dvec3().length() <= cap * (1.0 + 2.0 * f32::EPSILON as f64))
+        {
+            self.sent_cruise = self.wanted_cruise;
+            self.dispatch(&ClientMessage::Cruise { speed: self.sent_cruise.unwrap_or(0.0) });
+        }
     }
 
     /// Ordinary moves are envelope-checked server-side; this is the sanctioned
@@ -1106,24 +1175,23 @@ impl Connection {
         }
         let cell = (x, y, z);
         let confirmed = self.cell_revs.get(&cell).copied().unwrap_or(0);
-        let in_flight = self.pending_edits.iter().filter(|p| p.cell == cell).count() as u32;
-        let expect = confirmed + in_flight;
+        let expect = next_cell_revision(&self.pending_edits, cell, confirmed);
         self.next_req = self.next_req.wrapping_add(1);
         let req = self.next_req;
-        self.pending_edits.push(PendingReq { req, cell, expect, sent: Instant::now(), kind: PendingKind::Edit });
+        self.pending_edits.push(PendingReq { req, cell, expect, base: confirmed, sent: Instant::now(), kind: PendingKind::Edit });
         self.dispatch(&ClientMessage::Edit { req, x, y, z, expect, spec });
         Some(req)
     }
 
     /// Tell the server the cruise speed when it changes. `None` sends 0, which ends cruise.
-    /// Ordinary moves stay on [`send_move`]; this only raises the envelope's cap.
+    /// Higher caps precede moves; lower caps follow the last move at the old speed.
     pub fn sync_cruise(&mut self, speed: Option<f64>) {
         let declared = speed.filter(|s| s.is_finite() && *s > 0.0);
-        if self.sent_cruise == declared {
-            return;
+        self.wanted_cruise = declared;
+        if declared.unwrap_or(0.0) > self.sent_cruise.unwrap_or(0.0) {
+            self.sent_cruise = declared;
+            self.dispatch(&ClientMessage::Cruise { speed: declared.unwrap_or(0.0) });
         }
-        self.sent_cruise = declared;
-        self.dispatch(&ClientMessage::Cruise { speed: declared.unwrap_or(0.0) });
     }
 
     /// Send `bytes` on `channel`. False when the link is down, the name is illegal,
@@ -1170,16 +1238,15 @@ impl Connection {
     /// [`Incoming::ToolResult`] for the returned request id. Nothing is predicted: the law's
     /// outcome is the server's to decide.
     pub fn send_tool_use(&mut self, x: i32, y: i32, z: i32, tool_spec: Arc<str>) -> Option<u32> {
-        if tool_spec.len() > MAX_SPEC {
+        if !self.alive || tool_spec.len() > MAX_SPEC {
             return None;
         }
         let cell = (x, y, z);
         let confirmed = self.cell_revs.get(&cell).copied().unwrap_or(0);
-        let in_flight = self.pending_edits.iter().filter(|p| p.cell == cell).count() as u32;
-        let expect = confirmed + in_flight;
+        let expect = next_cell_revision(&self.pending_edits, cell, confirmed);
         self.next_req = self.next_req.wrapping_add(1);
         let req = self.next_req;
-        self.pending_edits.push(PendingReq { req, cell, expect, sent: Instant::now(), kind: PendingKind::Tool });
+        self.pending_edits.push(PendingReq { req, cell, expect, base: confirmed, sent: Instant::now(), kind: PendingKind::Tool });
         self.dispatch(&ClientMessage::ToolUse { req, x, y, z, expect, tool_spec });
         Some(req)
     }
@@ -1593,11 +1660,92 @@ mod tests {
     }
 
     #[test]
+    fn lowering_cruise_accounts_for_wire_velocity_rounding() {
+        let handle = server::spawn(0, Config { seed: 1, worldgen: crate::world::generation::WorldgenKind::Flat, ..Config::default() }).unwrap();
+        let mut conn = Connection::connect("127.0.0.1", handle.addr().port(), "ada", "").unwrap();
+        let cap = 33_333_333.333333332;
+        let velocity = Vec3::new(cap as f32, 0.0, 0.0);
+        assert!(velocity.x as f64 > cap, "the wire rounds this target upwards");
+        conn.sync_cruise(Some(cap * 10.0));
+        conn.sync_cruise(Some(cap));
+        conn.last_move = Instant::now() - MOVE_INTERVAL;
+        conn.send_move(conn.spawn, 0.0, 0.0, DQuat::IDENTITY, velocity, Face::PosY, Stance::Standing);
+        assert_eq!(conn.sent_cruise, Some(cap), "a settled velocity lowers the declared cap");
+        handle.stop();
+    }
+
+    #[test]
+    fn a_confirmation_before_its_ack_does_not_double_count_the_prediction() {
+        let cell = (1, 2, 3);
+        let mut pending = vec![PendingReq { req: 1, cell, expect: 0, base: 0, sent: Instant::now(), kind: PendingKind::Edit }];
+        assert_eq!(next_cell_revision(&pending, cell, 0), 1);
+        assert_eq!(next_cell_revision(&pending, cell, 1), 1);
+        pending.push(PendingReq { req: 2, cell, expect: 1, base: 0, sent: Instant::now(), kind: PendingKind::Edit });
+        assert_eq!(next_cell_revision(&pending, cell, 1), 2);
+        assert_eq!(next_cell_revision(&pending, cell, 5), 5);
+        pending[1].kind = PendingKind::Rejected;
+        assert_eq!(next_cell_revision(&pending, cell, 1), 1);
+    }
+
+    #[test]
+    fn rejected_edit_after_a_tool_result_keeps_authoritative_content() {
+        let mut v = View::new();
+        let cell = (1, 2, 3);
+        v.pending_edits.push(PendingReq { req: 1, cell, expect: 0, base: 0, sent: Instant::now(), kind: PendingKind::Tool });
+        v.pending_edits.push(PendingReq { req: 2, cell, expect: 1, base: 0, sent: Instant::now(), kind: PendingKind::Edit });
+        let out = v.apply(ServerMessage::ToolResult {
+            req: 1, reacted: true, rev: 1, cell_spec: "air".into(), tool_spec: "spent".into(),
+        });
+        assert!(matches!(out.as_slice(), [Incoming::ToolResult { req: 1, .. }]));
+        let out = v.apply(ServerMessage::EditAck { req: 2, accepted: false, rev: 1 });
+        assert!(matches!(out.as_slice(), [Incoming::EditRejected { req: 2, restore: false }]));
+    }
+
+    #[test]
+    fn rejected_edit_after_observing_authority_restores_its_current_baseline() {
+        let mut v = View::new();
+        let cell = (1, 2, 3);
+        v.cell_revs.insert(cell, 1);
+        v.pending_edits.push(PendingReq { req: 2, cell, expect: 1, base: 1, sent: Instant::now(), kind: PendingKind::Edit });
+        let out = v.apply(ServerMessage::EditAck { req: 2, accepted: false, rev: 1 });
+        assert!(matches!(out.as_slice(), [Incoming::EditRejected { req: 2, restore: true }]));
+    }
+
+    #[test]
+    fn rejected_predictions_wait_for_the_chain_and_unwind_newest_first() {
+        let cell = (1, 2, 3);
+        for authoritative in [0, 1] {
+            let mut v = View::new();
+            v.cell_revs.insert(cell, authoritative);
+            for req in 1..=2 {
+                v.pending_edits.push(PendingReq { req, cell, expect: req - 1, base: 0, sent: Instant::now(), kind: PendingKind::Edit });
+            }
+            assert!(v.apply(ServerMessage::EditAck { req: 1, accepted: false, rev: authoritative }).is_empty());
+            assert_eq!(v.pending_edits.len(), 2);
+            let out = v.apply(ServerMessage::EditAck { req: 2, accepted: false, rev: authoritative });
+            assert!(matches!(out.as_slice(), [Incoming::EditRejected { req: 2, restore: a }, Incoming::EditRejected { req: 1, restore: b }] if *a == (authoritative == 0) && a == b));
+            assert!(v.pending_edits.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_delayed_snapshot_cannot_revert_a_newer_cell_but_can_confirm_a_prediction() {
+        let mut v = View::new();
+        let cell = (1, 2, 3);
+        v.cell_revs.insert(cell, 2);
+        assert!(v.apply(ServerMessage::Snapshot { edits: vec![(1, 2, 3, 1, "air".into())] }).is_empty());
+        assert_eq!(v.cell_revs[&cell], 2);
+        let out = v.apply(ServerMessage::Snapshot { edits: vec![(1, 2, 3, 2, "air".into())] });
+        assert!(matches!(out.as_slice(), [Incoming::Mutation { .. }]));
+    }
+
+    #[test]
     fn unanswered_edit_expires_as_rejected_and_unsent_spec_returns_no_id() {
         let mut pending = vec![PendingReq {
             req: 3,
             cell: (1, 2, 3),
             expect: 0,
+            base: 0,
             sent: Instant::now() - Duration::from_secs(4),
             kind: PendingKind::Edit,
         }];
@@ -1610,6 +1758,7 @@ mod tests {
             req: 9,
             cell: (1, 2, 3),
             expect: 4,
+            base: 4,
             sent: Instant::now() - PENDING_TTL,
             kind: PendingKind::Tool,
         });
@@ -1633,6 +1782,7 @@ mod tests {
             req: 7,
             cell: (1, 2, 3),
             expect: 0,
+            base: 0,
             sent: Instant::now() - PENDING_TTL - Duration::from_millis(1),
             kind: PendingKind::Edit,
         });

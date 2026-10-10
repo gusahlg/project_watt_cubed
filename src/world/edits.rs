@@ -57,6 +57,7 @@ impl World {
         // A storage cell's matter sits where its chart embeds it.
         let at = self.seams.physical_cell(BlockCoord::new(x, y, z)).unwrap_or((x, y, z));
         self.gravity.record(at, delta);
+        let sky = self.generator.sky(coord);
         let new_edit = if id == generated {
             if let Some(cells) = self.edits.get_mut(&coord) {
                 cells.remove(&index);
@@ -66,7 +67,12 @@ impl World {
             }
             None
         } else {
-            self.edits.entry(coord).or_default().insert(index, id);
+            let cells = self.edits.entry(coord).or_default();
+            let first = cells.is_empty();
+            cells.insert(index, id);
+            if first {
+                self.index_edited_chunk(coord, sky);
+            }
             let span = self.edit_columns.entry((coord.x, coord.z)).or_insert([coord.y, coord.y]);
             *span = [span[0].min(coord.y), span[1].max(coord.y)];
             Some(id)
@@ -79,7 +85,7 @@ impl World {
         // lowers it. Either way the cached window is stale, and every loaded
         // chunk at or below the edit seeds skylight from it — re-settle them
         // so a constructed roof actually darkens the world underneath.
-        if let Sky::Axis(face) = self.generator.sky(coord) {
+        if let Sky::Axis(face) = sky {
             let (key, alt_chunk) = ColumnKey::of(face, coord);
             if let Some(ceiling) = self.ceilings.get(&key) {
                 let frame = FaceFrame::new(face);
@@ -143,6 +149,17 @@ impl World {
             }
         }
         previous
+    }
+
+    /// Enter chunk `coord`'s first edit in its column's roof index.
+    pub(in crate::world) fn index_edited_chunk(&mut self, coord: Coord, sky: Sky) {
+        if let Sky::Axis(face) = sky {
+            let (key, alt) = ColumnKey::of(face, coord);
+            let alts = self.edit_column_chunks.entry(key).or_default();
+            if !alts.contains(&alt) {
+                alts.push(alt);
+            }
+        }
     }
 
     /// Invalidate a chunk's mesh into the SYNC edit path: state → `Dirty`
@@ -391,13 +408,16 @@ impl World {
         let mut placed = 0;
         let mut cx = 0i32;
         while placed < n {
-            let inner = self.edits.entry(Coord::new(cx, 20, 0)).or_default();
+            let coord = Coord::new(cx, 20, 0);
+            let inner = self.edits.entry(coord).or_default();
             let room = CHUNK_VOLUME.min(n - placed);
             for index in 0..room {
                 inner.insert(index, id);
             }
             placed += room;
             self.edit_generation += room as u64;
+            let sky = self.generator.sky(coord);
+            self.index_edited_chunk(coord, sky);
             cx += 1;
         }
     }

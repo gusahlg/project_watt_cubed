@@ -558,7 +558,7 @@ fn step_axis(
     if noclip || delta.abs() <= MAX_COLLISION_STEP {
         pos[axis] = (start + delta).clamp(-border, border);
         if !noclip && world.collides(&collision_box(*pos, stance, up)) {
-            pos[axis] = start;
+            stop_at_contact(pos, start, axis, world, stance, up);
             return true;
         }
         return false;
@@ -575,11 +575,32 @@ fn step_axis(
         let last_good = pos[axis];
         pos[axis] = next;
         if world.collides(&collision_box(*pos, stance, up)) {
-            pos[axis] = last_good;
+            stop_at_contact(pos, last_good, axis, world, stance, up);
             return true;
         }
     }
     false
+}
+
+/// An axis-aligned substep meets a voxel face. Advance to that face rather than discarding
+/// the whole substep, which could mark the body grounded while it still hovered above it.
+fn stop_at_contact(pos: &mut DVec3, last_free: f64, axis: usize, world: &World, stance: Stance, up: Face) {
+    let forward = pos[axis] > last_free;
+    let body = collision_box(*pos, stance, up);
+    let edge = if forward { body.max()[axis] } else { body.min()[axis] };
+    let mut contact = pos[axis];
+    for (x, y, z) in body.voxel_cells() {
+        if !world.is_solid(x, y, z) { continue; }
+        let face = [x, y, z][axis] as f64 + if forward { 0.0 } else { 1.0 };
+        let at = pos[axis] + (face - edge);
+        contact = if forward { contact.min(at) } else { contact.max(at) };
+    }
+    let mut candidate = *pos;
+    candidate[axis] = if forward { contact.max(last_free) } else { contact.min(last_free) };
+    let dir = if forward { -1.0 } else { 1.0 };
+    *pos = nudge_free(candidate, axis, dir, world, stance, up)
+        .filter(|p| if forward { p[axis] >= last_free } else { p[axis] <= last_free })
+        .unwrap_or_else(|| { candidate[axis] = last_free; candidate });
 }
 
 #[cfg(test)]
@@ -759,6 +780,32 @@ mod tests {
     /// 60 × the game's 0.1 s dt clamp) tested only its endpoint and could jump
     /// the floor's entire 1-block extent, dropping the player through.
     #[test]
+    fn blocked_steps_reach_the_contact_face_on_every_axis() {
+        let mut world = World::generate();
+        let base = DVec3::new(0.5, 80.5 + stand_eye() - Stance::Standing.height() / 2.0, 0.5);
+        world.ensure_around(base);
+        for x in -3..=3 { for y in 77..=84 { for z in -3..=3 {
+            world.set_block(x, y, z, crate::block::registry::AIR);
+        } } }
+        let rock = world.registry().id_by_label("rock").unwrap();
+        world.set_block(0, 80, 0, rock);
+        for axis in 0..3 {
+            for direction in [-1.0, 1.0] {
+                let mut pos = base;
+                let body = collision_box(pos, Stance::Standing, Face::PosY);
+                let edge = if direction > 0.0 { body.max()[axis] } else { body.min()[axis] };
+                let face = [0.0, 80.0, 0.0][axis] + if direction > 0.0 { 0.0 } else { 1.0 };
+                pos[axis] += face - edge - direction * 0.125;
+                let from = pos;
+                assert!(!world.collides(&collision_box(pos, Stance::Standing, Face::PosY)));
+                assert!(step_axis(&mut pos, axis, direction * 0.4, &world, Stance::Standing, Face::PosY, false, WORLD_BORDER));
+                assert!((pos[axis] - from[axis] - direction * 0.125).abs() < 1e-9, "axis {axis}, direction {direction}: {from:?} -> {pos:?}");
+                assert!(!world.collides(&collision_box(pos, Stance::Standing, Face::PosY)));
+            }
+        }
+    }
+
+    #[test]
     fn terminal_velocity_fall_stops_on_a_one_block_thin_floor() {
         let mut world = World::generate();
         let (x, z) = (0.5, 0.5);
@@ -804,7 +851,7 @@ mod tests {
         let feet = player.position.y - stand_eye();
         let top = (floor_y + 1) as f64;
         assert!(
-            feet >= top - 1e-9 && feet < top + 0.3,
+            feet >= top - 1e-9 && feet < top + 1e-8,
             "feet must rest on the platform top ({top}), got {feet}"
         );
     }

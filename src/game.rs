@@ -329,7 +329,7 @@ impl Lap {
 }
 
 impl Game {
-    pub fn new(mut world: World, player: Player, save_name: String) -> Self {
+    pub fn new(world: World, player: Player, save_name: String) -> Self {
         let mut sched = crate::sched::Scheduler::new();
         // The fixed-tick sim runs through the scheduler. A pure clock lane is
         // never "starved", so its forward-progress floor is effectively infinite
@@ -347,12 +347,6 @@ impl Game {
             sched.register_interval(crate::save::autosave::AUTOSAVE_INTERVAL.as_secs_f32());
         let minimap_interval =
             sched.register_interval(MinimapConfig::DEFAULT.refresh_every.as_secs_f32());
-        // The stream lanes are call-point-driven producers (see
-        // sched::Scheduler::manual); World drives them via run_manual at their
-        // exact positions in stream(). One registration point keeps the lane
-        // types private to crate::world.
-        let stream_lanes = crate::world::lanes::StreamLanes::register(&mut sched);
-        world.set_stream_lanes(stream_lanes);
         Self {
             world,
             player,
@@ -648,14 +642,9 @@ impl Game {
         // step the deterministic world so terrain streams in before the frame is
         // grabbed. See the `scripted` field for why this can't be optional.
         if self.scripted {
-            self.world.stream(
-                self.player.position,
-                Some(&mut *eng),
-                &mut self.sched,
-                mods.appearance(),
-            );
+            self.world.stream(self.player.position, Some(&mut *eng), mods.appearance());
             let clocks = self.sched.clocks(dt);
-            let mut sched_ctx = SchedCtx::new(&mut self.world, Some(&mut *eng));
+            let mut sched_ctx = SchedCtx::new(&mut self.world);
             self.sched.tick(&mut sched_ctx, &clocks);
             return Signal::Continue;
         }
@@ -1144,7 +1133,7 @@ impl Game {
         // (fixed-tick accumulator + catch-up cap) is derived once per frame
         // here; other lanes still run directly below until they migrate in.
         let clocks = self.sched.clocks(dt);
-        let mut sched_ctx = SchedCtx::new(&mut self.world, Some(&mut *eng));
+        let mut sched_ctx = SchedCtx::new(&mut self.world);
         self.sched.tick(&mut sched_ctx, &clocks);
 
         let due = self.take_stream_due(dt);
@@ -1214,17 +1203,11 @@ impl Game {
     /// whether it streamed.
     fn stream_or_pump(&mut self, eng: Option<&mut Engine>, due: bool, mods: &Mods) -> bool {
         if !due || self.player.cruising() {
-            self.world
-                .pump(eng, &mut self.sched, mods.appearance());
+            self.world.pump(eng, mods.appearance());
             return false;
         }
         let center = self.stream_center();
-        self.world.stream(
-            center,
-            eng,
-            &mut self.sched,
-            mods.appearance(),
-        );
+        self.world.stream(center, eng, mods.appearance());
         true
     }
 
@@ -1252,7 +1235,7 @@ impl Game {
             let _ = self.motion_phase(&input, dt);
         }
         let clocks = self.sched.clocks(dt);
-        let mut sched_ctx = SchedCtx::new(&mut self.world, None);
+        let mut sched_ctx = SchedCtx::new(&mut self.world);
         self.sched.tick(&mut sched_ctx, &clocks);
         let due = self.take_stream_due(dt);
         self.stream_or_pump(None, due, mods);

@@ -1,51 +1,22 @@
-//! The `World::stream` passes as scheduler producers (`sched::Run`). Each is
-//! registered `manual` (see `sched::Scheduler::manual`) and driven at its exact
-//! call point inside `World::stream`, because its order relative to the other
-//! stream passes is load-bearing.
+//! The `World::stream` lanes. One [`stream_lanes!`] table declares each lane's marker type, its
+//! per-frame budget and its body; `stream` and `pump` call each lane's `run` at its fixed
+//! position in the pass, because that order is load-bearing.
 //!
-//! The async admission lanes — mesh, section, light, and column generation —
-//! share one loop (`world::admit` / `World::request_region_data`) over the
-//! per-lane accessor surface (`world::StreamLane`). They derive their per-frame
-//! `Deadline` from the `Budget::Millis` the scheduler hands `run()` — ONE budget
-//! locus, the manifest, never a private `pipeline::*_BUDGET` const — minted after
-//! each lane's pending gate so an idle frame never samples the clock — and share
-//! the one forward-progress floor rule (`world::admission_exhausted`). There is
-//! no second scheduler here: budget and floor come from the scheduler that drives
-//! the producer.
-//!
-//! The whole lane roster is ONE [`stream_lanes!`] table: each row declares the
-//! lane's `StreamLanes` field, its marker type (declared here for `new` rows;
-//! `use` rows are the `world::StreamLane` markers that already exist), its
-//! manifest name + budget, and its `run` body inline — the struct/impl/register
-//! scaffolding that used to be restated per lane comes from the macro.
+//! The async admission lanes (mesh, section, light and column generation) share one loop
+//! (`world::admit` / `World::request_region_data`) over the per-lane accessor surface
+//! (`world::StreamLane`). They derive their per-frame `Deadline` from the lane's
+//! `Budget::Millis`, minted after each lane's pending gate so an idle frame never samples the
+//! clock, and share the one forward-progress floor rule (`world::admission_exhausted`).
 
 use std::time::Duration;
 
-use voxel_engine::producer::{Budget, Cadence, Footprint, FootprintKey, Producer, Progress};
-
-use crate::sched::{Ctx, ManualHandle, Run, Scheduler};
+use voxel_engine::Engine;
+use voxel_engine::producer::{Budget, Progress};
 
 use super::{Coord, LightLane, MeshLane, SectionLane, World, admit, pipeline};
 
-/// A CPU, `Cadence::Frame`, `Global`-footprint manifest — the shape every stream
-/// lane shares. `name` and `budget` (the pass's per-frame item cap, declarative)
-/// are all that vary.
-fn stream_manifest(name: &'static str, budget: Budget) -> Producer {
-    Producer {
-        name,
-        footprint: Footprint {
-            reads: vec![FootprintKey::Global],
-            writes: vec![FootprintKey::Global],
-        },
-        cadence: Cadence::Frame,
-        budget,
-    }
-}
-
-/// The per-frame admission deadline from the scheduler-provided budget — the one
-/// place a lane's `Budget::Millis` becomes a [`Deadline`](pipeline::Deadline),
-/// so the budget has a single definition (the manifest).
-fn duration(budget: Budget) -> Duration {
+/// The span of a `Budget::Millis` lane budget, the one place a budget becomes a duration.
+pub(in crate::world) fn duration(budget: Budget) -> Duration {
     let Budget::Millis(ms) = budget else {
         unreachable!("streaming admission lanes declare Budget::Millis");
     };
@@ -66,142 +37,111 @@ fn far_center(world: &World) -> Coord {
     world.section_center().expect("stream lanes run after center is set")
 }
 
-fn eng<'a>(
-    slot: &'a mut Option<&mut voxel_engine::Engine>,
-    what: &'static str,
-) -> &'a mut voxel_engine::Engine {
-    slot.as_deref_mut().expect(what)
-}
-
-/// Run lane `L`'s admission around the centre `center` names (the streaming or the far one).
-fn admit_run<L: super::StreamLane>(ctx: &mut Ctx<'_>, center: fn(&World) -> Coord, b: Budget) -> Progress {
-    admit::<L>(ctx.world, center(ctx.world), b);
-    Progress::Idle
-}
-
-/// Declares a `new` row's marker struct (docs attach to it); a `use` row's
-/// marker already exists in `world::mod` (the `StreamLane` implementors).
+/// Declares a `new` row's marker struct (docs attach to it); an `admit` row's marker is a
+/// `world::StreamLane` implementor that already exists.
 macro_rules! declare_lane {
     (new $(#[$doc:meta])* $lane:ident) => {
         $(#[$doc])*
-        pub struct $lane;
+        pub(in crate::world) struct $lane;
     };
-    (use $(#[$doc:meta])* $lane:ident) => {};
     (admit $(#[$doc:meta])* $lane:ident) => {};
 }
 
-/// The one lane table: `field: [new|use] Marker(name, budget) => |ctx, budget| { body }`.
-/// Expands the `StreamLanes` handle struct, `register`, and each marker's
-/// `manifest()` + `Run` impl; the run bodies stay inline and visible below.
+/// The one lane table: `[new|admit] Marker(budget) => |world, eng, budget| { body }`. Expands
+/// each marker's `BUDGET` and inherent `run`.
 macro_rules! stream_lanes {
-    ($( $(#[$doc:meta])* $field:ident : $kind:ident $lane:ident ($name:literal, $budget:expr)
-        => |$ctx:ident, $b:ident| $body:block ),+ $(,)?) => {
-        /// The scheduler handles for every `World::stream` call-point producer, kept on
-        /// `World` so `stream` can drive each at its position. One struct, set once by
-        /// `Game::new`, rather than a handle field per lane.
-        #[derive(Clone, Copy)]
-        pub struct StreamLanes {
-            $(pub $field: ManualHandle,)+
-        }
-
-        impl StreamLanes {
-            /// Register every stream-lane producer on `sched` and return their handles.
-            /// The single wiring point (called by `Game::new`), so the lane marker types
-            /// stay private to `crate::world`.
-            pub(crate) fn register(sched: &mut Scheduler) -> StreamLanes {
-                StreamLanes {
-                    $($field: sched.register_manual($lane::manifest(), Box::new($lane)),)+
-                }
-            }
-        }
-
+    ($( $(#[$doc:meta])* $kind:ident $lane:ident ($budget:expr)
+        => |$world:ident, $eng:ident, $b:ident| $body:block ),+ $(,)?) => {
         $(
             declare_lane!($kind $(#[$doc])* $lane);
             impl $lane {
-                pub fn manifest() -> Producer {
-                    stream_manifest($name, $budget)
+                pub(in crate::world) const BUDGET: Budget = $budget;
+
+                #[inline]
+                pub(in crate::world) fn run($world: &mut World, $eng: Option<&mut Engine>) -> Progress {
+                    let $b = Self::BUDGET;
+                    $body
                 }
-            }
-            impl Run for $lane {
-                fn run(&mut self, $ctx: &mut Ctx<'_>, $b: Budget) -> Progress $body
             }
         )+
     };
 }
 
 stream_lanes! {
-    /// Patches each drawable chunk's GPU visibility mask — CPU lane, needs the
-    /// engine.
-    occlusion: new OcclusionLane("occlusion", Budget::Millis(0.5))
-        => |ctx, b| {
-            let Some(eng) = ctx.eng.as_deref_mut() else {
+    /// Patches each drawable chunk's GPU visibility mask; idle without the engine.
+    new OcclusionLane(Budget::Millis(0.5))
+        => |world, eng, b| {
+            let Some(eng) = eng else {
                 return Progress::Idle;
             };
-            ctx.world.rebuild_occlusion(Some(eng), b)
+            world.rebuild_occlusion(Some(eng), b)
         },
-    /// Synchronous remesh of edited (`Dirty`) chunks (`World::remesh_dirty`).
-    /// Uploads through the engine, so it needs `ctx.eng`.
-    dirty_remesh: new DirtyRemeshLane("dirty_remesh", Budget::Dispatches(super::DIRTY_BUDGET as u16))
-        => |ctx, _b| {
-            if !ctx.world.dirty_pending() {
+    /// Synchronous remesh of edited (`Dirty`) chunks (`World::remesh_dirty`). Uploads through
+    /// the engine.
+    new DirtyRemeshLane(Budget::Dispatches(super::DIRTY_BUDGET as u16))
+        => |world, eng, _b| {
+            if !world.dirty_pending() {
                 return Progress::Idle;
             }
-            let eng = eng(&mut ctx.eng, "dirty-remesh is a CPU lane; eng required");
-            ctx.world.remesh_dirty(eng)
+            world.remesh_dirty(eng.expect("dirty-remesh is a CPU lane; eng required"))
         },
     /// The far-field relief bake runs on a spawned thread; this only polls the
     /// completion channel and (idempotently) spawns a new one.
-    mip: new MipLane("lod_mip", Budget::Dispatches(1))
-        => |ctx, _b| {
-            ctx.world.poll_mip();
-            ctx.world.ensure_mip_bake();
+    new MipLane(Budget::Dispatches(1))
+        => |world, _eng, _b| {
+            world.poll_mip();
+            world.ensure_mip_bake();
             Progress::Idle
         },
     /// Section edit-overlay lane: re-materialise the edit-folded cell (the δf)
     /// for every section a live edit touched. Bounded by touched sections; an
     /// unedited world pays nothing.
-    section_overlay: new SectionOverlayLane("lod_overlay", Budget::Millis(1.0))
-        => |ctx, b| {
-            ctx.world.refresh_section_overlay(b)
-        },
+    new SectionOverlayLane(Budget::Millis(1.0))
+        => |world, _eng, b| { world.refresh_section_overlay(b) },
     /// Frees GPU meshes of edited sections so they re-extract from the updated
-    /// overlay. CPU lane — needs the engine.
-    section_remesh: new SectionRemeshLane("lod_section_remesh", Budget::Millis(1.0))
-        => |ctx, _b| {
-            let eng = eng(&mut ctx.eng, "section-remesh is a CPU lane; eng required");
-            ctx.world.remesh_dirty_sections(eng);
+    /// overlay. Needs the engine.
+    new SectionRemeshLane(Budget::Millis(1.0))
+        => |world, eng, _b| {
+            world.remesh_dirty_sections(eng.expect("section-remesh is a CPU lane; eng required"));
             Progress::Idle
         },
-    /// Rebuilds the drawn covering every frame (hard LOD cut). Also the
-    /// level-triggered load arming.
-    section_visible: new SectionVisibleLane("lod_visible", Budget::Millis(1.0))
-        => |ctx, _b| {
-            ctx.world.rebuild_section_visible(ctx.eng.as_deref_mut());
+    /// Rebuilds the drawn covering. Also the level-triggered load arming.
+    new SectionVisibleLane(Budget::Millis(1.0))
+        => |world, eng, _b| {
+            world.rebuild_section_visible(eng);
             Progress::Idle
         },
     /// Lands finished worker results (generate/mesh/light-apply); mesh upload
-    /// to GPU is budgeted. CPU lane — needs the engine.
-    drain: new DrainLane("drain", Budget::Millis(1.0))
-        => |ctx, b| {
-            let eng = eng(&mut ctx.eng, "drain is a CPU lane; eng required");
-            ctx.world.drain_results(eng, duration(b));
+    /// to GPU is budgeted. Needs the engine.
+    new DrainLane(Budget::Millis(1.0))
+        => |world, eng, b| {
+            world.drain_with(duration(b), eng.expect("drain is a CPU lane; eng required"));
             Progress::Idle
         },
     /// Column granularity (one job per `(cx,cz)` span) means this keeps its own
     /// gather/claim inside `World::request_region_data` rather than the per-chunk
     /// `admit` loop, but shares the one budget + forward-progress floor rule.
-    generate: new GenerateLane("generate", Budget::Millis(2.0))
-        => |ctx, b| {
-            let center = stream_center(ctx.world);
-            ctx.world.request_region_data(center, b)
+    new GenerateLane(Budget::Millis(2.0))
+        => |world, _eng, b| {
+            let center = stream_center(world);
+            world.request_region_data(center, b)
         },
     /// Cross-chunk light settling admission (the `world::LightLane` marker).
-    light_admit: admit LightLane("light_admit", Budget::Millis(1.0))
-        => |ctx, b| { admit_run::<LightLane>(ctx, stream_center, b) },
+    admit LightLane(Budget::Millis(1.0))
+        => |world, _eng, b| {
+            admit::<LightLane>(world, stream_center(world), b);
+            Progress::Idle
+        },
     /// Fresh full-res chunk meshing admission (the `world::MeshLane` marker).
-    mesh_admit: admit MeshLane("mesh_admit", Budget::Millis(2.0))
-        => |ctx, b| { admit_run::<MeshLane>(ctx, stream_center, b) },
+    admit MeshLane(Budget::Millis(2.0))
+        => |world, _eng, b| {
+            admit::<MeshLane>(world, stream_center(world), b);
+            Progress::Idle
+        },
     /// LOD2 column-section admission (the `world::SectionLane` marker).
-    section_admit: admit SectionLane("section_admit", Budget::Millis(1.0))
-        => |ctx, b| { admit_run::<SectionLane>(ctx, far_center, b) },
+    admit SectionLane(Budget::Millis(1.0))
+        => |world, _eng, b| {
+            admit::<SectionLane>(world, far_center(world), b);
+            Progress::Idle
+        },
 }

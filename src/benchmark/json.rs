@@ -110,6 +110,18 @@ macro_rules! json_integer {
 
 json_integer!(u8, u32, u64, u128, usize, i32, i64);
 
+impl From<f64> for Json {
+    fn from(value: f64) -> Self {
+        Self::number(value)
+    }
+}
+
+impl From<f32> for Json {
+    fn from(value: f32) -> Self {
+        Self::number(f64::from(value))
+    }
+}
+
 fn write_json_string(out: &mut String, value: &str) {
     out.push('"');
     for ch in value.chars() {

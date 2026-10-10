@@ -2,6 +2,7 @@
 //! module tree (`world::tests`), same `super::*` access to private state.
 
 use super::*;
+use super::fixtures::{air_loaded, ready_section, round_world};
 use crate::block::registry::AIR;
 use crate::coord::{BlockCoord, Face};
 use crate::math::Aabb;
@@ -168,7 +169,7 @@ fn far_lane_admits_when_near_slots_exceed_the_cpu_cull_ceiling() {
     let held = |i: usize| SectionPos { body: 0, face: Face::PosY, detail: section::FINEST_DETAIL, x: 1 + i as i32, z: 0 };
     for i in 0..SECTION_SLOT_FLOOR - 1 {
         let state = if i % 2 == 0 {
-            SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None }
+            ready_section()
         } else {
             SectionState::Meshing { token: pipeline::ClaimToken(i as u64) }
         };
@@ -226,10 +227,7 @@ fn section_lane_claim_and_integrate_parity() {
     let center = stand_on_twin(&mut world);
     let pos = world.desired_sections(center)[0];
     assert!(!<SectionLane as StreamLane>::in_flight(&world, pos));
-    // Claim without its paired submit would trip the debug assertion, so
-    // mirror the lane's real order: mint the pending token first.
-    world.section_pending_claim = Some((pos, pipeline::ClaimToken(7)));
-    <SectionLane as StreamLane>::claim(&mut world, pos);
+    <SectionLane as StreamLane>::claim(&mut world, pos, pipeline::ClaimToken(7));
     assert!(matches!(world.sections.get(&pos), Some(SectionState::Meshing { token: pipeline::ClaimToken(7) })));
     assert!(<SectionLane as StreamLane>::in_flight(&world, pos), "claim marks in-flight");
     <SectionLane as StreamLane>::integrate(
@@ -258,7 +256,7 @@ fn section_covering_gates_on_a_ready_ancestor_or_self() {
     let center = stand_on_twin(&mut world);
     let cell = world.desired_sections(center)[0];
     assert!(!world.section_covered(cell), "nothing loaded means uncovered");
-    let empty_ready = || SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None };
+    let empty_ready = ready_section;
     world.sections.insert(cell, empty_ready());
     assert!(world.section_covered(cell), "a Ready self covers");
     world.sections.remove(&cell);
@@ -280,7 +278,7 @@ fn ready_finer_section_draws_while_its_cut_is_meshing() {
         z: -8_000,
     };
     let child = parent.child(section::Quadrant::ALL[0]);
-    let empty = || SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None };
+    let empty = ready_section;
     world.section_desired = vec![parent];
     world.sections.insert(child, empty());
     world.sections.insert(parent, SectionState::Meshing { token: pipeline::ClaimToken(1) });
@@ -332,7 +330,7 @@ fn section_lane_stays_armed_while_desired_cells_are_uncovered() {
     // Everything Ready: converged — still no re-arm.
     world.pending_sections.take();
     for &cell in &world.section_desired.clone() {
-        world.sections.insert(cell, SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None });
+        world.sections.insert(cell, ready_section());
     }
     world.section_desired = world.desired_sections(center);
     world.rebuild_section_visible(None);
@@ -355,7 +353,7 @@ fn moving_far_lane_admits_a_hole_past_the_resident_nearest() {
     let at = |x: i32| SectionPos { body: 0, face: Face::PosY, detail: section::FINEST_DETAIL, x, z: 0 };
     world.section_desired = (0..40).map(at).collect();
     for x in 0..32 {
-        world.sections.insert(at(x), SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None });
+        world.sections.insert(at(x), ready_section());
     }
     let mut rank = Vec::new();
     let mut visited = Vec::new();
@@ -369,49 +367,40 @@ fn moving_far_lane_admits_a_hole_past_the_resident_nearest() {
     );
 }
 
-/// A LOD aux lane driven end-to-end through the scheduler's `run_manual`
-/// (the call-point path `World::stream` uses) has the same effect as the
-/// direct method — here the visible-set lane arming the section lane
-/// while the covering has open holes.
+/// A LOD aux lane run at its call point (the way `World::stream` drives it) has
+/// the same effect as the direct method — here the visible-set lane arming the
+/// section lane while the covering has open holes.
 #[test]
-fn section_visible_lane_drives_through_run_manual() {
+fn section_visible_lane_run_arms_open_holes() {
     let mut world = lod2_world();
     let center = stand_on_twin(&mut world);
     world.pending_sections.take();
     world.section_desired = world.desired_sections(center);
 
-    let mut sched = crate::sched::Scheduler::new();
-    let handle = sched.register_manual(
-        lanes::SectionVisibleLane::manifest(),
-        Box::new(lanes::SectionVisibleLane),
-    );
-    sched.run_manual(handle, &mut world, None);
+    lanes::SectionVisibleLane::run(&mut world, None);
 
     assert!(
         world.pending_sections.get(),
-        "the visible lane, driven via run_manual, arms the section lane on open holes"
+        "the visible lane arms the section lane on open holes"
     );
 }
 
-/// The mesh admit lane IS the `MeshLane` producer now (no shim): driven
-/// end-to-end through the scheduler's `run_manual` it has the same effect as
-/// calling `admit` directly — here clearing `pending_fresh` once its
+/// The mesh admit lane IS the `MeshLane` marker: its `run` has the same effect
+/// as calling `admit` directly — here clearing `pending_fresh` once its
 /// worklist is empty (drained).
 #[test]
-fn mesh_admit_lane_drives_through_run_manual() {
+fn mesh_admit_lane_run_drains_an_empty_worklist() {
     let mut world = lod2_world();
     let center = ChunkCoord::new(0, 0, 0);
     world.center = Some(center);
     world.mesh_worklist.clear();
     world.pending_fresh.set();
 
-    let mut sched = crate::sched::Scheduler::new();
-    let handle = sched.register_manual(MeshLane::manifest(), Box::new(MeshLane));
-    sched.run_manual(handle, &mut world, None);
+    MeshLane::run(&mut world, None);
 
     assert!(
         !world.pending_fresh.get(),
-        "the mesh-admit lane, driven via run_manual, drains an empty worklist"
+        "the mesh-admit lane drains an empty worklist"
     );
 }
 
@@ -443,22 +432,6 @@ fn desired_frontier_responds_to_altitude() {
         sky.iter().all(|s| s.detail > finest),
         "wholly-overhead near rings must drop out at altitude"
     );
-}
-
-/// A settled born-air chunk for testing coverage skip logic.
-fn air_chunk(cx: i32, cy: i32, cz: i32) -> Loaded {
-    Loaded {
-        chunk: std::sync::Arc::new(Chunk::from_uniform(cx, cy, cz, AIR)),
-        state: MeshState::Air,
-        rev: 0,
-        connectivity: None,
-        visible: true,
-        light: None,
-        has_blocklight: false,
-        light_reseed: false,
-        light_gen: 0,
-        mesh_hash: None,
-    }
 }
 
 /// Verify coverage_skips skips only provably-covered sections inside the slab,
@@ -518,7 +491,7 @@ fn coverage_skip_is_sound_and_backed() {
         for dz in 0..nchunks {
             for dx in 0..nchunks {
                 let (cx, cz) = (cx0 + dx, cz0 + dz);
-                world.chunks.insert(ChunkCoord::new(cx, cy, cz), air_chunk(cx, cy, cz));
+                world.chunks.insert(ChunkCoord::new(cx, cy, cz), air_loaded(cx, cy, cz));
             }
         }
     }
@@ -527,7 +500,7 @@ fn coverage_skip_is_sound_and_backed() {
     // If any chunk is in-flight, don't skip (fast-descent guard).
     world.chunks.insert(ChunkCoord::new(cx0, cy_lo, cz0), Loaded {
         state: MeshState::NeedsMesh { building: true, prev: None },
-        ..air_chunk(cx0, cy_lo, cz0)
+        ..air_loaded(cx0, cy_lo, cz0)
     });
     assert!(!world.coverage_skips(center, cell), "an in-flight covering chunk blocks the skip");
 }
@@ -696,9 +669,8 @@ fn edits_persist_across_unload() {
 #[test]
 fn distinct_seeds_differ() {
     use crate::render_config::RenderConfig;
-    use crate::world::generation::WorldgenKind;
-    let a = World::with_kind(1, RenderConfig::default(), WorldgenKind::Diffusion, false);
-    let b = World::with_kind(9_999, RenderConfig::default(), WorldgenKind::Diffusion, false);
+    let a = round_world(1, RenderConfig::default());
+    let b = round_world(9_999, RenderConfig::default());
     let strip = |w: &World| {
         let (_, x, z, ground) = home_storage_column(w, Face::PosY);
         assert_ne!(ground, i32::MIN, "the start chart has no surface");
@@ -999,7 +971,8 @@ fn async_rebuild_claim_and_stale_release_preserve_the_drawn_mesh() {
     world.chunks.get_mut(&coord).unwrap().state =
         MeshState::NeedsMesh { building: false, prev: Some(meshes(h)) };
 
-    <MeshLane as StreamLane>::claim(&mut world, coord);
+    let degraded = !world.light_ready(coord) && !world.light_terminal.contains(&coord);
+    <MeshLane as StreamLane>::claim(&mut world, coord, degraded);
     let state = &world.chunks[&coord].state;
     assert!(matches!(state, MeshState::NeedsMesh { building: true, prev: Some(_) }));
     assert!(state.live_meshes().unwrap().draws(h), "still drawing through the claim");
@@ -1112,10 +1085,7 @@ fn upload_byte_accounting_matches_vertex_and_index_sizes() {
     );
     let expected: usize = Pass::ALL.iter().map(|&p| out[p].vertex_bytes()).sum();
     assert!(expected > 0, "a surface chunk yields geometry");
-    assert_eq!(
-        streaming::mesh_output_bytes(&pipeline::MeshPayload::from(out)),
-        expected
-    );
+    assert_eq!(pipeline::MeshPayload::from(out).vertex_bytes(), expected);
 }
 
 /// Staged upload accounting is the same vertex-byte charge as CPU `MeshData`.
@@ -1160,10 +1130,9 @@ fn section_upload_byte_accounting_matches_vertex_sizes() {
     let expected: usize =
         meshes.slabs.iter().flat_map(|s| Pass::ALL.iter().map(move |&p| s.data[p].vertex_bytes())).sum();
     assert!(expected > 0, "a default-seed section yields geometry");
-    assert_eq!(streaming::section_output_bytes(&meshes), expected);
+    assert_eq!(meshes.vertex_bytes(), expected);
 
-    world.section_pending_claim = Some((pos, pipeline::ClaimToken(7)));
-    <SectionLane as StreamLane>::claim(&mut world, pos);
+    <SectionLane as StreamLane>::claim(&mut world, pos, pipeline::ClaimToken(7));
     <SectionLane as StreamLane>::integrate(
         &mut world,
         pipeline::Done::Section {
@@ -1181,7 +1150,7 @@ fn section_upload_byte_accounting_matches_vertex_sizes() {
 #[test]
 fn empty_section_mesh_charges_zero_upload_bytes() {
     let meshes = section::SectionMeshData::default();
-    assert_eq!(streaming::section_output_bytes(&meshes), 0);
+    assert_eq!(meshes.vertex_bytes(), 0);
 }
 
 /// Mesh admission pauses at the upload-queue cap and resumes below it.
@@ -1739,9 +1708,9 @@ fn lod2_far_field_drives_to_covering_complete() {
             if <SectionLane as StreamLane>::in_flight(&world, pos) {
                 continue;
             }
-            if let Some(job) = <SectionLane as StreamLane>::submit(&mut world, pos) {
+            if let Some((job, token)) = <SectionLane as StreamLane>::submit(&mut world, pos) {
                 assert!(workers.submit(job), "worker pool admits the section job");
-                <SectionLane as StreamLane>::claim(&mut world, pos);
+                <SectionLane as StreamLane>::claim(&mut world, pos, token);
             }
         }
         // Drain finished jobs and yield briefly when the pool is empty.
@@ -1757,7 +1726,7 @@ fn lod2_far_field_drives_to_covering_complete() {
             if let Some(s @ SectionState::Meshing { .. }) = world.sections.get_mut(&pos)
                 && matches!(s, SectionState::Meshing { token: t } if *t == token)
             {
-                *s = SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None };
+                *s = ready_section();
             }
         }
     }
@@ -1837,23 +1806,11 @@ fn admit_selects_the_nearest_ready_mesh_keys() {
                 let fill = if y == 0 { stone } else { AIR };
                 world.chunks.insert(
                     coord,
-                    Loaded {
-                        chunk: std::sync::Arc::new(Chunk::from_data(
-                            x,
-                            y,
-                            z,
-                            ChunkData::Uniform(fill),
-                        )),
-                        state: MeshState::needs_mesh(),
-                        rev: 0,
-                        connectivity: None,
-                        visible: true,
-                        light: None,
-                        has_blocklight: false,
-                        light_reseed: false,
-                        light_gen: 0,
-                        mesh_hash: None,
-                    },
+                    Loaded::new(
+                        std::sync::Arc::new(Chunk::from_data(x, y, z, ChunkData::Uniform(fill))),
+                        MeshState::needs_mesh(),
+                        0,
+                    ),
                 );
             }
         }
@@ -1919,23 +1876,11 @@ fn admit_does_not_visit_far_blocked_seeds_once_want_is_filled() {
                 let fill = if y == 0 { stone } else { AIR };
                 world.chunks.insert(
                     coord,
-                    Loaded {
-                        chunk: std::sync::Arc::new(Chunk::from_data(
-                            x,
-                            y,
-                            z,
-                            ChunkData::Uniform(fill),
-                        )),
-                        state: MeshState::needs_mesh(),
-                        rev: 0,
-                        connectivity: None,
-                        visible: true,
-                        light: None,
-                        has_blocklight: false,
-                        light_reseed: false,
-                        light_gen: 0,
-                        mesh_hash: None,
-                    },
+                    Loaded::new(
+                        std::sync::Arc::new(Chunk::from_data(x, y, z, ChunkData::Uniform(fill))),
+                        MeshState::needs_mesh(),
+                        0,
+                    ),
                 );
             }
         }
@@ -2216,11 +2161,10 @@ fn transition_lighting_old_done_is_ignored_in_both_orders() {
     assert!(world.light_apply_queue.is_empty());
 }
 
-/// A far-cap rejection leaves `section_pending_claim` set; the next accepted
-/// submit for a *different* key overwrites it, and claiming that key must
-/// install its own token — never the leftover.
+/// A far-cap rejection claims nothing: each submit mints its own token, and claiming a later
+/// key installs that key's token, never the refused one's.
 #[test]
-fn section_pending_claim_is_not_stolen_by_a_later_key() {
+fn a_refused_section_submit_claims_nothing() {
     let mut world = lod2_world();
     let a = SectionPos { body: 0, face: Face::PosY,
         detail: section::FINEST_DETAIL,
@@ -2232,20 +2176,12 @@ fn section_pending_claim_is_not_stolen_by_a_later_key() {
         x: 3,
         z: 4,
     };
-    let job_a = <SectionLane as StreamLane>::submit(&mut world, a).expect("submit A");
-    let pipeline::Job::Section { token: token_a, .. } = job_a else {
-        panic!("expected a section job");
-    };
-    assert_eq!(world.section_pending_claim, Some((a, token_a)));
-    // Rejection: do not claim A. Submit B overwrites the leftover.
-    let job_b = <SectionLane as StreamLane>::submit(&mut world, b).expect("submit B");
-    let pipeline::Job::Section { token: token_b, .. } = job_b else {
-        panic!("expected a section job");
-    };
+    let (job_a, token_a) = <SectionLane as StreamLane>::submit(&mut world, a).expect("submit A");
+    assert!(matches!(job_a, pipeline::Job::Section { token, .. } if token == token_a));
+    // Rejection: A is never claimed.
+    let (_, token_b) = <SectionLane as StreamLane>::submit(&mut world, b).expect("submit B");
     assert_ne!(token_a, token_b);
-    assert_eq!(world.section_pending_claim, Some((b, token_b)));
-    <SectionLane as StreamLane>::claim(&mut world, b);
-    assert!(world.section_pending_claim.is_none());
+    <SectionLane as StreamLane>::claim(&mut world, b, token_b);
     assert!(matches!(
         world.sections.get(&b),
         Some(SectionState::Meshing { token }) if *token == token_b
@@ -2268,7 +2204,6 @@ fn late_section_done_after_epoch_bump_does_not_reinsert() {
     world.section_epoch = world.section_epoch.wrapping_add(1);
     world.sections.clear();
     world.section_upload_queue.clear();
-    world.section_pending_claim = None;
     <SectionLane as StreamLane>::integrate(
         &mut world,
         pipeline::Done::Section {
@@ -2350,11 +2285,11 @@ fn flush_degraded_leaves_inflight_and_terminal_clears_on_unload_or_toggle() {
         }
     ));
 
-    world.chunks.remove(&c);
+    world.forget_chunk(c);
     world.tick_light_gate();
     assert!(
         !world.light_terminal.contains(&c),
-        "tick reaps terminal marks for unloaded chunks"
+        "unload drops terminal marks"
     );
     assert!(!world.light_gate.degraded.contains(&c));
 
@@ -2377,10 +2312,8 @@ fn mesh_submit_without_claim_leaves_terminal_and_degraded_intact() {
     world.chunks.get_mut(&c).unwrap().state = MeshState::needs_mesh();
     world.mark_degraded(c, true);
     world.light_terminal.insert(c);
-    let _job = <MeshLane as StreamLane>::submit(&mut world, c).expect("job");
-    assert!(world.light_gate.degraded.contains(&c));
-    assert!(world.light_terminal.contains(&c));
-    assert_eq!(world.mesh_pending_degraded, Some((c, false)));
+    let (_job, degraded) = <MeshLane as StreamLane>::submit(&mut world, c).expect("job");
+    assert!(!degraded, "a terminal chunk's snapshot is final");
     assert!(world.light_terminal.contains(&c));
     assert!(world.light_gate.degraded.contains(&c));
 }
@@ -2398,7 +2331,7 @@ fn mesh_free_hook_records_each_handle_once() {
     assert_eq!(mesh_free_log::take(), vec![h]);
 
     let h2 = MeshHandle::from_raw_parts(52, 1);
-    let mut loaded = air_chunk(0, 0, 0);
+    let mut loaded = air_loaded(0, 0, 0);
     loaded.state = ready(h2);
     loaded.retire_logged(MeshState::Air);
     assert_eq!(mesh_free_log::take(), vec![h2]);
@@ -2490,7 +2423,8 @@ fn claim_sequence(seed: u64) {
                     Some(MeshState::NeedsMesh { building: false, .. })
                 ) {
                     let rev = world.chunks[&coord].rev;
-                    <MeshLane as StreamLane>::claim(&mut world, coord);
+                    let degraded = !world.light_ready(coord) && !world.light_terminal.contains(&coord);
+                    <MeshLane as StreamLane>::claim(&mut world, coord, degraded);
                     owed_mesh.insert(coord, rev);
                 }
             }
@@ -2513,7 +2447,7 @@ fn claim_sequence(seed: u64) {
             5 => {
                 if world.chunks.contains_key(&coord) && !world.light_inflight.contains(&coord) {
                     let light_gen = world.chunks[&coord].light_gen;
-                    <LightLane as StreamLane>::claim(&mut world, coord);
+                    <LightLane as StreamLane>::claim(&mut world, coord, ());
                     owed_light.insert(coord, light_gen);
                 }
             }
@@ -2566,11 +2500,8 @@ fn claim_sequence(seed: u64) {
                     z: coord.z,
                 };
                 if !world.sections.contains_key(&pos) {
-                    if let Some(job) = <SectionLane as StreamLane>::submit(&mut world, pos) {
-                        let pipeline::Job::Section { token, .. } = job else {
-                            panic!("section");
-                        };
-                        <SectionLane as StreamLane>::claim(&mut world, pos);
+                    if let Some((_, token)) = <SectionLane as StreamLane>::submit(&mut world, pos) {
+                        <SectionLane as StreamLane>::claim(&mut world, pos, token);
                         owed_section.insert(pos, token);
                     }
                 } else if let Some(&token) = owed_section.get(&pos) {
@@ -2807,11 +2738,11 @@ impl crate::world::generation::TerrainGenerator for OpenAir {
 fn drain_light(world: &mut World) {
     let mut n = 0u32;
     loop {
-        let Some(coord) = LightLane::seed_set(world).and_then(|s| s.iter().copied().next()) else {
+        let Some(coord) = LightLane::worklist(world).iter().copied().next() else {
             break;
         };
-        LightLane::seed_set(world).expect("worklist").remove(&coord);
-        if let Some(pipeline::Job::Light { snapshot, coord: c, .. }) = LightLane::submit(world, coord)
+        LightLane::worklist(world).remove(&coord);
+        if let Some((pipeline::Job::Light { snapshot, coord: c, .. }, ())) = LightLane::submit(world, coord)
         {
             let mut grid = light::LightGrid::dark();
             light::propagate(
@@ -3653,96 +3584,6 @@ fn far_face_home_chart_edit_dirties_the_chart_section() {
     assert!(world.dirty_sections.iter().all(|p| p.body != home), "a chart edit dirtied the catalog id");
 }
 
-fn headless_integrate(world: &mut World, result: pipeline::Done) {
-    match result {
-        pipeline::Done::Column { key, chunks, heights } => world.accept_column(key, chunks, heights),
-        pipeline::Done::Mesh { coord, rev, data } => world.accept_mesh(coord, rev, data),
-        pipeline::Done::Light {
-            coord,
-            epoch,
-            light_gen,
-            grid,
-        } => world.accept_light(coord, epoch, light_gen, grid),
-        pipeline::Done::Section { .. } => {}
-        pipeline::Done::Failed(key) => world.fail_job(*key),
-        pipeline::Done::Cancelled(keys) => {
-            for key in keys.into_vec() {
-                world.cancel_job(key);
-            }
-        }
-    }
-}
-
-/// GPU-free stand-in for the upload half of `drain_results`: an empty mesh is
-/// `Air`, anything else a fake `Ready` that is never engine-freed.
-fn headless_uploads(world: &mut World) -> usize {
-    let mut upload_bytes = 0usize;
-    let mut uploads = 0usize;
-    let mut pops = 0usize;
-    while (uploads == 0 || upload_bytes < UPLOAD_BUDGET_BYTES) && pops < UPLOAD_SCAN_MAX {
-        let Some((coord, rev, data)) = world.upload_queue.pop_front() else {
-            break;
-        };
-        pops += 1;
-        if !world.mesh_result_applies(coord, rev) {
-            if let Some(loaded) = world.chunks.get_mut(&coord) {
-                if loaded.state.release_build() {
-                    adjust_count(&mut world.building_meshes, true, false);
-                }
-            }
-            world.pending_fresh.set();
-            world.mesh_worklist.insert(coord);
-            continue;
-        }
-        let bytes = data.vertex_bytes();
-        upload_bytes += bytes;
-        uploads += 1;
-        let next = if bytes == 0 {
-            MeshState::Air
-        } else {
-            let handle = voxel_engine::MeshHandle::from_raw_parts(1, 1);
-            let meshes = ChunkMeshes::from_upload_handles(ByPass::from_fn(|p| {
-                (p == Pass::Opaque).then_some(handle)
-            }))
-            .expect("one pass");
-            MeshState::Ready(meshes)
-        };
-        if let Some(loaded) = world.chunks.get_mut(&coord) {
-            let was = loaded.state.is_building();
-            loaded.retire_logged(next);
-            adjust_count(&mut world.building_meshes, was, false);
-        }
-    }
-    uploads
-}
-
-fn headless_light_apply(world: &mut World) -> usize {
-    let deadline = pipeline::Deadline::from_budget(pipeline::LIGHT_APPLY_BUDGET);
-    let mut applied = 0usize;
-    while applied == 0 || !deadline.expired() {
-        let Some((coord, grid)) = world.light_apply_queue.pop_front() else {
-            break;
-        };
-        world.settle_light(coord, grid);
-        applied += 1;
-    }
-    applied
-}
-
-fn headless_drain(world: &mut World) -> usize {
-    // `DrainLane` is `Budget::Millis(1.0)` with `RESULT_INTEGRATE_FLOOR` 8.
-    let deadline = pipeline::Deadline::from_budget(std::time::Duration::from_millis(1));
-    let mut integrated = 0usize;
-    while integrated < 8 || !deadline.expired() {
-        let Some(result) = world.workers.as_ref().and_then(pipeline::Workers::try_recv) else {
-            break;
-        };
-        headless_integrate(world, result);
-        integrated += 1;
-    }
-    integrated
-}
-
 /// Three quarters of a radius from the centre of the catalog's greatest rock, along +z.
 fn great_rock_eye(world: &World) -> [i64; 3] {
     let rock = world.terrain().cosmos().and_then(|c| c.great_rock()).expect("a great rock");
@@ -3755,12 +3596,11 @@ fn great_rock_eye(world: &World) -> [i64; 3] {
 #[test]
 fn open_gen_cursor_drains_across_frames() {
     use crate::world::chunk::CHUNK_SIZE;
-    use crate::world::generation::WorldgenKind;
 
     let mut render = RenderConfig::default();
     render.lod2 = false;
     render.occlusion = false;
-    let mut world = World::with_kind(42, render, WorldgenKind::Diffusion, false);
+    let mut world = round_world(42, render);
     let eye = great_rock_eye(&world);
     world.set_view_distances(1, 1);
     let center = ChunkCoord::new(
@@ -3775,11 +3615,9 @@ fn open_gen_cursor_drains_across_frames() {
     {
         let pool = world.worker_pool();
         let cap = pool.worker_capacity();
-        pool.set_pacing(cap, (cap * 4).max(8));
-        pool.set_view(
-            center.x, center.y, center.z, pipeline::FarView::flat(center.x, center.z), 1, 0.0, 0.0, 0.0, 0.0, None,
-            super::seam::Unfold::IDENTITY,
-        );
+        pool.set_near_cap(pipeline::near_lookahead(cap));
+        let far = pipeline::FarView::flat(center.x, center.z);
+        pool.publish(&pipeline::ViewSnap::full(center, far, 1, 0.0, DVec3::ZERO, None, seam::Unfold::IDENTITY));
     }
     let budget = voxel_engine::producer::Budget::Millis(0.0);
     world.request_region_data(center, budget);
@@ -3872,11 +3710,9 @@ fn buried_solid_mesh_is_air_and_an_edit_remeshes_it() {
     {
         let pool = world.worker_pool();
         let cap = pool.worker_capacity();
-        pool.set_pacing(cap, (cap * 4).max(8));
-        pool.set_view(
-            center.x, center.y, center.z, pipeline::FarView::flat(center.x, center.z), 2, 0.0, 0.0, 0.0, 0.0, up,
-            super::seam::Unfold::IDENTITY,
-        );
+        pool.set_near_cap(pipeline::near_lookahead(cap));
+        let far = pipeline::FarView::flat(center.x, center.z);
+        pool.publish(&pipeline::ViewSnap::full(center, far, 2, 0.0, DVec3::ZERO, up, seam::Unfold::IDENTITY));
     }
     admit::<MeshLane>(
         &mut world,
@@ -3917,94 +3753,42 @@ fn buried_solid_mesh_is_air_and_an_edit_remeshes_it() {
 
 fn stone_loaded(coord: ChunkCoord, stone: crate::block::BlockId) -> Loaded {
     use crate::world::chunk::{Chunk, ChunkData};
-    Loaded {
-        chunk: std::sync::Arc::new(Chunk::from_data(
-            coord.x,
-            coord.y,
-            coord.z,
-            ChunkData::Uniform(stone),
-        )),
-        state: MeshState::needs_mesh(),
-        rev: 0,
-        connectivity: None,
-        visible: true,
-        light: Some(light::LightGrid::dark()),
-        has_blocklight: false,
-        light_reseed: false,
-        light_gen: 0,
-        mesh_hash: None,
-    }
+    let chunk = std::sync::Arc::new(Chunk::from_data(coord.x, coord.y, coord.z, ChunkData::Uniform(stone)));
+    Loaded { light: Some(light::LightGrid::dark()), ..Loaded::new(chunk, MeshState::needs_mesh(), 0) }
 }
 
 /// Headless stream to `entry_complete` inside the seed-42 catalog's greatest asteroid
-/// (eye three quarters of a radius from its centre along +z).
-/// Open space streams an isotropic cube, so horizontal 12 is the volume that
-/// loads on the order of 16k chunks. Lane budgets match `lanes.rs`. No engine,
-/// no window. Ignored timing bench:
+/// (eye three quarters of a radius from its centre along +z): the real stream pass with the
+/// GPU stood in, timed by phase. Open space streams an isotropic cube, so horizontal 12 is the
+/// volume that loads on the order of 16k chunks. No engine, no window. Ignored timing bench:
 /// `cargo test --release --lib asteroid_entry_breakdown -- --ignored --nocapture`
 #[test]
 #[ignore]
 fn asteroid_entry_breakdown() {
     use std::time::{Duration, Instant};
 
+    use super::streaming::headless::{Headless, PHASE_NAMES};
     use crate::world::brick::ChunkPayload;
     use crate::world::chunk::{CHUNK_SIZE, CHUNK_VOLUME};
-    use crate::world::generation::WorldgenKind;
 
     const VIEW_H: i32 = 12;
     let mut render = RenderConfig::default();
     // Shipped settings leave distant LOD off. Occlusion rebuild needs the engine.
     render.lod2 = false;
     render.occlusion = false;
-    let mut world = World::with_kind(42, render, WorldgenKind::Diffusion, false);
-    let eye = great_rock_eye(&world);
+    let mut world = round_world(42, render);
+    let [x, y, z] = great_rock_eye(&world);
+    let eye = DVec3::new(x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5);
     world.set_view_distances(VIEW_H, 3);
-    let center = ChunkCoord::new(
-        eye[0].div_euclid(CHUNK_SIZE as i64) as i32,
-        eye[1].div_euclid(CHUNK_SIZE as i64) as i32,
-        eye[2].div_euclid(CHUNK_SIZE as i64) as i32,
-    );
-    world.center = Some(center);
-    world.stream_up = world.resolve_stream_up(center);
-    world.stream_up_set = true;
-    world.section_eye_y = eye[1] as f64;
-    world.pending_gen.set();
-    let up = world.live_up();
-    let rings = world.view.worklist_rings(up, 0);
-    world.mesh_worklist.fit(center, rings, up);
-    world.light_worklist.fit(center, rings, up);
-    assert!(
-        up.is_none(),
-        "open-space eye streams an isotropic cube, up={up:?}"
-    );
-    let cap = {
-        let pool = world.worker_pool();
-        let cap = pool.worker_capacity();
-        // Heavy entry frames stay unboosted: lookahead is `active * 4`.
-        pool.set_pacing(cap, (cap * 4).max(8));
-        pool.set_view(
-            center.x, center.y, center.z, pipeline::FarView::flat(center.x, center.z), VIEW_H, 0.0, 0.0, 0.0, 0.0, up,
-            super::seam::Unfold::IDENTITY,
-        );
-        cap
-    };
     // `None` up: every axis uses the horizontal radius. Data box adds one shell.
     let mesh_n = (2 * VIEW_H as usize + 1).pow(3);
     let data_n = (2 * (VIEW_H as usize + 1) + 1).pow(3);
-    println!(
-        "asteroid_entry setup center={center:?} up={up:?} workers={cap} mesh_box={mesh_n} data_box={data_n} lod2={}",
-        world.lod2
-    );
+    println!("asteroid_entry setup eye={eye:?} mesh_box={mesh_n} data_box={data_n} lod2={}", world.lod2);
 
     pipeline::job_time::reset();
     pipeline::job_time::set_enabled(true);
+    let mut steps = Headless::timed();
     let wall_start = Instant::now();
-    let mut main_gen = Duration::ZERO;
-    let mut main_light = Duration::ZERO;
-    let mut main_mesh = Duration::ZERO;
-    let mut main_integrate = Duration::ZERO;
-    let mut main_apply = Duration::ZERO;
-    let mut main_upload = Duration::ZERO;
     let mut idle = Duration::ZERO;
     let mut frames = 0u32;
     let mut next_report = wall_start + Duration::from_secs(5);
@@ -4012,48 +3796,8 @@ fn asteroid_entry_breakdown() {
     let mut finished = false;
     while Instant::now() < limit {
         frames += 1;
-        let mut progressed = 0usize;
-        let t = Instant::now();
-        progressed += headless_drain(&mut world);
-        main_integrate += t.elapsed();
-        let t = Instant::now();
-        progressed += headless_uploads(&mut world);
-        main_upload += t.elapsed();
-        let t = Instant::now();
-        progressed += headless_light_apply(&mut world);
-        main_apply += t.elapsed();
-        let t = Instant::now();
-        let generating_before = world.generating.len();
-        world.request_region_data(center, voxel_engine::producer::Budget::Millis(2.0));
-        progressed += world.generating.len().saturating_sub(generating_before);
-        main_gen += t.elapsed();
-        let t = Instant::now();
-        let admitted_before = world.counters.light_admitted;
-        if world.lighting {
-            admit::<LightLane>(
-                &mut world,
-                center,
-                voxel_engine::producer::Budget::Millis(1.0),
-            );
-        }
-        progressed += (world.counters.light_admitted - admitted_before) as usize;
-        main_light += t.elapsed();
-        let t = Instant::now();
-        let building_before = world.building_meshes;
-        let mesh_before = world.mesh_worklist.len();
-        world.tick_light_gate();
-        if !world.upload_backlogged() {
-            admit::<MeshLane>(
-                &mut world,
-                center,
-                voxel_engine::producer::Budget::Millis(2.0),
-            );
-        }
-        world.flush_degraded_terminal();
-        progressed += world.building_meshes.saturating_sub(building_before);
-        // Buried solids leave the worklist without a worker claim.
-        progressed += mesh_before.saturating_sub(world.mesh_worklist.len());
-        main_mesh += t.elapsed();
+        let landed = world.counters.jobs_completed + world.counters.jobs_cancelled;
+        world.stream_steps(eye, &mut steps);
         if world.entry_complete() {
             finished = true;
             break;
@@ -4077,12 +3821,8 @@ fn asteroid_entry_breakdown() {
             );
             next_report = Instant::now() + Duration::from_secs(5);
         }
-        if progressed == 0 {
-            let quiet = world.generating.is_empty()
-                && world.light_inflight.is_empty()
-                && world.building_meshes == 0
-                && world.upload_queue.is_empty()
-                && world.light_apply_queue.is_empty()
+        if world.counters.jobs_completed + world.counters.jobs_cancelled == landed {
+            let quiet = !world.anything_in_flight()
                 && !world.pending_gen.get()
                 && !world.pending_fresh.get()
                 && !world.light_pending.get();
@@ -4159,15 +3899,11 @@ fn asteroid_entry_breakdown() {
         secs(idle),
         g.chunks
     );
-    println!(
-        "asteroid_entry main_gen_s={:.3} main_light_s={:.3} main_mesh_s={:.3} main_integrate_s={:.3} main_apply_s={:.3} main_upload_s={:.3}",
-        secs(main_gen),
-        secs(main_light),
-        secs(main_mesh),
-        secs(main_integrate),
-        secs(main_apply),
-        secs(main_upload)
-    );
+    let mut line = String::from("asteroid_entry main s by phase:");
+    for (name, d) in PHASE_NAMES.iter().zip(steps.laps.as_ref().expect("timed steps").sum) {
+        line.push_str(&format!(" {name}={:.3}", secs(d)));
+    }
+    println!("{line}");
     println!(
         "asteroid_entry jobs gen={gn}/{:.3}s light={ln}/{:.3}s mesh={mn}/{:.3}s seeds_store={} seeds_border={} light_admitted={}",
         gns as f64 / 1e9,
@@ -4258,6 +3994,14 @@ impl World {
         assert_eq!(self.edits, other.edits, "edit overlay");
         assert_eq!(self.edit_generation, other.edit_generation, "edit revision");
         assert_eq!(self.edit_columns, other.edit_columns, "edited column spans");
+        let roofs = |w: &World| {
+            w.edit_column_chunks.iter().map(|(key, altitudes)| {
+                let mut layers = altitudes.clone();
+                layers.sort_unstable();
+                (*key, layers)
+            }).collect::<FastMap<_, _>>()
+        };
+        assert_eq!(roofs(self), roofs(other), "edited roof layers");
         let ceilings = |w: &World| w.ceilings.keys().copied().collect::<FastSet<_>>();
         assert_eq!(ceilings(self), ceilings(other), "cached ceilings");
         assert!(self.gravity.same_edits(&other.gravity), "gravity ledger");

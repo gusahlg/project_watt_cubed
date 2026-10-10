@@ -410,13 +410,16 @@ mod tests {
         let mut snap_ns = Vec::with_capacity(LOOPS);
         let mut encode_ns = Vec::with_capacity(LOOPS);
         let mut write_ns = Vec::with_capacity(LOOPS);
+        let mut encode_allocs = (0, 0);
         for _ in 0..LOOPS {
             let t0 = Instant::now();
             let snap = crate::save::snapshot(&world, &player, &mods, meta.clone());
             snap_ns.push(t0.elapsed().as_nanos());
+            crate::alloc_count::reset();
             let t1 = Instant::now();
             let bytes = snap.encode().unwrap();
             encode_ns.push(t1.elapsed().as_nanos());
+            encode_allocs = (crate::alloc_count::alloc_count(), crate::alloc_count::alloc_bytes());
             let t2 = Instant::now();
             crate::save::store::write(&id, &bytes).unwrap();
             write_ns.push(t2.elapsed().as_nanos());
@@ -429,8 +432,10 @@ mod tests {
         let encode_us = med(&encode_ns) as f64 / 1_000.0;
         let write_us = med(&write_ns) as f64 / 1_000.0;
         eprintln!(
-            "autosave_100k median of {LOOPS}: snapshot={snap_us:.1}µs encode={encode_us:.1}µs write={write_us:.1}µs encode+write={:.1}µs",
-            encode_us + write_us
+            "autosave_100k median of {LOOPS}: snapshot={snap_us:.1}µs encode={encode_us:.1}µs write={write_us:.1}µs encode+write={:.1}µs; encode allocates {} times, {} bytes",
+            encode_us + write_us,
+            encode_allocs.0,
+            encode_allocs.1
         );
 
         let _ = fs::remove_file(save_file(&id));

@@ -1,0 +1,9 @@
+[package]
+name = "field"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+description = "InfiniteDiffusion v5: integer fields refined by local rules in Jacobi passes over boxes, cube-spheres and infinite lattices. Deterministic for any order, tiling or thread count."
+publish = false
+
+[dependencies]

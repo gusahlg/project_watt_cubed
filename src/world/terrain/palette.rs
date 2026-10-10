@@ -345,7 +345,7 @@ fn colour_dist(a: [u8; 3], b: [u8; 3]) -> u32 {
     (0..3).map(|k| (a[k] as i32 - b[k] as i32).unsigned_abs()).sum()
 }
 
-fn cohesive(elems: &[Element]) -> bool {
+pub(crate) fn cohesive(elems: &[Element]) -> bool {
     for i in 0..elems.len() {
         for j in (i + 1)..elems.len() {
             if fit_raw(elems[i], elems[j]) < 0 {
@@ -359,7 +359,7 @@ fn cohesive(elems: &[Element]) -> bool {
 /// Both orientations are quiescent. A palette block is a handful of occurrences, far below
 /// capacity, so the contact can only transfer — and a transfer's gain does not depend on which
 /// block is written on the left. The gain is the cross-block fit minus the cached internal hold.
-fn dormant(a: &Block, b: &Block) -> bool {
+pub(crate) fn dormant(a: &Block, b: &Block) -> bool {
     let (ae, be) = (a.elements(), b.elements());
     let (ah, bh) = (a.holding(), b.holding());
     let (na, nb) = (ae.len(), be.len());

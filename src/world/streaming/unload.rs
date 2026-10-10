@@ -62,6 +62,39 @@ impl World {
         }
     }
 
+    /// Remove chunk `coord` and every per-chunk entry kept beside it, returning the mesh state and
+    /// cage the GPU still holds for it. Seeds of a chunk that is gone are garbage: its next load
+    /// seeds afresh. Left in, they pile up in the clamped last ring during flight (never visited,
+    /// re-bucketed on every centre move).
+    pub(in crate::world) fn forget_chunk(
+        &mut self,
+        coord: Coord,
+    ) -> Option<(MeshState, Option<voxel_engine::CageHandle>)> {
+        self.dirty_worklist.remove(&coord);
+        self.light_worklist.remove(&coord);
+        self.light_owed.remove(&coord);
+        self.mesh_worklist.remove(&coord);
+        self.light_terminal.remove(&coord);
+        self.light_gate.forget(coord);
+        self.remesh_stats.forget(coord);
+        // Column layers: the last chunk out drops the cached ceiling.
+        if let Sky::Axis(face) = self.generator.sky(coord) {
+            let (key, alt) = ColumnKey::of(face, coord);
+            if let Some(ys) = self.column_chunks.get_mut(&key) {
+                if let Some(i) = ys.iter().position(|&y| y == alt) {
+                    ys.remove(i);
+                }
+                if ys.is_empty() {
+                    self.column_chunks.remove(&key);
+                    self.ceilings.remove(&key);
+                }
+            }
+        }
+        let loaded = self.chunks.remove(&coord)?;
+        super::adjust_count(&mut self.building_meshes, loaded.state.is_building(), false);
+        Some((loaded.state, self.cages.remove(&coord)))
+    }
+
     /// Free chunks past the unload box, releasing their GPU meshes.
     pub(super) fn unload_far(&mut self, center: Coord, eng: &mut Engine) {
         self.unload_far_with(center, |state, cage| {
@@ -125,31 +158,8 @@ impl World {
         for &coord in &far {
             // Free the mesh handle (Ready or Dirty); Air/NeedsMesh own none.
             // `far` holds loaded chunks only (see `unload_leaving`).
-            if let Some(loaded) = self.chunks.remove(&coord) {
-                super::adjust_count(&mut self.building_meshes, loaded.state.is_building(), false);
-                free(loaded.state, self.cages.remove(&coord));
-            }
-            self.dirty_worklist.remove(&coord);
-            // Seeds of a chunk that is gone are garbage: its next load seeds afresh. Left in, they
-            // pile up in the clamped last ring during flight (never visited, re-bucketed on every
-            // centre move).
-            self.light_worklist.remove(&coord);
-            self.light_owed.remove(&coord);
-            self.mesh_worklist.remove(&coord);
-            self.light_terminal.remove(&coord);
-            self.remesh_stats.forget(coord);
-            // Column layers: the last chunk out drops the cached ceiling.
-            if let Sky::Axis(face) = self.generator.sky(coord) {
-                let (key, alt) = ColumnKey::of(face, coord);
-                if let Some(ys) = self.column_chunks.get_mut(&key) {
-                    if let Some(i) = ys.iter().position(|&y| y == alt) {
-                        ys.remove(i);
-                    }
-                    if ys.is_empty() {
-                        self.column_chunks.remove(&key);
-                        self.ceilings.remove(&key);
-                    }
-                }
+            if let Some((state, cage)) = self.forget_chunk(coord) {
+                free(state, cage);
             }
         }
         // Settled grids still queued for removed chunks describe the world
@@ -169,5 +179,38 @@ impl World {
         }
         // (Ceilings for fully-unloaded columns dropped by the refcount above;
         // the heightmap is pure, so a re-entered column simply recomputes once.)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An unloaded chunk leaves no mark behind: the light gate's timers, degraded and dirty sets,
+    /// and the terminal set hold no unloaded coord.
+    #[test]
+    fn unload_forgets_light_gate_marks() {
+        let mut world = World::generate();
+        world.lod2 = false;
+        world.set_view_distances(2, 2);
+        let cy = world.generator.height(0, 0).div_euclid(CHUNK_SIZE as i32);
+        let marked: Vec<Coord> = world.chunks.keys().copied().collect();
+        for &c in &marked {
+            world.light_gate.note_blocked(c);
+            world.light_gate.degraded.insert(c);
+            world.light_gate.dirty.insert(c, crate::sched::now());
+            world.light_terminal.insert(c);
+        }
+        world.unload_far_with(Coord::new(1_000, cy, 0), |_, _| {});
+        assert!(world.chunks.len() < marked.len(), "the move unloaded chunks");
+        let gate = &world.light_gate;
+        let held = |c: &Coord| {
+            gate.blocked_since.contains_key(c)
+                || gate.degraded.contains(c)
+                || gate.dirty.contains_key(c)
+                || world.light_terminal.contains(c)
+        };
+        let stale: Vec<Coord> = marked.iter().copied().filter(|c| !world.chunks.contains_key(c) && held(c)).collect();
+        assert!(stale.is_empty(), "unloaded chunks still marked: {stale:?}");
     }
 }

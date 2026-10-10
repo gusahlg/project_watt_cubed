@@ -25,6 +25,8 @@ pub(crate) mod frame_snapshot;
 pub(crate) mod game;
 pub mod harness;
 pub(crate) mod hash;
+#[cfg(feature = "dev-tools")]
+pub use hash::splitmix_next;
 pub(crate) mod ident;
 pub mod input;
 pub(crate) mod interact;

@@ -4,14 +4,65 @@ use super::*;
 use super::pacer::RESULT_INTEGRATE_FLOOR;
 use crate::world::{light, mesh};
 
+/// Where a drain puts what lands: the GPU, or a headless stand-in.
+pub(in crate::world) trait Landing {
+    /// Put a live chunk mesh result on screen.
+    fn chunk(&mut self, world: &mut World, coord: Coord, data: pipeline::MeshPayload);
+    /// The resident state a live section result becomes.
+    fn section(&mut self, world: &mut World, pos: SectionPos, data: pipeline::SectionPayload) -> SectionState;
+    /// Release a stale chunk result's staging.
+    fn release_chunk(&mut self, data: pipeline::MeshPayload) {
+        drop(data);
+    }
+    /// Release a stale section result's staging.
+    fn release_section(&mut self, data: pipeline::SectionPayload) {
+        drop(data);
+    }
+}
+
+impl Landing for Engine {
+    fn chunk(&mut self, world: &mut World, coord: Coord, data: pipeline::MeshPayload) {
+        world.upload_chunk_payload(coord, data, self);
+    }
+
+    fn section(&mut self, world: &mut World, pos: SectionPos, data: pipeline::SectionPayload) -> SectionState {
+        let (flat_color, flat_rgba) = world.section_material(pos);
+        let bend = world.chart_bend(pos);
+        let mut state = SectionState::from_upload_payload(pos, data, self, bend.as_ref());
+        // Slots are born visible (residency implies it for everything but the
+        // far field), so a section that Coverage does not draw — or draws only
+        // in part — must be corrected here, at the transition that gave it slots
+        // to correct. No frame intervenes: patches flush at submit.
+        state.set_visible(self, world.section_fade.drawn_mask(pos));
+        // Push the section's far-material style so it doesn't draw one frame at
+        // the engine's post-upload default.
+        state.push_style(self, FadeStyle { flat_color }, flat_rgba);
+        state
+    }
+
+    fn release_chunk(&mut self, data: pipeline::MeshPayload) {
+        data.release_staging(self);
+    }
+
+    fn release_section(&mut self, data: pipeline::SectionPayload) {
+        data.release_staging(self);
+    }
+}
+
 impl World {
-    /// Land finished worker results (non-blocking). Generate results clear
-    /// `generating`; stale results release their exact claims. Result
-    /// integration used to drain the unbounded channel in one frame, making a
-    /// productive worker burst a main-thread hitch. It now shares the adaptive
-    /// effort signal and keeps a small forward-progress floor.
-    pub(in crate::world) fn drain_results(&mut self, eng: &mut Engine, result_budget: Duration) {
+    /// Land finished worker results (non-blocking), then the budgeted uploads through
+    /// `landing`. Generate results clear `generating`; stale results release their exact
+    /// claims. Result integration used to drain the unbounded channel in one frame, making a
+    /// productive worker burst a main-thread hitch. It now shares the adaptive effort signal
+    /// and keeps a small forward-progress floor.
+    pub(in crate::world) fn drain_with(&mut self, result_budget: Duration, landing: &mut impl Landing) {
         self.integrate_results(result_budget);
+        self.land_uploads(landing);
+    }
+
+    /// The upload half of [`drain_with`](Self::drain_with): chunk meshes, light grids and
+    /// sections that integration queued. A stale result releases its staging.
+    pub(in crate::world) fn land_uploads(&mut self, landing: &mut impl Landing) {
         self.counters.section_upload_bytes = 0;
         self.counters.drain_upload_bytes = 0;
         if self.upload_queue.is_empty()
@@ -41,17 +92,15 @@ impl World {
             pops += 1;
             if !self.mesh_result_applies(coord, rev) {
                 // Stale while queued: edit made it Dirty or it left the box.
-                data.release_staging(eng);
+                landing.release_chunk(data);
                 self.drop_stale_upload(coord);
                 continue;
             }
-            upload_bytes += mesh_output_bytes(&data);
+            upload_bytes += data.vertex_bytes();
             uploads += 1;
             // Both passes upload together under one budget charge (same rev).
-            // Staged payloads install through the worker-written ring; the
-            // Vec fallback uses the existing main-thread copy. (The rev
-            // check above guarantees the state is NeedsMesh { building: true }.)
-            self.upload_chunk_payload(coord, data, eng);
+            // (The rev check above guarantees the state is NeedsMesh { building: true }.)
+            landing.chunk(self, coord, data);
         }
 
         self.apply_light_queue();
@@ -64,51 +113,31 @@ impl World {
         // re-admission must not capture the replacement claim.
         let section_budget = pacer.section_uploads();
         let mut section_uploads = 0;
-        while section_uploads < section_budget {
-            let Some((_, _, _, _)) = self.section_upload_queue.front() else {
+        while section_uploads < section_budget && upload_bytes < upload_budget {
+            let Some((pos, token, bytes, meshes)) = self.section_upload_queue.pop_front() else {
                 break;
             };
-            if upload_bytes >= upload_budget {
-                break;
-            }
-            let (pos, token, bytes, meshes) = self
-                .section_upload_queue
-                .pop_front()
-                .expect("front was Some");
             section_uploads += 1;
-            // `section_material` borrows all of `self`, so it must run before
-            // `self.sections.get_mut` below takes an overlapping mutable borrow.
-            let (flat_color, flat_rgba) = self.section_material(pos);
-            let bend = self.chart_bend(pos);
-            if let Some(state @ SectionState::Meshing { .. }) = self.sections.get_mut(&pos)
-                && matches!(state, SectionState::Meshing { token: t } if *t == token)
-            {
-                super::adjust_count(&mut self.meshing_sections, true, false);
-                upload_bytes += bytes;
-                self.counters.section_upload_bytes += bytes;
-                *state = SectionState::from_upload_payload(pos, meshes, eng, bend.as_ref());
-                // Slots are born visible (residency implies it for everything but the
-                // far field), so a section that Coverage does not draw — or draws only
-                // in part — must be corrected here, at the transition that gave it slots
-                // to correct. No frame intervenes: patches flush at submit.
-                state.set_visible(eng, self.section_fade.drawn_mask(pos));
-                // Push the section's far-material style so it doesn't draw one frame at
-                // the engine's post-upload default.
-                state.push_style(eng, FadeStyle { flat_color }, flat_rgba);
-                // A new Ready section moves the covering: re-arm the lane so
-                // any refinement it exposes loads immediately.
-                self.pending_sections.set();
-                self.section_cover_dirty.set();
-            } else {
-                meshes.release_staging(eng);
+            if !matches!(self.sections.get(&pos), Some(SectionState::Meshing { token: t }) if *t == token) {
+                landing.release_section(meshes);
+                continue;
             }
+            super::adjust_count(&mut self.meshing_sections, true, false);
+            upload_bytes += bytes;
+            self.counters.section_upload_bytes += bytes;
+            let state = landing.section(self, pos, meshes);
+            self.sections.insert(pos, state);
+            // A new Ready section moves the covering: re-arm the lane so
+            // any refinement it exposes loads immediately.
+            self.pending_sections.set();
+            self.section_cover_dirty.set();
         }
         self.counters.drain_upload_bytes = upload_bytes;
     }
 
-    /// The first block of [`drain_results`](Self::drain_results): integrate finished worker
-    /// results within the paced `budget`, past a small forward-progress floor.
-    pub(in crate::world) fn integrate_results(&mut self, budget: Duration) {
+    /// The first step of [`drain_with`](Self::drain_with): integrate finished worker results
+    /// within the paced `budget`, past a small forward-progress floor.
+    fn integrate_results(&mut self, budget: Duration) {
         let pacer = self.stream_pacer;
         let deadline = pipeline::Deadline::from_budget(pacer.duration(budget));
         let floor = pacer.floor(RESULT_INTEGRATE_FLOOR);
@@ -123,9 +152,9 @@ impl World {
     }
 
     /// Budgeted light application, after the chunk uploads of
-    /// [`drain_results`](Self::drain_results). Order-independent: each grid is absolute,
+    /// [`land_uploads`](Self::land_uploads). Order-independent: each grid is absolute,
     /// leftovers apply next frame with no seam.
-    pub(in crate::world) fn apply_light_queue(&mut self) {
+    fn apply_light_queue(&mut self) {
         let deadline =
             pipeline::Deadline::from_budget(self.stream_pacer.duration(pipeline::LIGHT_APPLY_BUDGET));
         let mut applied = 0usize;

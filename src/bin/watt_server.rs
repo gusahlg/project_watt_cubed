@@ -16,7 +16,9 @@
 //! few minutes and on shutdown (SIGINT, SIGTERM). Next to that file, `ops.txt`
 //! and `mods.toml` are read and united with the flags. An `ops.txt` line is
 //! `name secret`: that player becomes an operator by sending the chat line
-//! `/op secret`. A line with a name alone, like `--ops`, trusts the name, so
+//! `/op secret`. Quote names containing spaces, e.g. `"Big Ada" secret` or
+//! `"Big Ada"` for a trusted name with no secret. Unquoted lines keep their meaning.
+//! A line with a name alone, like `--ops`, trusts the name, so
 //! anyone who joins under it is an operator; the server warns about those.
 //! A `mods.toml`:
 //! ```toml

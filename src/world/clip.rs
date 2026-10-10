@@ -213,10 +213,7 @@ impl World {
         if self.quarantined.is_empty() {
             return false;
         }
-        let parked = |key| self.quarantined.contains(&key);
-        parked(streaming::FailKey::Mesh { coord: c })
-            || parked(streaming::FailKey::Open { coord: c })
-            || matches!(self.generator.sky(c), Sky::Axis(face) if parked(streaming::FailKey::Column { key: ColumnKey::of(face, c).0 }))
+        self.quarantined.contains(&streaming::FailKey::Mesh { coord: c }) || self.generate_quarantined(c)
     }
 
     fn cube_ring_settled(&self, center: Coord, ring: i32) -> bool {

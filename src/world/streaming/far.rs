@@ -90,13 +90,8 @@ fn coarsen_chart(
         if set.len() <= budget {
             break;
         }
-        let mut kids: FastMap<SectionPos, u8> = FastMap::default();
-        for &c in &set {
-            if c.detail.0 == child_d {
-                *kids.entry(c.parent()).or_insert(0) += 1;
-            }
-        }
-        let mut merges: Vec<SectionPos> = kids.into_iter().filter(|&(p, n)| n == 4 && keep(p)).map(|(p, _)| p).collect();
+        let mut merges: Vec<SectionPos> =
+            count_children(&set, child_d).into_iter().filter(|&(p, n)| n == 4 && keep(p)).map(|(p, _)| p).collect();
         merges.sort_unstable_by_key(section_key);
         for p in merges {
             if set.len() <= budget {
@@ -109,6 +104,17 @@ fn coarsen_chart(
         }
     }
     set.into_iter().collect()
+}
+
+/// How many tiles of `set` at detail `child_d` each parent has.
+fn count_children(set: &FastSet<SectionPos>, child_d: i8) -> FastMap<SectionPos, u8> {
+    let mut kids: FastMap<SectionPos, u8> = FastMap::default();
+    for &c in set {
+        if c.detail.0 == child_d {
+            *kids.entry(c.parent()).or_insert(0) += 1;
+        }
+    }
+    kids
 }
 
 /// Home-chart footprint of `s` (`hi` exclusive). A neighbour section unfolds across the seam.
@@ -182,13 +188,7 @@ fn coarsen_off_disk(set: &mut FastSet<SectionPos>, budget: usize, eu: i32, ev: i
             if set.len() <= budget {
                 break;
             }
-            let mut kids: FastMap<SectionPos, u8> = FastMap::default();
-            for &c in set.iter() {
-                if c.detail.0 == child_d {
-                    *kids.entry(c.parent()).or_insert(0) += 1;
-                }
-            }
-            let mut parents: Vec<_> = kids.into_iter().filter(|&(_, n)| n >= 2).collect();
+            let mut parents: Vec<_> = count_children(set, child_d).into_iter().filter(|&(_, n)| n >= 2).collect();
             parents.sort_unstable_by_key(|(p, n)| (std::cmp::Reverse(*n), p.body, p.face as u8, p.x, p.z));
             for (p, _) in parents {
                 if set.len() <= budget {
@@ -231,13 +231,7 @@ fn overlap_storage(
     let span = s.span() as i64;
     let (sx0, sz0) = (s.min_x() as i64, s.min_z() as i64);
     let (sx1, sz1) = (sx0 + span, sz0 + span);
-    let (hx0, hz0, hx1, hz1) = if let Some(m) = across {
-        let (a, c) = m.home_xz(sx0, sz0);
-        let (b, d) = m.home_xz(sx1, sz1);
-        (a.min(b), c.min(d), a.max(b), c.max(d))
-    } else {
-        (sx0, sz0, sx1, sz1)
-    };
+    let (hx0, hz0, hx1, hz1) = home_rect(s, across);
     let ix0 = hx0.max(near.0);
     let iz0 = hz0.max(near.2);
     let ix1 = hx1.min(near.1);
@@ -321,6 +315,12 @@ fn cover_near(
     for q in super::section::Quadrant::ALL {
         cover_near(s.child(q), near, across, out);
     }
+}
+
+/// The far field's eye metric at `eye` on ladder `cfg`, over the LOD height envelope.
+fn lod_metric(eye: DVec3, cfg: &pyramid::PyramidCfg) -> EyeMetric {
+    let env = HeightEnvelope::new(super::section::LOD_FLOOR_Y as f32, super::section::LOD_CEIL_Y as f32);
+    EyeMetric::new(eye, env, DyCap::new(cfg.outer_m(), cfg.base))
 }
 
 fn section_dist2(s: SectionPos, ex: f64, ez: f64) -> f64 {
@@ -630,15 +630,9 @@ impl World {
         let (center, eye_y, _) = self.lod_place(center);
         let cs = CHUNK_SIZE as i32;
         let cfg = &self.section_pyramid;
-        let env = HeightEnvelope::new(super::section::LOD_FLOOR_Y as f32, super::section::LOD_CEIL_Y as f32);
-        let cap = DyCap::new(cfg.outer_m(), cfg.base);
         if face == Face::PosY && datum == 0 {
             let (pcx, pcz) = (center.x * cs + cs / 2, center.z * cs + cs / 2);
-            return EyeMetric::new(
-                DVec3::new(pcx as f64 + delta.x, eye_y + delta.y, pcz as f64 + delta.z),
-                env,
-                cap,
-            );
+            return lod_metric(DVec3::new(pcx as f64 + delta.x, eye_y + delta.y, pcz as f64 + delta.z), cfg);
         }
         let frame = FaceFrame::new(face);
         let (cu, _, cv) = frame.chunk_to_local(center);
@@ -646,7 +640,7 @@ impl World {
         let d = frame.point_to_local(delta);
         let eye = DVec3::new((center.x * cs + cs / 2) as f64, eye_y, (center.z * cs + cs / 2) as f64);
         let rel = frame.point_to_local(eye).y + d.y - datum as f64;
-        EyeMetric::new(DVec3::new(u as f64 + d.x, rel, v as f64 + d.z), env, cap)
+        lod_metric(DVec3::new(u as f64 + d.x, rel, v as f64 + d.z), cfg)
     }
 
     /// Desired frontier at one metric, stamped with `body`/`face` before coarsening
@@ -725,14 +719,20 @@ impl World {
         (levels > 0).then(|| (pyramid::PyramidCfg::sections_with(src.unit, levels, src.finest.0 as u8), max_d))
     }
 
+    /// The chart eye's storage block and its height above the column under it (`None` where that
+    /// column has no ground).
+    fn chart_eye_rel(&self, center: Coord, delta: DVec3) -> ((i64, i64, i64), Option<f64>) {
+        let (ex, ey, ez) = storage_eye_block(center, self.section_eye_y, delta);
+        let ground = self.generator.surface(Face::PosY, ex as i32, ez as i32);
+        let rel = (ground != i32::MIN).then(|| (ey as f64 - ground as f64).clamp(0.0, 1.0e7));
+        ((ex, ey, ez), rel)
+    }
+
     /// Eye metric in the storage frame. Altitude is height above the column under the eye, so
     /// standing on a mountain still selects the finest ring (the cube envelope is `[0, 512]`).
     pub(super) fn chart_metric(&self, center: Coord, delta: DVec3, cfg: &pyramid::PyramidCfg) -> EyeMetric {
-        let (ex, ey, ez) = storage_eye_block(center, self.section_eye_y, delta);
-        let ground = self.generator.surface(Face::PosY, ex as i32, ez as i32);
-        let rel = if ground == i32::MIN { 0.0 } else { (ey as f64 - ground as f64).clamp(0.0, 1.0e7) };
-        let env = HeightEnvelope::new(super::section::LOD_FLOOR_Y as f32, super::section::LOD_CEIL_Y as f32);
-        EyeMetric::new(DVec3::new(ex as f64, rel, ez as f64), env, DyCap::new(cfg.outer_m(), cfg.base))
+        let ((ex, _, ez), rel) = self.chart_eye_rel(center, delta);
+        lod_metric(DVec3::new(ex as f64, rel.unwrap_or(0.0), ez as f64), cfg)
     }
 
     fn chart_pick(
@@ -745,12 +745,9 @@ impl World {
         memo: &mut NearBounds,
         held: &mut Vec<(SectionPos, [i32; 2])>,
     ) -> Vec<SectionPos> {
-        let (ex, ey, ez) = storage_eye_block(center, self.section_eye_y, delta);
-        let ground = self.generator.surface(Face::PosY, ex as i32, ez as i32);
-        if ground == i32::MIN {
+        let ((ex, ey, ez), Some(rel)) = self.chart_eye_rel(center, delta) else {
             return Vec::new();
-        }
-        let rel = (ey as f64 - ground as f64).clamp(0.0, 1.0e7);
+        };
         let body = super::section::CHART_BODY_BASE + seat.index as u16;
         let (y0, y1) = self.near_y_range(center);
         let near = self.chart_near(center, body, y0);
@@ -805,8 +802,7 @@ impl World {
         memo: &mut NearBounds,
         held: &mut Vec<(SectionPos, [i32; 2])>,
     ) -> Vec<(SectionPos, f64)> {
-        let env = HeightEnvelope::new(super::section::LOD_FLOOR_Y as f32, super::section::LOD_CEIL_Y as f32);
-        let metric = EyeMetric::new(DVec3::new(ex, rel, ez), env, DyCap::new(cfg.outer_m(), cfg.base));
+        let metric = lod_metric(DVec3::new(ex, rel, ez), cfg);
         let mut radial = quadtree::desired_sections(&metric, cfg);
         for s in &mut radial {
             s.body = body;
@@ -1040,9 +1036,17 @@ impl World {
         self.section_face_set = true;
     }
 
+    /// Cube body `id` of the cosmos, with its half size. `None` off a cosmos or for another shape.
+    fn cube_body(&self, id: u16) -> Option<(super::terrain::cosmos::Body, i64)> {
+        let cosmos = self.generator.cosmos()?;
+        let body = *cosmos.bodies().iter().find(|b| b.id == id)?;
+        let super::terrain::cosmos::Shape::Cube { half } = body.shape else { return None };
+        Some((body, half))
+    }
+
+    /// Whether cube `body_id`'s held face `prev` sticks (see [`update_lod_face`](Self::update_lod_face)).
     fn face_holds(&self, center: Coord, body_id: u16, prev: Face) -> bool {
-        let Some(cosmos) = self.generator.cosmos() else { return prev == Face::PosY };
-        let Some(body) = cosmos.bodies().iter().find(|b| b.id == body_id) else { return false };
+        let Some((body, _)) = self.cube_body(body_id) else { return false };
         let rel = self.lod_eye_point(center) - body.centre_f();
         let comps = [rel.x.abs(), rel.y.abs(), rel.z.abs()];
         let max = comps[0].max(comps[1]).max(comps[2]);
@@ -1052,9 +1056,7 @@ impl World {
 
     /// Neighbouring faces whose squares are within two finest sections of the eye.
     fn edge_faces(&self, center: Coord, body_id: u16, face: Face) -> Vec<Face> {
-        let Some(cosmos) = self.generator.cosmos() else { return Vec::new() };
-        let Some(body) = cosmos.bodies().iter().find(|b| b.id == body_id) else { return Vec::new() };
-        let super::terrain::cosmos::Shape::Cube { half } = body.shape else { return Vec::new() };
+        let Some((body, half)) = self.cube_body(body_id) else { return Vec::new() };
         let frame = FaceFrame::new(face);
         let local = frame.point_to_local(self.lod_eye_point(center) - body.centre_f());
         let band = (super::section::section_span(super::section::FINEST_DETAIL) * 2) as f64;

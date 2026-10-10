@@ -34,7 +34,7 @@ const MIN_STREAM_EFFORT: f32 = 0.15;
 const STREAM_RECOVERY_SECS: f64 = 0.75;
 
 /// Last topology pass cheaper than this: leftover light/mesh work at rest may
-/// run at full worker/admission capacity. Half a 60 Hz frame — the post-flight
+/// run at full admission with the deep near queue. Half a 60 Hz frame — the post-flight
 /// frames on this branch sit well below it, while an already-expensive pass
 /// keeps travel shedding.
 const STREAM_HEADROOM_SECS: f64 = 0.008;
@@ -226,8 +226,7 @@ impl StreamPacer {
         self.held
     }
 
-    /// Effort applied to admission deadlines, floors and uploads. The worker
-    /// count does not follow it.
+    /// Effort applied to admission deadlines, floors and uploads.
     fn applied_effort(self) -> f32 {
         if self.boost { 1.0 } else { self.effort }
     }
@@ -261,17 +260,12 @@ impl StreamPacer {
             .clamp(1, SECTION_UPLOAD_BUDGET)
     }
 
-    /// Every worker stays available. Speed shrinks the loading window, not the
-    /// pool: a few workers on the full radius never finish the chunks that matter.
-    fn active_workers(self, capacity: usize) -> usize {
-        capacity.max(1)
-    }
-
-    /// Near-queue lookahead. Travel keeps `capacity * 4` so a short queue can
-    /// still be dropped when the window moves; at rest the deeper cap keeps
-    /// cheap light jobs from idling the pool.
+    /// Near-queue lookahead. Travel keeps the short
+    /// [`near_lookahead`](pipeline::near_lookahead) so the queue can still be
+    /// dropped when the window moves; at rest the deeper cap keeps cheap light
+    /// jobs from idling the pool.
     fn near_queue_cap(self, capacity: usize) -> usize {
-        let travel = (capacity.max(1) * 4).max(8);
+        let travel = pipeline::near_lookahead(capacity);
         if self.boost {
             travel.max(NEAR_REST_QUEUE_CAP)
         } else {
@@ -385,71 +379,45 @@ impl World {
         // lazily spawned pool before the pacer catches it on the next pass.
         self.apply_loading_radius();
         let pacer = self.stream_pacer;
-        let up = self.live_up();
-        let load_h = self.load_h;
-        let load_v = self.load_v;
-        let load_heading = self.load_heading;
-        let horizontal = self.view.horizontal;
-        let section_vel = self.section_vel;
-        let tight = !self.loading_full();
+        let (up, fold) = (self.live_up(), self.fold);
+        let view = if self.loading_full() {
+            let (radius, vel) = (self.view.horizontal, self.section_vel);
+            pipeline::ViewSnap::full(center_chunk, far_view, radius, far_m, vel, up, fold)
+        } else {
+            // A speed-reduced loading horizon: the draw radius stays on the world; this only
+            // decides which queued near jobs still run. The far predictor zeros velocity above
+            // its teleport cap. The near window still aims with the real travel, or nothing at
+            // several km/s would know which way is ahead.
+            pipeline::ViewSnap {
+                center: center_chunk,
+                far: far_view,
+                radius: self.load_h,
+                v_radius: self.load_v,
+                margin: super::DATA_MARGIN,
+                heading: self.load_heading,
+                up,
+                fold,
+                far_m,
+                vel: pacer.travel(),
+            }
+        };
         let slab = self.spawn_slab;
-        let fold = self.fold;
         let workers = self.worker_pool();
         if let Some(stager) = stager {
             workers.set_stager(stager);
         }
         workers.set_slab(slab);
-        if tight {
-            // The far predictor zeros velocity above its teleport cap. The near
-            // window still aims with the real travel, or nothing at several
-            // km/s would know which way is ahead.
-            let travel = pacer.travel();
-            workers.set_load_view(
-                center_chunk.x,
-                center_chunk.y,
-                center_chunk.z,
-                far_view,
-                load_h,
-                load_v,
-                super::DATA_MARGIN,
-                load_heading,
-                far_m,
-                travel.x,
-                travel.y,
-                travel.z,
-                up,
-                fold,
-            );
-        } else {
-            workers.set_view(
-                center_chunk.x,
-                center_chunk.y,
-                center_chunk.z,
-                far_view,
-                horizontal,
-                far_m,
-                section_vel.x,
-                section_vel.y,
-                section_vel.z,
-                up,
-                fold,
-            );
-        }
-        let capacity = workers.worker_capacity();
-        workers.set_pacing(
-            pacer.active_workers(capacity),
-            pacer.near_queue_cap(capacity),
-        );
+        workers.publish(&view);
+        workers.set_near_cap(pacer.near_queue_cap(workers.worker_capacity()));
     }
 
     /// The view a spawn request publishes: at rest around near centre `c` and far centre `f`, with
     /// the collision slab.
     pub(super) fn publish_spawn_view(&mut self, c: Coord, f: Coord, up: Option<Face>, slab: ChunkBox) {
-        let (far_m, far_view) = (self.far_horizon(), self.far_view(f));
-        let view_r = self.view.horizontal;
-        let fold = self.fold;
+        let (far, far_m, radius) = (self.far_view(f), self.far_horizon(), self.view.horizontal);
+        let view = pipeline::ViewSnap::full(c, far, radius, far_m, DVec3::ZERO, up, self.fold);
         let workers = self.worker_pool();
-        workers.set_view(c.x, c.y, c.z, far_view, view_r, far_m, 0.0, 0.0, 0.0, up, fold);
+        workers.publish(&view);
         workers.set_slab(Some(slab));
     }
 
@@ -464,8 +432,8 @@ impl World {
         up: Option<Face>,
         fold: seam::Unfold,
     ) {
-        let workers = self.worker_pool();
-        workers.set_view(c.x, c.y, c.z, far_view, radius, far_m, 0.0, 0.0, 0.0, up, fold);
+        let view = pipeline::ViewSnap::full(c, far_view, radius, far_m, DVec3::ZERO, up, fold);
+        self.worker_pool().publish(&view);
     }
 }
 
@@ -485,7 +453,6 @@ mod tests {
         let mut pacer = StreamPacer::default();
         pacer.update(DVec3::new(200.0, 0.0, 0.0), 1.0 / 60.0);
         assert_eq!(pacer.effort(), MIN_STREAM_EFFORT, "shedding is immediate");
-        assert_eq!(pacer.active_workers(12), 12, "speed shrinks the window, not the pool");
         assert_eq!(pacer.floor(32), 5);
         assert_eq!(pacer.section_uploads(), 1);
 
@@ -501,23 +468,20 @@ mod tests {
     }
 
     #[test]
-    fn stream_pacer_runs_full_workers_for_queued_work_at_rest() {
+    fn stream_pacer_boosts_queued_work_at_rest() {
         let mut pacer = StreamPacer::default();
         pacer.update(DVec3::new(200.0, 0.0, 0.0), 1.0 / 60.0);
-        assert_eq!(pacer.active_workers(12), 12, "travel keeps every worker");
         pacer.set_boost(true, 0.001);
         assert!(
             !pacer.boosting(),
             "queued work during travel must not lift the floor"
         );
-        assert_eq!(pacer.active_workers(12), 12);
         assert_eq!(pacer.near_queue_cap(12), 48);
         assert!(pacer.floor(32) < 32, "travel still sheds admission");
 
         pacer.update(DVec3::ZERO, 1.0 / 60.0);
         pacer.set_boost(true, 0.001);
         assert!(pacer.boosting(), "cheap rest frame with leftover work");
-        assert_eq!(pacer.active_workers(12), 12);
         assert_eq!(pacer.near_queue_cap(12), NEAR_REST_QUEUE_CAP);
         assert_eq!(pacer.floor(32), 32);
         assert!(
@@ -531,7 +495,6 @@ mod tests {
             "an already-expensive pass keeps the travel floor"
         );
         assert!(pacer.effort() < 1.0, "one rest frame does not restore effort");
-        assert_eq!(pacer.active_workers(12), 12, "worker count does not follow the effort floor");
         assert!(pacer.floor(32) < 32);
     }
 

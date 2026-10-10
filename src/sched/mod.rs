@@ -7,14 +7,13 @@
 //!
 //! Conflict-graph scheduling (footprint interference, claim tracking) was
 //! removed: every real producer declares `FootprintKey::Global`, so ordering
-//! was always plain registration order in practice. See
-//! [`Scheduler::register_manual`] for how real lanes are actually driven.
+//! was always plain registration order in practice.
 
 use std::time::Instant;
 
 use voxel_engine::producer::{Budget, Cadence, Clocks, Producer, Progress, SourceId, TickReport};
 use voxel_engine::profile::{self, Meter};
-use voxel_engine::{Engine, Rev};
+use voxel_engine::Rev;
 
 use crate::world::World;
 
@@ -138,17 +137,14 @@ struct Interval {
 #[derive(Clone, Copy, Debug)]
 pub struct IntervalHandle(usize);
 
-/// The `&mut World` (+ optional engine handle) every producer runs against.
+/// The `&mut World` every producer runs against.
 pub struct Ctx<'a> {
     pub world: &'a mut World,
-    /// `Some` only for main-thread producers that also touch the renderer
-    /// (e.g. an upload); worker-pool and pure-CPU producers see `None`.
-    pub eng: Option<&'a mut Engine>,
 }
 
 impl<'a> Ctx<'a> {
-    pub fn new(world: &'a mut World, eng: Option<&'a mut Engine>) -> Self {
-        Ctx { world, eng }
+    pub fn new(world: &'a mut World) -> Self {
+        Ctx { world }
     }
 }
 
@@ -219,21 +215,7 @@ pub struct Scheduler {
     /// Wall-clock interval gates, advanced by the same frame clock as
     /// `fixed_accum`.
     intervals: Vec<Interval>,
-    /// Producers driven at a fixed call point inside an unmigrated serial pass
-    /// (today: the occlusion + dirty-remesh lanes inside `World::stream`),
-    /// invoked by [`Scheduler::run_manual`] rather than [`Scheduler::tick`].
-    /// They stay off the tick loop because their exact position relative to the
-    /// other, not-yet-migrated `stream` passes is load-bearing (dirty-remesh
-    /// must precede the draw-set cache; occlusion must read the post-load chunk
-    /// set) — a single tick slot cannot honour both. As those passes migrate,
-    /// these move onto `tick`.
-    manual: Vec<Registered>,
 }
-
-/// Handle to a [`Scheduler::register_manual`] producer, kept by the caller (the
-/// `World` streaming lanes) to invoke it at its call point.
-#[derive(Clone, Copy, Debug)]
-pub struct ManualHandle(usize);
 
 impl Default for Scheduler {
     fn default() -> Self {
@@ -248,43 +230,7 @@ impl Scheduler {
             source_revs: Vec::new(),
             fixed_accum: 0.0,
             intervals: Vec::new(),
-            manual: Vec::new(),
         }
-    }
-
-    /// Register a call-point-driven producer (see [`Scheduler::manual`]).
-    /// `tick` never runs these; the owner drives them with
-    /// [`Scheduler::run_manual`] at the exact point their order requires.
-    pub fn register_manual(&mut self, manifest: Producer, runner: Box<dyn Run>) -> ManualHandle {
-        // A pure call-point lane is driven every frame by its owner; the
-        // forward-progress floor (a starvation backstop for cadence-gated
-        // producers) is inapplicable, so it never force-fires on its own.
-        self.manual.push(Registered::new(manifest, runner, u32::MAX, None));
-        ManualHandle(self.manual.len() - 1)
-    }
-
-    /// Run one call-point producer now, against `world` (+ `eng` for the
-    /// lanes that upload to the renderer).
-    pub fn run_manual(
-        &mut self,
-        handle: ManualHandle,
-        world: &mut World,
-        eng: Option<&mut Engine>,
-    ) -> Progress {
-        let reg = &mut self.manual[handle.0];
-        let budget = reg.manifest.budget;
-        let mut ctx = Ctx::new(world, eng);
-
-        let progress = {
-            let _guard = reg.meter.map(profile::scope);
-            reg.runner.run(&mut ctx, budget)
-        };
-
-        reg.has_run = true;
-        if let Progress::UpTo(rev) = progress {
-            reg.stamp = rev;
-        }
-        progress
     }
 
     /// Starts un-elapsed, so a fresh lane waits a full period before its
@@ -466,7 +412,7 @@ mod tests {
     fn tick_n(sched: &mut Scheduler, world: &mut crate::world::World, frames: u32, dt: f32) {
         for _ in 0..frames {
             let clocks = sched.clocks(dt);
-            let mut ctx = Ctx::new(world, None);
+            let mut ctx = Ctx::new(world);
             sched.tick(&mut ctx, &clocks);
         }
     }
@@ -496,7 +442,7 @@ mod tests {
         assert_eq!(runs.get(), after_second, "a disabled producer must not run");
         sched.set_enabled(id, true);
         let clocks = sched.clocks(1.0 / 60.0);
-        sched.tick(&mut Ctx::new(&mut world, None), &clocks);
+        sched.tick(&mut Ctx::new(&mut world), &clocks);
         assert!(runs.get() <= after_second + 1, "re-enable must not replay a banked burst");
     }
 

@@ -359,7 +359,7 @@ fn charge(budgets: &mut KindBudget, msg: &ClientMessage, now: Instant) -> Charge
         ClientMessage::Chat { .. } => (&mut budgets.chat, false),
         ClientMessage::Swing => (&mut budgets.swing, false),
         ClientMessage::Edit { .. } => (&mut budgets.edit, true),
-        ClientMessage::SetTime { .. } => (&mut budgets.set_time, false),
+        ClientMessage::SetTime { .. } => (&mut budgets.set_time, true),
         ClientMessage::Move { .. } => (&mut budgets.movement, false),
         ClientMessage::Ping { .. } => (&mut budgets.ping, false),
         ClientMessage::Teleport { .. } => (&mut budgets.teleport, true),
@@ -407,6 +407,8 @@ struct PlayerHandle {
     last_move: Instant,
     /// Distance banked at `last_move`, spent by moves and refilled at the envelope speed.
     budget: f64,
+    /// Burst capacity used to express banked credit as a fraction across speed changes.
+    burst: f64,
     /// Proved an operator secret with `/op`.
     op: bool,
     /// Ids inside mutual interest range (`a.visible.contains(b) ==
@@ -1746,6 +1748,7 @@ fn admit_player(
                 stance: Stance::Standing,
                 last_move: Instant::now(),
                 budget: MOVE_FLOOR,
+                burst: MOVE_FLOOR,
                 op: false,
                 visible: HashSet::default(),
                 body,
@@ -1861,6 +1864,7 @@ fn client_loop(
                 match &msg {
                     ClientMessage::Edit { req, x, y, z, .. } => reject_edit(shared, id, *req, *x, *y, *z),
                     ClientMessage::Teleport { .. } => refuse_move(shared, id),
+                    ClientMessage::SetTime { .. } => answer_time(shared, ctx, id),
                     _ => {}
                 }
                 continue;
@@ -1901,7 +1905,7 @@ fn client_loop(
             ClientMessage::ToolUse { req, x, y, z, expect, tool_spec } => {
                 if !tool_rate.allow(now) {
                     // Over the tool budget this second: refuse, so the client's swing resolves.
-                    refuse_tool(shared, id, req, x, y, z, &tool_spec);
+                    refuse_tool(shared, &ctx.generator, id, req, x, y, z, &tool_spec);
                     continue;
                 }
                 on_tool_use(shared, &ctx.generator, id, req, x, y, z, expect, &tool_spec)
@@ -2024,17 +2028,19 @@ fn on_move(
         // the game's cruise ceiling unless the server cap is tighter.
         // Outside the border is refused either way. Solid ground is tested along the
         // path unless this player's noclip policy allows the pass.
-        let (free, too_far, left, from, cruising, occupied, occupied_n) = {
+        let (free, too_far, left, burst, from, cruising, occupied, occupied_n) = {
             let Some(h) = state.players.get(&id) else { return };
             let free = noclip_allowed(ctx, h);
             let elapsed = h.last_move.elapsed().as_secs_f64().min(MOVE_WINDOW_CAP_SECS);
+            let speed = envelope_speed(h, velocity, elapsed, max_speed);
+            let burst = MOVE_FLOOR.max(speed * MOVE_SLACK_SECS);
             let available = move_allowance(h, velocity, elapsed, max_speed);
             let distance = h.pos.distance(pos);
             let too_far = outside_world(pos) || distance > available;
             let mut occupied = [(0i32, 0, 0); BODY_CELL_CAP];
             let occupied_n = h.occupied.len().min(BODY_CELL_CAP);
             occupied[..occupied_n].copy_from_slice(&h.occupied[..occupied_n]);
-            (free, too_far, available - distance, h.pos, h.cruising, occupied, occupied_n)
+            (free, too_far, available - distance, burst, h.pos, h.cruising, occupied, occupied_n)
         };
         let blocked = !free
             && !too_far
@@ -2052,6 +2058,7 @@ fn on_move(
             );
             if let Some(h) = state.players.get_mut(&id) {
                 h.budget = left;
+                h.burst = burst;
                 if !free {
                     remember_occupied(h, pos, stance, up);
                 }
@@ -2214,9 +2221,13 @@ fn move_cap(h: &PlayerHandle, max_speed: f64) -> f64 {
 /// that speed when larger, so over any window the total stays within one burst plus the
 /// speed times the window, however the client splits it.
 fn move_allowance(h: &PlayerHandle, reported: Vec3, elapsed: f64, max_speed: f64) -> f64 {
-    let cap = move_cap(h, max_speed);
-    let speed = cap.min(speed_of(reported).max(speed_of(h.velocity)) + GRAVITY_BOUND * elapsed);
-    h.budget.min(MOVE_FLOOR.max(speed * MOVE_SLACK_SECS)) + speed * elapsed
+    let speed = envelope_speed(h, reported, elapsed, max_speed);
+    let burst = MOVE_FLOOR.max(speed * MOVE_SLACK_SECS);
+    (h.budget / h.burst).clamp(0.0, 1.0) * burst + speed * elapsed
+}
+
+fn envelope_speed(h: &PlayerHandle, reported: Vec3, elapsed: f64, max_speed: f64) -> f64 {
+    move_cap(h, max_speed).min(speed_of(reported).max(speed_of(h.velocity)) + GRAVITY_BOUND * elapsed)
 }
 
 fn clamp_velocity(v: Vec3, cap: f64) -> Vec3 {
@@ -2556,8 +2567,15 @@ fn on_edit(
     // Placed or removed: the cell's contacts wake.
     state.reactions.wake_cell((x, y, z));
     if let Some(out) = ack_to {
-        let _ = out
-            .try_send(ServerMessage::EditAck { req, accepted: true, rev }.encode().into());
+        // Reconcile even when a peer or tool result overwrote the prediction, or the request
+        // expired locally. Send content before the verdict: if the verdict cannot be queued,
+        // the confirmed revision still prevents timeout from undoing authoritative content.
+        if out.try_send(ServerMessage::Snapshot { edits: vec![(x, y, z, rev, spec.clone())] }.encode().into()).is_ok() {
+            let _ = out.try_send(ServerMessage::EditAck { req, accepted: true, rev }.encode().into());
+        } else {
+            // An essential confirmation cannot be silently lost: a fresh join will replay it.
+            kick_slow(&state, &[id]);
+        }
     }
     // The broadcast carries the SAME pooled Arc the ledger stores.
     let msg = ServerMessage::Edit { x, y, z, rev, spec };
@@ -2567,13 +2585,25 @@ fn on_edit(
 }
 
 /// Answer a tool use with "nothing happened": the cell's current content and the tool unchanged.
-fn refuse_tool(shared: &Arc<Mutex<State>>, id: u32, req: u32, x: i32, y: i32, z: i32, tool_spec: &str) {
+fn refuse_tool(shared: &Arc<Mutex<State>>, generator: &crate::world::terrain::Generator, id: u32, req: u32, x: i32, y: i32, z: i32, tool_spec: &str) {
     let state = shared.lock_recover();
     let Some(h) = state.players.get(&id) else { return };
-    let cell = state.edits.get(&(x, y, z));
-    let (rev, cell_spec) = cell.map_or((0, Arc::from("")), |c| (c.rev, c.spec.clone()));
+    let out = h.out.clone();
+    let found = state.edits.get(&(x, y, z)).map(|c| (c.rev, c.spec.clone()));
+    let (rev, cell_spec) = match found {
+        Some(found) => found,
+        None => {
+            drop(state);
+            let block = generator.voxel_at(x, y, z);
+            let state = shared.lock_recover();
+            state.edits.get(&(x, y, z)).map_or_else(
+                || (0, crate::save::block_spec(&state.registry, block).into()),
+                |c| (c.rev, c.spec.clone()),
+            )
+        }
+    };
     let msg = ServerMessage::ToolResult { req, reacted: false, rev, cell_spec, tool_spec: tool_spec.into() };
-    let _ = h.out.try_send(msg.encode().into());
+    let _ = out.try_send(msg.encode().into());
 }
 
 /// A player uses a held configuration as a tool on a cell. Gates: ready, reach, the tool spec
@@ -2781,6 +2811,7 @@ fn on_set_time(shared: &Arc<Mutex<State>>, ctx: &Ctx, id: u32, day: f32) {
         let Some(h) = state.players.get(&id) else { return };
         if !is_operator(ctx, h) {
             tell(h, id, "only an operator can set the time", &mut sends);
+            sends.push((id, ServerMessage::Time { day: state.day_now(ctx.day_secs), day_secs: ctx.day_secs }.encode().into()));
             let wake = queue(&state, sends);
             drop(state);
             drop(wake);
@@ -2791,6 +2822,14 @@ fn on_set_time(shared: &Arc<Mutex<State>>, ctx: &Ctx, id: u32, day: f32) {
         let wake = broadcast(&mut state, &ServerMessage::Time { day, day_secs: ctx.day_secs }, |_, _| true);
         drop(state);
         drop(wake);
+    }
+}
+
+/// A refused time change reconciles the caller's optimistic local clock.
+fn answer_time(shared: &Arc<Mutex<State>>, ctx: &Ctx, id: u32) {
+    let state = shared.lock_recover();
+    if let Some(h) = state.players.get(&id) {
+        let _ = h.out.try_send(ServerMessage::Time { day: state.day_now(ctx.day_secs), day_secs: ctx.day_secs }.encode().into());
     }
 }
 
@@ -3144,6 +3183,7 @@ mod tests {
             stance: Stance::Standing,
             last_move: Instant::now() - Duration::from_secs(10),
             budget: MOVE_FLOOR,
+                burst: MOVE_FLOOR,
             op: false,
             visible: HashSet::default(),
             body: PoseBody::new(0.0, 0.0, DQuat::IDENTITY, Vec3::ZERO, Face::PosY, Stance::Standing),
@@ -3576,13 +3616,34 @@ mod tests {
     /// the sender's ack — not a broadcast echo — carries the verdict prediction
     /// rolls back on.
     #[test]
+    fn a_full_outbox_disconnects_instead_of_losing_an_accepted_cells_content() {
+        let (out, _rx) = sync_channel::<Arc<[u8]>>(1);
+        out.try_send(ServerMessage::Pong { nonce: 0 }.encode().into()).unwrap();
+        let mut players = HashMap::new();
+        players.insert(1u32, test_player(DVec3::new(8.5, 20.0, 8.5), out, test_kick()));
+        let shared = Arc::new(Mutex::new(test_state(players)));
+        on_edit(&shared, None, chartless(), 1, 1, 8, 20, 8, 0, "air");
+        let state = shared.lock_recover();
+        assert_eq!(state.edits[&(8, 20, 8)].rev, 1, "rejoining will replay committed content");
+        assert!(state.players[&1].kicked.load(Ordering::Relaxed));
+    }
+
+    #[test]
     fn edit_revisions_arbitrate_races_and_ack_the_sender() {
         let (out, rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
         let mut players = HashMap::new();
         players.insert(1u32, test_player(DVec3::new(8.5, 20.0, 8.5), out, test_kick()));
         let shared = Arc::new(Mutex::new(test_state(players)));
         let ack = |rx: &std::sync::mpsc::Receiver<Arc<[u8]>>| {
-            match ServerMessage::decode(&rx.try_recv().expect("an ack is owed")) {
+            let mut reply = ServerMessage::decode(&rx.try_recv().expect("an answer is owed"));
+            if let Some(ServerMessage::Snapshot { edits }) = reply {
+                assert_eq!(edits.len(), 1);
+                assert_eq!((edits[0].0, edits[0].1, edits[0].2), (8, 20, 8));
+                let rev = edits[0].3;
+                reply = ServerMessage::decode(&rx.try_recv().expect("an ack follows content"));
+                assert!(matches!(reply, Some(ServerMessage::EditAck { accepted: true, rev: got, .. }) if got == rev));
+            }
+            match reply {
                 Some(ServerMessage::EditAck { req, accepted, rev }) => (req, accepted, rev),
                 other => panic!("expected an EditAck, got {other:?}"),
             }
@@ -4409,7 +4470,9 @@ mod tests {
         on_edit(&shared, Some(&table), chartless(), 1, 1, 8, 20, 8, 0, "air");
 
         match &drain_msgs(&rx1)[..] {
-            [ServerMessage::EditAck { req, accepted, rev }] => {
+            [ServerMessage::Snapshot { edits }, ServerMessage::EditAck { req, accepted, rev }] => {
+                assert_eq!(edits.len(), 1);
+                assert_eq!((edits[0].0, edits[0].1, edits[0].2, edits[0].3, edits[0].4.as_ref()), (8, 20, 8, 1, "air"));
                 assert_eq!((*req, *accepted, *rev), (1, true, 1));
             }
             other => panic!("expected one accepted ack, got {other:?}"),
@@ -4700,6 +4763,10 @@ mod tests {
         players.insert(1u32, test_player(DVec3::new(8.5, 20.0, 8.5), out, test_kick()));
         let shared = Arc::new(Mutex::new(test_state(players)));
         on_edit(&shared, None, chartless(), 1, 1, 8, 20, 8, 0, &spec);
+        match ServerMessage::decode(&rx.try_recv().unwrap()) {
+            Some(ServerMessage::Snapshot { edits }) => assert_eq!(edits, vec![(8, 20, 8, 1, Arc::from(spec.as_str()))]),
+            other => panic!("authoritative content precedes its ack, got {other:?}"),
+        }
         match ServerMessage::decode(&rx.try_recv().unwrap()) {
             Some(ServerMessage::EditAck { accepted: true, .. }) => {}
             other => panic!("a full configuration must be accepted, got {other:?}"),
@@ -5400,7 +5467,7 @@ mod tests {
 
         let set_time = ClientMessage::SetTime { day: 0.2 };
         assert!(matches!(charge(&mut budgets, &set_time, now), Charge::Pass));
-        assert!(matches!(charge(&mut budgets, &set_time, now), Charge::Drop));
+        assert!(matches!(charge(&mut budgets, &set_time, now), Charge::Answer));
 
         let ping = ClientMessage::Ping { nonce: 1 };
         for _ in 0..PING_RATE {
@@ -5919,6 +5986,24 @@ mod tests {
 
     /// Under a speed cap, a move split into many messages covers no more than one burst plus
     /// the cap over the time taken. A fast stream that stalls and lands at once still passes.
+    #[test]
+    fn movement_credit_keeps_its_fraction_when_speed_changes() {
+        let (out, _rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
+        let mut h = test_player(DVec3::ZERO, out, test_kick());
+        h.budget = MOVE_FLOOR / 4.0;
+        let speed = (4000.0 * crate::math::PER_METER) as f32 as f64;
+        let reported = Vec3::new(speed as f32, 0.0, 0.0);
+        let burst = speed * MOVE_SLACK_SECS;
+        assert!((move_allowance(&h, reported, 0.0, speed) - burst / 4.0).abs() < 1e-9);
+        h.burst = burst;
+        h.budget = burst / 4.0;
+        assert!((move_allowance(&h, Vec3::ZERO, 0.0, speed) - MOVE_FLOOR / 4.0).abs() < 1e-9);
+        h.budget = 0.0;
+        for velocity in [reported, Vec3::ZERO, reported] {
+            assert_eq!(move_allowance(&h, velocity, 0.0, speed), 0.0, "changing speed cannot refill spent credit");
+        }
+    }
+
     #[test]
     fn split_moves_gain_nothing_over_the_speed_cap() {
         let cap = 30.0 * crate::math::PER_METER;

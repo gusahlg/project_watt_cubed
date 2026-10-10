@@ -177,6 +177,8 @@ impl World {
         if stored {
             let span = self.edit_columns.entry((coord.x, coord.z)).or_insert([coord.y, coord.y]);
             *span = [span[0].min(coord.y), span[1].max(coord.y)];
+            let sky = self.generator.sky(coord);
+            self.index_edited_chunk(coord, sky);
         }
         self.edit_generation += cells.len() as u64;
         self.window.stale = true;

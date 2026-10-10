@@ -6,7 +6,9 @@ use super::super::LightSeedSplit;
 /// Live streaming-queue depths — the numeric twin of
 /// [`entry_debug`](World::entry_debug)'s formatted counters, for the harness's
 /// stress metrics (peak backlog depths, settle progress) where parsing a
-/// debug string would be absurd.
+/// debug string would be absurd. Cheap enough to sample every frame; the
+/// remesh distributions, which sort, are a separate [`RemeshDistribution`]
+/// taken at report time.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StreamGauges {
     pub chunks: usize,
@@ -19,8 +21,7 @@ pub struct StreamGauges {
     /// Near/far jobs waiting in the shared worker queue (running jobs excluded).
     pub worker_near_queue: usize,
     pub worker_far_queue: usize,
-    /// Velocity-aware worker allowance and the pool's physical ceiling.
-    pub active_workers: usize,
+    /// Worker threads in the pool.
     pub worker_capacity: usize,
     /// Current horizontal travel speed and normalized streaming effort.
     pub travel_speed_mps: f64,
@@ -56,6 +57,15 @@ pub struct StreamGauges {
     pub drop_stale_uploads: u64,
     /// Stale drops during the current stream/pump frame.
     pub drop_stale_this_frame: u32,
+    /// Reaction-event scheduler queue depth at sample time.
+    pub reactions_pending: usize,
+    /// Cumulative reaction mutations committed by the scheduler.
+    pub reactions_mutations: u64,
+}
+
+/// Per-chunk remesh counts over the world's life ([`World::remesh_distribution`]).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RemeshDistribution {
     /// `remesh_async` calls per coord between successful uploads.
     pub remesh_between_upload_mean: f32,
     pub remesh_between_upload_p95: f32,
@@ -64,10 +74,21 @@ pub struct StreamGauges {
     pub mesh_jobs_before_fixpoint_mean: f32,
     pub mesh_jobs_before_fixpoint_p95: f32,
     pub mesh_jobs_before_fixpoint_n: u64,
-    /// Reaction-event scheduler queue depth at sample time.
-    pub reactions_pending: usize,
-    /// Cumulative reaction mutations committed by the scheduler.
-    pub reactions_mutations: u64,
+}
+
+/// The first clause of [`entry_complete`](World::entry_complete) that does not
+/// hold, in clause order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EntryBlocker {
+    /// Near generate/mesh/light work queued or in flight, or a chunk owed a
+    /// final-light remesh.
+    NearWork,
+    /// An in-view chunk without a final mesh.
+    Unmeshed,
+    /// Section meshes waiting to upload.
+    SectionUploads,
+    /// A desired far cell neither covered by a section nor by settled chunks.
+    Uncovered,
 }
 
 /// Cumulative counters the flight bench and the stress gauges read.
@@ -105,9 +126,11 @@ impl World {
     /// or in flight, and (under lod2) the section far field is covering-complete.
     /// Reads private streaming state — its home here.
     pub fn entry_complete(&self) -> bool {
-        let Some(center) = self.center else {
-            return false;
-        };
+        self.center.is_some_and(|center| self.entry_blocker(center).is_none())
+    }
+
+    /// The first unsatisfied clause of [`entry_complete`](Self::entry_complete) around `center`.
+    fn entry_blocker(&self, center: Coord) -> Option<EntryBlocker> {
         // No near work queued or in flight, and nothing owed a final-light remesh.
         if !self.near_quiescent()
             || !self.upload_queue.is_empty()
@@ -115,31 +138,32 @@ impl World {
             || !self.light_gate.dirty.is_empty()
             || !self.light_gate.blocked_since.is_empty()
         {
-            return false;
+            return Some(EntryBlocker::NearWork);
         }
         // Every in-view chunk has a final mesh (data loaded, not building/dirty).
-        for coord in self.view_coords(self.mesh_box(center)) {
-            match self.chunks.get(&coord).map(|l| &l.state) {
-                Some(MeshState::Air | MeshState::Ready(_)) => {}
-                _ => return false,
-            }
+        let is_final = |c: Coord| {
+            matches!(self.chunks.get(&c).map(|l| &l.state), Some(MeshState::Air | MeshState::Ready(_)))
+        };
+        if !self.view_coords(self.mesh_box(center)).all(is_final) {
+            return Some(EntryBlocker::Unmeshed);
         }
         // LOD2 far field: all desired cells covered and no uploads pending. Skipped
         // when disabled (no far field in near-only mode). A cell the settled chunks
         // already draw is not admitted, so it counts as done without a section mesh.
-        if self.desired_unrefined().is_some() {
+        if self.lod2 {
             if !self.section_upload_queue.is_empty() {
-                return false;
+                return Some(EntryBlocker::SectionUploads);
             }
-            if self
-                .section_desired
-                .iter()
-                .any(|&c| !self.section_covered(c) && !self.full_res_covers(center, c))
-            {
-                return false;
+            if self.section_desired.iter().any(|&c| self.uncovered(center, c)) {
+                return Some(EntryBlocker::Uncovered);
             }
         }
-        true
+        None
+    }
+
+    /// A desired far cell neither its section nor the settled chunks draw.
+    fn uncovered(&self, center: Coord, cell: SectionPos) -> bool {
+        !self.section_covered(cell) && !self.full_res_covers(center, cell)
     }
 
     /// Near generate/mesh/light queues empty — the five-queue rest predicate.
@@ -194,17 +218,12 @@ impl World {
 
     /// Snapshot the streaming-queue depths (see [`super::StreamGauges`]).
     pub fn stream_gauges(&self) -> super::StreamGauges {
-        let (worker_near_queue, worker_far_queue, active_workers, worker_capacity) = self
+        let (worker_near_queue, worker_far_queue, worker_capacity) = self
             .workers
             .as_ref()
             .map(|workers| {
                 let (near, far) = workers.queue_depths();
-                (
-                    near,
-                    far,
-                    workers.active_workers(),
-                    workers.worker_capacity(),
-                )
+                (near, far, workers.worker_capacity())
             })
             .unwrap_or_default();
         let staging = self
@@ -212,8 +231,6 @@ impl World {
             .as_ref()
             .map(pipeline::Workers::staging_snapshot)
             .unwrap_or_default();
-        let (ru_mean, ru_p95, ru_n) = self.remesh_stats.between_upload_mean_p95();
-        let (jf_mean, jf_p95, jf_n) = self.remesh_stats.jobs_before_fixpoint_mean_p95();
         super::StreamGauges {
             chunks: self.chunks.len(),
             generating: self.generating.len(),
@@ -224,7 +241,6 @@ impl World {
             light_apply_queue: self.light_apply_queue.len(),
             worker_near_queue,
             worker_far_queue,
-            active_workers,
             worker_capacity,
             travel_speed_mps: self.stream_pacer.speed_mps(),
             effort: self.stream_pacer.effort(),
@@ -242,12 +258,6 @@ impl World {
             remesh_async_calls: self.remesh_stats.remesh_async_calls,
             drop_stale_uploads: self.remesh_stats.drop_stale_uploads,
             drop_stale_this_frame: self.remesh_stats.drop_stale_this_frame,
-            remesh_between_upload_mean: ru_mean,
-            remesh_between_upload_p95: ru_p95,
-            remesh_between_upload_n: ru_n,
-            mesh_jobs_before_fixpoint_mean: jf_mean,
-            mesh_jobs_before_fixpoint_p95: jf_p95,
-            mesh_jobs_before_fixpoint_n: jf_n,
             section_upload_bytes: self.counters.section_upload_bytes,
             drain_upload_bytes: self.counters.drain_upload_bytes,
             mesh_staged: staging.chunk_staged,
@@ -261,10 +271,26 @@ impl World {
         }
     }
 
+    /// The remesh distributions so far. Sorts up to 65,536 samples per
+    /// distribution, so it belongs at report time, not in a frame.
+    pub fn remesh_distribution(&self) -> RemeshDistribution {
+        let (ru_mean, ru_p95, ru_n) = self.remesh_stats.between_upload_mean_p95();
+        let (jf_mean, jf_p95, jf_n) = self.remesh_stats.jobs_before_fixpoint_mean_p95();
+        RemeshDistribution {
+            remesh_between_upload_mean: ru_mean,
+            remesh_between_upload_p95: ru_p95,
+            remesh_between_upload_n: ru_n,
+            mesh_jobs_before_fixpoint_mean: jf_mean,
+            mesh_jobs_before_fixpoint_p95: jf_p95,
+            mesh_jobs_before_fixpoint_n: jf_n,
+        }
+    }
+
     /// Human-readable reason `entry_complete` is not yet true — the first
     /// unsatisfied clause with a count, so a stalled bless/harness run says WHICH
-    /// streaming stage is stuck instead of hanging silently. Clause order mirrors
-    /// [`entry_complete`](Self::entry_complete).
+    /// streaming stage is stuck instead of hanging silently. The clauses are
+    /// [`entry_complete`](Self::entry_complete)'s own, after the spawn slab and
+    /// quarantined claims that explain a wait upstream of them.
     pub fn entry_debug(&self) -> String {
         if let Some(slab) = self.spawn_slab {
             let missing = self
@@ -288,16 +314,36 @@ impl World {
                 self.quarantined.iter().take(4).collect::<Vec<_>>()
             );
         }
+        match self.entry_blocker(center) {
+            None => "entry complete".into(),
+            Some(EntryBlocker::NearWork) => self.near_work_debug(),
+            Some(EntryBlocker::Unmeshed) => self.unmeshed_debug(center),
+            Some(EntryBlocker::SectionUploads) => {
+                format!("section_upload_queue = {}", self.section_upload_queue.len())
+            }
+            Some(EntryBlocker::Uncovered) => {
+                let desired = &self.section_desired;
+                let uncovered = desired.iter().filter(|&&c| self.uncovered(center, c)).count();
+                format!("column sections uncovered: {uncovered} of {} desired", desired.len())
+            }
+        }
+    }
+
+    /// The near queues still holding work, and if the fresh-mesh lane is among
+    /// them, WHICH ready()-predicate its stuck chunks fail — the four gates from
+    /// `MeshLane::ready`.
+    fn near_work_debug(&self) -> String {
         // Share the one queue-depth source with the harness gauge, so the two
         // can never drift; the gate counters have no gauge field, so stay local.
         let g = self.stream_gauges();
-        let near: [(&str, usize); 10] = [
+        let near: [(&str, usize); 11] = [
             ("generating", g.generating),
             ("mesh_worklist", g.mesh_worklist),
             ("upload_queue", g.upload_queue),
             ("light_worklist", g.light_worklist),
             ("light_inflight", g.light_inflight),
             ("light_apply_queue", g.light_apply_queue),
+            ("light_owed", self.light_owed.len()),
             ("degraded", self.light_gate.degraded.len()),
             ("light_dirty", self.light_gate.dirty.len()),
             ("terminal", self.light_terminal.len()),
@@ -308,37 +354,36 @@ impl World {
             .filter(|(_, n)| *n != 0)
             .map(|(k, n)| format!("{k}={n}"))
             .collect();
-        if !pending.is_empty() {
-            let mut msg = format!("near work pending: {}", pending.join(", "));
-            // If the fresh-mesh lane is the blocker, tally WHICH ready()-predicate the
-            // stuck chunks fail — the four gates from `MeshLane::ready`.
-            if !self.mesh_worklist.is_empty() {
-                let (mut not_needs, mut out_box, mut no_neigh, mut lit_or_expired) = (0, 0, 0, 0);
-                for &c in self.mesh_worklist.iter() {
-                    if !self.is_needs_mesh(c) {
-                        not_needs += 1;
-                    } else if !self.in_mesh_box(c) {
-                        out_box += 1;
-                    } else if !self.neighbours_have_data(c) && !self.light_terminal.contains(&c) {
-                        no_neigh += 1;
-                    } else if self.light_ready(c)
-                        || self.light_wait_expired(c)
-                        || self.light_terminal.contains(&c)
-                    {
-                        lit_or_expired += 1;
-                    }
+        let mut msg = format!("near work pending: {}", pending.join(", "));
+        if !self.mesh_worklist.is_empty() {
+            let (mut not_needs, mut out_box, mut no_neigh, mut lit_or_expired) = (0, 0, 0, 0);
+            for &c in self.mesh_worklist.iter() {
+                if !self.is_needs_mesh(c) {
+                    not_needs += 1;
+                } else if !self.in_mesh_box(c) {
+                    out_box += 1;
+                } else if !self.neighbours_have_data(c) && !self.light_terminal.contains(&c) {
+                    no_neigh += 1;
+                } else if self.light_ready(c)
+                    || self.light_wait_expired(c)
+                    || self.light_terminal.contains(&c)
+                {
+                    lit_or_expired += 1;
                 }
-                msg.push_str(&format!(
-                    " | mesh_worklist stuck-on: not_needs_mesh={not_needs} out_of_box={out_box} \
-                     no_neighbour_data={no_neigh} ready_but_unclaimed={lit_or_expired} \
-                     (lighting={})",
-                    self.lighting
-                ));
             }
-            return msg;
+            msg.push_str(&format!(
+                " | mesh_worklist stuck-on: not_needs_mesh={not_needs} out_of_box={out_box} \
+                 no_neighbour_data={no_neigh} ready_but_unclaimed={lit_or_expired} \
+                 (lighting={})",
+                self.lighting
+            ));
         }
-        // Terminal wedge: near-work queues empty but some in-box chunk not final.
-        // Tally by state and (for idle NeedsMesh) by which gate would block.
+        msg
+    }
+
+    /// Terminal wedge: near-work queues empty but some in-box chunk not final.
+    /// Tally by state and (for idle NeedsMesh) by which gate would block.
+    fn unmeshed_debug(&self, center: Coord) -> String {
         let (mut missing, mut idle, mut building, mut dirty, mut queued) = (0, 0, 0, 0, 0);
         let (mut idle_no_neigh, mut idle_unlit) = (0, 0);
         for c in self.view_coords(self.mesh_box(center)) {
@@ -368,30 +413,34 @@ impl World {
             }
         }
         let unmeshed = missing + idle + building + dirty + queued;
-        if unmeshed != 0 {
-            return format!(
-                "chunks without a final mesh: {unmeshed} \
-                 [missing={missing} idle={idle} building={building} dirty={dirty} \
-                 queued_but_worklist_drained={queued}] \
-                 idle stuck-on: no_neighbour_data={idle_no_neigh} unlit={idle_unlit}"
-            );
+        format!(
+            "chunks without a final mesh: {unmeshed} \
+             [missing={missing} idle={idle} building={building} dirty={dirty} \
+             queued_but_worklist_drained={queued}] \
+             idle stuck-on: no_neighbour_data={idle_no_neigh} unlit={idle_unlit}"
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The per-frame gauge snapshot neither sorts nor allocates, however many remesh samples the
+    /// world holds: the distributions come from `remesh_distribution`, at report time.
+    #[test]
+    fn stream_gauges_do_not_allocate() {
+        let mut world = World::with_config_lazy(1, crate::render_config::RenderConfig::default());
+        for x in 0..1000 {
+            let c = Coord::new(x, 0, 0);
+            world.remesh_stats.note_upload(c);
+            world.remesh_stats.note_mesh_job(c, true);
         }
-        if self.lod2 {
-            if !self.section_upload_queue.is_empty() {
-                return format!("section_upload_queue = {}", self.section_upload_queue.len());
-            }
-            let uncovered = self
-                .section_desired
-                .iter()
-                .filter(|&&c| !self.section_covered(c) && !self.full_res_covers(center, c))
-                .count();
-            if uncovered != 0 {
-                return format!(
-                    "column sections uncovered: {uncovered} of {} desired",
-                    self.section_desired.len()
-                );
-            }
-        }
-        "entry complete".into()
+        crate::alloc_count::reset();
+        let gauges = world.stream_gauges();
+        assert_eq!(crate::alloc_count::alloc_count(), 0, "a gauge snapshot allocated");
+        assert_eq!(gauges.chunks, 0);
+        let remesh = world.remesh_distribution();
+        assert_eq!((remesh.remesh_between_upload_n, remesh.mesh_jobs_before_fixpoint_n), (1000, 1000));
     }
 }

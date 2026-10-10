@@ -35,6 +35,13 @@ impl LightGate {
     fn mark_dirty(&mut self, coord: Coord) {
         self.dirty.entry(coord).or_insert_with(crate::sched::now);
     }
+
+    /// Drop an unloaded chunk from every set.
+    pub(super) fn forget(&mut self, coord: Coord) {
+        self.blocked_since.remove(&coord);
+        self.degraded.remove(&coord);
+        self.dirty.remove(&coord);
+    }
 }
 
 /// Cap on per-chunk remesh/job samples kept for the stress mean/p95 gauges.
@@ -161,7 +168,7 @@ impl World {
         // Empty altitude range: both generators sample the 256 column profiles
         // before iterating the chunk layers, so this is the height field
         // without a voxel fill.
-        let heights = self.generator.generate_column(key, 1..=0).1;
+        let heights = self.generator.generate_column(key, std::ops::RangeInclusive::new(1, 0)).1;
         let ceiling = std::sync::Arc::new(self.ceiling_from_heights(key, &heights));
         self.ceilings.insert(key, std::sync::Arc::clone(&ceiling));
         ceiling
@@ -201,16 +208,18 @@ impl World {
         ceiling
     }
 
+    /// Raise `ceiling` over every opaque edit in column `key`, read through the roof index.
     fn raise_edited_roofs(&self, key: ColumnKey, ceiling: &mut light::CeilingWindow) {
+        let Some(alts) = self.edit_column_chunks.get(&key) else {
+            return;
+        };
         let frame = FaceFrame::new(key.face);
         let s = CHUNK_SIZE as i32;
-        for (&c, cells) in &self.edits {
-            if !matches!(self.generator.sky(c), Sky::Axis(face) if face == key.face) {
+        for &layer in alts {
+            let c = key.chunk(layer);
+            let Some(cells) = self.edits.get(&c) else {
                 continue;
-            }
-            if ColumnKey::of(key.face, c).0 != key {
-                continue;
-            }
+            };
             for (&index, &id) in cells {
                 if !self.registry.is_opaque(id) {
                     continue;
@@ -450,19 +459,31 @@ impl World {
     /// that face stays dark, matching a missing chunk, instead of holding the
     /// surface for [`LIGHT_WAIT_DEGRADE`]. The full window still waits.
     pub(in crate::world) fn light_ready(&self, coord: Coord) -> bool {
+        self.light_ready_in(coord, None)
+    }
+
+    /// [`light_ready`](Self::light_ready) with the loading window when the caller already built
+    /// it. Otherwise the window is built once, at the first neighbour without a grid.
+    fn light_ready_in(&self, coord: Coord, mut window: Option<Option<LoadWindow>>) -> bool {
         if !self.lighting {
             // Nothing to settle: gate meshing on data alone (checked separately).
             return self.chunks.contains_key(&coord);
         }
+        let lit = |c: Coord| self.chunks.get(&c).is_some_and(|l| l.light.is_some());
         !self.light_worklist.contains(&coord)
             && !self.light_inflight.contains(&coord)
-            && self.chunks.get(&coord).is_some_and(|l| l.light.is_some())
-            && Face::ALL.iter().all(|&f| self.neighbour_light_ready(self.neighbour(coord, f)))
+            && lit(coord)
+            && Face::ALL.iter().all(|&f| {
+                // A grid, or the reduced window will not schedule the flood.
+                let n = self.neighbour(coord, f);
+                lit(n) || !self.window_admits(*window.get_or_insert_with(|| self.load_window()), n, true)
+            })
     }
 
-    /// `coord` has a grid, or the reduced window will not schedule its flood.
-    fn neighbour_light_ready(&self, coord: Coord) -> bool {
-        self.chunks.get(&coord).is_some_and(|l| l.light.is_some()) || !self.admits_light(coord)
+    /// [`admits_mesh`](Self::admits_mesh), or [`admits_light`](Self::admits_light) for `data`,
+    /// against a loading window the caller already built.
+    pub(super) fn window_admits(&self, window: Option<LoadWindow>, coord: Coord, data: bool) -> bool {
+        window.is_none_or(|w| w.covers(self.fold.fold(coord), data))
     }
 
     /// True when the 27-neighbourhood has no pending light work. Apply-queue
@@ -525,11 +546,13 @@ impl World {
     /// awaiting a fresh mesh, but its neighbourhood light has not settled. The
     /// [`LightGate`] times exactly these chunks.
     pub(in crate::world) fn chunk_light_blocked(&self, coord: Coord) -> bool {
-        self.is_needs_mesh(coord)
-            && self.in_mesh_box(coord)
-            && self.admits_mesh(coord)
+        if !self.is_needs_mesh(coord) || !self.in_mesh_box(coord) {
+            return false;
+        }
+        let window = self.load_window();
+        self.window_admits(window, coord, false)
             && self.neighbours_have_data(coord)
-            && !self.light_ready(coord)
+            && !self.light_ready_in(coord, Some(window))
     }
 
     /// Whether `coord` has waited on neighbour light past [`LIGHT_WAIT_DEGRADE`] —
@@ -554,9 +577,9 @@ impl World {
     }
 
     /// Advance the light-gate before the mesh lane runs: reap timers whose
-    /// chunk stopped waiting, drop degraded/dirty entries for unloaded chunks,
-    /// promote `light_dirty` (and relit-degraded) chunks whose 27-neighbourhood
-    /// has no pending light work or whose degrade timer expired, and re-seed
+    /// chunk stopped waiting, promote `light_dirty` (and relit-degraded)
+    /// chunks whose 27-neighbourhood has no pending light work or whose
+    /// degrade timer expired, and re-seed
     /// exactly the chunks whose DEGRADE TIMER expired — expiry raises no event
     /// of its own, so this sweep (over ONLY the timed/dirty maps, never the
     /// world) is what un-strands them. Timers START at the admit loop's
@@ -565,26 +588,19 @@ impl World {
     /// neighbour data via `store_chunk`).
     pub(in crate::world) fn tick_light_gate(&mut self) {
         // `LightGate` is `Default`, so move it out to break the self-borrow while
-        // the predicates below read the chunk map. Empty maps skip `retain`
-        // (it still walks capacity); a drained flood `shrink_to_fit`s once.
+        // the predicates below read the chunk map. Unload already dropped every
+        // gone chunk ([`forget_chunk`](Self::forget_chunk)). A drained flood
+        // `shrink_to_fit`s once; an empty timer map skips `retain` (it still
+        // walks capacity).
         let mut gate = std::mem::take(&mut self.light_gate);
-        if !gate.degraded.is_empty() {
-            gate.degraded.retain(|c| self.chunks.contains_key(c));
-            if gate.degraded.is_empty() {
-                gate.degraded.shrink_to_fit();
-            }
+        if gate.degraded.is_empty() && gate.degraded.capacity() > 0 {
+            gate.degraded.shrink_to_fit();
         }
-        if !gate.dirty.is_empty() {
-            gate.dirty.retain(|c, _| self.chunks.contains_key(c));
-            if gate.dirty.is_empty() {
-                gate.dirty.shrink_to_fit();
-            }
+        if gate.dirty.is_empty() && gate.dirty.capacity() > 0 {
+            gate.dirty.shrink_to_fit();
         }
-        if !self.light_terminal.is_empty() {
-            self.light_terminal.retain(|c| self.chunks.contains_key(c));
-            if self.light_terminal.is_empty() {
-                self.light_terminal.shrink_to_fit();
-            }
+        if self.light_terminal.is_empty() && self.light_terminal.capacity() > 0 {
+            self.light_terminal.shrink_to_fit();
         }
         if !gate.blocked_since.is_empty() {
             gate.blocked_since
@@ -672,8 +688,7 @@ impl World {
             // Every arm below acts, and only once the 27-neighbourhood has
             // no pending light work.
             _ if !self.light_nhood_quiet(coord) => true,
-            // Unloaded out from under the set between marking and here, or
-            // nothing to draw: drop the degraded flag.
+            // No chunk, or nothing to draw: drop the degraded flag.
             None | Some(MeshState::Air) => {
                 self.light_terminal.remove(&coord);
                 false
@@ -710,5 +725,155 @@ impl World {
                 true
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::render_config::RenderConfig;
+    use crate::world::generation::WorldgenKind;
+    use crate::world::terrain::cosmos::Shape;
+
+    /// The roof raise before the index: every edited chunk of the world, filtered by sky and column.
+    fn raise_by_scan(world: &World, key: ColumnKey, ceiling: &mut light::CeilingWindow) {
+        let frame = FaceFrame::new(key.face);
+        let s = CHUNK_SIZE as i32;
+        for (&c, cells) in &world.edits {
+            if !matches!(world.generator.sky(c), Sky::Axis(face) if face == key.face) {
+                continue;
+            }
+            if ColumnKey::of(key.face, c).0 != key {
+                continue;
+            }
+            for (&index, &id) in cells {
+                if !world.registry.is_opaque(id) {
+                    continue;
+                }
+                let (lx, ly, lz) = Chunk::local_of(index);
+                let (lu, _, lv) = frame.index_to_local(lx, ly, lz);
+                let cell = (c.x * s + lx as i32, c.y * s + ly as i32, c.z * s + lz as i32);
+                ceiling.raise(lu, lv, frame.cell_to_local(cell).1 + 1);
+            }
+        }
+    }
+
+    fn surfaces(ceiling: &light::CeilingWindow) -> Vec<i32> {
+        let mut out: Vec<i32> = (0..CHUNK_SIZE * CHUNK_SIZE).map(|i| ceiling.surface_at(i % CHUNK_SIZE, i / CHUNK_SIZE)).collect();
+        out.push(ceiling.min_surface());
+        out
+    }
+
+    /// Random roofs, holes and compacted edits on every face of the stored cubes: each column's
+    /// ceiling built through the index equals the one built by scanning the whole overlay.
+    #[test]
+    fn indexed_roofs_match_the_overlay_scan() {
+        let mut world = World::with_kind(7, RenderConfig::default(), WorldgenKind::Diffusion, false);
+        let rock = world.registry.id_by_label("rock").expect("rock");
+        let cosmos = world.generator.cosmos().expect("cosmos");
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut rand = |n: i32| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % n as u64) as i32
+        };
+        // A storage cell just above each face centre of every stored cube: storage is the
+        // reference cube moved by `origin - ref_min`, and each face keeps its own sky.
+        let mut sites = Vec::new();
+        for atlas in world.generator.atlases() {
+            let Some(g) = atlas.grid else { continue };
+            let Some(Shape::Cube { half }) = cosmos.bodies().iter().find(|b| b.id == g.body).map(|b| b.shape) else {
+                continue;
+            };
+            let centre = (atlas.centre.x as i32, atlas.centre.y as i32, atlas.centre.z as i32);
+            for face in Face::ALL {
+                let frame = FaceFrame::new(face);
+                let (cu, ca, cv) = frame.cell_to_local(centre);
+                let r = frame.cell_to_world((cu, ca + half as i32 + 20, cv));
+                let at = |a: usize, c: i32| (i64::from(c) - g.ref_min[a] + g.origin[a]) as i32;
+                sites.push((face, (at(0, r.0), at(1, r.1), at(2, r.2))));
+            }
+        }
+        let mut cells = Vec::new();
+        let mut faces = Vec::new();
+        for &(face, site) in &sites {
+            let frame = FaceFrame::new(face);
+            let (su, sa, sv) = frame.cell_to_local(site);
+            for _ in 0..40 {
+                let (x, y, z) = frame.cell_to_world((su + rand(80) - 40, sa + rand(48) - 24, sv + rand(80) - 40));
+                world.set_block(x, y, z, if rand(4) == 0 { AIR } else { rock });
+                cells.push((x, y, z));
+                if let Sky::Axis(f) = world.generator.sky(World::chunk_of(x, y, z))
+                    && !faces.contains(&f)
+                {
+                    faces.push(f);
+                }
+            }
+        }
+        // A lone roof put back compacts its chunk out of the overlay; the index keeps the layer.
+        let (face, site) = sites[0];
+        let frame = FaceFrame::new(face);
+        let (su, sa, sv) = frame.cell_to_local(site);
+        let lone = frame.cell_to_world((su + 300, sa + 10, sv));
+        let generated = world.generator.voxel_at(lone.0, lone.1, lone.2);
+        world.set_block(lone.0, lone.1, lone.2, if generated == rock { AIR } else { rock });
+        cells.push(lone);
+        for &(x, y, z) in cells.iter().rev().step_by(3) {
+            let generated = world.generator.voxel_at(x, y, z);
+            world.set_block(x, y, z, generated);
+        }
+        assert!(faces.len() >= 3, "edits under several skies: {faces:?}");
+        let gone = World::chunk_of(lone.0, lone.1, lone.2);
+        assert!(!world.edits.contains_key(&gone), "the lone roof compacted away");
+        let mut keys: Vec<ColumnKey> = world.edit_column_chunks.keys().copied().collect();
+        for &c in world.edits.keys() {
+            if let Sky::Axis(face) = world.generator.sky(c) {
+                keys.push(ColumnKey::of(face, c).0);
+            }
+        }
+        for key in keys {
+            let heights = world.generator.generate_column(key, std::ops::RangeInclusive::new(1, 0)).1;
+            let mut scanned = light::CeilingWindow::from_heights(key.face, |lu, lv| heights[lu + lv * CHUNK_SIZE]);
+            raise_by_scan(&world, key, &mut scanned);
+            assert_eq!(surfaces(&world.ceiling_from_heights(key, &heights)), surfaces(&scanned), "{key:?}");
+        }
+    }
+
+    /// Ceiling install cost while unrelated edits grow from 1k to 100k chunks: flat with the index,
+    /// linear for the overlay scan it replaced.
+    /// `cargo test --release --lib ceiling_install_cost -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn ceiling_install_cost() {
+        let mut world = World::generate();
+        let rock = world.registry.id_by_label("rock").expect("rock");
+        let key = ColumnKey { face: Face::PosY, a: 0, b: 0 };
+        for i in 0..8 {
+            world.set_block(i, 40 + i, 2 * i, rock);
+        }
+        let heights = world.generator.generate_column(key, std::ops::RangeInclusive::new(1, 0)).1;
+        let mut edited = 0;
+        let mut costs = Vec::new();
+        for n in [1_000, 10_000, 100_000] {
+            while edited < n {
+                world.set_block(16 * (2 + edited % 1_000), 30, 16 * (2 + edited / 1_000), rock);
+                edited += 1;
+            }
+            let reps = 2_000;
+            let start = Instant::now();
+            for _ in 0..reps {
+                world.ceilings.remove(&key);
+                world.install_ceiling(key, &heights);
+            }
+            let indexed = start.elapsed().as_secs_f64() * 1e6 / f64::from(reps);
+            let start = Instant::now();
+            let mut ceiling = light::CeilingWindow::from_heights(key.face, |lu, lv| heights[lu + lv * CHUNK_SIZE]);
+            raise_by_scan(&world, key, &mut ceiling);
+            let scan = start.elapsed().as_secs_f64() * 1e6;
+            println!("ceiling install with {n} edited chunks: indexed {indexed:.2} us, overlay scan {scan:.0} us");
+            costs.push(indexed);
+        }
+        assert!(costs[2] < costs[0] * 4.0, "install cost grew with unrelated edits: {costs:?}");
     }
 }

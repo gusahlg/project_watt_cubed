@@ -41,13 +41,45 @@ pub(in crate::world) enum GenRun {
 }
 
 impl GenRun {
+    /// The run that generates chunk `coord` alone, under its sky `sky`.
+    fn of_chunk(coord: Coord, sky: Sky) -> GenRun {
+        match sky {
+            Sky::Axis(face) => {
+                let (key, alt) = ColumnKey::of(face, coord);
+                GenRun::Column { key, lo: alt, hi: alt }
+            }
+            Sky::Open => GenRun::Open { coord },
+        }
+    }
+
+    /// The strike/quarantine identity of this run's job.
+    fn fail_key(self) -> FailKey {
+        match self {
+            GenRun::Column { key, .. } => FailKey::Column { key },
+            GenRun::Open { coord } => FailKey::Open { coord },
+        }
+    }
+
+    /// The column the worker fills and its inclusive altitude range. `Open` is the one-layer
+    /// PosY column `generate_column` round-trips.
+    fn span(self) -> (ColumnKey, i32, i32) {
+        match self {
+            GenRun::Column { key, lo, hi } => (key, lo, hi),
+            GenRun::Open { coord } => (ColumnKey { face: Face::PosY, a: coord.x, b: coord.z }, coord.y, coord.y),
+        }
+    }
+
+    /// Every chunk the run generates, lowest altitude first.
+    pub(super) fn coords(self) -> impl Iterator<Item = Coord> {
+        let (key, lo, hi) = self.span();
+        (lo..=hi).map(move |alt| key.chunk(alt))
+    }
+
     /// Chunk the run is ordered from. A column uses its low end: every layer
     /// shares the tangent coordinates, and +Y ordering ignores altitude.
     fn anchor(self) -> Coord {
-        match self {
-            GenRun::Column { key, lo, .. } => key.chunk(lo),
-            GenRun::Open { coord } => coord,
-        }
+        let (key, lo, _) = self.span();
+        key.chunk(lo)
     }
 }
 
@@ -55,7 +87,7 @@ impl GenRun {
 /// budget that pays that walk each pass admits only the floor.
 #[derive(Default)]
 pub(in crate::world) struct GenCursor {
-    /// Runs for the current data box, nearest-first, not yet submitted.
+    /// Runs for the current data box not yet submitted, the next one last.
     pub(in crate::world) runs: Vec<(u64, GenRun)>,
     /// What `runs` was gathered for. A mismatch, or `dirty`, rebuilds the queue instead of
     /// scanning the data box again.
@@ -270,34 +302,31 @@ impl World {
                 let anchor = entry.1.anchor();
                 entry.0 = column_order(center, vel, fold.fold(anchor), up);
             }
-            self.gen_cursor.runs.sort_by_key(|e| e.0);
+            // Farthest first, so the nearest pops off the end; ties keep their submission order.
+            self.gen_cursor.runs.sort_by(|a, b| b.0.cmp(&a.0));
             self.gen_cursor.vel = vel;
             self.gen_cursor.ranked = true;
         }
         let min_admit = self.stream_pacer.floor(GEN_MIN_ADMIT);
         let mut admitted = 0usize;
-        let mut consumed = 0usize;
-        while consumed < self.gen_cursor.runs.len() {
+        while let Some(&(_, run)) = self.gen_cursor.runs.last() {
             if super::admission_exhausted(admitted, min_admit, deadline) {
                 break;
             }
-            let run = self.gen_cursor.runs[consumed].1;
-            if self.run_quarantined(run) || self.run_covered(run) || !self.run_in_load(run) {
-                consumed += 1;
-                continue;
-            }
-            let accepted = match run {
-                GenRun::Column { key, lo, hi } => self.try_submit_column(key, lo, hi),
-                GenRun::Open { coord } => self.try_submit_open(coord),
-            };
-            if accepted {
+            // A quarantined run drops, matching `gather_column_runs`'s `skip_quarantine`, as does
+            // one already claimed or left behind by the loading window. Pool backpressure is a
+            // different `false` from submit and leaves the run queued.
+            let drop = self.quarantined.contains(&run.fail_key())
+                || run.coords().all(|c| self.claimed(c))
+                || !self.run_in_load(run);
+            if !drop {
+                if !self.submit_run(run) {
+                    break;
+                }
                 admitted += 1;
-                consumed += 1;
-            } else {
-                break;
             }
+            self.gen_cursor.runs.pop();
         }
-        self.gen_cursor.runs.drain(..consumed);
         if self.gen_cursor.runs.is_empty() {
             Progress::Idle
         } else {
@@ -334,7 +363,8 @@ impl World {
             coords.extend(self.view_coords(slab));
         }
         if !self.loading_full() {
-            coords.retain(|c| self.admits_new(*c));
+            let window = self.load_window();
+            coords.retain(|&c| self.admits_new_in(window, c));
         }
         let mut stored = false;
         coords.retain(|c| {
@@ -351,40 +381,26 @@ impl World {
         let runs = gather_column_runs(
             coords,
             |c| self.generator.sky(c),
-            |c| self.chunks.contains_key(&c) || self.generating.contains(&c),
+            |c| self.claimed(c),
             |fail| self.quarantined.contains(&fail),
             false,
             true,
         );
         self.gen_cursor.runs.clear();
-        self.gen_cursor.runs.extend(runs.into_iter().map(|run| (0, run)));
+        self.gen_cursor.runs.extend(runs.into_iter().rev().map(|run| (0, run)));
         self.gen_cursor.key = Some(self.gen_key(center));
         self.gen_cursor.dirty = false;
         self.gen_cursor.ranked = false;
     }
 
-    /// A quarantined run is dropped, matching `gather_column_runs`'s
-    /// `skip_quarantine`. Pool backpressure is a different `false` from submit
-    /// and must leave the run queued.
-    fn run_quarantined(&self, run: GenRun) -> bool {
-        let key = match run {
-            GenRun::Open { coord } => FailKey::Open { coord },
-            GenRun::Column { key, .. } => FailKey::Column { key },
-        };
-        self.quarantined.contains(&key)
+    /// Chunk `coord` is loaded, or a generate job claims it.
+    fn claimed(&self, coord: Coord) -> bool {
+        self.chunks.contains_key(&coord) || self.generating.contains(&coord)
     }
 
-    /// Every chunk of `run` is loaded or already claimed.
-    fn run_covered(&self, run: GenRun) -> bool {
-        match run {
-            GenRun::Open { coord } => {
-                self.chunks.contains_key(&coord) || self.generating.contains(&coord)
-            }
-            GenRun::Column { key, lo, hi } => (lo..=hi).all(|alt| {
-                let coord = key.chunk(alt);
-                self.chunks.contains_key(&coord) || self.generating.contains(&coord)
-            }),
-        }
+    /// The generate job that would fill chunk `coord` is quarantined.
+    pub(in crate::world) fn generate_quarantined(&self, coord: Coord) -> bool {
+        self.quarantined.contains(&GenRun::of_chunk(coord, self.generator.sky(coord)).fail_key())
     }
 
     /// Land a generated column: install the skylight ceiling from the worker's
@@ -426,10 +442,15 @@ impl World {
         if self.loading_full() {
             return true;
         }
-        match run {
-            GenRun::Open { coord } => self.admits_new(coord),
-            GenRun::Column { key, lo, hi } => (lo..=hi).any(|alt| self.admits_new(key.chunk(alt))),
-        }
+        let window = self.load_window();
+        run.coords().any(|c| self.admits_new_in(window, c))
+    }
+
+    /// [`admits_new`](Self::admits_new) under a reduced loading window the caller already built:
+    /// the spawn slab, or inside `window` (`None` before the first stream).
+    fn admits_new_in(&self, window: Option<LoadWindow>, coord: Coord) -> bool {
+        self.spawn_slab.is_some_and(|slab| self.view_contains(slab, coord))
+            || window.is_some_and(|w| w.covers(self.fold.fold(coord), true))
     }
 
     /// Ensure every chunk within the data box of `center` exists (voxel data
@@ -471,11 +492,7 @@ impl World {
         self.publish_spawn_view(c, f, up, slab);
         self.submit_slab_columns(slab);
         self.pending_gen.set();
-        if self.view_coords(slab).all(|coord| self.chunks.contains_key(&coord)) {
-            self.spawn_slab = None;
-        } else {
-            self.spawn_slab = Some(slab);
-        }
+        self.spawn_slab = (!self.slab_loaded(slab)).then_some(slab);
     }
 
     /// Synchronously generate the collision slab. Headless callers (tests,
@@ -492,10 +509,12 @@ impl World {
     /// True once every chunk of the requested spawn/teleport slab is loaded,
     /// or no slab is outstanding.
     pub fn spawn_ready(&self) -> bool {
-        match self.spawn_slab {
-            None => true,
-            Some(slab) => self.view_coords(slab).all(|c| self.chunks.contains_key(&c)),
-        }
+        self.spawn_slab.is_none_or(|slab| self.slab_loaded(slab))
+    }
+
+    /// Every chunk of `slab` is loaded.
+    fn slab_loaded(&self, slab: ChunkBox) -> bool {
+        self.view_coords(slab).all(|c| self.chunks.contains_key(&c))
     }
 
     /// Drive in-flight generate jobs until the spawn slab is loaded. Tests
@@ -525,10 +544,7 @@ impl World {
     }
 
     fn refresh_spawn_slab(&mut self) {
-        let Some(slab) = self.spawn_slab else {
-            return;
-        };
-        if self.view_coords(slab).all(|c| self.chunks.contains_key(&c)) {
+        if self.spawn_slab.is_some_and(|slab| self.slab_loaded(slab)) {
             self.spawn_slab = None;
         }
     }
@@ -538,18 +554,14 @@ impl World {
         let runs = gather_column_runs(
             coords,
             |c| self.generator.sky(c),
-            |c| self.chunks.contains_key(&c) || self.generating.contains(&c),
+            |c| self.claimed(c),
             |fail| self.quarantined.contains(&fail),
             true,
             false,
         );
         let mut remaining = false;
         for run in runs {
-            let accepted = match run {
-                GenRun::Column { key, lo, hi } => self.try_submit_column(key, lo, hi),
-                GenRun::Open { coord } => self.try_submit_open(coord),
-            };
-            if !accepted {
+            if !self.submit_run(run) {
                 remaining = true;
             }
         }
@@ -558,66 +570,49 @@ impl World {
         }
     }
 
-    /// Submit one column job and claim its missing coords. `false` means the
+    /// Submit one run's job and claim its missing chunks. `false` means the
     /// pool rejected it (backpressure, shutdown, or quarantine) so the caller
     /// must retry.
-    fn try_submit_column(&mut self, key: ColumnKey, lo: i32, hi: i32) -> bool {
-        if self.quarantined.contains(&FailKey::Column { key }) {
+    fn submit_run(&mut self, run: GenRun) -> bool {
+        if self.quarantined.contains(&run.fail_key()) {
             return false;
         }
-        let edits: Vec<(Coord, Vec<(usize, crate::block::registry::BlockId)>)> = (lo..=hi)
-            .filter_map(|alt| {
-                let coord = key.chunk(alt);
-                self.edits
-                    .get(&coord)
-                    .map(|cells| (coord, cells.iter().map(|(&i, &id)| (i, id)).collect()))
-            })
-            .collect();
-        let job = pipeline::Job::GenerateColumn {
-            key,
-            range: lo..=hi,
-            generator: self.generator.clone(),
-            edits,
+        let generator = self.generator.clone();
+        let job = match run {
+            GenRun::Column { key, lo, hi } => pipeline::Job::GenerateColumn {
+                key,
+                range: lo..=hi,
+                generator,
+                edits: run.coords().filter_map(|c| Some((c, self.chunk_edits(c)?))).collect(),
+            },
+            // The worker still fills it through the PosY one-chunk
+            // `generate_column` encoding; the claim key does not.
+            GenRun::Open { coord } => pipeline::Job::GenerateOpen {
+                coord,
+                generator,
+                edits: self.chunk_edits(coord).unwrap_or_default(),
+            },
         };
         let accepted = self.worker_pool().submit(job);
         if accepted {
-            for alt in lo..=hi {
-                let coord = key.chunk(alt);
-                if !self.chunks.contains_key(&coord) {
-                    self.generating.insert(coord);
+            for c in run.coords() {
+                if !self.chunks.contains_key(&c) {
+                    self.generating.insert(c);
                 }
             }
         }
         accepted
     }
 
-    /// Submit one `Open` chunk. The worker still fills it through the PosY
-    /// one-chunk `generate_column` encoding; the claim key does not.
-    fn try_submit_open(&mut self, coord: Coord) -> bool {
-        if self.quarantined.contains(&FailKey::Open { coord }) {
-            return false;
-        }
-        let edits = self
-            .edits
-            .get(&coord)
-            .map(|cells| cells.iter().map(|(&i, &id)| (i, id)).collect())
-            .unwrap_or_default();
-        let job = pipeline::Job::GenerateOpen {
-            coord,
-            generator: self.generator.clone(),
-            edits,
-        };
-        let accepted = self.worker_pool().submit(job);
-        if accepted && !self.chunks.contains_key(&coord) {
-            self.generating.insert(coord);
-        }
-        accepted
+    /// Chunk `coord`'s edit overlay as `(index, block)` pairs, for a job that replays it.
+    pub(super) fn chunk_edits(&self, coord: Coord) -> Option<Vec<(usize, crate::block::registry::BlockId)>> {
+        self.edits.get(&coord).map(|cells| cells.iter().map(|(&i, &id)| (i, id)).collect())
     }
 
     /// Air and uniform bulk never take a worker slot: same `Chunk`, same edit replay,
     /// same light fast path as a generated uniform chunk.
     fn store_if_free(&mut self, coord: Coord) -> bool {
-        if self.chunks.contains_key(&coord) || self.generating.contains(&coord) {
+        if self.claimed(coord) {
             return false;
         }
         let id = match self.generator.classify(coord) {
@@ -635,7 +630,7 @@ impl World {
     /// the voxels did — never a second `height()` walk on this thread.
     /// Skips coords already claimed in `generating`: the async result is imminent.
     pub(in crate::world) fn ensure_data(&mut self, coord: Coord) {
-        if self.chunks.contains_key(&coord) || self.generating.contains(&coord) {
+        if self.claimed(coord) {
             return;
         }
         if self.store_if_free(coord) {
@@ -643,11 +638,8 @@ impl World {
             return;
         }
         let sky = self.generator.sky(coord);
-        let (key, alt) = match sky {
-            Sky::Axis(face) => ColumnKey::of(face, coord),
-            // Same PosY encoding as `gather_column_runs`: one layer, no ceiling.
-            Sky::Open => (ColumnKey { face: Face::PosY, a: coord.x, b: coord.z }, coord.y),
-        };
+        // `Open` takes the one-layer PosY encoding and no ceiling.
+        let (key, alt, _) = GenRun::of_chunk(coord, sky).span();
         let (chunks, heights) = self.generator.generate_column(key, alt..=alt);
         if matches!(sky, Sky::Axis(_)) {
             self.install_ceiling(key, &heights);

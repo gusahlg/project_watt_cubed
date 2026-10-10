@@ -126,7 +126,6 @@ impl World {
             let _ = workers.clear_far();
         }
         self.section_epoch = self.section_epoch.wrapping_add(1);
-        self.section_pending_claim = None;
         for (_, state) in self.sections.drain() {
             state.free(eng);
         }
