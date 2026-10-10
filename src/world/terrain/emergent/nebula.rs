@@ -40,6 +40,8 @@ pub struct System {
     pub centre: [f64; 3],
     /// Member cells and their masses, in cell order.
     pub cells: Vec<(u32, u64)>,
+    /// The sink cell and mass of every basin in it (the first basin first).
+    pub sinks: Vec<(u32, u64)>,
     /// Holds the origin cell: the start system.
     pub origin: bool,
 }
@@ -89,21 +91,23 @@ impl Rule<Cell> for Steepest {
     }
 }
 
-/// Send a quarter of the mass along the pointer, receive from every neighbour pointing here;
-/// composition becomes the mass-weighted mean.
-struct Transfer;
+/// Send `m >> shift` along the pointer, receive from every neighbour pointing here; composition
+/// becomes the mass-weighted mean.
+struct Transfer {
+    shift: u32,
+}
 
 impl Rule<Cell> for Transfer {
     const RADIUS: u8 = 1;
     fn apply(&self, prev: &[Cell], i: usize, nb: &[u32]) -> Cell {
         let c = prev[i];
-        let keep = if c.to as usize != i { c.m - (c.m >> 2) } else { c.m };
+        let keep = if c.to as usize != i { c.m - (c.m >> self.shift) } else { c.m };
         let mut m = keep;
         let mut acc = c.comp.map(|v| v as i64 * keep as i64);
         for &n in nb {
             let o = prev[n as usize];
             if o.to as usize == i {
-                let sent = o.m >> 2;
+                let sent = o.m >> self.shift;
                 m += sent;
                 for a in 0..4 {
                     acc[a] += o.comp[a] as i64 * sent as i64;
@@ -129,7 +133,7 @@ impl Nebula {
         let origin = faces.index([N / 2; 3]);
         let amp = (p.prior_amp as i64 * cfg.variety as i64 / 100) as i32;
         let (lo, hi) = ([0; 3], [(N as i32 - 1) * SUB; 3]);
-        let lumps = Fbm::new(seed, 16 * SUB, 3, HALF, 1, lo, hi);
+        let lumps = Fbm::new(seed, 16 * SUB, p.octaves, HALF, 1, lo, hi);
         let filaments = NoiseBox::new(seed, 8 * SUB, 9, lo, hi);
         let chem: [NoiseBox; 4] = std::array::from_fn(|k| NoiseBox::new(seed, 12 * SUB, 20 + k as u32, lo, hi));
         let prior = |i: usize| {
@@ -149,14 +153,16 @@ impl Nebula {
             Cell { m: (ONE as i64 + noise + well) as u64, phi: 0, to: i as u32, comp }
         };
         let mut f = Field::new(map(full.len(), prior, threads));
+        let send = Transfer { shift: p.send };
         for _ in 0..p.collapse {
             f.run(&faces, &Blur { from_mass: true }, 1, threads);
             f.run(&faces, &Blur { from_mass: false }, 1, threads);
             f.run(&full, &Steepest, 1, threads);
-            f.run(&full, &Transfer, 1, threads);
+            f.run(&full, &send, 1, threads);
         }
+        // The watershed reads the collapsed mass smoothed by `p.blur` sweeps.
         f.run(&faces, &Blur { from_mass: true }, 1, threads);
-        f.run(&faces, &Blur { from_mass: false }, 1, threads);
+        f.run(&faces, &Blur { from_mass: false }, p.blur.max(1) - 1, threads);
         f.run(&full, &Steepest, 1, threads);
         let cells = f.into_cells();
         let mut sink: Vec<u32> = cells.iter().map(|c| c.to).collect();
@@ -186,8 +192,10 @@ impl Nebula {
         let total = cells.iter().map(|c| c.m as f64).sum();
         let mut systems: Vec<System> = Vec::new();
         let mut residual = 0.0;
+        let floor = p.system_min * basins[origin_basin].0 as f64;
         for k in order {
-            let (mass, moment, members, _) = &basins[k];
+            let (mass, moment, members, sink) = &basins[k];
+            let sinks = vec![(*sink, *mass)];
             let centre: [f64; 3] = std::array::from_fn(|a| {
                 (moment[a] as f64 / (2.0 * *mass as f64) - (N / 2) as f64) * CELL
             });
@@ -195,15 +203,16 @@ impl Nebula {
             let nearest = systems.iter().enumerate().map(|(i, s)| (dist(s), i)).min_by(|a, b| a.0.total_cmp(&b.0));
             let inside = centre.iter().all(|v| v.abs() <= p.system_bound);
             match nearest {
-                None => systems.push(System { mass: *mass as f64, centre, cells: members.clone(), origin: true }),
-                Some((d, _)) if d >= p.d_sep && inside => {
-                    systems.push(System { mass: *mass as f64, centre, cells: members.clone(), origin: false })
+                None => systems.push(System { mass: *mass as f64, centre, cells: members.clone(), sinks, origin: true }),
+                Some((d, _)) if d >= p.d_sep && inside && *mass as f64 >= floor => {
+                    systems.push(System { mass: *mass as f64, centre, cells: members.clone(), sinks, origin: false })
                 }
                 Some((d, s)) if d < 2.0 * p.d_sep => {
                     let sys = &mut systems[s];
                     sys.mass += *mass as f64;
                     sys.cells.extend_from_slice(members);
                     sys.cells.sort_unstable();
+                    sys.sinks.push((*sink, *mass));
                 }
                 Some(_) => residual += *mass as f64,
             }

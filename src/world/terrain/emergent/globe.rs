@@ -3,9 +3,9 @@
 //! impacts and a late flux, climate from the real sun path, erosion, seas and life, then a colour
 //! per node and a min/max mip. Local phases are Jacobi rules on the field engine; the global ones
 //! (distance to plate boundaries, priority flood, sea level) are exact single-threaded passes in
-//! index order. Channels are f32 with IEEE basic operations only.
+//! index order. Channels are separate f32 arrays with IEEE basic operations only.
 
-use std::collections::{BinaryHeap, VecDeque};
+use std::collections::VecDeque;
 use std::time::Instant;
 
 use field::{hash32_3, map, Fbm, Field, NoiseBox, Rule, Sphere, Topology, HALF, MAX_NEIGHBOURS, ONE};
@@ -50,7 +50,8 @@ pub struct Node {
     pub fill: u8,
     pub life: u8,
     pub plate: u8,
-    /// Convergence at the nearest plate boundary and distance to it (nodes).
+    /// Convergence at the nearest plate boundary and distance to it (nodes; the uplift's reach when
+    /// farther, with no convergence).
     pub stress: [i8; 2],
     /// rgb565.
     pub albedo: u16,
@@ -83,6 +84,8 @@ pub struct Input {
     /// Body temperature, K.
     pub temp: f64,
     pub volatile: f64,
+    /// Organic share: the suite's carbon-like layers, or the palette's organic ground roles on a
+    /// temperate world with air.
     pub carbon: f64,
     pub glow: bool,
     /// Relief knob, 1.0 = designed.
@@ -111,7 +114,11 @@ impl Input {
             air: b.traits.air_top.is_some(),
             temp: b.traits.temp as f64,
             volatile: s.classes[3],
-            carbon: s.classes[2],
+            carbon: if b.traits.air_top.is_some() && (super::TEMPERATE.0..=super::TEMPERATE.1).contains(&(b.traits.temp as f64)) {
+                s.classes[2].max(super::ORGANICS)
+            } else {
+                s.classes[2]
+            },
             glow: b.traits.glow,
             relief,
             impacts: b.history.impacts.iter().map(|i| (i.dir, i.energy)).collect(),
@@ -148,18 +155,6 @@ pub struct Globe {
     pub sea: f32,
 }
 
-/// The working channels of a node.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct Cell {
-    h: f32,
-    temp: f32,
-    wet: f32,
-    src: f32,
-    /// Drainage receiver and area (solid-angle units), from the priority flood.
-    recv: u32,
-    area: f32,
-}
-
 fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
@@ -183,31 +178,89 @@ fn direction(seed: u32, k: i32, salt: u32) -> [f64; 3] {
     [0.0, 1.0, 0.0]
 }
 
-/// Moisture blows from colder neighbours to warmer ones and rains out where it climbs.
-struct Moist {
-    relief: f32,
+/// Every node's upwind neighbours (wind blows from cold to warm, and temperature does not change
+/// while moisture moves), as compact lists.
+struct Upwind {
+    start: Vec<u32>,
+    list: Vec<u32>,
 }
 
-impl Rule<Cell> for Moist {
-    const RADIUS: u8 = 1;
-    fn apply(&self, prev: &[Cell], i: usize, nb: &[u32]) -> Cell {
-        let c = prev[i];
-        let (mut sum, mut h_up, mut n) = (0.0f32, 0.0f32, 0.0f32);
-        for &j in nb {
-            let o = &prev[j as usize];
-            if o.temp < c.temp {
-                sum += o.wet;
-                h_up += o.h;
-                n += 1.0;
-            }
+impl Upwind {
+    fn new(s: &Sphere, temp: &[f32], threads: usize) -> Upwind {
+        // Per node in parallel, then packed.
+        let sets: Vec<([u32; 8], u8)> = map(
+            s.len(),
+            |i| {
+                let mut set = ([0u32; 8], 0u8);
+                if s.owns(i) {
+                    let mut nb = [0u32; MAX_NEIGHBOURS];
+                    let n = s.neighbours(i, &mut nb);
+                    for &j in &nb[..n] {
+                        if temp[j as usize] < temp[i] {
+                            set.0[set.1 as usize] = j;
+                            set.1 += 1;
+                        }
+                    }
+                }
+                set
+            },
+            threads,
+        );
+        let mut start = Vec::with_capacity(s.len() + 1);
+        let mut list = Vec::with_capacity(s.len() * 4);
+        for (set, n) in &sets {
+            start.push(list.len() as u32);
+            list.extend_from_slice(&set[..*n as usize]);
         }
-        let carried = if n > 0.0 {
-            let rain = 0.5 * ((c.h - h_up / n) / self.relief).max(0.0);
-            (0.92 * sum / n - rain).max(0.0)
+        start.push(list.len() as u32);
+        Upwind { start, list }
+    }
+
+    #[inline]
+    fn of(&self, i: usize) -> &[u32] {
+        &self.list[self.start[i] as usize..self.start[i + 1] as usize]
+    }
+
+    /// The moisture (Q16) each node loses climbing from its upwind neighbours' mean height.
+    fn rain(&self, h: &[f32], relief: f32, threads: usize) -> Vec<u16> {
+        map(
+            h.len(),
+            |i| {
+                let up = self.of(i);
+                if up.is_empty() {
+                    return 0;
+                }
+                let mean = up.iter().map(|&j| h[j as usize]).sum::<f32>() / up.len() as f32;
+                ((0.5 * ((h[i] - mean) / relief).max(0.0)).min(1.0) * 65_535.0) as u16
+            },
+            threads,
+        )
+    }
+}
+
+/// Moisture (Q16) blows from colder neighbours to warmer ones, keeps 92% a step and rains out
+/// where it climbs; seas and other sources stay saturated.
+struct Moist<'a> {
+    up: &'a Upwind,
+    rain: &'a [u16],
+    src: &'a [u16],
+}
+
+/// 0.92 in Q16.
+const CARRY: u32 = 60_293;
+
+impl Rule<u16> for Moist<'_> {
+    const RADIUS: u8 = 1;
+    const NEIGHBOURS: bool = false;
+    fn apply(&self, prev: &[u16], i: usize, _nb: &[u32]) -> u16 {
+        let up = self.up.of(i);
+        let carried = if up.is_empty() {
+            (prev[i] as u32 * CARRY) >> 16
         } else {
-            0.92 * c.wet
+            let sum: u32 = up.iter().map(|&j| prev[j as usize] as u32).sum();
+            (((sum as u64 * CARRY as u64) / (up.len() as u64 * 65_536)) as u32).saturating_sub(self.rain[i] as u32)
         };
-        Cell { wet: c.src.max(carried).min(1.0), ..c }
+        self.src[i].max(carried as u16)
     }
 }
 
@@ -218,41 +271,51 @@ struct Thermal<'a> {
     radius: f32,
 }
 
-impl Rule<Cell> for Thermal<'_> {
+impl Thermal<'_> {
+    /// Whether any edge of node `i` is steeper than the talus slope (else a pass is the identity).
+    fn steep(&self, h: &[f32], i: usize) -> bool {
+        let mut nb = [0u32; MAX_NEIGHBOURS];
+        let n = self.sphere.neighbours(i, &mut nb);
+        let edge = self.sphere.edge(i);
+        nb[..n].iter().enumerate().any(|(k, &j)| (h[i] - h[j as usize]).abs() > self.talus * self.sphere.chord[edge + k] * self.radius)
+    }
+}
+
+impl Rule<f32> for Thermal<'_> {
     const RADIUS: u8 = 1;
-    fn apply(&self, prev: &[Cell], i: usize, nb: &[u32]) -> Cell {
-        let c = prev[i];
+    fn apply(&self, prev: &[f32], i: usize, nb: &[u32]) -> f32 {
         let mut dh = 0.0f32;
         let edge = self.sphere.edge(i);
         for (k, &j) in nb.iter().enumerate() {
             let limit = self.talus * self.sphere.chord[edge + k] * self.radius;
-            let drop = c.h - prev[j as usize].h;
+            let drop = prev[i] - prev[j as usize];
             if drop > limit {
                 dh -= 0.125 * (drop - limit);
             } else if -drop > limit {
                 dh += 0.125 * (-drop - limit);
             }
         }
-        Cell { h: c.h + dh, ..c }
+        prev[i] + dh
     }
 }
 
 /// Stream power: a node cuts toward its receiver in proportion to √area times the drop.
-struct Stream {
+struct Stream<'a> {
+    recv: &'a [u32],
+    area: &'a [f32],
     k: f32,
 }
 
-impl Rule<Cell> for Stream {
+impl Rule<f32> for Stream<'_> {
     const RADIUS: u8 = 1;
-    fn apply(&self, prev: &[Cell], i: usize, _nb: &[u32]) -> Cell {
-        let c = prev[i];
-        let r = c.recv as usize;
+    const NEIGHBOURS: bool = false;
+    fn apply(&self, prev: &[f32], i: usize, _nb: &[u32]) -> f32 {
+        let r = self.recv[i] as usize;
         if r == i {
-            return c;
+            return prev[i];
         }
-        let floor = prev[r].h;
-        let drop = (c.h - floor).max(0.0);
-        Cell { h: c.h - (self.k * c.area.sqrt() * drop).min(drop), ..c }
+        let drop = (prev[i] - prev[r]).max(0.0);
+        prev[i] - (self.k * self.area[i].sqrt() * drop).min(drop)
     }
 }
 
@@ -368,8 +431,11 @@ pub fn grow(input: &Input, threads: usize) -> Globe {
     );
     laps.lap(1);
 
-    // Relief: distance to the nearest boundary (multi-source BFS in index order), then uplift at
-    // convergent boundaries, trenches on the denser side, rifts where plates part, hotspot domes.
+    // Relief: distance to the nearest boundary (multi-source BFS in index order, out to the width
+    // the uplift reaches), then uplift at convergent boundaries, trenches on the denser side, rifts
+    // where plates part, hotspot domes.
+    let width = (input.g as f64 / 16.0).max(2.0);
+    let reach = width.ceil() as u16;
     let mut hops = vec![u16::MAX; n];
     let mut source = vec![0u32; n];
     let mut queue = VecDeque::new();
@@ -382,6 +448,9 @@ pub fn grow(input: &Input, threads: usize) -> Globe {
     }
     let mut nb = [0u32; MAX_NEIGHBOURS];
     while let Some(i) = queue.pop_front() {
+        if hops[i] >= reach {
+            continue;
+        }
         let k = s.neighbours(i, &mut nb);
         for &j in &nb[..k] {
             let j = j as usize;
@@ -392,7 +461,6 @@ pub fn grow(input: &Input, threads: usize) -> Globe {
             }
         }
     }
-    let width = (input.g as f64 / 16.0).max(2.0);
     let hotspots: Vec<[f64; 3]> = (0..(input.heat * 4.0).round() as i32).map(|k| direction(seed, k, 0x4075)).collect();
     let h = relief as f64;
     let elev: Vec<f32> = map(
@@ -484,59 +552,65 @@ pub fn grow(input: &Input, threads: usize) -> Globe {
     let sea = sea_level(&cratered, &weights, &owners, budget_fill * total);
 
     // Climate: daily mean light from the sun's path, lapse with height, greenhouse in the body
-    // temperature already.
+    // temperature already. Channels are separate arrays, so a pass moves only what it writes.
     let lapse = 0.0065 * input.gravity / 24.0;
-    let mut f = Field::new(map(
+    let temp: Vec<f32> = map(
         n,
         |i| {
             let d = s.dirs[i];
             let along = (d[0] + d[1] + d[2]) * SUN_AXIS;
             let light = (1.0 - along * along).max(0.0).sqrt();
             let hgt = (cratered[i] as f64).max(sea as f64);
-            let temp = input.temp + 40.0 * (light.sqrt().sqrt() - 0.85) - lapse * hgt;
-            let src = if input.air && !hot && (cratered[i] as f64) < sea as f64 { 1.0 } else { 0.0 };
-            Cell { h: cratered[i], temp: temp as f32, wet: src, src, recv: i as u32, area: weights[i] as f32 }
+            (input.temp + 40.0 * (light.sqrt().sqrt() - 0.85) - lapse * hgt) as f32
         },
         threads,
-    ));
+    );
+    let seas = |h: &[f32]| -> Vec<u16> { h.iter().map(|&v| if input.air && !hot && v < sea { u16::MAX } else { 0 }).collect() };
+    let src = seas(&cratered);
+    let mut wet = Field::new(src.clone());
+    let up = if input.air { Upwind::new(s, &temp, threads) } else { Upwind { start: vec![0; n + 1], list: Vec::new() } };
     if input.air {
-        f.run(s, &Moist { relief }, MOIST_PASSES, threads);
+        let rain = up.rain(&cratered, relief, threads);
+        wet.run(s, &Moist { up: &up, rain: &rain, src: &src }, MOIST_PASSES, threads);
     }
     laps.lap(4);
 
-    // Erosion: thermal slides, then on worlds with air a priority flood to the sea, drainage area
-    // down the flood's tree and stream-power cutting.
+    // Erosion: thermal slides (skipped exactly when no edge is steeper than the talus slope, which
+    // at globe scale is the rule), then on worlds with air a priority flood to the sea, drainage
+    // area down the flood's tree and stream-power cutting.
     let talus = input.layers.first().map_or(0.6, |x| 0.3 + 0.7 * x.friction as f32 / 255.0);
-    f.run(s, &Thermal { talus, sphere: s, radius: radius as f32 }, THERMAL_PASSES, threads);
+    let thermal = Thermal { talus, sphere: s, radius: radius as f32 };
+    let mut h = Field::new(cratered.clone());
+    if map(n, |i| s.owns(i) && thermal.steep(&cratered, i), threads).contains(&true) {
+        h.run(s, &thermal, THERMAL_PASSES, threads);
+    }
     let mut flow = vec![0u8; n];
     if input.air {
-        let cells = f.cells_mut();
-        let order = flood(s, cells, &owners, sea);
+        let mut recv: Vec<u32> = (0..n as u32).collect();
+        let order = flood(s, h.cells_mut(), &mut recv, &owners, sea);
+        let mut area: Vec<f32> = weights.iter().map(|&w| w as f32).collect();
         for &i in order.iter().rev() {
-            let r = cells[i].recv as usize;
+            let r = recv[i] as usize;
             if r != i {
-                cells[r].area += cells[i].area;
+                area[r] += area[i];
             }
         }
         let unit_area = (total / owners.len() as f64) as f32;
         for &i in &owners {
-            flow[i] = log2_floor((cells[i].area / unit_area).max(1.0));
+            flow[i] = log2_floor((area[i] / unit_area).max(1.0));
         }
-        f.run(s, &Stream { k: 0.02 / unit_area.sqrt() }, STREAM_PASSES, threads);
+        h.run(s, &Stream { recv: &recv, area: &area, k: 0.02 / unit_area.sqrt() }, STREAM_PASSES, threads);
     }
+    let h = h.into_cells();
     laps.lap(5);
 
     // Fill and life: seas of the climate's kind, one more advection pass from them, then life.
-    {
-        let cells = f.cells_mut();
-        for c in cells.iter_mut() {
-            c.src = if input.air && !hot && c.h < sea { 1.0 } else { 0.0 };
-        }
-    }
+    let src = seas(&h);
     if input.air {
-        f.run(s, &Moist { relief }, 1, threads);
+        let rain = up.rain(&h, relief, threads);
+        wet.run(s, &Moist { up: &up, rain: &rain, src: &src }, 1, threads);
     }
-    let cells = f.into_cells();
+    let wet = wet.into_cells();
     laps.lap(6);
 
     let fill_rgb = |k: u8| match k {
@@ -548,20 +622,20 @@ pub fn grow(input: &Input, threads: usize) -> Globe {
         n,
         |i| {
             let o = s.owner(i);
-            let c = cells[o];
-            let depth = (cratered[o] - c.h).max(0.0) + (-c.h).max(0.0);
+            let (height, t, moist) = (h[o], temp[o], wet[o] as f32 / 65_535.0);
+            let depth = (cratered[o] - height).max(0.0) + (-height).max(0.0);
             let rock = ((depth / (relief / layers as f32)) as usize).min(layers - 1);
-            let fill = if c.h >= sea {
+            let fill = if height >= sea {
                 0
             } else if hot {
                 LAVA
-            } else if c.temp > 320.0 {
+            } else if t > 320.0 {
                 SALT
             } else {
                 FROST
             };
-            let comfort = (1.0 - ((c.temp - 288.0) / 40.0) * ((c.temp - 288.0) / 40.0)).max(0.0);
-            let life = if input.air && fill == 0 { comfort * c.wet * input.carbon as f32 } else { 0.0 };
+            let comfort = (1.0 - ((t - 288.0) / 40.0) * ((t - 288.0) / 40.0)).max(0.0);
+            let life = if input.air && fill == 0 { comfort * moist * input.carbon as f32 } else { 0.0 };
             let base = if fill != 0 {
                 fill_rgb(fill)
             } else {
@@ -571,16 +645,20 @@ pub fn grow(input: &Input, threads: usize) -> Globe {
             let t = (life * 4.0).min(0.8);
             let rgb: [f32; 3] = std::array::from_fn(|k| base[k] + (green[k] - base[k]) * t);
             Node {
-                elev: c.h.clamp(-32_768.0, 32_767.0) as i16,
+                elev: height.clamp(-32_768.0, 32_767.0) as i16,
                 uplift: elev[o].clamp(-32_768.0, 32_767.0) as i16,
-                temp: (c.temp - 273.0).clamp(-128.0, 127.0) as i8,
-                wet: (c.wet * 255.0) as u8,
+                temp: (t - 273.0).clamp(-128.0, 127.0) as i8,
+                wet: (moist * 255.0) as u8,
                 flow: flow[o],
                 rock: rock as u8,
                 fill,
                 life: (life * 255.0).min(255.0) as u8,
                 plate: plate[o],
-                stress: [(conv[source[o] as usize] * 127.0).clamp(-127.0, 127.0) as i8, hops[o].min(127) as i8],
+                stress: if hops[o] == u16::MAX {
+                    [0, reach.min(127) as i8]
+                } else {
+                    [(conv[source[o] as usize] * 127.0).clamp(-127.0, 127.0) as i8, hops[o].min(127) as i8]
+                },
                 albedo: rgb565(rgb),
                 age: (age * 255.0) as u8,
             }
@@ -596,12 +674,6 @@ pub fn grow(input: &Input, threads: usize) -> Globe {
 /// ⌊log₂⌋ of a number ≥ 1 from its exponent bits.
 fn log2_floor(x: f32) -> u8 {
     (((x.to_bits() >> 23) & 0xFF) as i32 - 127).clamp(0, 255) as u8
-}
-
-/// An integer that orders like the float (no NaNs).
-fn ordered(h: f32) -> i32 {
-    let b = h.to_bits() as i32;
-    b ^ (((b >> 31) as u32) >> 1) as i32
 }
 
 /// The elevation under which the owners' weights sum to `want`.
@@ -624,34 +696,52 @@ fn sea_level(h: &[f32], w: &[f64], owners: &[usize], want: f64) -> f32 {
 }
 
 /// Priority flood from the sea (or the lowest node): every node drains to the neighbour it was
-/// reached from, so drainage is a tree with no pits. Returns the order nodes were reached.
-fn flood(s: &Sphere, cells: &mut [Cell], owners: &[usize], sea: f32) -> Vec<usize> {
-    let key = |h: f32, i: usize| std::cmp::Reverse((ordered(h), i));
-    let mut heap = BinaryHeap::new();
-    let mut seen = vec![false; cells.len()];
+/// reached from, so drainage is a tree with no pits (pits are filled in `h`). Keys only grow
+/// during a flood, so the queue is monotone buckets of whole blocks, each a stack threaded through
+/// one array (last in, first out). Returns the order nodes were reached.
+fn flood(s: &Sphere, h: &mut [f32], recv: &mut [u32], owners: &[usize], sea: f32) -> Vec<usize> {
+    const NONE: u32 = u32::MAX;
+    const BUCKETS: usize = 1 << 16;
+    let bucket = |v: f32| (v.floor().clamp(-32_768.0, 32_767.0) as i32 + 32_768) as usize;
+    let mut head = vec![NONE; BUCKETS];
+    let mut next = vec![NONE; h.len()];
+    let mut seen = vec![false; h.len()];
+    let push = |head: &mut [u32], next: &mut [u32], j: usize, b: usize| {
+        next[j] = head[b];
+        head[b] = j as u32;
+    };
+    let mut at = BUCKETS;
     for &i in owners {
-        if cells[i].h < sea {
-            heap.push(key(cells[i].h, i));
+        if h[i] < sea {
+            push(&mut head, &mut next, i, bucket(h[i]));
             seen[i] = true;
+            at = at.min(bucket(h[i]));
         }
     }
-    if heap.is_empty() {
-        let low = owners.iter().copied().min_by(|&a, &b| cells[a].h.total_cmp(&cells[b].h).then(a.cmp(&b))).unwrap_or(0);
-        heap.push(key(cells[low].h, low));
+    if at == BUCKETS {
+        let low = owners.iter().copied().min_by(|&a, &b| h[a].total_cmp(&h[b]).then(a.cmp(&b))).unwrap_or(0);
+        push(&mut head, &mut next, low, bucket(h[low]));
         seen[low] = true;
+        at = bucket(h[low]);
     }
     let mut order = Vec::with_capacity(owners.len());
     let mut nb = [0u32; MAX_NEIGHBOURS];
-    while let Some(std::cmp::Reverse((_, i))) = heap.pop() {
+    while at < BUCKETS {
+        if head[at] == NONE {
+            at += 1;
+            continue;
+        }
+        let i = head[at] as usize;
+        head[at] = next[i];
         order.push(i);
         let k = s.neighbours(i, &mut nb);
         for &j in &nb[..k] {
             let j = j as usize;
             if !seen[j] {
                 seen[j] = true;
-                cells[j].recv = i as u32;
-                cells[j].h = cells[j].h.max(cells[i].h);
-                heap.push(key(cells[j].h, j));
+                recv[j] = i as u32;
+                h[j] = h[j].max(h[i]);
+                push(&mut head, &mut next, j, bucket(h[j]));
             }
         }
     }
