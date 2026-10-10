@@ -50,7 +50,8 @@ pub struct Node {
     pub fill: u8,
     pub life: u8,
     pub plate: u8,
-    /// Convergence at the nearest plate boundary and distance to it (nodes).
+    /// Convergence at the nearest plate boundary and distance to it (nodes; the uplift's reach when
+    /// farther, with no convergence).
     pub stress: [i8; 2],
     /// rgb565.
     pub albedo: u16,
@@ -185,16 +186,31 @@ struct Upwind {
 }
 
 impl Upwind {
-    fn new(s: &Sphere, temp: &[f32]) -> Upwind {
+    fn new(s: &Sphere, temp: &[f32], threads: usize) -> Upwind {
+        // Per node in parallel, then packed.
+        let sets: Vec<([u32; 8], u8)> = map(
+            s.len(),
+            |i| {
+                let mut set = ([0u32; 8], 0u8);
+                if s.owns(i) {
+                    let mut nb = [0u32; MAX_NEIGHBOURS];
+                    let n = s.neighbours(i, &mut nb);
+                    for &j in &nb[..n] {
+                        if temp[j as usize] < temp[i] {
+                            set.0[set.1 as usize] = j;
+                            set.1 += 1;
+                        }
+                    }
+                }
+                set
+            },
+            threads,
+        );
         let mut start = Vec::with_capacity(s.len() + 1);
         let mut list = Vec::with_capacity(s.len() * 4);
-        let mut nb = [0u32; MAX_NEIGHBOURS];
-        for i in 0..s.len() {
+        for (set, n) in &sets {
             start.push(list.len() as u32);
-            if s.owns(i) {
-                let n = s.neighbours(i, &mut nb);
-                list.extend(nb[..n].iter().filter(|&&j| temp[j as usize] < temp[i]));
-            }
+            list.extend_from_slice(&set[..*n as usize]);
         }
         start.push(list.len() as u32);
         Upwind { start, list }
@@ -415,8 +431,11 @@ pub fn grow(input: &Input, threads: usize) -> Globe {
     );
     laps.lap(1);
 
-    // Relief: distance to the nearest boundary (multi-source BFS in index order), then uplift at
-    // convergent boundaries, trenches on the denser side, rifts where plates part, hotspot domes.
+    // Relief: distance to the nearest boundary (multi-source BFS in index order, out to the width
+    // the uplift reaches), then uplift at convergent boundaries, trenches on the denser side, rifts
+    // where plates part, hotspot domes.
+    let width = (input.g as f64 / 16.0).max(2.0);
+    let reach = width.ceil() as u16;
     let mut hops = vec![u16::MAX; n];
     let mut source = vec![0u32; n];
     let mut queue = VecDeque::new();
@@ -429,6 +448,9 @@ pub fn grow(input: &Input, threads: usize) -> Globe {
     }
     let mut nb = [0u32; MAX_NEIGHBOURS];
     while let Some(i) = queue.pop_front() {
+        if hops[i] >= reach {
+            continue;
+        }
         let k = s.neighbours(i, &mut nb);
         for &j in &nb[..k] {
             let j = j as usize;
@@ -439,7 +461,6 @@ pub fn grow(input: &Input, threads: usize) -> Globe {
             }
         }
     }
-    let width = (input.g as f64 / 16.0).max(2.0);
     let hotspots: Vec<[f64; 3]> = (0..(input.heat * 4.0).round() as i32).map(|k| direction(seed, k, 0x4075)).collect();
     let h = relief as f64;
     let elev: Vec<f32> = map(
@@ -547,7 +568,7 @@ pub fn grow(input: &Input, threads: usize) -> Globe {
     let seas = |h: &[f32]| -> Vec<u16> { h.iter().map(|&v| if input.air && !hot && v < sea { u16::MAX } else { 0 }).collect() };
     let src = seas(&cratered);
     let mut wet = Field::new(src.clone());
-    let up = if input.air { Upwind::new(s, &temp) } else { Upwind { start: vec![0; n + 1], list: Vec::new() } };
+    let up = if input.air { Upwind::new(s, &temp, threads) } else { Upwind { start: vec![0; n + 1], list: Vec::new() } };
     if input.air {
         let rain = up.rain(&cratered, relief, threads);
         wet.run(s, &Moist { up: &up, rain: &rain, src: &src }, MOIST_PASSES, threads);
@@ -633,7 +654,11 @@ pub fn grow(input: &Input, threads: usize) -> Globe {
                 fill,
                 life: (life * 255.0).min(255.0) as u8,
                 plate: plate[o],
-                stress: [(conv[source[o] as usize] * 127.0).clamp(-127.0, 127.0) as i8, hops[o].min(127) as i8],
+                stress: if hops[o] == u16::MAX {
+                    [0, reach.min(127) as i8]
+                } else {
+                    [(conv[source[o] as usize] * 127.0).clamp(-127.0, 127.0) as i8, hops[o].min(127) as i8]
+                },
                 albedo: rgb565(rgb),
                 age: (age * 255.0) as u8,
             }
