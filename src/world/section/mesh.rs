@@ -1865,6 +1865,8 @@ mod tests {
         /// Near-square samples whose column is near (the far field leaves it to the chunks).
         near_n: i32,
         sections: usize,
+        /// The first missing tops: station, the two tiles and which side had a top.
+        missing_at: Vec<String>,
         /// The eye's column is topped by a far tile or left to the chunks as a near column.
         covered: bool,
         hash: u32,
@@ -1969,6 +1971,19 @@ mod tests {
             }
         }
         let missing = gaps.iter().filter(|g| g.gap > 1_000_000).count();
+        let missing_at = gaps
+            .iter()
+            .filter(|g| g.gap > 1_000_000)
+            .take(2)
+            .map(|g| {
+                let t = tiles.iter().find(|t| (t.pos.x, t.pos.z) == g.a && t.pos.detail.0 == g.da);
+                let info = t.map(|t| {
+                    let near: Vec<_> = t.tops.iter().filter(|top| (top[0] - 2..=top[1] + 2).contains(&g.station)).map(|top| [top[0] - t.x0, top[1] - t.x0, top[2] - t.z0, top[3] - t.z0, top[4]]).collect();
+                    format!("clip {:#x} x0 {} z0 {} tops near {near:?} walls {}", t.clip.0, t.x0, t.z0, t.walls.len())
+                });
+                format!("station {} tops {}/{} d{} {:?} {:?} vs d{} {:?}", g.station, g.top_lo, g.top_hi, g.da, g.a, info, g.db, g.b)
+            })
+            .collect();
         let vertical = gaps.iter().filter(|g| g.gap <= 1_000_000).count();
         let cs = 16i32;
         let h = world.view.horizontal;
@@ -1994,11 +2009,13 @@ mod tests {
         }
         let eye = ((center.x * cs + cs / 2), (center.z * cs + cs / 2));
         let covered = near_at(eye.0, eye.1) || tiles.iter().any(|t| top_at(t, eye.0, eye.1).is_some());
-        ChartFrontier { bare, gaps: vertical, missing, under, under_n, near_n, sections: desired.len(), covered, hash, tiles }
+        ChartFrontier { bare, gaps: vertical, missing, under, under_n, near_n, sections: desired.len(), missing_at, covered, hash, tiles }
     }
 
-    /// Whether tile `t` leaves storage column `(x, z)` to the full-res chunks.
+    /// Whether tile `t` leaves storage column `(x, z)` to the full-res chunks. A point on the tile's
+    /// edge reads the column inside it.
     fn clipped(t: &Tile, x: i32, z: i32) -> bool {
+        let (x, z) = (x.clamp(t.x0, t.x1 - 1), z.clamp(t.z0, t.z1 - 1));
         !t.clip.is_empty() && t.clip.masks((x - t.x0).div_euclid(16), (z - t.z0).div_euclid(16))
     }
 
@@ -2070,7 +2087,7 @@ mod tests {
         assert!(f.under_n > 0, "{name}: the near box was not sampled");
         assert_eq!(f.bare, 0, "{name}: bare columns");
         assert_eq!(f.gaps, 0, "{name}: vertical seam gaps");
-        assert_eq!(f.missing, 0, "{name}: missing tops");
+        assert_eq!(f.missing, 0, "{name}: missing tops {:?}", f.missing_at);
         assert_eq!(f.under, 0, "{name}: near-square columns drawn twice or not at all {}/{}", f.under, f.under_n);
         assert!(f.covered, "{name}: nothing draws the eye column");
     }
