@@ -43,7 +43,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use project_watt_cubed::math::PER_METER;
 use project_watt_cubed::net::DEFAULT_PORT;
-use project_watt_cubed::net::server::{self, Config, NoclipPolicy, TeleportPolicy};
+use project_watt_cubed::net::server::{self, Config, Policy};
 use project_watt_cubed::paths::Paths;
 use project_watt_cubed::world::generation::WorldgenKind;
 
@@ -59,8 +59,8 @@ fn main() {
     let mut port = DEFAULT_PORT;
     let mut config = Config {
         seed: fresh_seed(),
-        teleport: TeleportPolicy::Ops,
-        noclip: NoclipPolicy::Ops,
+        teleport: Policy::Ops,
+        noclip: Policy::Ops,
         warn_world_overrides: true,
         ..Config::default()
     };
@@ -101,20 +101,12 @@ fn main() {
             "--world" => config.world = Some(PathBuf::from(take(&args, &mut i, "--world"))),
             "--ops" => config.ops.extend(split_list(&take(&args, &mut i, "--ops"))),
             "--teleport" => {
-                config.teleport = match take(&args, &mut i, "--teleport").as_str() {
-                    "off" => TeleportPolicy::Off,
-                    "ops" => TeleportPolicy::Ops,
-                    "all" => TeleportPolicy::All,
-                    _ => die("teleport must be off, ops, or all"),
-                };
+                config.teleport = Policy::parse(&take(&args, &mut i, "--teleport"))
+                    .unwrap_or_else(|| die("teleport must be off, ops, or all"));
             }
             "--noclip" => {
-                config.noclip = match take(&args, &mut i, "--noclip").as_str() {
-                    "off" => NoclipPolicy::Off,
-                    "ops" => NoclipPolicy::Ops,
-                    "all" => NoclipPolicy::All,
-                    _ => die("noclip must be off, ops, or all"),
-                };
+                config.noclip = Policy::parse(&take(&args, &mut i, "--noclip"))
+                    .unwrap_or_else(|| die("noclip must be off, ops, or all"));
             }
             "--max-speed" => {
                 let mps: f64 = take(&args, &mut i, "--max-speed")
@@ -148,16 +140,8 @@ fn main() {
     );
     println!(
         "teleport {}, noclip {}, max speed {:.0} m/s",
-        match config.teleport {
-            TeleportPolicy::Off => "off",
-            TeleportPolicy::Ops => "ops",
-            TeleportPolicy::All => "all",
-        },
-        match config.noclip {
-            NoclipPolicy::Off => "off",
-            NoclipPolicy::Ops => "ops",
-            NoclipPolicy::All => "all",
-        },
+        config.teleport.name(),
+        config.noclip.name(),
         config.max_speed / PER_METER
     );
     match (config.mods_allow.is_empty(), config.mods_deny.is_empty()) {

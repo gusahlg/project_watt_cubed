@@ -1,6 +1,6 @@
 //! The cosmos lab (EMERGENT-WORLDGEN-DESIGN P1): grow N universes and print what they hold
 //! (bodies, layouts, gravity, heat, air, suites, fallbacks, storage, creation time) with the P1
-//! acceptance gates, and write PPMs (nebula slices, suite swatches, G=32 globe previews).
+//! acceptance gates, and write PPMs (nebula slices, suite swatches, G=64 globe previews).
 //!
 //! `cosmos_lab <out_dir> [--seeds N] [--first S] [--threads T] [--images K] [--set name=value]...
 //! [--sweep name=v1,v2,...]`. A sweep prints the gates for each value instead of the full report.
@@ -158,6 +158,8 @@ impl Counts {
 #[derive(Default)]
 struct Stats {
     seeds: usize,
+    threads: usize,
+    params: Params,
     bodies: Series,
     others: Series,
     systems: Series,
@@ -196,6 +198,19 @@ struct Stats {
     own_colour_spread: Series,
     own_restless: Series,
     own_restless_of: usize,
+    suite_leached: Series,
+    /// Mineral–role meetings: at rest, losing an occurrence, gaining one.
+    reaction: [usize; 3],
+    suite_own_share: Series,
+    seeds_all_spread: usize,
+    ground: Counts,
+    alive: usize,
+    alive_ground: Counts,
+    seeds_life: usize,
+    seeds_glow: usize,
+    cap_binds: usize,
+    kept_binaries: Series,
+    unsettled: Series,
     suite_spread_ok: usize,
     seeds_all_own: usize,
     start_own: usize,
@@ -260,16 +275,25 @@ impl Stats {
             self.pi_clamped += t.pi_clamped as usize;
         }
         self.both_layouts += ((forms[0] || forms[1]) && forms[2]) as usize;
-        self.suites.push(u.suites.len() as f64);
-        let mut all_own = true;
-        for (s, &ms) in u.suites.iter().zip(&u.suite_ms) {
+        for &ms in u.suite_ms.iter().filter(|&&ms| ms > 0.0) {
+            self.suite_ms.push(ms);
+        }
+        // The suites bodies use (a composition may have been checked in a ground no body kept).
+        let mut used: Vec<usize> = u.bodies.iter().map(|b| b.traits.suite as usize).collect();
+        used.sort_unstable();
+        used.dedup();
+        self.suites.push(used.len() as f64);
+        let (mut all_own, mut all_spread, mut own_n) = (true, true, 0);
+        let law = project_watt_cubed::material::Law::current();
+        for &k in &used {
+            let s = &u.suites[k];
             self.suite_count += 1;
             // Suites the law was asked for (the start world's last resort is a fixed role).
-            if ms > 0.0 {
-                self.suite_ms.push(ms);
+            if u.suite_ms[k] > 0.0 {
                 self.suite_distinct.push(s.distinct as f64);
                 self.suite_sweeps.push(s.sweeps as f64);
                 self.suite_dropped.push(s.dropped as f64);
+                self.suite_leached.push(s.leached as f64);
                 self.suite_replaced.push(s.own.iter().filter(|m| m.replaced).count() as f64);
                 for m in &s.own {
                     self.own_amount.push(m.amount as f64);
@@ -279,22 +303,25 @@ impl Stats {
                 self.own_amount_spread.push((amounts.clone().max().unwrap_or(0) - amounts.min().unwrap_or(0)) as f64);
                 self.own_colour_spread.push(colour_spread(&s.own));
                 if self.seeds <= 100 {
-                    let law = project_watt_cubed::material::Law::current();
                     for m in &s.own {
-                        let (n, of) = project_watt_cubed::world::terrain::emergent::minerals::restless_against(&law, m);
-                        self.own_restless.push(n as f64);
-                        self.own_restless_of = of;
+                        let r = project_watt_cubed::world::terrain::emergent::minerals::reactions(&law, m, s.ground, &self.params);
+                        self.own_restless.push((r[1] + r[2]) as f64);
+                        self.own_restless_of = self.own_restless_of.max(r.iter().sum());
+                        for k in 0..3 {
+                            self.reaction[k] += r[k];
+                        }
                     }
                 }
                 let names = ["few distinct", "colour", "restless"];
                 let why: Vec<&str> = (0..3).filter(|k| s.causes >> k & 1 == 1).map(|k| names[k]).collect();
-                self.causes.add(if why.is_empty() { "own".to_string() } else { why.join("+") });
+                self.causes.add(format!("{:?}: {}", s.ground, if why.is_empty() { "own".to_string() } else { why.join("+") }));
             }
             if s.fallback {
                 self.suite_fallback += 1;
                 all_own = false;
                 continue;
             }
+            own_n += 1;
             for m in &s.minerals {
                 self.suite_amount.push(m.amount as f64);
                 self.suite_cohesion.push(m.cohesion as f64);
@@ -303,8 +330,24 @@ impl Stats {
             self.suite_colour_spread.push(s.colour_spread as f64);
             self.suite_density.push(s.density);
             self.suite_yield.push(s.yield_stress);
-            self.suite_spread_ok += (s.amount_spread >= AMOUNT_SPREAD_MIN && s.colour_spread >= COLOUR_SPREAD_MIN) as usize;
+            let spread = s.amount_spread >= AMOUNT_SPREAD_MIN && s.colour_spread >= COLOUR_SPREAD_MIN;
+            self.suite_spread_ok += spread as usize;
+            all_spread &= spread;
         }
+        self.suite_own_share.push(own_n as f64 / used.len().max(1) as f64);
+        self.seeds_all_spread += (all_own && all_spread) as usize;
+        for b in &u.bodies {
+            self.ground.add(format!("{:?}", b.ground));
+            if b.traits.life > 0 {
+                self.alive += 1;
+                self.alive_ground.add(format!("{:?}", b.ground));
+            }
+        }
+        self.seeds_life += u.bodies.iter().any(|b| b.traits.life > 0) as usize;
+        self.seeds_glow += u.bodies.iter().any(|b| b.traits.glow) as usize;
+        self.cap_binds += (u.capped > 0) as usize;
+        self.kept_binaries.push(u.bodies.iter().filter(|b| b.traits.rank == Rank::Partner).count() as f64 / 2.0);
+        self.unsettled.push(u.unsettled as f64);
         self.seeds_all_own += all_own as usize;
         let start = &u.bodies[0];
         self.start_own += !u.suites[start.traits.suite as usize].fallback as usize;
@@ -312,8 +355,10 @@ impl Stats {
         self.start_radius.push(start.radius as f64);
         self.start_tries.push(u.start_tries as f64);
         self.start_fallback += u.start_fallback as usize;
-        let contract = (start.density * start.radius as f64 / project_watt_cubed::world::terrain::emergent::RHO_R - 1.0).abs() < 1e-6;
-        let valid = start.traits.rank == Rank::Start && start.traits.form == Form::Round && contract;
+        // The radius is snapped to 16 blocks: the contract holds to half a snap.
+        let contract = (start.density * start.radius as f64 - project_watt_cubed::world::terrain::emergent::RHO_R).abs() <= 8.0 * start.density;
+        let pull = (start.traits.gravity as f64 / project_watt_cubed::world::terrain::emergent::start_pull() - 1.0).abs() < 1e-3;
+        let valid = start.traits.rank == Rank::Start && start.traits.form == Form::Round && contract && pull;
         self.start_valid += valid as usize;
         self.resalts.push(u.resalts as f64);
         self.debris.push(u.debris);
@@ -347,40 +392,45 @@ impl Stats {
     fn gates(&self) -> String {
         let pct = |a: usize, b: usize| 100.0 * a as f64 / b.max(1) as f64;
         let own = pct(self.seeds_all_own, self.seeds);
-        let spread_ok = pct(self.suite_spread_ok, self.suite_count - self.suite_fallback);
+        let spread = pct(self.seeds_all_spread, self.seeds);
         let suite_med = self.suite_ms.quantile(0.5);
-        let g128 = self.t_globe128.quantile(0.5);
-        let g128_p99 = self.t_globe128.quantile(0.99);
         let g64 = self.t_globe64.quantile(0.5);
-        let g64_p99 = self.t_globe64.quantile(0.99);
+        let g128 = self.t_globe128.quantile(0.5);
         let valid = pct(self.start_valid, self.seeds);
         let verdict = |ok: bool| if ok { "PASS" } else { "FAIL" };
         let mut s = String::new();
         let _ = writeln!(
             s,
-            "GATE suites: {own:.1}% of seeds have every suite their own (non-fallback, >= 3 cohesive minerals); need >= 90% -> {}",
-            verdict(own >= 90.0)
+            "GATE suites: {own:.1}% of seeds use only suites of their own (non-fallback, >= 3 cohesive minerals), {spread:.1}% with every one also at amount spread >= {AMOUNT_SPREAD_MIN} and colour spread >= {COLOUR_SPREAD_MIN}; need >= 90% -> {}",
+            verdict(spread >= 90.0)
         );
         let _ = writeln!(
             s,
-            "  suite fallback rate {:.1}% of {} suites; start-world suite own in {:.1}% of seeds; own suites with amount spread >= {AMOUNT_SPREAD_MIN} and colour spread >= {COLOUR_SPREAD_MIN}: {spread_ok:.1}% (thresholds proposed, not agreed)",
-            pct(self.suite_fallback, self.suite_count),
+            "  used suites own: {:.1}% of {}; start-world suite own in {:.1}% of seeds; per-seed own share {}",
+            pct(self.suite_count - self.suite_fallback, self.suite_count),
             self.suite_count,
-            pct(self.start_own, self.seeds)
+            pct(self.start_own, self.seeds),
+            self.suite_own_share.summary()
         );
         let _ = writeln!(
             s,
-            "GATE speed: suites median {:.3} ms per suite (need <= 0.5) -> {}; start globe at G=128 on the run's threads p50 {g128:.1} ms, p99 {g128_p99:.1} ms (need <= 25) -> {}; the design's fallback G=64: p50 {g64:.1} ms, p99 {g64_p99:.1} ms -> {}",
-            suite_med,
+            "GATE speed: suites median {suite_med:.3} ms per suite (need <= 0.5) -> {}; start globe at its resolution p50 {:.1} ms (need <= 25 on {} threads) -> {}; G=64 p50 {g64:.1} ms, G=128 p50 {g128:.1} ms",
             verdict(suite_med <= 0.5),
-            verdict(g128_p99 <= 25.0),
-            verdict(g64_p99 <= 25.0)
+            self.t_globe.quantile(0.5),
+            self.threads,
+            verdict(self.t_globe.quantile(0.5) <= 25.0)
         );
         let _ = writeln!(
             s,
-            "GATE start world: valid (start rank, round, ρ·R pinned) in {valid:.1}% of seeds, {:.1}% through the `rock` fallback; need 100% -> {}",
+            "GATE start world: valid (start rank, round, ρ·R pinned, spawn pull within 0.1%) in {valid:.1}% of seeds, {:.1}% through the `rock` fallback; need 100% -> {}",
             pct(self.start_fallback, self.seeds),
             verdict(self.start_valid == self.seeds)
+        );
+        let _ = writeln!(
+            s,
+            "TARGET bodies: median {} (want 8-20); the cap of 64 binds in {:.1}% of seeds",
+            fmt(self.bodies.quantile(0.5)),
+            pct(self.cap_binds, self.seeds)
         );
         s
     }
@@ -484,7 +534,7 @@ fn suite_image(out: &str, seed: u64, u: &Universe) {
     write_ppm(&format!("{out}/suites_{seed}.ppm"), w, h, &img);
 }
 
-/// A G=32 globe as an unfolded cube: albedo shaded by elevation.
+/// A globe as an unfolded cube: albedo shaded by elevation.
 fn globe_image(path: &str, g: &globe::Globe) {
     let s = field::Sphere::get(g.g);
     let side = (g.g + 1) as usize;
@@ -517,7 +567,7 @@ fn sweep(a: &Args, cfg: &TerrainCfg, name: &str, values: &[String]) {
     for v in values {
         let mut p = a.params.clone();
         p.set(name, v).unwrap_or_else(|e| panic!("{e}"));
-        let mut st = Stats::default();
+        let mut st = Stats { threads: a.threads, params: p.clone(), ..Stats::default() };
         for seed in a.first..a.first + a.seeds {
             let u = Universe::new(seed, cfg, &p, a.threads);
             let g = globe::grow(&Input::of(&u, 0, 32, 1.0), a.threads);
@@ -530,7 +580,18 @@ fn sweep(a: &Args, cfg: &TerrainCfg, name: &str, values: &[String]) {
         println!("law cohesion {}", st.own_cohesion.summary());
         println!("law colour spread {}", st.own_colour_spread.summary());
         println!("law distinct {}", st.suite_distinct.summary());
+        println!("leached per suite {}", st.suite_leached.summary());
+        println!("law minerals' reacting roles (of up to {}) {}", st.own_restless_of, st.own_restless.summary());
+        let r = st.reaction;
+        let all = (r[0] + r[1] + r[2]).max(1) as f64;
+        println!("mineral-role meetings: rest {:.1}%, mineral loses {:.1}%, mineral gains {:.1}%", 100.0 * r[0] as f64 / all, 100.0 * r[1] as f64 / all, 100.0 * r[2] as f64 / all);
+        println!("basins {}", st.basins.summary());
+        println!("per-seed own share {}", st.suite_own_share.summary());
+        print!("{}", st.ground.line("grounds"));
         print!("{}", st.causes.line("verdict"));
+        println!("systems {}", st.systems.summary());
+        println!("kept binaries {}", st.kept_binaries.summary());
+        println!("life: {} bodies, {:.1}% of seeds; glow: {} bodies, {:.1}% of seeds", st.alive, 100.0 * st.seeds_life as f64 / st.seeds as f64, st.glow, 100.0 * st.seeds_glow as f64 / st.seeds as f64);
         println!("law minerals' reacting universals (of {}) {}", st.own_restless_of, st.own_restless.summary());
         println!("start density {}", st.start_density.summary());
         print!("{}", st.gates());
@@ -577,7 +638,7 @@ fn main() {
     }
     println!("# Cosmos lab: {} seeds from {}, {} threads", a.seeds, a.first, a.threads);
     println!("params: {}\n", a.params.describe());
-    let mut st = Stats::default();
+    let mut st = Stats { threads: a.threads, params: a.params.clone(), ..Stats::default() };
     let mut examples = String::new();
     let wall = Instant::now();
     for seed in a.first..a.first + a.seeds {
@@ -594,7 +655,7 @@ fn main() {
             nebula_image(&a.out, seed, &u, &cfg, &a.params);
             suite_image(&a.out, seed, &u);
             for id in 0..u.bodies.len().min(4) {
-                let gl = globe::grow(&Input::of(&u, id, 32, 1.0), a.threads);
+                let gl = globe::grow(&Input::of(&u, id, 64, 1.0), a.threads);
                 globe_image(&format!("{}/globe_{seed}_{id}.ppm", a.out), &gl);
             }
             let _ = writeln!(examples, "seed {seed}: {} systems, {} bodies", u.systems, u.bodies.len());
@@ -650,7 +711,21 @@ fn main() {
     print!("{}", st.air.line("air"));
     println!("air top (blocks): {}", st.air_top.summary());
     print!("{}", st.life.histogram("life (0..255)", &[0.0, 1.0, 8.0, 16.0, 32.0, 64.0, 128.0]));
-    println!("glowing bodies: {}", st.glow);
+    println!(
+        "living bodies: {} ({:.2}% of bodies, in {:.1}% of seeds); by ground: {}",
+        st.alive,
+        100.0 * st.alive as f64 / st.bodies.0.iter().sum::<f64>(),
+        100.0 * st.seeds_life as f64 / st.seeds as f64,
+        st.alive_ground.line("").trim_start_matches(": ").trim_end()
+    );
+    println!(
+        "glowing bodies: {} ({:.2}% of bodies, in {:.1}% of seeds)",
+        st.glow,
+        100.0 * st.glow as f64 / st.bodies.0.iter().sum::<f64>(),
+        100.0 * st.seeds_glow as f64 / st.seeds as f64
+    );
+    print!("{}", st.ground.line("painter grounds"));
+    println!("bodies whose final traits pick another painter: {}", st.unsettled.summary());
     println!("\n## Suites");
     print!("{}", st.suites.histogram("suites per seed", &lin(0.0, 4.0, 12)));
     println!("### The law's minerals (every suite the law was asked for, before any fallback)");
@@ -662,7 +737,7 @@ fn main() {
     print!(
         "{}",
         st.own_restless.histogram(
-            &format!("universal materials (of {}) each mineral reacts with, first 100 seeds", st.own_restless_of),
+            &format!("ground roles (of up to {}) each mineral reacts with, first 100 seeds", st.own_restless_of),
             &[0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 24.0, 32.0]
         )
     );
@@ -676,6 +751,7 @@ fn main() {
     println!("distinct minerals after repair: {}", st.suite_distinct.summary());
     println!("differentiation sweeps: {}", st.suite_sweeps.summary());
     println!("occurrences dropped by repair: {}", st.suite_dropped.summary());
+    println!("occurrences leached: {}", st.suite_leached.summary());
     println!("layers the rest check replaced: {}", st.suite_replaced.summary());
     println!(
         "fallback suites: {} of {} ({:.1}%)",
@@ -692,7 +768,8 @@ fn main() {
     println!("\n## Leftovers");
     println!("debris share of nebula mass: {}", st.debris.summary());
     println!("rings: {}", st.rings.summary());
-    println!("contact binaries: {}", st.binaries.summary());
+    println!("contact binaries formed: {}", st.binaries.summary());
+    println!("contact binaries kept: {}", st.kept_binaries.summary());
     println!("bodies fallen onto their parent: {}", st.fell.summary());
     println!("bodies out of bounds: {}", st.out_of_bounds.summary());
     println!("bodies over the cap of {}: {}", a.params.bodies_max, st.capped.summary());

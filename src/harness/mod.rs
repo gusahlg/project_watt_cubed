@@ -660,7 +660,8 @@ fn execute(stages: Vec<Stage>, build: &GameBuild) -> Outcomes {
     if stages.is_empty() {
         return Outcomes::default();
     }
-    let mut mods = Mods::from_build(build);
+    let mut options = crate::settings::Options::new();
+    let mut mods = Mods::from_build(build, &mut options);
     let mut settings = Settings::default();
     // Update requires a router even though scripted games consume no live input.
     let mut router = crate::input::router::Router::new();
@@ -754,13 +755,14 @@ fn execute(stages: Vec<Stage>, build: &GameBuild) -> Outcomes {
             &mut router,
             &mut mods,
             &mut settings,
+            &mut options,
             &mut sound,
             &mut audio,
             &cues,
         );
         // Shake 0: captures must be deterministic (no live trauma exists in the
         // scripted path anyway).
-        g.draw(eng, &mut mods, settings.fov, 0.0);
+        g.draw(eng, &mut mods, settings.fov, 0.0, &[]);
 
         // A live stress run owns its stage's frames from here: it deliberately
         // flies THROUGH the un-entry states the gate below waits out, so it

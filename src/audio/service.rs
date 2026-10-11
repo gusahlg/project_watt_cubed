@@ -10,7 +10,7 @@ use glam::DQuat;
 use voxel_engine::{DVec3, IVec3};
 
 use crate::block::registry::{BlockId, SoundClass};
-use crate::console::Console;
+use crate::modding::{NoticeLevel, Notices};
 use crate::coord::Face;
 use crate::modding::ActionSet;
 use crate::net::client::Connection;
@@ -76,7 +76,6 @@ pub struct AudioView<'a> {
     pub pos: DVec3,
     pub peers: &'a [PeerAudio],
     pub in_world: bool,
-    pub voice_enabled: bool,
     /// The inverse of deafen: the saved "hear voice" row.
     pub hear_voice: bool,
     pub actions: ActionSet,
@@ -357,9 +356,9 @@ impl AudioService {
         sound: &'a mut SoundSystem,
         symbols: &'a CueSymbols,
         world: Option<&'a World>,
-        console: Option<&'a mut Console>,
+        notices: Option<&'a mut Notices>,
     ) -> AudioApi<'a> {
-        AudioApi { sound, symbols, service: self, world, console, log: None }
+        AudioApi { sound, symbols, service: self, world, notices, log: None }
     }
 
     /// Submit the journal the mods just filled, then surface faults. An empty idle
@@ -370,7 +369,7 @@ impl AudioService {
         world: &World,
         listener: Listener,
         dt: f32,
-        console: &mut Console,
+        notices: &mut Notices,
     ) {
         let bed = self.ambient.as_ref().map(|bed| Emitter { id: EmitterId(1), cue: bed.cue, at: listener.pos, gain: bed.gain });
         let emitters = bed.as_slice();
@@ -385,11 +384,11 @@ impl AudioService {
         for fault in sound.drain_faults() {
             let set = seen.get_or_insert_with(std::collections::HashSet::new);
             if set.insert(std::mem::discriminant(&fault)) {
-                console.print(format!("* audio: {fault:?}"));
+                notices.push(NoticeLevel::Error, format!("* audio: {fault:?}"));
             }
         }
         if let Some(error) = self.capture.as_mut().and_then(|cap| cap.poll_fault()) {
-            console.print(format!("* voice capture error: {error}"));
+            notices.push(NoticeLevel::Error, format!("* voice capture error: {error}"));
             self.capture = None;
             self.capture_faulted = true;
         }
@@ -419,7 +418,7 @@ pub struct AudioApi<'a> {
     symbols: &'a CueSymbols,
     service: &'a mut AudioService,
     world: Option<&'a World>,
-    console: Option<&'a mut Console>,
+    notices: Option<&'a mut Notices>,
     log: Option<&'a mut Vec<Play>>,
 }
 
@@ -550,8 +549,8 @@ impl AudioApi<'_> {
             }
             Err(error) => {
                 self.service.capture_faulted = true;
-                if let Some(console) = self.console.as_deref_mut() {
-                    console.print(format!("* voice capture unavailable: {error}"));
+                if let Some(notices) = self.notices.as_deref_mut() {
+                    notices.push(NoticeLevel::Error, format!("* voice capture unavailable: {error}"));
                 }
             }
         }
@@ -690,15 +689,15 @@ impl AudioBench {
             symbols: &self.symbols,
             service: &mut self.service,
             world,
-            console: None,
+            notices: None,
             log: Some(&mut self.log),
         }
     }
 
     pub fn finish(&mut self, world: &World) {
         let listener = Listener { pos: DVec3::ZERO, yaw: 0.0, pitch: 0.0, frame: DQuat::IDENTITY };
-        let mut console = Console::new();
-        self.service.finish(&mut self.sound, world, listener, 1.0 / 60.0, &mut console);
+        let mut notices = Notices::default();
+        self.service.finish(&mut self.sound, world, listener, 1.0 / 60.0, &mut notices);
     }
 
     pub fn plays(&self) -> &[Play] {
@@ -771,11 +770,11 @@ mod tests {
         let world = World::generate();
         let pos = DVec3::new(0.5, 80.0, 0.5);
         let listener = Listener { pos, yaw: 0.0, pitch: 0.0, frame: DQuat::IDENTITY };
-        let mut console = Console::new();
+        let mut notices = Notices::default();
         {
-            let _api = svc.api(&mut sound, &symbols, Some(&world), Some(&mut console));
+            let _api = svc.api(&mut sound, &symbols, Some(&world), Some(&mut notices));
         }
-        svc.finish(&mut sound, &world, listener, 1.0 / 60.0, &mut console);
+        svc.finish(&mut sound, &world, listener, 1.0 / 60.0, &mut notices);
         assert!(svc.can_skip(&sound, true, pos));
         assert!(!svc.can_skip(&sound, true, pos + DVec3::X * 0.01), "a centimetre of travel must re-enable the commit");
         assert!(!svc.can_skip(&sound, false, pos), "a pending event or a held action must re-enable the commit");

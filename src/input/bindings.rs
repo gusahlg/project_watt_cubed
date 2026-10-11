@@ -30,11 +30,8 @@ impl Default for Bindings {
         gameplay_state[GS::Jump as usize] = vec![Source::Key(Key::Space)];
 
         let mut gameplay_event: [Vec<Chord>; GameplayEvent::COUNT] = Default::default();
-        gameplay_event[GE::ToggleFly as usize] = vec![Chord::key(Key::F)];
         gameplay_event[GE::Break as usize] = vec![Chord::mouse(MouseButton::Left)];
         gameplay_event[GE::Place as usize] = vec![Chord::mouse(MouseButton::Right)];
-        gameplay_event[GE::OpenConsole as usize] = vec![Chord::key(Key::Slash)];
-        gameplay_event[GE::OpenChat as usize] = vec![Chord::key(Key::T)];
         gameplay_event[GE::ToggleCapture as usize] = vec![Chord::key(Key::Tab)];
 
         // Coordinate system: forward (+Z) = W/S, right (+X) = D/A, up (+Y) = Space/LeftShift.

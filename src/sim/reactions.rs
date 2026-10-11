@@ -182,6 +182,13 @@ impl ReactionScheduler {
     /// the next turn; an unchanged one goes dormant. Returns the commits in order.
     pub fn tick<S: CellStore>(&mut self, store: &mut S, budget: Budget) -> Vec<Mutation> {
         let mut committed = Vec::new();
+        self.tick_into(store, budget, &mut committed);
+        committed
+    }
+
+    /// [`tick`](Self::tick), appending the commits to `committed`, so a caller that ticks
+    /// every frame reuses one buffer.
+    pub fn tick_into<S: CellStore>(&mut self, store: &mut S, budget: Budget, committed: &mut Vec<Mutation>) {
         let this_turn = self.turns;
         let next = this_turn + 1;
         for _ in 0..budget.contacts_per_turn {
@@ -214,7 +221,6 @@ impl ReactionScheduler {
             }
         }
         self.turns = next;
-        committed
     }
 }
 

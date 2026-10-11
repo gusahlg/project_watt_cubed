@@ -20,7 +20,7 @@ use field::hash32_3;
 use material::{Element, Law};
 
 use self::accrete::{fuse, half_of, Impact, Proto};
-use self::minerals::Suite;
+use self::minerals::{Found, Ground, Suite};
 use self::nebula::Nebula;
 use super::cosmos::{HOME_CUBE_HALF, HOME_RADIUS, RELIEF};
 use super::TerrainCfg;
@@ -35,6 +35,12 @@ pub const M_HOME: f64 = 5.0 * 5.0e7 * 5.0e7 * 5.0e7;
 pub const RHO_R: f64 = 5.0 * HOME_RADIUS as f64;
 /// Cube half-size over datum radius of the start world (25e6 over 31,017,520).
 const HALF_PER_RADIUS: f64 = HOME_CUBE_HALF as f64 / HOME_RADIUS as f64;
+/// The start world's surface pull fixed by the spawn contract: `G·M/R²` with `M = ρ(2·half)³`,
+/// `half = HALF_PER_RADIUS·R` and `ρR = RHO_R`, whatever its density.
+pub fn start_pull() -> f64 {
+    G * 8.0 * HALF_PER_RADIUS * HALF_PER_RADIUS * HALF_PER_RADIUS * RHO_R
+}
+
 /// Face-centre pull of a uniform cube over `G·ρ·half`.
 pub const KAPPA_FACE: f64 = 5.193_793_156_516_389;
 const SQRT3: f64 = 1.732_050_807_568_877_2;
@@ -64,6 +70,8 @@ const AIR_SCALE: f64 = 20_000.0 * 24.0 / T_HOME;
 const AIR_MAX: f64 = 40_000.0;
 /// Radiogenic heat per unit mass of a fully emissive suite (about the start world's G·M/R).
 const E_RAD: f64 = 8.8e8;
+/// Share of the surface the palette's organic ground roles cover on a temperate world with air.
+const ORGANICS: f64 = 0.5;
 
 macro_rules! params {
     ($($(#[$doc:meta])* $name:ident: $ty:ty = $default:expr,)*) => {
@@ -100,26 +108,42 @@ macro_rules! params {
 }
 
 params! {
-    /// Nebula prior amplitude over the unit floor (scaled by the variety knob).
+    /// Nebula prior amplitude over the unit floor (scaled by the variety knob), and its octaves
+    /// (from 16 cells down).
     prior_amp: i32 = 24,
+    octaves: u32 = 3,
     /// Origin well mass at its centre cell (units of the floor), and its radius in cells.
     well: i32 = 64,
     well_r: i32 = 3,
-    /// Collapse phases.
+    /// Collapse phases, the share a cell sends per phase (`m >> send`), and the smoothing sweeps
+    /// the watershed reads.
     collapse: u32 = 8,
+    send: u32 = 2,
+    blur: u32 = 2,
     /// System separation, and the box systems must lie in.
     d_sep: f64 = 4.0e8,
     system_bound: f64 = 7.7e8,
+    /// Least mass of a system of its own, as a share of the start system's (lighter basins join a
+    /// near system or become debris).
+    system_min: f64 = 0.25,
     /// The start system's mass over today's home mass (calibrates the nebula before accretion).
     origin_share: f64 = 1.5,
     /// Parcels per system and the ratio of the largest parcel mass to the smallest.
-    parcels: u32 = 256,
+    parcels: u32 = 64,
     parcel_range: f64 = 1000.0,
+    /// When above 0, parcels start around the basin sinks with this scatter (cells); at 0 on cells
+    /// picked by cell mass.
+    sink_spread: f64 = 0.6,
+    /// A merged basin lighter than this share of its system seeds no cloud of its own: its mass
+    /// joins the system's first sink.
+    sink_min: f64 = 1.0,
     /// Merge strength A = R_IN³ / M_home.
     merge_a: f64 = 1.6e8 * 1.6e8 * 1.6e8 / M_HOME,
     /// Contact binary: least mass ratio, and strength (impact energy per mass under K_BIN·Y/ρ).
     q_bin: f64 = 0.4,
-    k_bin: f64 = 1.0,
+    k_bin: f64 = 30.0,
+    /// Least mass of a binary's lighter part, as a share of today's home mass.
+    bin_min: f64 = 1.0e-4,
     /// A satellite's own surface pull over its parent's pull there.
     k_dom: f64 = 4.0,
     /// Debris mass that rings a body.
@@ -127,15 +151,25 @@ params! {
     /// Reservoirs in a body's column, occurrences per reservoir, and their ring distance from the
     /// body's composition.
     reservoirs: usize = 12,
-    occ_min: u32 = 8,
-    occ_max: u32 = 24,
-    spread: u32 = 48,
+    occ_min: u32 = 2,
+    occ_max: u32 = 6,
+    spread: u32 = 96,
+    /// Keep every drawn occurrence the palette's gap from every palette element and the others.
+    gap: bool = true,
+    /// Before the rest check a restless mineral may leach (1: drop the occurrence the contact moves)
+    /// or weather (2: trade occurrences with an endless bath of the role) until it rests; 0: neither.
+    leach: u8 = 2,
+    /// Check suites against what touches the bulk they become in P2 (true), or against the
+    /// painter's whole ground vocabulary (false; slower, about 4 points more suites of their own).
+    bulk: bool = true,
     /// Differentiation sweeps at most.
     sweeps: u32 = 48,
     /// Least colour spread of a suite before it falls back to the palette.
     colour_min: u16 = 60,
     /// Heat at which a glowing suite lights its body.
     h_glow: f64 = 1.5,
+    /// Heat at which a crust melts into the palette's emissive magma.
+    h_melt: f64 = 2.0,
     /// Air retention: air stays when g·R ≥ β·T·(1 + loss).
     beta: f64 = 2.6e4,
     /// Most bodies a universe keeps.
@@ -309,6 +343,8 @@ pub struct Body {
     pub density: f64,
     pub seed: u32,
     pub comp: [i8; 4],
+    /// The painter ground its suite was checked against.
+    pub ground: Ground,
     pub traits: Traits,
     pub history: History,
 }
@@ -380,6 +416,8 @@ pub struct Universe {
     pub fell: u32,
     pub out_of_bounds: u32,
     pub capped: u32,
+    /// Bodies whose final traits pick another painter than the ground their suite was checked in.
+    pub unsettled: u32,
     pub storage: Storage,
     pub time: Timings,
 }
@@ -388,33 +426,46 @@ pub struct Universe {
 struct Suites {
     base: Element,
     seed: u32,
-    keys: Vec<[i8; 4]>,
+    /// What each composition is made of, and the milliseconds that took.
+    found: Vec<(Found, f64)>,
+    keys: Vec<([i8; 4], Ground)>,
     list: Vec<Suite>,
+    /// Milliseconds each suite took (its composition's [`Found`] counted once, with the first).
     ms: Vec<f64>,
     /// Wall-clock milliseconds spent finding suites.
     wall: f64,
 }
 
+/// One suite to find: its composition, whether its [`Found`] is already known, and its ground.
+type Job<'a> = ([i8; 4], Option<&'a Found>, Vec<Ground>);
+
 impl Suites {
-    fn of(&mut self, law: &Law, comp: [i8; 4], p: &Params) -> usize {
-        if let Some(k) = self.keys.iter().position(|&c| c == comp) {
-            return k;
-        }
-        let t = Instant::now();
-        self.list.push(minerals::suite(law, self.base, comp, suite_seed(self.seed, comp), p));
-        self.ms.push(ms(t));
-        self.wall += ms(t);
-        self.keys.push(comp);
-        self.list.len() - 1
+    fn new(base: Element, seed: u32) -> Self {
+        Suites { base, seed, found: Vec::new(), keys: Vec::new(), list: Vec::new(), ms: Vec::new(), wall: 0.0 }
     }
 
-    /// Find the suites of `keys` that are missing, on up to `threads` threads (each suite is a pure
+    fn of(&mut self, law: &Law, comp: [i8; 4], ground: Ground, p: &Params) -> usize {
+        match self.keys.iter().position(|&k| k == (comp, ground)) {
+            Some(k) => k,
+            None => {
+                self.prefetch(law, &[(comp, ground)], p, 1);
+                self.keys.len() - 1
+            }
+        }
+    }
+
+    /// Find the suites of `keys` that are missing, on up to `threads` threads (each is a pure
     /// function of its key, so the order they are found in changes nothing).
-    fn prefetch(&mut self, law: &Law, keys: &[[i8; 4]], p: &Params, threads: usize) {
-        let mut todo: Vec<[i8; 4]> = Vec::new();
-        for &k in keys {
-            if !self.keys.contains(&k) && !todo.contains(&k) {
-                todo.push(k);
+    fn prefetch(&mut self, law: &Law, keys: &[([i8; 4], Ground)], p: &Params, threads: usize) {
+        let mut todo: Vec<([i8; 4], Vec<Ground>)> = Vec::new();
+        for &(comp, ground) in keys {
+            if self.keys.contains(&(comp, ground)) {
+                continue;
+            }
+            match todo.iter_mut().find(|(c, _)| *c == comp) {
+                Some((_, grounds)) if !grounds.contains(&ground) => grounds.push(ground),
+                Some(_) => {}
+                None => todo.push((comp, vec![ground])),
             }
         }
         if todo.is_empty() {
@@ -422,28 +473,50 @@ impl Suites {
         }
         let t = Instant::now();
         let (base, seed) = (self.base, self.seed);
-        let chunk = todo.len().div_ceil(threads.max(1));
-        let found: Vec<Vec<(Suite, f64)>> = std::thread::scope(|s| {
-            let jobs: Vec<_> = todo
+        let jobs: Vec<Job> = todo
+            .into_iter()
+            .map(|(comp, grounds)| (comp, self.found.iter().find(|(f, _)| f.comp == comp).map(|(f, _)| f), grounds))
+            .collect();
+        let chunk = jobs.len().div_ceil(threads.max(1));
+        type Done = ([i8; 4], Option<(Found, f64)>, Vec<(Ground, Suite, f64)>);
+        let done: Vec<Done> = std::thread::scope(|s| {
+            let handles: Vec<_> = jobs
                 .chunks(chunk)
                 .map(|part| {
                     s.spawn(move || {
                         part.iter()
-                            .map(|&k| {
+                            .map(|(comp, known, grounds)| {
                                 let t = Instant::now();
-                                let suite = minerals::suite(law, base, k, suite_seed(seed, k), p);
-                                (suite, ms(t))
+                                let new = known.is_none().then(|| minerals::found(law, base, *comp, suite_seed(seed, *comp), p));
+                                let first = ms(t);
+                                let f = (*known).or(new.as_ref()).expect("found");
+                                let suites = grounds
+                                    .iter()
+                                    .map(|&g| {
+                                        let t = Instant::now();
+                                        (g, minerals::suite(law, f, g, p), ms(t))
+                                    })
+                                    .collect();
+                                (*comp, new.map(|f| (f, first)), suites)
                             })
-                            .collect()
+                            .collect::<Vec<Done>>()
                     })
                 })
                 .collect();
-            jobs.into_iter().map(|j| j.join().expect("a suite thread")).collect()
+            handles.into_iter().flat_map(|h| h.join().expect("a suite thread")).collect()
         });
-        for (k, (suite, each)) in todo.into_iter().zip(found.into_iter().flatten()) {
-            self.keys.push(k);
-            self.list.push(suite);
-            self.ms.push(each);
+        for (comp, new, suites) in done {
+            let mut extra = 0.0;
+            if let Some((f, first)) = new {
+                extra = first;
+                self.found.push((f, first));
+            }
+            for (g, suite, each) in suites {
+                self.keys.push((comp, g));
+                self.list.push(suite);
+                self.ms.push(each + extra);
+                extra = 0.0;
+            }
         }
         self.wall += ms(t);
     }
@@ -457,7 +530,7 @@ impl Suites {
     fn push(&mut self, s: Suite) -> usize {
         self.list.push(s);
         self.ms.push(0.0);
-        self.keys.push([i8::MIN; 4]);
+        self.keys.push(([i8::MIN; 4], Ground::Face));
         self.list.len() - 1
     }
 }
@@ -596,7 +669,7 @@ fn expand(ws: &mut Vec<Work>, suites: &mut Suites, law: &Law, p: &Params) {
         for k in 0..2 {
             parts[k].b.mass = pair.masses[k];
             parts[k].b.comp = pair.comps[k];
-            parts[k].suite = suites.of(law, key(pair.comps[k]), p);
+            parts[k].suite = suites.of(law, key(pair.comps[k]), Ground::Face, p);
             parts[k].shape(&suites.list[parts[k].suite]);
         }
         let rho = [0, 1].map(|k| suites.list[parts[k].suite].density);
@@ -608,8 +681,9 @@ fn expand(ws: &mut Vec<Work>, suites: &mut Suites, law: &Law, p: &Params) {
             let side = (if k == 0 { -pair.masses[1] } else { pair.masses[0] }) / total;
             parts[k].b.pos[pair.axis] = com[pair.axis] + pair.sign * sep * side;
         }
+        // The heavier part keeps the index (a start world split from a pair is its heavier part).
         let j = ws.len();
-        let [a, mut b] = parts;
+        let [a, mut b] = if pair.masses[0] >= pair.masses[1] { parts } else { let [x, y] = parts; [y, x] };
         b.partner = Some(i);
         ws[i] = a;
         ws[i].partner = Some(j);
@@ -620,7 +694,7 @@ fn expand(ws: &mut Vec<Work>, suites: &mut Suites, law: &Law, p: &Params) {
 /// Satellites must dominate their own surface: each body (lightest first) is a satellite of the
 /// heavier body pulling hardest at its centre if its own surface pull is at least `k_dom` times
 /// that body's pull there; otherwise it falls onto it. Repeats until stable. Returns the falls.
-fn hierarchy(ws: &mut [Work], suites: &mut Suites, law: &Law, p: &Params, start: usize) -> u32 {
+fn hierarchy(ws: &mut [Work], suites: &mut Suites, law: &Law, p: &Params, start: usize, grounds: &[Ground]) -> u32 {
     let mut falls = 0;
     loop {
         let mut order: Vec<usize> = (0..ws.len()).filter(|&i| ws[i].alive).collect();
@@ -640,7 +714,7 @@ fn hierarchy(ws: &mut [Work], suites: &mut Suites, law: &Law, p: &Params, start:
             ws[i].parent = parent.map(|(_, c)| c);
             let Some((_, c)) = parent else { continue };
             if i != start {
-                let own = suites.of(law, key(ws[i].b.comp), p);
+                let own = suites.of(law, key(ws[i].b.comp), grounds[i], p);
                 ws[i].suite = own;
                 ws[i].shape(&suites.list[own]);
                 if ws[i].half < OWN_SUITE_HALF && ws[i].partner.is_none() {
@@ -657,7 +731,7 @@ fn hierarchy(ws: &mut [Work], suites: &mut Suites, law: &Law, p: &Params, start:
                 ws[i].alive = false;
                 falls += 1;
                 if c != start {
-                    let k = suites.of(law, key(ws[c].b.comp), p);
+                    let k = suites.of(law, key(ws[c].b.comp), grounds[c], p);
                     ws[c].suite = k;
                     ws[c].shape(&suites.list[k]);
                 }
@@ -678,7 +752,7 @@ fn start_suite(law: &Law, suites: &mut Suites, p: &Params, comp: [f64; 4], tries
         let h = hash32_3(seed, tries as i32, a as i32, 0, 0x5A17);
         comp[a] + if tries == 0 { 0.0 } else { (h % 65) as f64 - 32.0 }
     });
-    suites.of(law, key(salted), p)
+    suites.of(law, key(salted), Ground::Face, p)
 }
 
 /// Three syllables or so from a seed, at most 12 letters.
@@ -767,6 +841,7 @@ struct Settled {
     fell: u32,
     out_of_bounds: u32,
     capped: u32,
+    unsettled: u32,
     rings: u32,
     debris: f64,
 }
@@ -804,12 +879,17 @@ fn settle(
     let mut scale = m_s / ws[start].b.mass;
     let mut calibration = 1.0;
     let (mut fell, mut out_of_bounds, mut capped, mut lost) = (0, 0, 0, 0.0);
+    // Each body's suite is checked against the ground of the painter its traits pick, and the
+    // traits read the suite: start from the face painter's ground and settle both together.
+    let mut grounds = vec![Ground::Face; ws.len()];
     for round in 0..CALIBRATIONS {
-        calibration *= scale;
-        for w in ws.iter_mut() {
-            w.b.mass *= scale;
-            if let Some(pair) = &mut w.b.pair {
-                pair.masses = pair.masses.map(|m| m * scale);
+        if scale != 1.0 {
+            calibration *= scale;
+            for w in ws.iter_mut() {
+                w.b.mass *= scale;
+                if let Some(pair) = &mut w.b.pair {
+                    pair.masses = pair.masses.map(|m| m * scale);
+                }
             }
         }
         if round == 0 {
@@ -834,30 +914,35 @@ fn settle(
                     lost += ws[i].b.mass;
                 }
             }
-            let keys: Vec<[i8; 4]> = (0..ws.len())
+            let keys: Vec<([i8; 4], Ground)> = (0..ws.len())
                 .filter(|&i| ws[i].alive && i != start)
                 .flat_map(|i| match &ws[i].b.pair {
                     Some(pair) => vec![key(pair.comps[0]), key(pair.comps[1])],
                     None => vec![key(ws[i].b.comp)],
                 })
+                .map(|k| (k, Ground::Face))
                 .collect();
             suites.prefetch(law, &keys, p, threads);
             expand(&mut ws, suites, law, p);
+            grounds.resize(ws.len(), Ground::Face);
         }
-        for i in 0..ws.len() {
-            if ws[i].alive {
-                let k = if i == start { s_suite } else { suites.of(law, key(ws[i].b.comp), p) };
-                ws[i].suite = k;
-                ws[i].shape(&suites.list[k]);
-            }
-        }
+        assign(&mut ws, suites, law, p, start, s_suite, &grounds);
         let before = ws[start].b.mass;
-        fell += hierarchy(&mut ws, suites, law, p, start);
-        if ws[start].b.mass == before {
+        fell += hierarchy(&mut ws, suites, law, p, start, &grounds);
+        let next = grounds_of(&ws, start, &lite(&ws, start, r_s, suites, p));
+        let changed = next != grounds;
+        if changed {
+            let keys: Vec<([i8; 4], Ground)> =
+                (0..ws.len()).filter(|&i| ws[i].alive && i != start).map(|i| (key(ws[i].b.comp), next[i])).collect();
+            suites.prefetch(law, &keys, p, threads);
+            grounds = next;
+        }
+        scale = if ws[start].b.mass == before { 1.0 } else { m_s / ws[start].b.mass };
+        if !changed && scale == 1.0 {
             break;
         }
-        scale = m_s / ws[start].b.mass;
     }
+    assign(&mut ws, suites, law, p, start, s_suite, &grounds);
     // The last resort (`rock`) is accepted as it is.
     let last = tries > START_TRIES;
     if ws[start].layout.form != Form::Round && !last {
@@ -891,11 +976,24 @@ fn settle(
         ws[light].alive = false;
         fell += 1;
         if root != start {
-            let k = suites.of(law, key(ws[root].b.comp), p);
+            let k = suites.of(law, key(ws[root].b.comp), grounds[root], p);
             ws[root].suite = k;
             ws[root].shape(&suites.list[k]);
         }
     }
+    // The spawn contract holds the start world's mass: a last fall onto it rescales the universe.
+    if ws[start].b.mass != m_s {
+        let f = m_s / ws[start].b.mass;
+        calibration *= f;
+        for w in ws.iter_mut() {
+            w.b.mass *= f;
+        }
+        ws[start].b.mass = m_s;
+        assign(&mut ws, suites, law, p, start, s_suite, &grounds);
+    }
+    let traits = lite(&ws, start, r_s, suites, p);
+    let settled_grounds = grounds_of(&ws, start, &traits);
+    let unsettled = (0..ws.len()).filter(|&i| ws[i].alive && settled_grounds[i] != grounds[i]).count() as u32;
     let mut keep: Vec<usize> = (0..ws.len()).filter(|&i| ws[i].alive).collect();
     // Ids by (rank, distance to the start world).
     let rank = |i: usize| {
@@ -914,37 +1012,10 @@ fn settle(
         rank(a).cmp(&rank(b)).then(dist(ws[a].b.pos, origin).total_cmp(&dist(ws[b].b.pos, origin))).then(a.cmp(&b))
     });
     let id_of = |i: usize| keep.iter().position(|&k| k == i).map(|k| k as u16);
-    // Traits.
-    let radius = |i: usize| if i == start { r_s } else { ws[i].radius() };
-    let heat_raw = |i: usize| {
-        let s = &suites.list[ws[i].suite];
-        let emissive = s.minerals.iter().filter(|m| m.emission > 0).count() as f64 / s.minerals.len() as f64;
-        G * ws[i].b.mass / radius(i) + ws[i].b.heat_in + E_RAD * emissive
-    };
-    let heat0 = heat_raw(start);
-    let heat: Vec<f64> = keep.iter().map(|&i| heat_raw(i) / heat0).collect();
-    let glow: Vec<bool> = keep.iter().zip(&heat).map(|(&i, &h)| suites.list[ws[i].suite].glow && h >= p.h_glow).collect();
     let mut bodies = Vec::with_capacity(keep.len());
     for (k, &i) in keep.iter().enumerate() {
-        let w = &ws[i];
+        let (w, t) = (&ws[i], &traits[i]);
         let s = &suites.list[w.suite];
-        let r = radius(i);
-        let g = if i == start { G * w.b.mass / (r * r) } else { w.surface_pull(s) };
-        let irr: f64 = keep
-            .iter()
-            .enumerate()
-            .filter(|&(j, &o)| glow[j] && o != i && ws[o].system == w.system)
-            .map(|(j, &o)| {
-                let d = dist(w.b.pos, ws[o].b.pos);
-                heat[j] * radius(o) * radius(o) * window(d) / (d * d)
-            })
-            .sum();
-        let bare = T_BASE + T_HEAT * heat[k] + T_IRR * irr;
-        let air = g * r >= p.beta * bare * (1.0 + (heat[k] - 1.0).max(0.0));
-        let temp = bare + if air { GREENHOUSE } else { 0.0 };
-        let wet = if air { s.classes[3] } else { 0.0 };
-        let comfort = (1.0 - ((temp - T_HOME) / COMFORT) * ((temp - T_HOME) / COMFORT)).max(0.0);
-        let life = comfort * wet * s.classes[2];
         let seed_b = hash32_3(seed, w.system as i32, i as i32, 0, 0xB0D1);
         let form = if i == start { Form::Round } else { w.layout.form };
         bodies.push(Body {
@@ -952,10 +1023,11 @@ fn settle(
             system: w.system,
             centre: w.b.pos.map(|v| (v / 16.0).round() as i64 * 16),
             half: (w.half / 16.0).round() as i64 * 16,
-            radius: if form == Form::Round { (r / 16.0).round() as i64 * 16 } else { 0 },
+            radius: if form == Form::Round { (t.radius / 16.0).round() as i64 * 16 } else { 0 },
             density: s.density,
             seed: seed_b,
             comp: key(w.b.comp),
+            ground: grounds[i],
             traits: Traits {
                 rank: rank(i),
                 form,
@@ -965,13 +1037,13 @@ fn settle(
                 yield_stress: s.yield_stress,
                 pi_g: w.pi,
                 pi_clamped: w.layout.clamped,
-                gravity: g as f32,
-                heat: (heat[k] * 256.0).clamp(0.0, 65_535.0) as u16,
-                glow: glow[k],
-                air_top: air.then(|| (AIR_SCALE * temp / g).min(AIR_MAX) as i32),
-                temp: temp.clamp(-32_768.0, 32_767.0) as i16,
-                wet: (wet * 255.0) as u8,
-                life: (life * 255.0) as u8,
+                gravity: t.g as f32,
+                heat: (t.heat * 256.0).clamp(0.0, 65_535.0) as u16,
+                glow: t.glow,
+                air_top: t.air.then(|| (AIR_SCALE * t.temp / t.g).min(AIR_MAX) as i32),
+                temp: t.temp.clamp(-32_768.0, 32_767.0) as i16,
+                wet: (t.wet * 255.0) as u8,
+                life: (t.life * 255.0) as u8,
                 suite: w.suite as u16,
                 name: name(seed_b),
             },
@@ -1003,9 +1075,100 @@ fn settle(
         fell,
         out_of_bounds,
         capped,
+        unsettled,
         rings,
         debris: debris_mass,
     })
+}
+
+/// Give every live body the suite of its composition in its ground (the start world keeps its own)
+/// and the shape that suite asks for.
+fn assign(ws: &mut [Work], suites: &mut Suites, law: &Law, p: &Params, start: usize, s_suite: usize, grounds: &[Ground]) {
+    for i in 0..ws.len() {
+        if ws[i].alive {
+            let k = if i == start { s_suite } else { suites.of(law, key(ws[i].b.comp), grounds[i], p) };
+            ws[i].suite = k;
+            ws[i].shape(&suites.list[k]);
+        }
+    }
+}
+
+/// What the traits read, per body.
+#[derive(Clone, Copy, Debug, Default)]
+struct Lite {
+    radius: f64,
+    g: f64,
+    heat: f64,
+    glow: bool,
+    air: bool,
+    temp: f64,
+    wet: f64,
+    life: f64,
+}
+
+/// The traits of every live body (indexed like `ws`).
+///
+/// Life and glow (a modelling choice): a body glows when its heat reaches `h_glow` and either its
+/// suite glows or the heat reaches `h_melt`, where its crust melts into the palette's emissive
+/// magma. Life is comfort × wetness × organics; a body with air in the temperate band carries the
+/// palette's organic ground roles (soil, moss, timber), [`ORGANICS`] of its surface, whatever its
+/// suite holds.
+fn lite(ws: &[Work], start: usize, r_s: f64, suites: &Suites, p: &Params) -> Vec<Lite> {
+    let radius = |i: usize| if i == start { r_s } else { ws[i].radius() };
+    let heat_raw = |i: usize| {
+        let s = &suites.list[ws[i].suite];
+        let emissive = s.minerals.iter().filter(|m| m.emission > 0).count() as f64 / s.minerals.len() as f64;
+        G * ws[i].b.mass / radius(i) + ws[i].b.heat_in + E_RAD * emissive
+    };
+    let heat0 = heat_raw(start);
+    let mut out = vec![Lite::default(); ws.len()];
+    for i in (0..ws.len()).filter(|&i| ws[i].alive) {
+        let heat = heat_raw(i) / heat0;
+        out[i].heat = heat;
+        out[i].glow = heat >= p.h_glow && (suites.list[ws[i].suite].glow || heat >= p.h_melt);
+        out[i].radius = radius(i);
+    }
+    for i in (0..ws.len()).filter(|&i| ws[i].alive) {
+        let (w, s) = (&ws[i], &suites.list[ws[i].suite]);
+        let r = out[i].radius;
+        let g = if i == start { G * w.b.mass / (r * r) } else { w.surface_pull(s) };
+        let irr: f64 = (0..ws.len())
+            .filter(|&o| ws[o].alive && out[o].glow && o != i && ws[o].system == w.system)
+            .map(|o| {
+                let d = dist(w.b.pos, ws[o].b.pos);
+                out[o].heat * out[o].radius * out[o].radius * window(d) / (d * d)
+            })
+            .sum();
+        let heat = out[i].heat;
+        let bare = T_BASE + T_HEAT * heat + T_IRR * irr;
+        let air = g * r >= p.beta * bare * (1.0 + (heat - 1.0).max(0.0));
+        let temp = bare + if air { GREENHOUSE } else { 0.0 };
+        let wet = if air { s.classes[3] } else { 0.0 };
+        let comfort = (1.0 - ((temp - T_HOME) / COMFORT) * ((temp - T_HOME) / COMFORT)).max(0.0);
+        let temperate = air && (TEMPERATE.0..=TEMPERATE.1).contains(&temp);
+        let organics = if temperate { s.classes[2].max(ORGANICS) } else { s.classes[2] };
+        out[i] = Lite { g, air, temp, wet, life: comfort * wet * organics, ..out[i] };
+    }
+    out
+}
+
+/// The painter each live body gets (design P2): the start world and cubes the face painter, round
+/// bodies Ember when they glow, Verdant when they carry life, Moon otherwise.
+fn grounds_of(ws: &[Work], start: usize, traits: &[Lite]) -> Vec<Ground> {
+    (0..ws.len())
+        .map(|i| {
+            let t = &traits[i];
+            if i == start || !ws[i].alive || ws[i].layout.form != Form::Round {
+                Ground::Face
+            } else if t.glow {
+                Ground::Ember
+            } else if t.air && t.life > 0.0 {
+                Ground::Verdant
+            } else {
+                Ground::Moon
+            }
+        })
+        .collect()
 }
 
 /// The nebula seed of a universe seed after `resalt` interest re-salts (all 64 bits count).
@@ -1026,8 +1189,7 @@ impl Universe {
             let neb = Nebula::new(s, cfg, p, threads);
             time.nebula += ms(t);
             let t = Instant::now();
-            let mut suites =
-                Suites { base: neb.base, seed: s, keys: Vec::new(), list: Vec::new(), ms: Vec::new(), wall: 0.0 };
+            let mut suites = Suites::new(neb.base, s);
             let rock = minerals::role_suite(&law, "rock");
             let scale = p.origin_share * M_HOME / neb.systems[0].mass;
             let mut protos: Vec<(u16, Proto)> = Vec::new();
@@ -1072,6 +1234,7 @@ impl Universe {
                     fell: settled.fell,
                     out_of_bounds: settled.out_of_bounds,
                     capped: settled.capped,
+                    unsettled: settled.unsettled,
                     storage,
                     time,
                 };

@@ -127,7 +127,7 @@ impl Raw {
 
     /// A move with a level body: identity frame, up +Y, standing, facing yaw 0.
     fn walk(&mut self, pos: DVec3, velocity: Vec3) {
-        self.send(&ClientMessage::Move {
+        self.send(&ClientMessage::Move { pose: protocol::Pose {
             pos,
             yaw: 0.0,
             pitch: 0.0,
@@ -135,7 +135,7 @@ impl Raw {
             velocity,
             up: Face::PosY,
             stance: Stance::Standing,
-        });
+        } });
     }
 
     fn mod_data(&mut self, channel: &str, seq: u32, bytes: &[u8]) {
@@ -534,7 +534,7 @@ fn a_move_reaches_a_near_peer_on_the_next_tick_within_the_quantisation_bound() {
         let stance = if i % 2 == 1 { Stance::Sneaking } else { Stance::Standing };
         let mark = bob.mark();
         let sent = Instant::now();
-        ada.send(&ClientMessage::Move { pos, yaw, pitch, frame, velocity, up, stance });
+        ada.send(&ClientMessage::Move { pose: protocol::Pose { pos, yaw, pitch, frame, velocity, up, stance } });
         let at = bob.wait(mark, "ada's move", |m| matches!(m, ServerMessage::PeerPoses { .. }));
         let poses = bob.poses(mark, at + 1, ada.id);
         assert_eq!(poses.len(), 1, "move {i}: the next frame carries ada once");
@@ -1033,7 +1033,7 @@ fn forged_moves_are_refused_and_never_reach_a_peer() {
     liar.walk(DVec3::new(1.5e9, home.y, home.z), Vec3::ZERO);
     liar.walk(DVec3::new(f64::NAN, home.y, home.z), Vec3::ZERO);
     liar.walk(home + DVec3::new(1.0, 0.0, 0.0), Vec3::new(f32::INFINITY, 0.0, 0.0));
-    liar.send(&ClientMessage::Move {
+    liar.send(&ClientMessage::Move { pose: protocol::Pose {
         pos: home + DVec3::new(1.0, 0.0, 0.0),
         yaw: f32::NAN,
         pitch: 0.0,
@@ -1041,7 +1041,7 @@ fn forged_moves_are_refused_and_never_reach_a_peer() {
         velocity: Vec3::ZERO,
         up: Face::PosY,
         stance: Stance::Standing,
-    });
+    } });
     let end = liar.sync();
     let answers: Vec<DVec3> =
         liar.log[mark..end].iter().filter(|(_, m)| is_position(m)).map(|(_, m)| position(m)).collect();
@@ -1404,7 +1404,7 @@ fn a_peer_turning_round_is_drawn_turning_the_short_way() {
     let ada_id = ada.id;
     let home = ada.spawn;
     let to = home + DVec3::new(0.5, 0.0, 0.0);
-    let facing = |pos: DVec3, yaw: f32| ClientMessage::Move {
+    let facing = |pos: DVec3, yaw: f32| ClientMessage::Move { pose: protocol::Pose {
         pos,
         yaw,
         pitch: 0.0,
@@ -1412,7 +1412,7 @@ fn a_peer_turning_round_is_drawn_turning_the_short_way() {
         velocity: Vec3::ZERO,
         up: Face::PosY,
         stance: Stance::Standing,
-    };
+    } };
     let latest_yaw = |c: &Connection| peer(c, ada_id).sample(Instant::now() + Duration::from_secs(3600)).yaw;
     ada.send(&facing(home, 3.0));
     poll_until(&mut bob, "ada facing one way", |c, _| {

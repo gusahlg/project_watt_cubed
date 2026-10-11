@@ -4,9 +4,10 @@ The smallest useful PWC mod, kept in the game repository as a living example of 
 (`crates/pwc-mod-api`). It adds one HUD line in the top-right corner that counts the blocks you
 broke this session.
 
-- **Controls:** none. Toggle it on the Mods screen.
+- **Controls:** none. It is in a build when the instance has it (`pwc mod add`), and runs there.
 - **Persisted state:** none.
-- **Dependencies:** none besides the mod API (`pwc-api ^2.0`).
+- **Dependencies:** none besides the mod API (`pwc-api ^3.0`). Its test uses
+  `pwc_mod_api::testing::Harness`.
 
 Try it with the PWC package manager:
 

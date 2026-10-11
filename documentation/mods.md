@@ -35,10 +35,16 @@ mod's own source keeps its licence.
 
 `src/modding/build.rs`:
 
-- `ModDescriptor { id, name, version, register }` — one compiled-in package: its `mod.toml`
-  identity and its entry point `fn register(&mut ModRegistrar)`.
+- `PackageInfo { id, name, version, description, kind, dependencies, register }` — one
+  compiled-in package of any `PackageKind` (`Mod`, `Library`, `Bundle`): its `mod.toml` identity,
+  its direct dependencies from the lock (a bundle's are its members), and for a mod its entry
+  point `fn register(&mut ModRegistrar)`. Libraries and bundles have `register: None`.
 - `GameBuild` — the packages of one build in registration (dependency) order, plus the
-  environment hash of the `pwc.lock` it came from. `GameBuild::vanilla()` has no packages.
+  environment hash of the `pwc.lock` it came from. Generated builds use
+  `GameBuild::from_static(ENVIRONMENT, PACKAGES)`; `GameBuild::vanilla()` has no packages.
+  `GameBuild::info()` is the read-only `BuildInfo` (`packages()`, `package(id)`, `environment()`).
+- `ModDescriptor { id, name, version, register }` with `GameBuild::with_mod` is the 2.x shorthand
+  for a mod package with no description and no dependencies; tests still use it.
 - `project_watt_cubed::run(build)` starts the game; `harness::golden_main(build)` runs the
   golden-shot harness for that build (blessed images in `WATT_GOLDEN_DIR`, default
   `tests/golden`).
@@ -52,31 +58,44 @@ fn main() {
 }
 ```
 
-where `game_build()` lists every package of the lock. Nothing scans directories or loads code at
-run time; disabled mods cost nothing.
+where `game_build()` lists every package of the lock, of every kind. Nothing scans directories or
+loads code at run time. The build decides which mods are in: there is no switch in the game.
 
 ## Registration
 
-`Mods::from_build(&build)` calls each package's `register` in order. The `ModRegistrar` it gets:
+`Mods::from_build(&build, &mut options)` calls the `register` of each package that has one, in
+order; the options the packages declare go into the app's `Options`, beside the settings. The
+`ModRegistrar` it gets:
 
-- `add(m)` / `add_disabled(m)` install a value implementing `Mod` (the player's `mods.cfg` choice
-  still wins at load);
-- `declare_group(group)` adds a section to the Mods screen (`ESSENTIALS` is well known);
+- `add(m)` installs a value implementing `Mod`; it runs for as long as the build has it;
+- `option(spec)` declares a tunable in the core's options registry and returns its `OptionId`
+  (see [Options](#options));
+- `screen_entry(entry)` offers a screen on the main menu and/or the pause screen (see
+  [Screens](#screens));
 - `provide(handle)` / `get::<T>()` share values between packages during registration — a package
-  reads what its dependencies provided (the inventory reads the hotbar's shared state this way).
+  reads what its dependencies provided (the inventory reads the hotbar's shared state this way);
+- `package()` is the package being registered, and `build()` the whole build as a `BuildInfo`:
+  every package of every kind, including those registered later. A package that shows what is
+  installed copies what it needs here (`PackageInfo` is `Copy`); `pwc_mod_api::bundles_of`
+  works out bundle membership from the bundles' dependency lists. The core names no package.
 
 ## The `Mod` trait
 
-`Mod` methods default to no-ops; a mod implements only `name`, `id` and the hooks it needs. When
-several enabled mods implement a hook:
+`Mod` methods default to no-ops; a mod implements only `id` and the hooks it needs (`name`
+defaults to the id and is only for logs and saves older than ids). A mod is *active* unless the
+core suspended its package for the session (see [Suspension](#suspension)). When several active
+mods implement a hook:
 
-- Fan-out, in installation order: `update`, `on_toggle_fly`, `on_block_break`, `on_break_rejected`,
-  `on_place_rejected`, `on_tool_changed`, `on_tool_used`, `on_game_event`, `on_audio`. `hud` uses the same order as z-order (later draws on
-  top), and `commands` lists concatenate in it. `actions` are collected from every enabled mod.
-  `on_audio` runs every frame, menus included.
-- First enabled wins: `menu_theme`, `start_screen`, `close_overlay` (first `true`), `tool`,
-  `namer`, `appearance`, `worldgen`, `worldgen_config`, `run_command` (first `Some`).
-- Compose: `visual_group` bits OR into the render mask.
+- Fan-out, in installation order: `update`, `on_frame`, `on_message`, `on_block_break`,
+  `on_break_rejected`, `on_place_rejected`, `on_tool_changed`, `on_tool_used`, `on_game_event`,
+  `on_audio`. `hud` uses the same order as z-order (later draws on top). `actions` are collected
+  from every active mod. `on_audio` runs every frame, menus included. `on_options` reaches every
+  mod, suspended ones too.
+- First active wins: `close_overlay` (first `true`), `root_screen`, `pause_screen`, `tool`,
+  `namer`, `appearance`, `worldgen`, `worldgen_config` (first `Some`). The keyboard capture belongs
+  to the first mod that asks until it gives it back or Escape ends it.
+- Compose: `visual_group` bits OR into the render mask: a lane is allowed when an installed,
+  unsuspended package provides its group.
 
 `tool` names the configuration a primary action applies (a left click uses it, a right click
 places it). With no mod answering, there is no tool and the primary action breaks the block into
@@ -93,36 +112,100 @@ future one will show, and rebinding is left for later. HUD output is data
 `note_block_moved(from, to)`). Chunk load, generation, meshing and saving never wake anything; on
 a client connected to a server the authority runs the scheduler.
 
-The core has no console commands and no flight toggle of its own. `run_command(ctx, cmd, args)`
-handles a console line (its default asks the context-free `command(cmd, args)`) with the player,
-world, settings and sky in a `CommandContext`; the core follows up on what changed (applies and
-saves changed settings, re-mixes the audio, sends a changed clock to the server, streams a moved
-player's destination and reports it as a teleport). `commands()` lists a mod's commands for
-`/help` and Tab completion; a line no enabled mod handles gets a short hint. `on_toggle_fly(ctx)`
-receives the flight key (`F`), latched and replayed at the mod tick like the other edges. The
-Developer Toolkit package (`pwc.dev-toolkit`) provides the commands and flight.
+The core has no console, no commands and no flight key of its own. `on_frame(ctx)` runs every
+in-world frame with the immediate actions, the keyboard capture (`FrameContext::capture_text`) and
+the game state in a `GameContext`; the core follows up on what it changed (applies and saves
+changed settings, re-mixes the audio, sends a changed clock to the server, streams a moved
+player's destination and reports it as a teleport). `on_message` hands over chat lines, joins,
+leaves and the core's notices. `pwc.chat`, `pwc.commands` and `pwc.dev-toolkit` provide the chat,
+the commands and flight on top of them.
 
-`id()` is a stable key: `mods.cfg` lines (`id=on|off`, `id.state=` knob payloads) and world saves
-(per-mod `save_state`) are keyed by it.
+`id()` is a stable key: world saves (per-mod `save_state`) are keyed by it.
+
+## Suspension
+
+The only runtime state a mod has is whether its package is suspended. A server that refuses a
+package lets the client join with it suspended for that session (`Mods::suspend_packages`, undone
+by `resume_packages` on leaving); benchmarks pin it with `WATT_BENCH_SUSPEND=<ids>`, and
+`WATT_BENCH_VISUALS=core` suspends every package that provides a visual group. A suspended mod's
+hooks do not run, its actions and screen entries are gone, and `Hello` does not report it (`Hello`
+reports every package of kind mod that is not suspended). Suspension is never saved and has no UI;
+screens see it as `ScreenFacts::suspended`.
+
+## Options
+
+One core-owned registry holds every value a player may tune. The core's own settings are one
+owner, `"core"` (the `SETTINGS` table over `Settings`); a package declares more at registration:
+
+```rust
+let relief = registrar.option(
+    OptionSpec::percent("relief", "Terrain Relief", Category::World, (25, 200, 25), 100).next_world(),
+);
+registrar.add(MyWorldgen { relief, value: 100 });
+// later, in Mod::on_options(&mut self, options: &Options):
+self.value = options.int(self.relief); // by index: no strings on any frame path
+```
+
+Kinds are `toggle`, `choice`, `percent` and `float`; `next_world()` marks an option that applies to
+new worlds, and `legacy_key(k)` reads a value saved under an older key once: an old core
+`settings.cfg` key (Voice Chat reads `voice_enabled`), or a knob an older game kept in `mods.cfg`,
+flattened as `<mod-id>.state.<knob>` (InfiniteDiffusion reads `diffusion.state.relief`). The core
+reads `mods.cfg` only until `settings.cfg` records `options_format=1`, and never writes or deletes
+it. The app keeps the values beside the settings, calls `Mod::on_options` after registration, after
+loading `settings.cfg`, and whenever `Options::revision` moves, and persists them after its own keys
+as `<package-id>.<key>=`. Lines no declared option claims are kept and written back.
+
+`OptionsView` lists core settings and package options through one interface, by index (with
+`full_key`, `show`, `hint`, `step` and `parse`), so a settings screen renders both without naming a
+package and no package depends on a settings screen. A frame hook gets the same view through
+`GameContext::options_mut` (that is how `pwc.commands`' `/set` reaches every setting and option),
+and a screen through `ScreenContext::options_mut`; the core applies and saves what changed.
+
+## Screens
+
+Menus are mods; the core only hosts them (`src/screen.rs`). A `Screen` reads the core's raw
+`MenuInput` and the `ScreenFacts` (saves, session, hosting, a notice, the waiting `Phase`,
+in-world, the build's `BuildInfo`, the suspended packages, the registered entries, the visual
+mask) and answers `Stay`, `Back`, `Push(screen)`, `Open(entry id)` or `Request(AppRequest)`: new
+world, load, delete, host, join, cancel, resume, leave world, quit. It changes tunables only
+through `ScreenContext::options_mut`, so the host applies and saves them. It draws by pushing
+`UiElement`s (text and rectangles; the font is monospace, `text_width` is the metric), which the
+core renders: a mod never touches the frame.
+
+Screens reach the player through two slots and an entry registry, so no menu names another:
+
+- `Mod::root_screen(facts)`: the screen out of a world (a start screen), built each time the
+  player returns to it; it also draws the connecting and loading page from `facts.phase`.
+- `Mod::pause_screen(facts)`: opened by Esc in a world after text capture and every overlay
+  declined the key. The world keeps running and is drawn behind the screen (the screen paints a
+  translucent backdrop; `facts.in_world` is true); the game reads no input meanwhile.
+- `ModRegistrar::screen_entry(ScreenEntry { id, label, places, order, open })`: a screen offered
+  on `Places::MAIN`, `Places::PAUSE` or both. A root or pause screen lists
+  `facts.entries_for(place)` and opens one with `ScreenOutcome::Open(id)`.
 
 ## Core fallbacks (vanilla)
 
-With no mod answering a hook the core falls back to: the default menu theme and the fallback start
-screen, `FlatAppearance` (every texel the base colour), `describe` names read off the observation
+With no mod answering a hook the core falls back to: no screens at all (the game enters the most
+recent readable world, or a new one, on its first frame, settings live only in `settings.cfg`, and
+Esc saves and quits; with a root screen but no pause screen, Esc leaves the world as it always
+did), `FlatAppearance` (every texel the base colour), `describe` names read off the observation
 ("glowing clear hard solid"), the flat world generator, and no tool. The inventory still collects
 what you break; without the inventory mod it is simply not shown. The number keys select nothing
-unless the hotbar package is enabled. Without the sounds mod the game plays no cues. Without the
+unless the hotbar package is installed. Without the sounds mod the game plays no cues. Without the
 proximity-chat mod the microphone stays closed and voice is neither sent nor played.
 
 ## The mod API crate
 
 `crates/pwc-mod-api` is the one crate mods depend on. It re-exports the host types
-(`Mod`, `ModContext`, `ModRegistrar`, `GameBuild`, `ModDescriptor`, `Knob`, `Group`, …), the game
-modules mods may use (`block`, `world`, `player`, `ui`, `menu`, `settings`, `inventory`, `render_config`,
+(`Mod`, `ModContext`, `ModRegistrar`, `GameBuild`, `BuildInfo`, `PackageInfo`, `VisualMask`, …), the game
+modules mods may use (`block`, `world`, `player`, `ui`, `screen`, `settings`, `inventory`, `render_config`,
 `net`, `session`, `sim`, `input`, `derived`, `engine`, `material`, `audio`) and a `prelude`. Its version is
-the **mod API version** a package's `mod.toml` requires (`pwc-api = "^2.0"`); a breaking change to
-what it re-exports needs a major version bump. The 2.1.0 additions and the 2.0.0 breaks are listed at the top of
-`crates/pwc-mod-api/src/lib.rs`. `audio` plays cues and voice; it does not expose the device.
+the **mod API version** a package's `mod.toml` requires (`pwc-api = "^3.0"`); a breaking change to
+what it re-exports needs a major version bump. The 3.0.0 breaks (everything mods-v3 changed) and
+the earlier versions are listed at the top of `crates/pwc-mod-api/src/lib.rs`. `audio` plays cues
+and voice; it does not expose the device. Besides re-exports it has `bundles_of` and
+`testing::Harness`. The host type `Mods` is not part of the API: a mod cannot reach the other mods
+of a build.
 
 ## First-party mods
 
@@ -131,32 +214,42 @@ a package with its own README, licence (`Apache-2.0 OR MIT`) and tests:
 
 | Package | Mods (ids) |
 |---|---|
-| `pwc.menus` | `menus` — the standard menu look |
-| `pwc.start-screen` | `start` — the start screen and its Worlds page |
+| `pwc.ui-kit` | library — the menu framework, the default look and the text widgets |
+| `pwc.start-screen` | `start` — the root screen: main menu, Worlds page, forms, waiting page |
+| `pwc.settings-menu` | entry "Settings" — every core setting and package option, by page |
+| `pwc.mod-menu` | entry "Mods" — the build's packages, read-only |
+| `pwc.pause-menu` | `pause_menu` — the pause screen: Resume, pause entries, Leave World |
 | `pwc.hotbar` | `hotbar` — the selection UI along the bottom; it answers `tool` |
 | `pwc.inventory` | `inventory` — the inventory as a list, equips into the hotbar (depends on `pwc.hotbar`) |
 | `pwc.visuals` | `atmosphere`, `post`, `lighting` — the fancy render lanes |
 | `pwc.neural-textures` | `neural_textures` — per-configuration CPPN textures |
 | `pwc.material-names` | `material_names` — Markov-model names for blocks and tools |
-| `pwc.infinite-diffusion` | `diffusion` — selects the InfiniteDiffusion world generator and its knobs |
-| `pwc.game-ui` | `game_ui` — in-world HUD pieces, starting with the facing indicator |
+| `pwc.infinite-diffusion` | `diffusion` — selects the InfiniteDiffusion world generator and declares its options |
+| `pwc.game-ui` | `game_ui` — the HUD: reticle, coordinates, frame rate, players, loading and link notices, facing indicator |
+| `pwc.chat` | `chat` — the text chat on § and the scrollback of the game's messages |
+| `pwc.commands` | `commands` — slash commands (`/help`, `/set`, `/time`, audio, `/op`) and a registry for other mods' commands |
+| `pwc.chat-commands` | bundle of `pwc.chat` and `pwc.commands` |
 | `pwc.sounds` | `sounds` — footsteps, blocks, tools, swings and menu clicks |
 | `pwc.proximity-chat` | `proximity_chat` — push-to-talk voice for visible peers |
 | `pwc.essentials` | bundle of all of the above |
 
 The InfiniteDiffusion generator itself (`src/world/terrain`) stays in the core: the content
-fingerprint, the LOD far field and the saves reference it. The mod selects it and owns its knobs.
+fingerprint, the LOD far field and the saves reference it. The mod selects it and declares its
+options.
 
 ## Persistence
 
-`mods.cfg` (config root) stores a `version=` marker, `id=on|off` lines and optional `id.state=`
-knob payloads. Files from before version 2 recorded `diffusion=off` as the default of an old
-experiment; those lines are ignored. Per-world state (`save_state`) lives in the world save, keyed
-by mod id. A `pwc`-built instance has its own data directory (`WATT_DATA_DIR`), so its worlds and
-choices never mix with the vanilla build's.
+Package options live in `settings.cfg` (config root) after the core's keys, as
+`<package-id>.<key>=`. An old `mods.cfg` is read once for knob values (see [Options](#options)) and
+left on disk. Per-world state (`save_state`) lives in the world
+save, keyed by mod id. A `pwc`-built instance has its own data directory (`WATT_DATA_DIR`), so its
+worlds and settings never mix with the vanilla build's.
 
 ## Testing
 
 The core cannot link the real mods in its own tests (they depend on it), so `src/modding/testing.rs`
-provides stand-ins with the same ids, groups and the behaviours the host, menu and save tests
-exercise. Each package tests its own behaviour in the package manager repository.
+provides stand-ins with the same ids, installed under their package ids, and the behaviours the
+host and save tests exercise. Each package tests its own behaviour in the package manager
+repository through `pwc_mod_api::testing::Harness` (the packages of a build registered as the game
+registers them, with their options and the hooks as the game arbitrates them);
+`pwc_ui_kit::testing::Fixture` builds a `ScreenContext` for screen tests.
