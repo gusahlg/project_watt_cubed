@@ -2281,6 +2281,17 @@ impl TerrainGenerator for Terrain {
         self.surface_bounds(body, face, u0, v0, (u1 - u0).max(v1 - v0))
     }
 
+    fn relief_band(&self, body: u16, face: Face, u0: i32, v0: i32, span: i32) -> Option<(i32, i32)> {
+        if chart_body(body).is_some() {
+            let (index, u0, v0) = chart_storage(&self.storage, body, face, u0, v0)?;
+            if self.storage.home_index() == Some(index) {
+                return self.home_bounds(u0, v0, span);
+            }
+            return self.storage.relief_band(u0, v0, span);
+        }
+        self.surface_bounds(body, face, u0, v0, span)
+    }
+
     fn surface_bounds(&self, body: u16, face: Face, u0: i32, v0: i32, span: i32) -> Option<(i32, i32)> {
         if chart_body(body).is_some() {
             let (index, u0, v0) = chart_storage(&self.storage, body, face, u0, v0)?;

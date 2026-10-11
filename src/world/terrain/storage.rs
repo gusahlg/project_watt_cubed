@@ -181,6 +181,22 @@ struct Charted {
     /// Uniform block below band 0. Meaningful for the start world; rounds answer from their painter.
     fill: BlockId,
     boxes: Vec<(Patch, [i64; 3], [i64; 3])>,
+    /// Chunk columns `[x0, x1) × [z0, z1)` its boxes lie in: a query elsewhere skips its boxes.
+    extent: [i64; 4],
+}
+
+impl Charted {
+    fn new(round: Option<Round>, atlas: Atlas, home: bool, fill: BlockId) -> Self {
+        let boxes = boxes_of(&atlas);
+        let extent = boxes.iter().fold([i64::MAX, i64::MIN, i64::MAX, i64::MIN], |e, (_, lo, hi)| [e[0].min(lo[0]), e[1].max(hi[0]), e[2].min(lo[2]), e[3].max(hi[2])]);
+        Charted { round, atlas, home, fill, boxes, extent }
+    }
+
+    /// Whether chunk column `(cx, cz)` may lie in one of its boxes.
+    #[inline]
+    fn holds(&self, cx: i64, cz: i64) -> bool {
+        cx >= self.extent[0] && cx < self.extent[1] && cz >= self.extent[2] && cz < self.extent[3]
+    }
 }
 
 /// The round bodies of one cosmos.
@@ -224,7 +240,7 @@ impl StorageWorlds {
                 }
             };
             let (home, fill) = if need == Need::Home { (true, fills[usize::from(id)].0) } else { (false, AIR) };
-            worlds.push(Charted { boxes: boxes_of(&atlas), round, atlas, home, fill });
+            worlds.push(Charted::new(round, atlas, home, fill));
         }
         let atlases = worlds.iter().map(|w| Arc::new(w.atlas.clone())).collect();
         let cube_x0 = worlds.iter().filter_map(|w| w.atlas.grid.as_ref().map(|g| g.origin[0])).min().unwrap_or(i64::MAX);
@@ -390,7 +406,7 @@ impl StorageWorlds {
     /// The body and box holding storage chunk `c`.
     fn find(&self, c: ChunkCoord) -> Option<(&Charted, Patch, [i64; 3])> {
         let k = [c.x as i64, c.y as i64, c.z as i64];
-        self.worlds.iter().find_map(|w| {
+        self.worlds.iter().filter(|w| w.holds(k[0], k[2])).find_map(|w| {
             w.boxes
                 .iter()
                 .find(|(_, lo, hi)| (0..3).all(|a| k[a] >= lo[a] && k[a] < hi[a]))
@@ -455,7 +471,7 @@ impl StorageWorlds {
     /// `lx + lz·16`, sampling each chart's relief lattice once.
     pub fn heights_16(&self, cx: i32, cz: i32) -> [i32; CHUNK_SIZE * CHUNK_SIZE] {
         let (kx, kz) = (cx as i64, cz as i64);
-        for w in &self.worlds {
+        for w in self.worlds.iter().filter(|w| w.holds(kx, kz)) {
             for &(patch, lo, hi) in &w.boxes {
                 if kx < lo[0] || kx >= hi[0] || kz < lo[2] || kz >= hi[2] {
                     continue;
@@ -494,7 +510,7 @@ impl StorageWorlds {
         }
         let (cx, cz) = (x0.div_euclid(CS as i32) as i64, z0.div_euclid(CS as i32) as i64);
         let (rx, rz) = (i64::from(x1) - 1, i64::from(z1) - 1);
-        for w in &self.worlds {
+        for w in self.worlds.iter().filter(|w| w.holds(cx, cz)) {
             for &(patch, lo, hi) in &w.boxes {
                 if cx < lo[0] || cx >= hi[0] || cz < lo[2] || cz >= hi[2] {
                     continue;
@@ -534,7 +550,7 @@ impl StorageWorlds {
         }
         let (cx, cz) = (x0.div_euclid(CS as i32) as i64, z0.div_euclid(CS as i32) as i64);
         let (x1, z1) = (x0 as i64 + span as i64 - 1, z0 as i64 + span as i64 - 1);
-        for w in &self.worlds {
+        for w in self.worlds.iter().filter(|w| w.holds(cx, cz)) {
             for &(patch, lo, hi) in &w.boxes {
                 if cx < lo[0] || cx >= hi[0] || cz < lo[2] || cz >= hi[2] {
                     continue;
@@ -560,12 +576,47 @@ impl StorageWorlds {
         None
     }
 
+    /// [`bounds`](Self::bounds) without sampling: the most any body's surface rises above or sinks
+    /// below its datum ([`super::cosmos::RELIEF`]), plus plant reach. O(1) in the square.
+    pub fn relief_band(&self, x0: i32, z0: i32, span: i32) -> Option<(i32, i32)> {
+        if span <= 0 {
+            return None;
+        }
+        let (cx, cz) = (x0.div_euclid(CS as i32) as i64, z0.div_euclid(CS as i32) as i64);
+        let (x1, z1) = (x0 as i64 + span as i64 - 1, z0 as i64 + span as i64 - 1);
+        for w in self.worlds.iter().filter(|w| w.holds(cx, cz)) {
+            for &(patch, lo, hi) in &w.boxes {
+                if cx < lo[0] || cx >= hi[0] || cz < lo[2] || cz >= hi[2] {
+                    continue;
+                }
+                let (bx0, bx1) = (lo[0] * CS, hi[0] * CS);
+                let (bz0, bz1) = (lo[2] * CS, hi[2] * CS);
+                if (x0 as i64) < bx0 || x1 >= bx1 || (z0 as i64) < bz0 || z1 >= bz1 {
+                    return None;
+                }
+                if matches!(patch, Patch::Grid) {
+                    continue;
+                }
+                let Patch::Shell { band: 0, .. } = patch else { return None };
+                let round = Self::round_of(w);
+                let relief = super::cosmos::RELIEF as f32;
+                let (a, b) = (round.surface_of_relief(patch, -relief), round.surface_of_relief(patch, relief));
+                let y_lo = a.min(b) + lo[1] * CS;
+                let y_hi = a.max(b) + lo[1] * CS + super::round::PLANT_REACH;
+                let lo_i = y_lo.clamp(i32::MIN as i64 + 1, i32::MAX as i64 - 1) as i32;
+                let hi_i = y_hi.clamp(lo_i as i64 + 1, i32::MAX as i64) as i32;
+                return Some((lo_i, hi_i));
+            }
+        }
+        None
+    }
+
     /// Far-LOD blocks of storage column `(x, z)` at altitudes `ys` (solid below the surface, plants
     /// above, no caves). Air outside every box.
     pub fn lod_column(&self, x: i32, z: i32, ys: &[i32], out: &mut [BlockId]) {
         let n = out.len().min(ys.len());
         let (cx, cz) = (x.div_euclid(CS as i32) as i64, z.div_euclid(CS as i32) as i64);
-        for w in &self.worlds {
+        for w in self.worlds.iter().filter(|w| w.holds(cx, cz)) {
             for &(patch, lo, hi) in &w.boxes {
                 if cx < lo[0] || cx >= hi[0] || cz < lo[2] || cz >= hi[2] {
                     continue;
@@ -589,7 +640,7 @@ impl StorageWorlds {
     /// `i32::MIN` (open) outside every box. Boxes never share a column.
     pub fn surface(&self, x: i32, z: i32) -> i32 {
         let (cx, cz) = (x.div_euclid(CS as i32) as i64, z.div_euclid(CS as i32) as i64);
-        for w in &self.worlds {
+        for w in self.worlds.iter().filter(|w| w.holds(cx, cz)) {
             for &(patch, lo, hi) in &w.boxes {
                 if cx < lo[0] || cx >= hi[0] || cz < lo[2] || cz >= hi[2] {
                     continue;

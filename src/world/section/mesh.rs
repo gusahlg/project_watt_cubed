@@ -2170,7 +2170,7 @@ mod tests {
         world.adopt_fold(center);
         // The near field streaming lays out around this centre, from scratch.
         let eye = world.phys_eye(center, false);
-        world.place_near(center, eye, true);
+        world.place_near_settled(center, eye, true);
         // Every tile meshes from its patch with the clip it takes once the near chunks settle, and
         // is placed in storage, where the tiles of neighbouring charts meet.
         let (desired, clips) = world.desired_and_clips(center);

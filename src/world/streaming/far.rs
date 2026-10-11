@@ -335,6 +335,7 @@ impl World {
             horizontal: self.view.horizontal,
             mip_ready: self.section_mip.is_some(),
             near: self.near.rev,
+            bounds: self.land_bounds(),
         };
         if self.section_frontier_key != Some(key) || !self.dirty_sections.is_empty() {
             let mut leaves = Vec::new();
@@ -370,7 +371,22 @@ impl World {
     /// [`desired_sections_with`](Self::desired_sections_with) alone.
     #[cfg(test)]
     pub(in crate::world) fn desired_sections(&self, center: Coord) -> Vec<SectionPos> {
-        self.desired_sections_with(center, &mut Vec::new())
+        self.desired_sections_settled(center, &mut Vec::new())
+    }
+
+    /// [`desired_sections_with`](Self::desired_sections_with) once every tight bound it asks for
+    /// has landed: the cut a settled pass takes.
+    #[cfg(test)]
+    pub(in crate::world) fn desired_sections_settled(&self, center: Coord, leaves: &mut Vec<Leaf>) -> Vec<SectionPos> {
+        for _ in 0..64 {
+            let out = self.desired_sections_with(center, leaves);
+            if !self.bounds_pending() {
+                return out;
+            }
+            super::headless::finish_samples(self);
+            self.land_bounds();
+        }
+        panic!("the cut's tight bounds never settled")
     }
 
     /// The cut around far centre `center` and the clip each tile takes once every near column's
@@ -378,7 +394,7 @@ impl World {
     #[cfg(test)]
     pub(in crate::world) fn desired_and_clips(&self, center: Coord) -> (Vec<SectionPos>, FastMap<SectionPos, ColumnClip>) {
         let mut leaves = Vec::new();
-        let desired = self.desired_sections_with(center, &mut leaves);
+        let desired = self.desired_sections_settled(center, &mut leaves);
         let clips = self
             .wanted_clips(&leaves)
             .into_iter()

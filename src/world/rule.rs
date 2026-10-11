@@ -31,10 +31,10 @@ const HORIZON_DOUBLINGS: i32 = 8;
 
 /// Widest tile whose terrain bounds are read from the sampled surface rather than the generator's
 /// band: nearer tiles need tight boxes, farther ones are cheap to over-split.
-const TIGHT_SPAN: i32 = 256;
+pub(in crate::world) const TIGHT_SPAN: i32 = 256;
 
 /// Widest tile whose surface is sampled itself; a wider tight one joins its quarters.
-const SAMPLED_SPAN: i32 = 64;
+pub(in crate::world) const SAMPLED_SPAN: i32 = 64;
 
 /// Side of the physical cell the eye is measured from.
 pub(in crate::world) const EYE_CELL: f64 = 16.0;
@@ -146,30 +146,64 @@ impl World {
         Some((lo.min(hi) - DRESS, lo.max(hi) + DRESS))
     }
 
-    /// [`baked_bounds`](Self::baked_bounds) from the generator's surface bounds: what the square
-    /// can hold before anything is baked or edited. Pure, so `memo` keeps it through bakes and
-    /// edits, and a tile wider than [`SAMPLED_SPAN`] but within [`TIGHT_SPAN`] is the union of its
-    /// quarters' bounds: their samples hold all of its own, so each surface sample is taken once
-    /// for every level (and mostly ahead of the cut, by [`Prefetch`]).
+    /// [`baked_bounds`](Self::baked_bounds) from the generator: a tile up to [`TIGHT_SPAN`] across
+    /// takes its tight bounds once they are in ([`tight_bounds`](Self::tight_bounds)); until then,
+    /// and for any wider tile, its body's relief band, which costs nothing to read. The cut never
+    /// samples terrain: a box on the band is a superset, so it can only split a node early, and it
+    /// is measured again when the tight bounds land.
     pub(in crate::world) fn generator_bounds_in(&self, memo: &mut RuleMemo, s: SectionPos) -> Option<(f64, f64)> {
-        if let Some(b) = memo.ground.get(&s) {
-            return b;
-        }
-        let w = s.span();
-        let mut quarters = || {
-            let mut all: Option<(f64, f64)> = None;
-            for q in super::section::Quadrant::ALL {
-                let (lo, hi) = self.generator_bounds_in(memo, s.child(q))?;
-                all = Some(all.map_or((lo, hi), |(a, b)| (a.min(lo), b.max(hi))));
+        if s.span() <= TIGHT_SPAN {
+            if let Some(b) = self.tight_bounds(memo, s) {
+                return b;
             }
+            memo.standing_on_band(s);
+        }
+        if s.body < CHART_BODY_BASE {
+            return band_bounds(&*self.generator, s);
+        }
+        // A chart's band is its patch's: read once per patch.
+        *memo.bands.entry((s.body, s.face)).or_insert_with(|| {
+            let root = SectionPos { detail: s.detail, body: s.body, face: s.face, x: 0, z: 0 };
+            band_bounds(&*self.generator, root)
+        })
+    }
+
+    /// Tile `s`'s tight bounds when they are in: sampled off the main thread up to
+    /// [`SAMPLED_SPAN`], the union of its quarters' wider (their samples hold all of its own, so
+    /// each surface sample is taken once for every level). `None` (and the missing tiles asked
+    /// for) until every sample under it has landed.
+    fn tight_bounds(&self, memo: &mut RuleMemo, s: SectionPos) -> Option<Option<(f64, f64)>> {
+        if let Some(b) = memo.ground.get(&s) {
+            return Some(b);
+        }
+        if s.span() <= SAMPLED_SPAN {
+            memo.ask(&self.generator, s);
+            return None;
+        }
+        let (mut all, mut known): (Option<(f64, f64)>, bool) = (None, true);
+        for q in super::section::Quadrant::ALL {
+            match self.tight_bounds(memo, s.child(q)) {
+                Some(Some((lo, hi))) => all = Some(all.map_or((lo, hi), |(a, b)| (a.min(lo), b.max(hi)))),
+                Some(None) => {}
+                None => known = false,
+            }
+        }
+        known.then(|| {
+            memo.ground.insert(s, all);
             all
-        };
-        let b = match w > SAMPLED_SPAN && w <= TIGHT_SPAN {
-            true => quarters().or_else(|| sampled_bounds(&*self.generator, s)),
-            false => sampled_bounds(&*self.generator, s),
-        };
-        memo.ground.insert(s, b);
-        b
+        })
+    }
+
+    /// Keep the tight bounds the sampler has answered since the last pass.
+    pub(in crate::world) fn land_bounds(&self) -> u64 {
+        let mut memo = self.node_boxes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        memo.land(LAND_MAX);
+        memo.landed
+    }
+
+    /// Tight bounds still owed to the cut.
+    pub(in crate::world) fn bounds_pending(&self) -> bool {
+        self.node_boxes.lock().unwrap_or_else(std::sync::PoisonError::into_inner).pending()
     }
 
     /// Section `s`'s physical box: its footprint between its lowest and highest terrain, placed
@@ -213,10 +247,12 @@ impl World {
             // block by the chord rule, but a far tile may not.
             let bend = bend?;
             let pad = span * span / (8.0 * bend.atlas.radius.max(1) as f64) + 1.0;
-            let embedded: Vec<DVec3> = corners.map(|p| bend.atlas.embed_storage(bend.patch, p)).collect();
+            // Each footprint corner's column, at the floor and the top.
+            let column = |c: usize| bend.atlas.embed_storage_column(bend.patch, x0 + span * (c & 1) as f64, z0 + span * (c >> 1) as f64, [lo, hi]);
+            let [c0, c1, c2, c3] = [column(0), column(1), column(2), column(3)];
             // Its cells are not one block everywhere: the footprint's longer edge, at its floor.
-            let side = (embedded[1] - embedded[0]).length().max((embedded[4] - embedded[0]).length());
-            return PhysBox::around(embedded, pad, side);
+            let side = (c1[0] - c0[0]).length().max((c2[0] - c0[0]).length());
+            return PhysBox::around([c0[0], c0[1], c1[0], c1[1], c2[0], c2[1], c3[0], c3[1]], pad, side);
         }
         let frame = FaceFrame::new(s.face);
         let world = |p: DVec3| {
@@ -235,19 +271,26 @@ impl World {
     }
 }
 
-/// The generator's bounds of tile `s`, dressed: a tile up to [`TIGHT_SPAN`] across reads the
-/// sampled surface, a larger one the generator's band. What [`World::generator_bounds_in`] keeps,
-/// sampled on whichever thread asks first.
+/// The tight generator bounds of a tile up to [`SAMPLED_SPAN`] across, dressed: its sampled
+/// surface. What the rule's sampler thread answers.
 fn sampled_bounds(generator: &dyn TerrainGenerator, s: SectionPos) -> Option<(f64, f64)> {
     let (x0, z0, w) = (s.min_x(), s.min_z(), s.span());
-    let (lo, hi) = if w <= TIGHT_SPAN {
-        generator.surface_rect(s.body, s.face, x0, z0, x0 + w, z0 + w)?
-    } else {
-        generator.surface_bounds(s.body, s.face, x0, z0, w)?
-    };
+    dress(generator.surface_rect(s.body, s.face, x0, z0, x0 + w, z0 + w)?)
+}
+
+/// The O(1) bounds of any tile, dressed: its body's relief band over the square.
+fn band_bounds(generator: &dyn TerrainGenerator, s: SectionPos) -> Option<(f64, f64)> {
+    dress(generator.relief_band(s.body, s.face, s.min_x(), s.min_z(), s.span())?)
+}
+
+/// Terrain altitudes `(lo, hi)` widened by [`DRESS`] each way.
+fn dress((lo, hi): (i32, i32)) -> Option<(f64, f64)> {
     let (lo, hi) = (f64::from(lo), f64::from(hi));
     Some((lo.min(hi) - DRESS, lo.max(hi) + DRESS))
 }
+
+/// Most tight bounds one pass keeps.
+const LAND_MAX: usize = 1 << 12;
 
 mod prefetch;
 mod select;
@@ -255,7 +298,6 @@ mod surface;
 #[cfg(test)]
 mod probes;
 
-pub(in crate::world) use prefetch::Prefetch;
 pub(in crate::world) use select::Leaf;
 pub(in crate::world) use surface::{Ground, RuleMemo};
 

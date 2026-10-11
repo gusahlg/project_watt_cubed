@@ -553,6 +553,28 @@ impl Atlas {
         self.embed(patch, s - DVec3::new(o[0] as f64, o[1] as f64, o[2] as f64))
     }
 
+    /// [`embed_storage`](Self::embed_storage) of storage column `(x, z)` at each storage height of
+    /// `ys`: on a shell patch the column's direction is mapped once, bit for bit `embed`'s.
+    pub fn embed_storage_column<const N: usize>(&self, patch: Patch, x: f64, z: f64, ys: [f64; N]) -> [DVec3; N] {
+        let (o, _) = self.storage_box(patch);
+        let (lx, lz) = (x - o[0] as f64, z - o[2] as f64);
+        let Patch::Shell { band, face } = patch else {
+            return ys.map(|y| self.embed(patch, DVec3::new(lx, y - o[1] as f64, lz)));
+        };
+        let b = &self.bands[band as usize];
+        let i = if self.inward { b.n as f64 - lx } else { lx };
+        let step = 2.0 / b.n as f64;
+        let d = Map::Equiangular.dir(-1.0 + i * step, -1.0 + lz * step);
+        let (tu, nn, tv) = basis(face);
+        let w = tu * d.x + nn * d.y + tv * d.z;
+        ys.map(|y| {
+            let ly = y - o[1] as f64;
+            let r = if self.inward { b.r_hi as f64 - ly } else { b.r_lo as f64 + ly };
+            let r = r + self.lift(patch, lx, lz, r);
+            self.centre + w * r
+        })
+    }
+
     /// The patch around physical point `p`: where `p` sits in storage and the Jacobian
     /// `∂physical/∂storage` there (the local affine frame motion and picking run in).
     pub fn local(&self, p: DVec3) -> Option<Local> {

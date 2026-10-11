@@ -14,6 +14,11 @@ pub(in crate::world) trait Surface {
     fn roots(&self, rule: &Rule, eye: DVec3, out: &mut Vec<SectionPos>);
     /// The node's physical box; `None` where it holds no surface (the subtree is skipped).
     fn node_box(&mut self, s: SectionPos) -> Option<PhysBox>;
+    /// Whether the node's box is final. One that is not (its terrain still being read) is drawn as
+    /// it is rather than split on a box that is only a bound.
+    fn settled(&mut self, _s: SectionPos) -> bool {
+        true
+    }
 }
 
 /// One tile of the cut and its distance from the eye.
@@ -44,7 +49,7 @@ impl Rule {
             if dist >= horizon {
                 continue;
             }
-            if self.splits(s.detail.0, dist, b.span) {
+            if self.splits(s.detail.0, dist, b.span) && surface.settled(s) {
                 stack.extend(Quadrant::ALL.map(|q| s.child(q)));
             } else {
                 out.push(Leaf { pos: s, dist });

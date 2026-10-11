@@ -679,8 +679,6 @@ pub struct World {
     section_frontier_key: Option<SectionFrontierKey>,
     /// The physical boxes the rule measured, kept until a node's bounds change.
     node_boxes: std::sync::Mutex<rule::RuleMemo>,
-    /// The thread sampling the generator's bounds of tiles the cut is about to split into.
-    bounds_prefetch: Option<rule::Prefetch>,
     /// The generator's tops of columns no loaded chunk shows the ground of (the minimap's).
     ground_tops: std::sync::Mutex<ground_tops::GroundTops>,
     /// The rule's cut: each desired section's distance from the eye cell, for load priority.
@@ -727,6 +725,8 @@ struct SectionFrontierKey {
     mip_ready: bool,
     /// The near field revision the clips were taken from.
     near: u32,
+    /// Tight bounds landed under boxes that stood on the band.
+    bounds: u64,
 }
 
 impl World {
@@ -898,7 +898,6 @@ impl World {
             section_fade: coverage::Coverage::default(),
             section_frontier_key: None,
             node_boxes: std::sync::Mutex::default(),
-            bounds_prefetch: None,
             ground_tops: std::sync::Mutex::default(),
             section_dist: FastMap::default(),
             section_ancestors: FastSet::default(),

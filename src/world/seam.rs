@@ -68,6 +68,9 @@ impl Region {
 pub struct Seams {
     atlases: Vec<Arc<Atlas>>,
     regions: Vec<Region>,
+    /// Each atlas's regions (a run of `regions`) and the box around them: a chunk outside an
+    /// atlas's box skips its regions.
+    groups: Vec<(Region, std::ops::Range<usize>)>,
     /// Smallest storage chunk x of any box: everything below is physical space.
     min_cx: i32,
     cache: Mutex<FastMap<(Coord, Face), Option<Across>>>,
@@ -76,7 +79,9 @@ pub struct Seams {
 impl Seams {
     pub fn new(atlases: Vec<Arc<Atlas>>) -> Self {
         let mut regions = Vec::new();
+        let mut groups = Vec::new();
         for (i, atlas) in atlases.iter().enumerate() {
+            let first = regions.len();
             for p in atlas.patches() {
                 let (o, size) = atlas.storage_box(p);
                 debug_assert!((0..3).all(|a| o[a] % CS == 0 && size[a] % CS == 0), "storage boxes are chunk aligned");
@@ -84,9 +89,14 @@ impl Seams {
                 let hi = std::array::from_fn(|a| ((o[a] + size[a]) / CS) as i32);
                 regions.push(Region { lo, hi, atlas: i });
             }
+            let run = &regions[first..];
+            if let Some(r0) = run.first() {
+                let around = run.iter().fold(*r0, |b, r| Region { lo: std::array::from_fn(|a| b.lo[a].min(r.lo[a])), hi: std::array::from_fn(|a| b.hi[a].max(r.hi[a])), atlas: i });
+                groups.push((around, first..regions.len()));
+            }
         }
         let min_cx = regions.iter().map(|r| r.lo[0]).min().unwrap_or(i32::MAX);
-        Self { atlases, regions, min_cx, cache: Mutex::new(FastMap::default()) }
+        Self { atlases, regions, groups, min_cx, cache: Mutex::new(FastMap::default()) }
     }
 
     /// No atlases: every answer is the plain grid.
@@ -110,7 +120,8 @@ impl Seams {
         if c.x < self.min_cx {
             return None;
         }
-        self.regions.iter().find(|r| r.contains(c))
+        let (_, run) = self.groups.iter().find(|(around, _)| around.contains(c))?;
+        self.regions[run.clone()].iter().find(|r| r.contains(c))
     }
 
     /// Whether `c` is a storage chunk inside some box.

@@ -257,7 +257,8 @@ impl World {
             return;
         }
         let ready = |p: SectionPos| self.section_ready(p);
-        let cut = quadtree::whole_cut(&self.section_desired, COARSEST, &ready);
+        let stand_ins = quadtree::stand_in_nodes(self.sections.iter().filter(|(_, s)| s.is_ready()).map(|(&p, _)| p));
+        let cut = quadtree::whole_cut(&self.section_desired, COARSEST, &ready, &stand_ins);
         let backlog = self.section_desired.iter().any(|&c| !self.sections.contains_key(&c) && quadtree::drawable_cover(c, COARSEST, &ready).is_none());
         if backlog {
             self.pending_sections.set();

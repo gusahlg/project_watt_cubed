@@ -15,7 +15,8 @@ use crate::space::chart::{Map, basis};
 use crate::world::World;
 use crate::world::chunk::CHUNK_SIZE;
 use crate::world::section::{CHART_BODY_BASE, SectionPos, section_fits, section_span};
-use crate::world::sampler::Recent;
+use crate::world::FastSet;
+use crate::world::sampler::{Recent, Sampler};
 use crate::world::terrain;
 
 /// The ground the far field stands on.
@@ -29,20 +30,118 @@ pub(in crate::world) enum Ground {
     Flat,
 }
 
-/// The physical boxes of nodes the rule measured. A box changes only when its node's bounds do (a
-/// relief bake lands, an edit's overlay is re-derived), which clears the boxes. The generator's
-/// bounds under them are pure and stay. Both keep what the cuts used lately.
+/// The physical boxes of nodes the rule measured, and the tight generator bounds under them. A box
+/// changes when its node's bounds do (a relief bake lands, an edit's overlay is re-derived, its
+/// tight bounds land), which drops it. Tight bounds are pure and stay. Both keep what the cuts used
+/// lately.
+///
+/// The cut never samples terrain: a node up to [`super::TIGHT_SPAN`] whose tight bounds are not in
+/// yet stands on its body's relief band, the tiles under it are asked of a sampler thread, and it
+/// does not split until they land (like a tile not yet built, its detail arrives with its data).
+/// When they land, its box goes, and [`landed`](Self::landed) tells the frontier to cut again.
 #[derive(Default)]
 pub(in crate::world) struct RuleMemo {
     pub(in crate::world) boxes: Recent<SectionPos, Option<PhysBox>>,
-    /// [`World::generator_bounds_in`] per node.
+    /// Tight generator bounds per node up to [`super::TIGHT_SPAN`]: sampled up to
+    /// [`super::SAMPLED_SPAN`], the union of its quarters' above.
     pub(in crate::world) ground: Recent<SectionPos, Option<(f64, f64)>>,
+    sampler: Option<Sampler<SectionPos, Option<(f64, f64)>>>,
+    /// Tiles marked asked and not yet sent.
+    asks: Vec<SectionPos>,
+    /// Nodes whose box stands on the band until the tiles under them land.
+    provisional: FastSet<SectionPos>,
+    /// Bumped when tight bounds land under a node whose box stood on the band.
+    pub(in crate::world) landed: u64,
+    /// Leaves whose children were fetched ahead (a cut mostly holds the leaves the last one did).
+    pub(in crate::world) fetched: Recent<SectionPos, ()>,
+    /// A chart patch's relief band, which is the same for every tile of it.
+    pub(in crate::world) bands: crate::world::FastMap<(u16, Face), Option<(f64, f64)>>,
 }
+
+/// Asks sent to the sampler at once.
+const ASK_BATCH: usize = 256;
 
 impl RuleMemo {
     /// Forget the boxes; the generator's bounds stand.
     pub(in crate::world) fn clear(&mut self) {
         self.boxes.clear();
+    }
+
+    /// Ask the sampler for tile `s`'s tight bounds, unless it was asked already.
+    pub(in crate::world) fn ask(&mut self, generator: &terrain::Generator, s: SectionPos) {
+        if self.sampler.is_none() {
+            let generator = generator.clone();
+            self.sampler = Sampler::start("rule-bounds", move |s| super::sampled_bounds(&*generator, s));
+        }
+        let Some(sampler) = &mut self.sampler else { return };
+        if sampler.mark(s) {
+            self.asks.push(s);
+            if self.asks.len() >= ASK_BATCH {
+                self.flush();
+            }
+        }
+    }
+
+    /// Whether `s` was asked for and has not landed.
+    #[cfg(test)]
+    pub(in crate::world) fn asked(&self, s: &SectionPos) -> bool {
+        self.sampler.as_ref().is_some_and(|p| p.asked(s))
+    }
+
+    /// Send the asks gathered so far.
+    pub(in crate::world) fn flush(&mut self) {
+        if let Some(sampler) = &mut self.sampler {
+            sampler.send(std::mem::take(&mut self.asks));
+        }
+    }
+
+    /// Keep up to `most` landed bounds. Each drops the boxes of its tile and of the nodes over it
+    /// that read it, and a node whose box stood on the band makes the cut due again.
+    pub(in crate::world) fn land(&mut self, most: usize) {
+        let RuleMemo { boxes, ground, sampler, provisional, landed, .. } = self;
+        let Some(sampler) = sampler else { return };
+        sampler.land(most, |s, b| {
+            if !ground.contains(&s) {
+                ground.insert(s, b);
+            }
+            let mut p = s;
+            loop {
+                boxes.remove(&p);
+                if provisional.remove(&p) {
+                    *landed += 1;
+                }
+                if p.span() * 2 > super::TIGHT_SPAN {
+                    break;
+                }
+                p = p.parent();
+            }
+        });
+    }
+
+    /// Tight bounds asked for and not yet landed, or a box still standing on the band.
+    pub(in crate::world) fn pending(&self) -> bool {
+        !self.asks.is_empty() || !self.provisional.is_empty() || self.sampler.as_ref().is_some_and(|p| p.waiting() > 0)
+    }
+
+    /// Whether the sampler has answered every tile sent to it.
+    #[cfg(test)]
+    pub(in crate::world) fn answered(&self) -> bool {
+        self.sampler.as_ref().is_none_or(|p| p.answered())
+    }
+
+    /// Tiles asked for that have not landed.
+    pub(in crate::world) fn waiting(&self) -> usize {
+        self.asks.len() + self.sampler.as_ref().map_or(0, |p| p.waiting())
+    }
+
+    /// Mark node `s`'s box as standing on the band.
+    pub(in crate::world) fn standing_on_band(&mut self, s: SectionPos) {
+        self.provisional.insert(s);
+    }
+
+    /// Whether node `s`'s box stands on the band, its tight bounds pending.
+    pub(in crate::world) fn stands_on_band(&self, s: &SectionPos) -> bool {
+        self.provisional.contains(s)
     }
 }
 
@@ -76,6 +175,7 @@ impl World {
         let memo = self.node_boxes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut surface = WorldSurface { world: self, ground, memo };
         rule.select(&PhysBox::eye_cell(eye), &mut surface, &mut Vec::new(), out);
+        surface.memo.flush();
         rule
     }
 }
@@ -95,6 +195,11 @@ impl WorldSurface<'_> {
         // quarter turn over `n` at the patch centre, down to about 1/√2 of that at a corner).
         let theta = (rule.horizon() / radius).min(std::f64::consts::PI);
         let dir = rel.normalize_or_zero();
+        // Half the diagonal of a root in angle (a cell is at most a quarter turn over `n`, at the
+        // patch centre), and the least radius of the eye or of any ground, for the horizon test.
+        let footprint = std::f64::consts::FRAC_PI_2 / n as f64 * span as f64 * std::f64::consts::FRAC_1_SQRT_2 * 1.01;
+        let low = rel.length().min((radius - terrain::cosmos::RELIEF as f64 - 1024.0).max(0.0));
+        let wide = theta >= std::f64::consts::FRAC_PI_4;
         for face in FACES {
             let all = || (0..tiles).flat_map(move |z| (0..tiles).map(move |x| (x, z)));
             let (tu, nn, tv) = basis(face);
@@ -109,6 +214,8 @@ impl WorldSurface<'_> {
                 let cell = std::f64::consts::FRAC_PI_2 / n as f64;
                 let reach = 2.0 * theta / cell + span as f64;
                 let (lx, lz) = ((xi + 1.0) * 0.5 * n as f64, (eta + 1.0) * 0.5 * n as f64);
+                // An inward chart counts its local x the other way.
+                let lx = if atlas.inward { n as f64 - lx } else { lx };
                 let range = |c: f64| {
                     let lo = ((c - reach) / span as f64).floor().max(0.0) as i64;
                     let hi = ((c + reach) / span as f64).floor().min((tiles - 1) as f64) as i64;
@@ -118,6 +225,19 @@ impl WorldSurface<'_> {
                 Box::new(rz.flat_map(move |z| rx.clone().map(move |x| (x, z))))
             };
             for (x, z) in window {
+                // A root wholly past the horizon is not measured: the angle between the eye and
+                // the root's centre, less the most its footprint subtends, bounds the chord from
+                // the eye to any point of it.
+                if dir != DVec3::ZERO && !wide {
+                    let c = |t: i64| (t as f64 + 0.5) * span as f64;
+                    let i = if atlas.inward { n as f64 - c(x) } else { c(x) };
+                    let mid = Map::Equiangular.dir(-1.0 + i * 2.0 / n as f64, -1.0 + c(z) * 2.0 / n as f64);
+                    let along = (tu * mid.x + nn * mid.y + tv * mid.z).normalize();
+                    let angle = along.dot(dir).clamp(-1.0, 1.0).acos() - footprint;
+                    if angle > 0.0 && 2.0 * low * (0.5 * angle.min(std::f64::consts::PI)).sin() >= rule.horizon() {
+                        continue;
+                    }
+                }
                 out.push(SectionPos { detail: Detail(rule.coarsest), body, face, x: x as i32, z: z as i32 });
             }
         }
@@ -201,6 +321,10 @@ impl Surface for WorldSurface<'_> {
 
     fn node_box(&mut self, s: SectionPos) -> Option<PhysBox> {
         self.world.node_box_in(&mut self.memo, s)
+    }
+
+    fn settled(&mut self, s: SectionPos) -> bool {
+        !self.memo.stands_on_band(&s)
     }
 }
 

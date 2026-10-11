@@ -1800,6 +1800,10 @@ fn a_full_pass_and_a_follow_pass_take_their_steps_in_order() {
     assert_eq!(full.log, full_steps, "full pass");
 
     assert!(world.anything_in_flight(), "the full pass started generation");
+    // The near field reads its columns' ground off the main thread: the pass it lands in lays the
+    // square out again, a full pass.
+    crate::world::streaming::headless::finish_samples(&world);
+    world.stream_steps(eye, &mut Record::default());
     // Re-resolve the covering in the follow pass. Not through pending_sections: the section lane
     // runs first and clears it whenever the workers already delivered, which made this flaky.
     world.section_cover_dirty.set();

@@ -238,11 +238,32 @@ pub(in crate::world) fn step(world: &mut World, eye: DVec3) {
     world.stream_steps(eye, &mut Headless { at: Some(at), ..Headless::default() });
 }
 
+/// [`step`], timing its phases into `laps`.
+pub(in crate::world) fn step_timed(world: &mut World, eye: DVec3, laps: &mut Option<Laps>) {
+    let prior = world.near_eye_prev.map(|(_, at)| at).or_else(|| world.section_eye_prev.map(|(_, at)| at)).unwrap_or_else(Instant::now);
+    let at = Instant::now().max(prior + Duration::from_nanos(16_666_667));
+    let mut h = Headless { at: Some(at), laps: laps.take() };
+    world.stream_steps(eye, &mut h);
+    *laps = h.laps;
+}
+
 /// [`step`], then [`finish_jobs`]: a pass bounded by the work it started rather than by the
 /// wall clock, so a starved worker pool slows the pass down but cannot change what lands.
 pub(in crate::world) fn step_finished(world: &mut World, eye: DVec3) {
     step(world, eye);
     finish_jobs(world, |_, _| {});
+    finish_samples(world);
+}
+
+/// Block until the rule's and the near field's samplers have answered everything asked of them, so
+/// the next pass lands it all.
+pub(in crate::world) fn finish_samples(world: &World) {
+    world.node_boxes.lock().unwrap_or_else(std::sync::PoisonError::into_inner).flush();
+    let start = Instant::now();
+    while !world.node_boxes.lock().unwrap_or_else(std::sync::PoisonError::into_inner).answered() || !world.near_sampler_answered() {
+        assert!(start.elapsed() < STUCK, "a sampler stopped answering");
+        std::thread::sleep(Duration::from_micros(200));
+    }
 }
 
 /// No result for this long while a claim waits on one is a stuck claim, not a slow pool.
