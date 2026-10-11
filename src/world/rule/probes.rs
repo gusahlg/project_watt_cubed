@@ -114,15 +114,16 @@ fn audit_cut(world: &World, eye: DVec3) -> CutAudit {
     audit
 }
 
-/// Ground columns whose top lies inside the render distance (half a chunk of margin) and are not
-/// drawn by settled full-res chunks alone: no settled chunk holds the top, or a far tile draws
-/// over it (a tile whose drawn mesh leaves the column out does not). Columns are chunk centres of
-/// the near square: charts read storage through the net, a cube face its reference frame.
-fn not_full_res(world: &World, eye: DVec3) -> (usize, usize) {
+/// How the ground columns whose top lies inside the render distance (less `margin` blocks) are
+/// drawn: for each, whether a settled chunk holds its top, and whether a far tile draws over it (a
+/// tile whose drawn mesh leaves the column out does not). Columns are chunk centres of the near
+/// square: charts read storage through the net, a cube face its reference frame, a flat world its
+/// plane.
+pub(in crate::world) fn ground_columns(world: &World, eye: DVec3, margin: f64) -> Vec<(bool, bool)> {
     let cs = CHUNK_SIZE as i32;
     let center = world.center.expect("a centre");
     let h = world.view.horizontal;
-    let reach = f64::from(h * cs) - f64::from(cs) * 0.75;
+    let reach = f64::from(h * cs) - margin;
     let tiles: Vec<(SectionPos, [i64; 4], crate::world::section::ColumnClip)> = drawn(world).into_iter().map(|s| (s, world.tile_rect(s), drawn_clip(world, s))).collect();
     // A chart's tiles are read in storage, whatever patch they count from.
     let covers = |body: u16, face: Option<Face>, u: i32, v: i32| {
@@ -136,7 +137,7 @@ fn not_full_res(world: &World, eye: DVec3) -> (usize, usize) {
         })
     };
     let settled = |c: Coord| world.chunks.get(&c).is_some_and(|l| l.state.settled());
-    let (mut inside, mut bad) = (0, 0);
+    let mut out = Vec::new();
     let (reference, _, in_cube) = world.lod_place(center);
     if in_cube {
         let face = world.live_up().expect("an up face");
@@ -158,15 +159,27 @@ fn not_full_res(world: &World, eye: DVec3) -> (usize, usize) {
                 if p.distance(eye) >= reach {
                     continue;
                 }
-                inside += 1;
                 let rc = World::chunk_of(x, y, z);
                 let c = Coord::new(rc.x - d[0], rc.y - d[1], rc.z - d[2]);
-                bad += usize::from(!settled(c) || covers(body, Some(face), u, v));
+                out.push((settled(c), covers(body, Some(face), u, v)));
             }
         }
-        return (inside, bad);
+        return out;
     }
-    let seat = world.seams.chart_seat(center).expect("a chart under the eye");
+    let Some(seat) = world.seams.chart_seat(center) else {
+        // A flat world's plane.
+        for cz in center.z - h..=center.z + h {
+            for cx in center.x - h..=center.x + h {
+                let (x, z) = (cx * cs + cs / 2, cz * cs + cs / 2);
+                let top = world.generator.height(x, z) - 1;
+                if DVec3::new(f64::from(x), f64::from(top), f64::from(z)).distance(eye) >= reach {
+                    continue;
+                }
+                out.push((settled(Coord::new(cx, top.div_euclid(cs), cz)), covers(0, Some(Face::PosY), x, z)));
+            }
+        }
+        return out;
+    };
     let floor = seat.lo[1].div_euclid(i64::from(cs)) as i32;
     let body = crate::world::section::CHART_BODY_BASE + seat.index as u16;
     for cz in center.z - h..=center.z + h {
@@ -180,12 +193,22 @@ fn not_full_res(world: &World, eye: DVec3) -> (usize, usize) {
             if p.distance(eye) >= reach {
                 continue;
             }
-            inside += 1;
-            let top_chunk = Coord::new(c.x, top.div_euclid(cs), c.z);
-            bad += usize::from(!settled(top_chunk) || covers(body, None, x, z));
+            out.push((settled(Coord::new(c.x, top.div_euclid(cs), c.z)), covers(body, None, x, z)));
         }
     }
-    (inside, bad)
+    out
+}
+
+/// Ground columns inside the render distance (half a chunk of margin), and how many of them are
+/// not drawn by settled full-res chunks alone.
+fn not_full_res(world: &World, eye: DVec3) -> (usize, usize) {
+    let cols = ground_columns(world, eye, f64::from(CHUNK_SIZE as i32) * 0.75);
+    (cols.len(), cols.iter().filter(|&&(settled, far)| !settled || far).count())
+}
+
+/// Ground columns inside the render distance that nothing draws: no settled chunk and no far tile.
+pub(in crate::world) fn bare(world: &World, eye: DVec3) -> usize {
+    ground_columns(world, eye, 0.0).iter().filter(|&&(settled, far)| !settled && !far).count()
 }
 
 /// A physical eye on the start world `above` blocks over the ground at angle `t` (radians) from
@@ -380,4 +403,101 @@ fn lod_rule_cut_at_the_owner_site() {
             rule.coarsest
         );
     }
+}
+
+/// The start world of `seed` at render distance `h` and vertical distance `v`.
+fn view_of(seed: i64, h: i32, v: i32) -> World {
+    let (lod_levels, lod_detail) = lod_for(h);
+    let render = RenderConfig { lod2: true, occlusion: true, lod_levels, lod_detail, ..RenderConfig::default() };
+    let mut world = round_world(seed, render);
+    world.set_view_distances(h, v);
+    world
+}
+
+/// Settled at spawn and on the steepest nearby hillside (render distance 6), every ground column
+/// inside the render distance is drawn by settled full-res chunks and by no far tile, and the
+/// eye's own column is near.
+#[test]
+fn near_columns_settle_full_res_at_spawn_and_on_a_hillside() {
+    let mut world = view_of(42, 6, 3);
+    let spawn = world.chart_spawn().expect("charted");
+    let centre = world.generator.cosmos().expect("cosmos").home().centre_f();
+    let from = spawn - centre;
+    let hill = (0..400)
+        .map(|k| arc_eye(&world, from, DVec3::X, f64::from(k) * 1.0e-4, 1.7))
+        .max_by_key(|&eye| {
+            let s = world.chart_eye(eye).expect("a chart eye");
+            let (x, z) = (s.x.floor() as i32, s.z.floor() as i32);
+            let ground = |dx: i32, dz: i32| world.generator.surface(Face::PosY, x + dx, z + dz);
+            let rim = [(-96, 0), (96, 0), (0, -96), (0, 96)].map(|(dx, dz)| ground(dx, dz));
+            rim.iter().max().unwrap() - rim.iter().min().unwrap()
+        })
+        .expect("sites");
+    for (name, eye) in [("spawn", world.home_eye(from, 1.62)), ("hillside", hill)] {
+        world.prepare_around(eye);
+        world.drive_spawn_ready();
+        let passes = settle(&mut world, eye);
+        let (inside, bad) = not_full_res(&world, eye);
+        println!("{name}: settled in {passes} passes, {bad} of {inside} columns inside R not full-res, {} chunks", world.chunks.len());
+        assert!(inside > 0, "{name}: no ground inside R");
+        assert_eq!(bad, 0, "{name}: ground inside R not full-res");
+    }
+}
+
+/// Walking 400 blocks at eight blocks a pass, then descending from 300 over the ground at render
+/// distance 6: on every pass every ground column inside the render distance is drawn by a settled
+/// chunk or a far tile, and settled again it is drawn by the chunks alone.
+#[test]
+fn walking_and_descending_never_bare_the_ground() {
+    let mut world = view_of(42, 6, 3);
+    let spawn = world.chart_spawn().expect("charted");
+    let centre = world.generator.cosmos().expect("cosmos").home().centre_f();
+    let from = spawn - centre;
+    let radius = from.length();
+    let start = world.home_eye(from, 1.62);
+    world.prepare_around(start);
+    world.drive_spawn_ready();
+    settle(&mut world, start);
+    for k in 1..=50 {
+        let eye = arc_eye(&world, from, DVec3::Z, 8.0 * f64::from(k) / radius, 1.62);
+        world.near_eye_prev = None;
+        step(&mut world, eye);
+        assert_eq!(bare(&world, eye), 0, "walk pass {k}: bare ground");
+    }
+    let descent: Vec<DVec3> = (0..=38).map(|k| arc_eye(&world, from, DVec3::Z, 400.0 / radius, (300.0 - 8.0 * f64::from(k)).max(1.62))).collect();
+    for (k, &eye) in descent.iter().enumerate() {
+        world.near_eye_prev = None;
+        step(&mut world, eye);
+        assert_eq!(bare(&world, eye), 0, "descent pass {k}: bare ground");
+    }
+    let eye = *descent.last().expect("a descent");
+    settle(&mut world, eye);
+    let (inside, bad) = not_full_res(&world, eye);
+    assert_eq!(bad, 0, "settled: {bad} of {inside} columns inside R not full-res");
+}
+
+/// On a flat world at render distance 6, hovering 200 up (no ground within R) and standing on the
+/// ground: no column inside R is ever bare, and settled on the ground every column inside R is
+/// drawn by the chunks alone.
+#[test]
+fn flat_world_near_columns_are_full_res() {
+    use crate::world::generation::{FLAT_HEIGHT, WorldgenKind};
+    let render = RenderConfig { lod2: true, occlusion: true, ..RenderConfig::default() };
+    let mut world = World::with_kind(1, render, WorldgenKind::Flat, false);
+    world.set_view_distances(6, 3);
+    let at = |above: f64| DVec3::new(8.5, f64::from(FLAT_HEIGHT) + above, 8.5);
+    world.prepare_around(at(200.0));
+    world.drive_spawn_ready();
+    settle(&mut world, at(200.0));
+    for k in 0..=25 {
+        let eye = at(200.0 - 8.0 * f64::from(k));
+        world.near_eye_prev = None;
+        step(&mut world, eye);
+        assert_eq!(bare(&world, eye), 0, "descent pass {k}: bare ground");
+    }
+    let eye = at(1.62);
+    settle(&mut world, eye);
+    let (inside, bad) = not_full_res(&world, eye);
+    assert!(inside > 0);
+    assert_eq!(bad, 0, "{bad} of {inside} columns inside R not full-res");
 }

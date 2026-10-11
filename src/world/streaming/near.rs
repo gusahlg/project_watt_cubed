@@ -63,8 +63,8 @@ pub(in crate::world) struct NearField {
     pub(in crate::world) rev: u32,
     /// First-open-cell bounds `(lo, hi)` in frame altitude, by real column.
     ground: FastMap<ColumnKey, Option<(i32, i32)>>,
-    /// Physical terrain boxes by real column.
-    boxes: FastMap<ColumnKey, Option<PhysBox>>,
+    /// Physical terrain boxes by real column, with the ground (edits included) they were placed for.
+    boxes: FastMap<ColumnKey, ((i32, i32), Option<PhysBox>)>,
     /// The ground is to be read again (an edit landed).
     pub(in crate::world) stale: bool,
 }
@@ -279,7 +279,14 @@ impl World {
                 let Some((lo, hi)) = ground.map(|b| self.column_edits(frame, real, b)) else { continue };
                 let (a, b) = (self.frame_layer(frame, real, lo.saturating_sub(1)), self.frame_layer(frame, real, hi.saturating_sub(1)));
                 col.shell = Some([a.min(b) - 1, a.max(b) + 1]);
-                let b = *near.boxes.entry(real).or_insert_with(|| self.column_box(frame, real, ground));
+                let b = match near.boxes.get(&real) {
+                    Some(&(g, b)) if g == (lo, hi) => b,
+                    _ => {
+                        let b = self.column_box(frame, real, Some((lo, hi)));
+                        near.boxes.insert(real, ((lo, hi), b));
+                        b
+                    }
+                };
                 let d = b.map_or(f64::INFINITY, |b| b.dist_box(eye));
                 col.near = d < r;
                 col.keep = d < keep_r;
