@@ -190,12 +190,12 @@ impl World {
     /// in physical space over a round world, where no ground is near.
     pub(in crate::world) fn near_frame(&self, center: Coord) -> Option<Frame> {
         let up = self.live_up()?;
-        if !self.fold.is_identity() {
+        let (reference, _, in_cube) = self.lod_place(center);
+        if !in_cube && !self.fold.is_identity() {
             let seat = self.seams.chart_seat(center)?;
             let floor = seat.lo[1].div_euclid(CHUNK_SIZE as i64) as i32;
             return (up == Face::PosY).then_some(Frame::Chart { index: seat.index, body: CHART_BODY_BASE + seat.index as u16, floor });
         }
-        let (reference, _, in_cube) = self.lod_place(center);
         if in_cube {
             if self.generator.sky(center) != Sky::Axis(up) {
                 return None;
@@ -544,7 +544,12 @@ impl World {
                 for (du, dv) in [(0, 0), (cs - 1, 0), (0, cs - 1), (cs - 1, cs - 1)] {
                     let (x, y, z) = f.cell_to_world((x0 + du, 0, z0 + dv));
                     let r = World::chunk_of(x, y, z);
-                    let c = Coord::new(r.x - shift[0], r.y - shift[1], r.z - shift[2]);
+                    let mut c = [r.x - shift[0], r.y - shift[1], r.z - shift[2]];
+                    // At the centre's layer, inside the cube's storage: a column is any layer of it.
+                    if let Some(centre) = self.center {
+                        c[face.axis()] = [centre.x, centre.y, centre.z][face.axis()];
+                    }
+                    let c = Coord::new(c[0], c[1], c[2]);
                     let (key, _) = ColumnKey::of(face, c);
                     if !out.iter().any(|&o: &Coord| ColumnKey::of(face, o).0 == key) {
                         out.push(c);

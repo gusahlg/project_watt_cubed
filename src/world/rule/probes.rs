@@ -501,3 +501,43 @@ fn flat_world_near_columns_are_full_res() {
     assert!(inside > 0);
     assert_eq!(bad, 0, "{bad} of {inside} columns inside R not full-res");
 }
+
+/// What the near field holds on twin 2 after a walk: a report when (a) fails there.
+#[test]
+#[ignore]
+fn lod_rule_twin_near_report() {
+    let mut world = owner_view(42);
+    world.prepare_around(TWIN_EYE);
+    world.drive_spawn_ready();
+    settle(&mut world, TWIN_EYE);
+    let cols = ground_columns(&world, TWIN_EYE, 12.0);
+    let center = world.center.expect("a centre");
+    println!(
+        "frame {:?} up {:?} lod_place {:?} near columns {} of {}; settled {} far {}",
+        world.near.frame(),
+        world.near.up(),
+        world.lod_place(center),
+        world.near.near_columns().count(),
+        cols.len(),
+        cols.iter().filter(|c| c.0).count(),
+        cols.iter().filter(|c| c.1).count()
+    );
+    let far_c = world.section_center().expect("far centre");
+    let (desired, clips) = world.desired_and_clips(far_c);
+    let near_tiles: Vec<_> = drawn(&world).into_iter().filter(|&s| world.node_box(s).is_some_and(|b| b.dist_box(&PhysBox::eye_cell(TWIN_EYE)) < 256.0)).collect();
+    println!("desired {} wanted clips {}; drawn tiles within R {}", desired.len(), clips.len(), near_tiles.len());
+    let nc: Vec<_> = world.near.near_columns().take(3).collect();
+    println!("near columns e.g. {nc:?}; fold identity {}", world.fold.is_identity());
+    if let Some(&s) = near_tiles.first() {
+        let keys: Vec<_> = (0..8).flat_map(|cz| (0..8).map(move |cx| (cx, cz))).filter_map(|(cx, cz)| world.tile_column_chunks(s, cx, cz)).map(|c| (c[0].x, c[0].z, world.fold.fold(c[0]))).collect();
+        println!("tile {s:?} columns {:?} .. {:?}", keys.first(), keys.last());
+    }
+    for s in near_tiles.iter().take(4) {
+        let mut col = None;
+        let side = crate::world::section::ColumnClip::side(*s);
+        if side.is_some() {
+            col = world.tile_column_chunks(*s, 0, 0);
+        }
+        println!("  {s:?} drawn clip {:#x} target {:#x} wanted {:?} col00 {:?} near {:?}", drawn_clip(&world, *s).0, world.clip_target(*s).0, clips.get(s), col, col.as_ref().and_then(|c| world.near.near_column(world.fold.fold(c[0]))));
+    }
+}
