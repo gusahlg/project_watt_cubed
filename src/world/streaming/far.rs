@@ -338,9 +338,7 @@ impl World {
         };
         if self.section_frontier_key != Some(key) || !self.dirty_sections.is_empty() {
             let mut leaves = Vec::new();
-            let mut memo = std::mem::take(&mut self.rule_memo);
-            self.section_desired = self.desired_sections_with(center, &mut memo, &mut leaves);
-            self.rule_memo = memo;
+            self.section_desired = self.desired_sections_with(center, &mut leaves);
             let wanted = self.wanted_clips(&leaves);
             self.section_dist = leaves.iter().map(|l| (l.pos, l.dist)).collect();
             self.lod_morph = ground.map_or([voxel_engine::LodMorph::default(); 16], |g| self.morph_bands(&self.rule_on(g), &leaves, &cell));
@@ -369,7 +367,7 @@ impl World {
     /// [`desired_sections_with`](Self::desired_sections_with) alone.
     #[cfg(test)]
     pub(in crate::world) fn desired_sections(&self, center: Coord) -> Vec<SectionPos> {
-        self.desired_sections_with(center, &mut Default::default(), &mut Vec::new())
+        self.desired_sections_with(center, &mut Vec::new())
     }
 
     /// The cut around far centre `center` and the clip each tile takes once every near column's
@@ -377,7 +375,7 @@ impl World {
     #[cfg(test)]
     pub(in crate::world) fn desired_and_clips(&self, center: Coord) -> (Vec<SectionPos>, FastMap<SectionPos, ColumnClip>) {
         let mut leaves = Vec::new();
-        let desired = self.desired_sections_with(center, &mut Default::default(), &mut leaves);
+        let desired = self.desired_sections_with(center, &mut leaves);
         let clips = self
             .wanted_clips(&leaves)
             .into_iter()
@@ -389,11 +387,11 @@ impl World {
     /// The rule's cut around far centre `center`, sorted by [`section_key`], with its leaves (and
     /// their distances) in `leaves`. Open space selects nothing. Prediction never changes it: a
     /// moving eye only reorders what loads first.
-    fn desired_sections_with(&self, center: Coord, memo: &mut super::super::rule::RuleMemo, leaves: &mut Vec<Leaf>) -> Vec<SectionPos> {
+    fn desired_sections_with(&self, center: Coord, leaves: &mut Vec<Leaf>) -> Vec<SectionPos> {
         leaves.clear();
         let Some(ground) = self.far_ground(center) else { return Vec::new() };
         let eye = self.phys_eye(center, true);
-        self.rule_cut(ground, eye, memo, leaves);
+        self.rule_cut(ground, eye, leaves);
         let mut out: Vec<SectionPos> = leaves.iter().map(|l| l.pos).collect();
         out.sort_unstable_by_key(section_key);
         debug_assert!(out.len() * 4 / 3 <= super::SECTION_SLOT_FLOOR, "the rule's cut holds {} tiles, past the section floor", out.len());

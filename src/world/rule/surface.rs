@@ -28,20 +28,27 @@ pub(in crate::world) enum Ground {
     Flat,
 }
 
-/// The generator bounds of nodes the rule measured. The generator never changes them, so they are
-/// kept until the memo grows past [`MEMO_CAP`].
+/// The physical boxes of nodes the rule measured. A box changes only when its node's bounds do (a
+/// relief bake lands, an edit's overlay is re-derived), which clears the memo, as does growing past
+/// [`MEMO_CAP`].
 #[derive(Default)]
 pub(in crate::world) struct RuleMemo {
-    bounds: FastMap<SectionPos, Option<(f64, f64)>>,
+    pub(in crate::world) boxes: FastMap<SectionPos, Option<PhysBox>>,
 }
 
-const MEMO_CAP: usize = 1 << 17;
+impl RuleMemo {
+    pub(in crate::world) fn clear(&mut self) {
+        self.boxes.clear();
+    }
+}
 
-/// The world as the rule's [`Surface`] on one ground.
+pub(in crate::world) const MEMO_CAP: usize = 1 << 17;
+
+/// The world as the rule's [`Surface`] on one ground, holding the box memo for the walk.
 struct WorldSurface<'a> {
     world: &'a World,
     ground: Ground,
-    memo: &'a mut RuleMemo,
+    memo: std::sync::MutexGuard<'a, RuleMemo>,
 }
 
 impl World {
@@ -62,11 +69,9 @@ impl World {
 
     /// The rule's cut on `ground` from physical eye `eye` (measured from the cell that holds it),
     /// into `out`. Returns the rule it took.
-    pub(in crate::world) fn rule_cut(&self, ground: Ground, eye: DVec3, memo: &mut RuleMemo, out: &mut Vec<Leaf>) -> Rule {
+    pub(in crate::world) fn rule_cut(&self, ground: Ground, eye: DVec3, out: &mut Vec<Leaf>) -> Rule {
         let rule = self.rule_on(ground);
-        if memo.bounds.len() > MEMO_CAP {
-            memo.bounds.clear();
-        }
+        let memo = self.node_boxes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut surface = WorldSurface { world: self, ground, memo };
         rule.select(&PhysBox::eye_cell(eye), &mut surface, &mut Vec::new(), out);
         rule
@@ -179,11 +184,7 @@ impl Surface for WorldSurface<'_> {
     }
 
     fn node_box(&mut self, s: SectionPos) -> Option<PhysBox> {
-        let (lo, hi) = match self.world.baked_bounds(s) {
-            Some(b) => b,
-            None => (*self.memo.bounds.entry(s).or_insert_with(|| self.world.generator_bounds(s)))?,
-        };
-        self.world.place_box(s, lo, hi)
+        self.world.node_box_in(&mut self.memo, s)
     }
 }
 
@@ -193,8 +194,8 @@ impl World {
     #[cfg(test)]
     pub(in crate::world) fn rule_roots_debug(&self, ground: Ground, eye: DVec3) -> String {
         let rule = self.rule_on(ground);
-        let mut memo = RuleMemo::default();
-        let mut surface = WorldSurface { world: self, ground, memo: &mut memo };
+        let memo = self.node_boxes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut surface = WorldSurface { world: self, ground, memo };
         let mut roots = Vec::new();
         surface.roots(&rule, eye, &mut roots);
         let cell = PhysBox::eye_cell(eye);
@@ -248,9 +249,10 @@ impl World {
         let mut split: Vec<SectionPos> = leaves.iter().filter(|l| l.pos.detail.0 < rule.coarsest).map(|l| l.pos.parent()).collect();
         split.sort_unstable_by_key(|s| (s.body, s.face as u8, s.detail, s.x, s.z));
         split.dedup();
+        let mut memo = self.node_boxes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         for p in split {
             let d = p.detail.0 as usize;
-            if let Some(b) = self.node_box(p) {
+            if let Some(b) = self.node_box_in(&mut memo, p) {
                 inner[d] = inner[d].max(b.dist_box(eye) + (b.hi - b.lo).length() + cell);
             }
         }

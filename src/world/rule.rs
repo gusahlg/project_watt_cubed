@@ -159,8 +159,26 @@ impl World {
     /// Section `s`'s physical box: its footprint between its lowest and highest terrain, placed
     /// through its chart, the warp of its cube, or its face frame.
     pub(in crate::world) fn node_box(&self, s: SectionPos) -> Option<PhysBox> {
-        let (lo, hi) = self.baked_bounds(s).or_else(|| self.generator_bounds(s))?;
-        self.place_box(s, lo, hi)
+        let mut memo = self.node_boxes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.node_box_in(&mut memo, s)
+    }
+
+    /// [`node_box`](Self::node_box) through a memo the caller already holds.
+    pub(in crate::world) fn node_box_in(&self, memo: &mut RuleMemo, s: SectionPos) -> Option<PhysBox> {
+        if let Some(&b) = memo.boxes.get(&s) {
+            return b;
+        }
+        if memo.boxes.len() > MEMO_CAP {
+            memo.boxes.clear();
+        }
+        let b = self.baked_bounds(s).or_else(|| self.generator_bounds(s)).and_then(|(lo, hi)| self.place_box(s, lo, hi));
+        memo.boxes.insert(s, b);
+        b
+    }
+
+    /// Forget every measured box: a node's bounds changed.
+    pub(in crate::world) fn forget_node_boxes(&self) {
+        self.node_boxes.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
     }
 
     /// `s`'s footprint between frame altitudes `lo` and `hi`, in physical space.
@@ -204,6 +222,7 @@ mod probes;
 
 pub(in crate::world) use select::Leaf;
 pub(in crate::world) use surface::{Ground, RuleMemo};
+use surface::MEMO_CAP;
 
 #[cfg(test)]
 mod tests {

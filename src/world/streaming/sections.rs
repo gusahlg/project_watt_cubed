@@ -67,6 +67,7 @@ impl World {
         {
             self.section_mip = Some(mip);
             self.section_mip_rx = None;
+            self.forget_node_boxes();
             self.pending_sections.set();
         }
     }
@@ -101,6 +102,8 @@ impl World {
                 break;
             }
             self.section_overlay_dirty.remove(&pos);
+            // The tile's bounds move with its overlay: the rule measures it afresh.
+            self.node_boxes.lock().unwrap_or_else(std::sync::PoisonError::into_inner).boxes.remove(&pos);
             let rev = voxel_engine::Rev(self.section_edit_rev.get(&pos).copied().unwrap_or(0));
             let touched = self.edits_for_section(pos);
             if touched.is_empty() {

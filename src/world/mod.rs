@@ -668,7 +668,8 @@ pub struct World {
     /// passes — a still camera repeats no grid walk or relief coarsening.
     section_frontier_key: Option<SectionFrontierKey>,
     /// Generator bounds of the nodes the rule measured.
-    rule_memo: rule::RuleMemo,
+    /// The physical boxes the rule measured, kept until a node's bounds change.
+    node_boxes: std::sync::Mutex<rule::RuleMemo>,
     /// The rule's cut: each desired section's distance from the eye cell, for load priority.
     section_dist: FastMap<SectionPos, f64>,
     /// Morph band per engine detail: where a level's vertices blend to their parent's surface.
@@ -883,7 +884,7 @@ impl World {
             section_visible: Vec::new(),
             section_fade: coverage::Coverage::default(),
             section_frontier_key: None,
-            rule_memo: rule::RuleMemo::default(),
+            node_boxes: std::sync::Mutex::default(),
             section_dist: FastMap::default(),
             section_ancestors: FastSet::default(),
             lod_morph: [voxel_engine::LodMorph::default(); 16],
