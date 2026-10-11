@@ -1931,8 +1931,8 @@ mod tests {
             .bodies()
             .iter()
             .copied()
-            .find(|b| b.kind == crate::world::terrain::cosmos::Kind::Twin)
-            .expect("a twin");
+            .find(|b| b.traits.form == crate::world::terrain::cosmos::Form::Warped)
+            .expect("a warped cube");
         let (au, av) = (
             i32::try_from(twin.centre[0]).expect("twin x") + 8,
             i32::try_from(twin.centre[2]).expect("twin z") + 8,
@@ -2353,7 +2353,8 @@ mod tests {
     /// near square is drawn one way: by the far field, or (near, at spawn ground level) by the
     /// chunks. Bytes re-pinned to `0x25d65e7b` when the cut became the distance rule's: chart tiles count
     /// from their own patch, the finest tiles over near columns leave them out, and every level but
-    /// the coarsest carries its morph `dy` (seed 42, diffusion, default view).
+    /// the coarsest carries its morph `dy` (seed 42, diffusion, default view); and to `0x0bfc_3833`
+    /// at worldgen 11, where seed 42 grows another start world.
     #[test]
     fn far_chart_altitude_frontier_is_closed() {
         use crate::render_config::RenderConfig;
@@ -2366,7 +2367,7 @@ mod tests {
         world.section_eye_y = storage.y;
         let spawn = frontier_counts(&mut world, center);
         println!("spawn: hash {:#x}, {} sections, {} of {} near-square columns near", spawn.hash, spawn.sections, spawn.near_n, spawn.under_n);
-        assert_eq!(spawn.hash, 0x25d65e7b, "spawn ground-level far-field bytes changed");
+        assert_eq!(spawn.hash, 0x0bfc_3833, "spawn ground-level far-field bytes changed");
         assert!(spawn.near_n > 0, "no column near spawn is near");
         assert_chart_closed("spawn", &spawn);
 

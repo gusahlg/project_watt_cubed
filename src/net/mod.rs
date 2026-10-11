@@ -294,7 +294,7 @@ mod fingerprint_tests {
             world_fingerprint(&registry, WorldgenKind::Diffusion, TerrainCfg::default()),
             world_fingerprint(&registry, WorldgenKind::Diffusion, knobs),
         ];
-        assert_eq!(fp, [0x2ae6_d587_2d8b_db9a, 0x6ce5_8e44_4cb6_e65b, 0x7cdc_238a_9080_c3e4, 0x725c_01ff_99cd_ef75]);
+        assert_eq!(fp, [0xa538_98be_743f_779f, 0xcd64_290f_bad2_6cfe, 0x2b2c_2f7e_8e1f_40eb, 0x23ef_8f5f_c062_c22a]);
     }
 
     /// Peers compare this id at join: a change refuses every older client.
@@ -303,7 +303,7 @@ mod fingerprint_tests {
         let id = content_id(&crate::block::BlockRegistry::with_builtins());
         assert_eq!(
             id,
-            ContentId { worldgen: 10, gravity: 0xbda9_b2eb_c25d_c4d0, law: 0x04ce_0caa_d622_c6eb, palette: 0x95c9_349d_7e12_74b8 }
+            ContentId { worldgen: 11, gravity: 0xbda9_b2eb_c25d_c4d0, law: 0x04ce_0caa_d622_c6eb, palette: 0x95c9_349d_7e12_74b8 }
         );
     }
 }

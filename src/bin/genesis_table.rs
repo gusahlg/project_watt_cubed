@@ -16,7 +16,9 @@ use project_watt_cubed::mechanics::genesis::{
     canonical_nodes, canonical_of, choose, entry_solved, pi_g, read_table, solve, write_table, Layout, Patience, Spec, Table, TableEntry, DATUM_SAMPLES,
     TABLE_ELEMENTS, TABLE_HALF,
 };
+use project_watt_cubed::gravity::relief::harmonics_of;
 use project_watt_cubed::mechanics::material::Params;
+use project_watt_cubed::space::datum::DatumField;
 
 const HALF: f64 = TABLE_HALF;
 const DENSITY: f64 = 5.0;
@@ -34,7 +36,8 @@ fn main() {
         }
         Some("--write") => write(args.get(1).expect("--write <file>")),
         Some("--upgrade") => upgrade(args.get(1).expect("--upgrade <from> <to>"), args.get(2).expect("--upgrade <from> <to>")),
-        _ => eprintln!("usage: genesis_table --pi <Π> [elements] | --write <file>"),
+        Some("--harmonics") => harmonics(args.get(1).expect("--harmonics <from> <to>"), args.get(2).expect("--harmonics <from> <to>")),
+        _ => eprintln!("usage: genesis_table --pi <Π> [elements] | --write <file> | --upgrade <from> <to> | --harmonics <from> <to>"),
     }
 }
 
@@ -79,8 +82,20 @@ fn upgrade(from: &str, to: &str) {
     save(to, entries);
 }
 
-fn save(path: &str, entries: Vec<TableEntry>) {
-    let table = Table { elements: TABLE_ELEMENTS, samples: DATUM_SAMPLES, entries };
+/// Keep every entry as it is and add the relief expansions (a version-2 table).
+fn harmonics(from: &str, to: &str) {
+    let bytes = std::fs::read(from).expect("read the table");
+    save(to, read_table(&bytes).expect("a table").entries);
+}
+
+/// Write the table, each entry with its datum's relief expansion, and the expansion of a unit lift.
+fn save(path: &str, mut entries: Vec<TableEntry>) {
+    let datum = |face: &[f32]| DatumField { g: DATUM_SAMPLES, offsets: (0..6).flat_map(|_| face.iter().copied()).collect() };
+    for e in &mut entries {
+        e.harmonics = harmonics_of(&datum(&e.offsets));
+    }
+    let ones = harmonics_of(&datum(&[1.0; DATUM_SAMPLES * DATUM_SAMPLES]));
+    let table = Table { elements: TABLE_ELEMENTS, samples: DATUM_SAMPLES, ones, entries };
     std::fs::write(path, write_table(&table)).expect("write the table");
     println!("wrote {path}");
 }
@@ -128,7 +143,7 @@ fn shaped(n: usize, log2_pi: f64, converged: bool, nodes: Vec<DVec3>) -> TableEn
         Layout::Round { radius, datum, .. } => (radius / HALF, datum.offsets[..DATUM_SAMPLES * DATUM_SAMPLES].iter().map(|&o| (o as f64 / HALF) as f32).collect()),
         Layout::Cube => (0.0, vec![0.0; DATUM_SAMPLES * DATUM_SAMPLES]),
     };
-    TableEntry { log2_pi, converged, max_tilt: out.max_tilt, roundness: out.roundness, radius, offsets, nodes }
+    TableEntry { log2_pi, converged, max_tilt: out.max_tilt, roundness: out.roundness, radius, offsets, harmonics: Vec::new(), nodes }
 }
 
 fn one(pi: f64, n: usize, trace: usize) {

@@ -249,6 +249,44 @@ impl Atlas {
         atlas
     }
 
+    /// The same atlas with every box moved `z0` along storage z (a shelf row; the boxes keep their x).
+    pub fn with_z(mut self, z0: i64) -> Self {
+        assert!(z0 >= 0 && z0 % 16 == 0, "storage row z {z0} is chunk aligned");
+        for b in &mut self.bands {
+            for o in &mut b.origin {
+                o[2] += z0;
+            }
+        }
+        if let Some(i) = &mut self.inner {
+            for o in &mut i.t_origin {
+                o[2] += z0;
+            }
+            i.core_origin[2] += z0;
+        }
+        if let Some(g) = &mut self.grid {
+            g.origin[2] += z0;
+        }
+        self
+    }
+
+    /// Storage z span of the boxes, from z 0 of their row through the end of the last one.
+    pub fn z_span(&self) -> i64 {
+        let z0 = self.z0();
+        self.patches().map(|p| {
+            let (o, s) = self.storage_box(p);
+            o[2] + s[2]
+        }).max().unwrap_or(z0) - z0
+    }
+
+    /// Storage z of the row this atlas's boxes sit in.
+    pub fn z0(&self) -> i64 {
+        match (&self.grid, self.bands.first()) {
+            (Some(g), _) => g.origin[2],
+            (None, Some(b)) => b.origin[0][2],
+            (None, None) => 0,
+        }
+    }
+
     /// Storage x where this atlas's boxes begin.
     pub fn x0(&self) -> i64 {
         if let Some(g) = &self.grid {
@@ -333,23 +371,23 @@ impl Atlas {
     /// side by side along x with their faces along z and never share a column, so this reads the
     /// layout rather than testing every box.
     pub fn column(&self, x: i64, z: i64) -> Option<(Patch, i64, i64)> {
-        // Six faces of side `n` along z from 0, `GAP` apart, at storage x `x0`.
-        let faces = |x0: i64, n: i64| {
-            let lx = x - x0;
-            if lx < 0 || lx >= n || z < 0 {
+        // Six faces of side `n` along z from the row's z, `GAP` apart, at storage x `x0`.
+        let faces = |o: [i64; 3], n: i64| {
+            let (lx, rz) = (x - o[0], z - o[2]);
+            if lx < 0 || lx >= n || rz < 0 {
                 return None;
             }
-            let f = z / (n + GAP);
-            let lz = z - f * (n + GAP);
-            (f < 6 && lz < n).then_some((FACES[f as usize], lx, lz))
+            let f = rz / (n + GAP);
+            let lz = rz - f * (n + GAP);
+            (f < 6 && lz < n).then(|| (FACES[f as usize], lx, lz))
         };
         for (band, b) in self.bands.iter().enumerate() {
-            if let Some((face, lx, lz)) = faces(b.origin[0][0], b.n) {
+            if let Some((face, lx, lz)) = faces(b.origin[0], b.n) {
                 return Some((Patch::Shell { band: band as u8, face }, lx, lz));
             }
         }
         if let Some(i) = self.inner {
-            if let Some((face, lx, lz)) = faces(i.t_origin[0][0], i.t_n) {
+            if let Some((face, lx, lz)) = faces(i.t_origin[0], i.t_n) {
                 return Some((Patch::Transition { face }, lx, lz));
             }
             let (lx, lz) = (x - i.core_origin[0], z - i.core_origin[2]);

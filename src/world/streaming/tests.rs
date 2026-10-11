@@ -1544,7 +1544,7 @@ fn far_chart_seam_readiness_converges() {
     };
 
     let mut sites: Vec<(String, DVec3)> = Vec::new();
-    let symptom = world.chart_eye(DVec3::new(0.0, -8_640_801.0, 22_107_307.0)).expect("symptom chart eye");
+    let symptom = world.chart_eye(on_home(&world, DVec3::new(0.0, -8_640_801.0, 22_107_307.0))).expect("symptom chart eye");
     sites.push(("symptom".into(), symptom));
     let sym_ground = world.terrain().surface(Face::PosY, symptom.x as i32, symptom.z as i32);
     sites.push(("symptom-ground".into(), DVec3::new(symptom.x, sym_ground as f64, symptom.z)));
@@ -1811,4 +1811,17 @@ fn a_full_pass_and_a_follow_pass_take_their_steps_in_order() {
         "section_visible", "SecVisible", "occlusion", "Occlusion",
     ];
     assert_eq!(follow.log, follow_steps, "follow pass");
+}
+
+/// The point 200 blocks above the start world's relaxed ground in the direction the old symptom
+/// site `old` lay from the authored start world's centre (`HOME_CENTRE`): the old sites, carried
+/// onto whatever start world the seed grows.
+fn on_home(world: &World, old: DVec3) -> DVec3 {
+    use crate::world::terrain::cosmos::{Shape, HOME_CENTRE};
+    let cosmos = world.terrain().cosmos().expect("a cosmos");
+    let home = cosmos.home();
+    let Shape::Ball { r } = home.shape else { panic!("the start world is round") };
+    let dir = (old - DVec3::new(HOME_CENTRE[0] as f64, HOME_CENTRE[1] as f64, HOME_CENTRE[2] as f64)).normalize();
+    let c = home.centre_f();
+    c + dir * (r as f64 + cosmos.surface_offset(home, c + dir) + 200.0)
 }

@@ -129,15 +129,29 @@ impl WorldSurface<'_> {
         let Some(cosmos) = self.world.generator.cosmos() else { return };
         let Some(b) = cosmos.bodies().iter().find(|b| b.id == body) else { return };
         let terrain::cosmos::Shape::Cube { half } = b.shape else { return };
-        let warp = self
-            .world
-            .seams
-            .atlases()
-            .iter()
-            .find(|a| a.grid.as_ref().is_some_and(|g| g.body == body))
-            .and_then(|a| a.warp.as_ref().map(|w| w.max_displacement()))
-            .unwrap_or(0.0);
-        let reach = rule.horizon() + warp;
+        let warp = self.world.seams.atlases().iter().find(|a| a.grid.as_ref().is_some_and(|g| g.body == body)).and_then(|a| a.warp.as_ref());
+        // Tiles are laid out on the reference cube, so a sagging cube's eye goes back through its
+        // warp, and the horizon is padded by how much the displacement changes around that point
+        // (sampled over twice the horizon: the field is smooth at that scale), never by more than
+        // its largest displacement. A strong sag's whole displacement would ask for too many roots.
+        let horizon = rule.horizon();
+        let (eye, reach) = match warp.map(|w| (w, w.invert(eye))) {
+            Some((w, Some(reference))) => {
+                let u0 = w.apply(reference) - reference;
+                let mut pad = 0.0_f64;
+                for k in 0..=6 {
+                    for j in 0..=6 {
+                        for i in 0..=6 {
+                            let p = reference + (DVec3::new(i as f64, j as f64, k as f64) / 3.0 - DVec3::ONE) * 2.0 * horizon;
+                            pad = pad.max((w.apply(p) - p - u0).length());
+                        }
+                    }
+                }
+                (reference, horizon + (1.25 * pad).min(w.max_displacement()))
+            }
+            Some((w, None)) => (eye, horizon + w.max_displacement()),
+            None => (eye, horizon),
+        };
         let span = f64::from(section_span(Detail(rule.coarsest)));
         let lim = (half + terrain::cosmos::RELIEF) as f64;
         for face in Face::ALL {

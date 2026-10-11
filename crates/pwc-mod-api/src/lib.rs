@@ -17,6 +17,19 @@
 //! requires a major version bump. The [`prelude`] covers what most mods need; the module
 //! re-exports give access to the game's subsystems a mod may read or drive.
 //!
+//! # 3.1.0
+//!
+//! The emergent cosmos (worldgen 11): every seed grows its own bodies. Additions only.
+//! - `world::terrain::cosmos::Body` carries `traits` (`Traits`: rank, form, parent, partner, core,
+//!   mass, gravity, heat, glow, air top, temperature, wetness, life, suite, name) and `name()`;
+//!   `Traits::class()` is a label of what the body is ("start world", "binary cube", "living moon",
+//!   ...). `Cosmos::suites` and `Cosmos::suite` give each body's minerals.
+//! - `Cosmos::new` and `Cosmos::with_deep` take the full 64-bit seed.
+//! - `Body::kind` (`Kind`) stays one release, derived from the traits (`Traits::legacy_kind`): a
+//!   body with id 0 is `Home`, a satellite `Moon`, a cube partner `Twin`, a shell `Hollow`, a free
+//!   core `Ember`, anything else `Verdant`. The Twins, Verdance, the Hollow and the Ember are
+//!   outcomes now, not fixtures.
+//!
 //! # 3.0.0
 //!
 //! The mods-v3 release: chat, commands, every menu and the mod list are mods, the build decides

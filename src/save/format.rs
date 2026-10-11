@@ -35,8 +35,9 @@
 //! Version 9 is the same header with 4 knobs and a 33-byte player record (no frame,
 //! velocity, or up axis). It still decodes: identity frame, zero velocity, +Y up,
 //! and the four new knobs at 100. `PlayerState::legacy_pose` is set so the bridge
-//! can stand that player in local gravity; the flag is not written. A Diffusion world stamped with a generator
-//! older than the warped-cube twins (`worldgen < 10`) is [`SaveError::BeforeCubePlanet`].
+//! can stand that player in local gravity; the flag is not written. A Diffusion world stamped with
+//! another generator version than this game's is [`SaveError::OtherUniverse`]: every version grows a
+//! different universe from the same seed.
 //! Flat v9 worlds load. Versions 4-8 predate the selective-transfer law: their headers
 //! still peek (the slot list shows them) but [`decode`] refuses them with [`SaveError::Outdated`].
 //!
@@ -74,11 +75,8 @@ const WORLDGEN_STAMP_LEN: usize = 1 + 8 * 2;
 const HEADER_LEN_PRE_LAW: usize = HEADER_LEN_V5 + WORLDGEN_STAMP_LEN;
 const HEADER_LEN_V9: usize = HEADER_LEN_V5 + WORLDGEN_STAMP_LEN_V9 + material::STAMP_LEN;
 pub const HEADER_LEN: usize = HEADER_LEN_PRE_LAW + material::STAMP_LEN;
-/// `WorldgenKind::Diffusion` on disk. A Diffusion world from before the warped-cube twins is refused.
+/// `WorldgenKind::Diffusion` on disk. A Diffusion world of another generator version is refused.
 const KIND_DIFFUSION: u8 = 1;
-/// The first InfiniteDiffusion generator whose twins live on a warped cube grid. Worldgen 9 still
-/// paints them as physical cubes (unreleased). Flat worlds from the same era load.
-const FIRST_CUBE_PLANET_WORLDGEN: u16 = 10;
 
 /// Knob value a v9 stamp (four knobs) pads the four new ones with.
 const KNOB_DEFAULT: u16 = 100;
@@ -505,10 +503,10 @@ pub fn decode(bytes: &[u8]) -> Result<Decoded, SaveError> {
     let worldgen_version = u16::from_le_bytes(bytes[HEADER_LEN_V5 - 2..HEADER_LEN_V5].try_into().unwrap());
     let off = HEADER_LEN_V5;
     let kind = bytes[off];
-    // Diffusion worlds from before the warped-cube twins predate this universe (worldgen 9 still
-    // paints the twins as physical cubes). Flat worlds from the same era load.
-    if kind == KIND_DIFFUSION && worldgen_version < FIRST_CUBE_PLANET_WORLDGEN {
-        return Err(SaveError::BeforeCubePlanet);
+    // A Diffusion world of another generator version is another universe (since v11 the seed grows
+    // its bodies, so the storage layout moves too). Flat worlds load.
+    if kind == KIND_DIFFUSION && worldgen_version != crate::world::terrain::WORLDGEN_VERSION {
+        return Err(SaveError::OtherUniverse(worldgen_version));
     }
     let knobs = if version == 9 {
         let mut knobs = [KNOB_DEFAULT; 8];
@@ -673,7 +671,7 @@ mod tests {
 
     fn sample() -> SaveDoc {
         SaveDoc {
-            worldgen_version: 10,
+            worldgen_version: crate::world::terrain::WORLDGEN_VERSION,
             worldgen: WorldgenStamp::default(),
             law_stamp: material::Law::current().stamp(),
             meta: SaveMeta {
@@ -1010,23 +1008,19 @@ mod tests {
     }
 
     #[test]
-    fn v9_diffusion_before_cube_planets_is_refused() {
+    fn diffusion_worlds_of_another_generator_are_refused() {
         let err = decode(&v9_save(KIND_DIFFUSION, 6, [100; 4])).unwrap_err();
-        assert!(matches!(err, SaveError::BeforeCubePlanet));
-        assert!(err.to_string().contains("made before the cube-planet universe"));
-        // A v10 Diffusion world written while the generator was still v3 is refused too; one stamped
-        // with the cube-planet generator loads.
+        assert!(matches!(err, SaveError::OtherUniverse(6)));
+        assert!(err.to_string().contains("grown by world generator v6"));
+        // Every other generator version is refused, older or newer; this game's loads.
         let mut doc = sample();
         doc.worldgen.kind = KIND_DIFFUSION;
-        doc.worldgen_version = 6;
-        assert!(matches!(decode(&encode(&doc).unwrap()), Err(SaveError::BeforeCubePlanet)));
-        doc.worldgen_version = 7;
-        assert!(matches!(decode(&encode(&doc).unwrap()), Err(SaveError::BeforeCubePlanet)));
-        doc.worldgen_version = 8;
-        assert!(matches!(decode(&encode(&doc).unwrap()), Err(SaveError::BeforeCubePlanet)));
-        doc.worldgen_version = 9;
-        assert!(matches!(decode(&encode(&doc).unwrap()), Err(SaveError::BeforeCubePlanet)));
-        doc.worldgen_version = 10;
+        let current = crate::world::terrain::WORLDGEN_VERSION;
+        for v in [6, 7, 8, 9, 10, current + 1] {
+            doc.worldgen_version = v;
+            assert!(matches!(decode(&encode(&doc).unwrap()), Err(SaveError::OtherUniverse(w)) if w == v), "v{v}");
+        }
+        doc.worldgen_version = current;
         assert!(matches!(decode(&encode(&doc).unwrap()).unwrap(), Decoded::Intact(_)));
     }
 

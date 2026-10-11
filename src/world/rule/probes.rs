@@ -16,8 +16,6 @@ use crate::world::streaming::headless::{step, step_finished};
 
 const OWNER_SEED: i64 = 1_791_184_794_939_118_871;
 const OWNER_EYE: DVec3 = DVec3::new(-19.1, 390.8, -0.6);
-/// Twin 2's +Y stand on seed 42.
-const TWIN_EYE: DVec3 = DVec3::new(296_989_696.0, -308_421_885.0, -370_431_824.0);
 
 /// The start world of `seed` at the owner's view.
 fn owner_view(seed: i64) -> World {
@@ -254,11 +252,22 @@ fn steep_site(world: &World) -> DVec3 {
     best.1
 }
 
-/// A twin 2 eye `dx` blocks along +X from its +Y stand, as high over the ground as the stand is.
-fn twin_walk_eye(world: &World, dx: f64) -> DVec3 {
+/// A sagging cube's +Y stand (the old twin 2 of seed 42): the owner's view of a pinned seed that
+/// grows one, and the eye two blocks over the ground at its face centre.
+fn twin_site() -> (World, DVec3) {
+    use crate::world::terrain::cosmos::fixture::{first, seed, Want};
+    let world = owner_view(seed(&[Want::Warped]));
+    let cube = first(world.generator.cosmos().expect("a cosmos"), Want::Warped).expect("a warped cube");
+    let (x, z) = (cube.centre[0] as f64 + 0.5, cube.centre[2] as f64 + 0.5);
+    let ground = world.generator.surface(Face::PosY, x.floor() as i32, z.floor() as i32);
+    (world, DVec3::new(x, f64::from(ground) + 2.0, z))
+}
+
+/// An eye `dx` blocks along +X from the cube's stand `stand`, as high over the ground as the stand is.
+fn twin_walk_eye(world: &World, stand: DVec3, dx: f64) -> DVec3 {
     let ground = |p: DVec3| f64::from(world.generator.surface(Face::PosY, p.x.floor() as i32, p.z.floor() as i32));
-    let over = TWIN_EYE.y - ground(TWIN_EYE);
-    let p = TWIN_EYE + DVec3::new(dx, 0.0, 0.0);
+    let over = stand.y - ground(stand);
+    let p = stand + DVec3::new(dx, 0.0, 0.0);
     DVec3::new(p.x, ground(p) + over, p.z)
 }
 
@@ -280,13 +289,13 @@ fn lod_rule_symptom_a_hillsides_inside_r_are_full_res() {
         failures.push(format!("steep chart site: {bad} of {inside}"));
     }
 
-    let mut world = owner_view(42);
-    world.prepare_around(TWIN_EYE);
+    let (mut world, stand) = twin_site();
+    world.prepare_around(stand);
     world.drive_spawn_ready();
-    settle(&mut world, TWIN_EYE);
-    let mut eye = TWIN_EYE;
+    settle(&mut world, stand);
+    let mut eye = stand;
     for k in 1..=17 {
-        eye = twin_walk_eye(&world, 16.0 * f64::from(k));
+        eye = twin_walk_eye(&world, stand, 16.0 * f64::from(k));
         world.near_eye_prev = None;
         step_finished(&mut world, eye);
     }
@@ -320,11 +329,11 @@ fn lod_rule_symptom_b_detail_is_concentric() {
     settle(&mut world, OWNER_EYE);
     check("owner site", &world, OWNER_EYE);
 
-    let mut world = owner_view(42);
-    world.prepare_around(TWIN_EYE);
+    let (mut world, stand) = twin_site();
+    world.prepare_around(stand);
     world.drive_spawn_ready();
-    settle(&mut world, TWIN_EYE);
-    check("twin 2", &world, TWIN_EYE);
+    settle(&mut world, stand);
+    check("twin 2", &world, stand);
 
     let (lod_levels, lod_detail) = lod_for(16);
     let render = RenderConfig { lod2: true, occlusion: true, lod_levels, lod_detail, ..RenderConfig::default() };
@@ -527,11 +536,11 @@ fn flat_world_near_columns_are_full_res() {
 #[test]
 #[ignore]
 fn lod_rule_twin_near_report() {
-    let mut world = owner_view(42);
-    world.prepare_around(TWIN_EYE);
+    let (mut world, stand) = twin_site();
+    world.prepare_around(stand);
     world.drive_spawn_ready();
-    settle(&mut world, TWIN_EYE);
-    let cols = ground_columns(&world, TWIN_EYE, 12.0);
+    settle(&mut world, stand);
+    let cols = ground_columns(&world, stand, 12.0);
     let center = world.center.expect("a centre");
     println!(
         "frame {:?} up {:?} lod_place {:?} near columns {} of {}; settled {} far {}",
@@ -545,7 +554,7 @@ fn lod_rule_twin_near_report() {
     );
     let far_c = world.section_center().expect("far centre");
     let (desired, clips) = world.desired_and_clips(far_c);
-    let near_tiles: Vec<_> = drawn(&world).into_iter().filter(|&s| world.node_box(s).is_some_and(|b| b.dist_box(&PhysBox::eye_cell(TWIN_EYE)) < 256.0)).collect();
+    let near_tiles: Vec<_> = drawn(&world).into_iter().filter(|&s| world.node_box(s).is_some_and(|b| b.dist_box(&PhysBox::eye_cell(stand)) < 256.0)).collect();
     println!("desired {} wanted clips {}; drawn tiles within R {}", desired.len(), clips.len(), near_tiles.len());
     let nc: Vec<_> = world.near.near_columns().take(3).collect();
     println!("near columns e.g. {nc:?}; fold identity {}", world.fold.is_identity());

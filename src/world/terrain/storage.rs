@@ -15,7 +15,7 @@ use std::sync::Arc;
 use glam::DVec3;
 
 use super::Materials;
-use super::cosmos::{Body, Cosmos, Kind, RELIEF, Shape};
+use super::cosmos::{Body, Cosmos, Form, Rank, RELIEF, Shape};
 use super::round::{Round, Style};
 use crate::block::registry::{AIR, BlockId};
 use crate::coord::ChunkCoord;
@@ -24,21 +24,145 @@ use crate::space::warp::Warp;
 use crate::space::datum::DatumField;
 use crate::world::chunk::{CHUNK_SIZE, ChunkData};
 
-/// Unit direction from a moon's parent (the nearest body that is not a moon and not the Ember,
-/// which shares the Hollow's centre) out to the moon. Ice caps face this way.
+/// Unit direction from a moon's parent out to the moon. Ice caps face this way.
 fn parent_pole(bodies: &[Body], moon: &Body) -> DVec3 {
-    let c = moon.centre_f();
-    let parent = bodies.iter().filter(|b| b.id != moon.id && b.kind != Kind::Moon && b.kind != Kind::Ember).min_by(|a, b| {
-        (a.centre_f() - c).length_squared().total_cmp(&(b.centre_f() - c).length_squared())
-    });
+    let parent = moon.traits.parent.and_then(|p| bodies.get(usize::from(p)));
     match parent {
         Some(p) => {
-            let d = c - p.centre_f();
+            let d = moon.centre_f() - p.centre_f();
             let len = d.length();
             if len > 1.0 { d / len } else { DVec3::Y }
         }
         None => DVec3::Y,
     }
+}
+
+/// The round painter a body's traits pick: glowing worlds burn, living ones grow forests, the rest
+/// are cratered moons.
+fn style_of(b: &Body) -> Style {
+    if b.traits.glow {
+        Style::Ember
+    } else if b.traits.life > 0 {
+        Style::Verdant
+    } else {
+        Style::Moon { tone: (b.seed % 3) as u8 }
+    }
+}
+
+/// Rows of storage stay below this z (section, heightmip and save keys are audited to here).
+const Z_END: i64 = 1_000_000_000;
+/// Storage x (and a cube box's y) stays below the cells block coordinates resolve.
+const END: i64 = crate::math::CELL_LIMIT as i64;
+/// Empty storage cells between shelf rows.
+const ROW_GAP: i64 = 64;
+
+/// One box set a body needs in storage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Need {
+    /// The start world's atlas (band 0 is the face painter's).
+    Home,
+    /// A round body's atlas.
+    Ball,
+    /// A shell's outer and inner surfaces.
+    Outer,
+    Inner,
+    /// A sagging cube's box.
+    Cube,
+}
+
+impl Need {
+    /// The atlas at storage origin `at` (`[x, y, z]`; only a cube's box uses `y`).
+    fn atlas(self, b: &Body, at: [i64; 3], warps: &[(u16, Arc<Warp>)]) -> Atlas {
+        let c = b.centre_f();
+        match (self, b.shape) {
+            (Need::Home | Need::Ball, Shape::Ball { r }) => Atlas::new(c, r, r + RELIEF, false, at[0]).with_z(at[2]),
+            (Need::Outer, Shape::Shell { outer, inner }) => Atlas::shell(c, outer, (outer + inner) / 2, outer + RELIEF, false, at[0]).with_z(at[2]),
+            (Need::Inner, Shape::Shell { outer, inner }) => Atlas::shell(c, inner, inner - RELIEF, (outer + inner) / 2, true, at[0]).with_z(at[2]),
+            (Need::Cube, Shape::Cube { half }) => {
+                let reach = half + RELIEF;
+                let ref_min = b.centre.map(|v| v - reach);
+                let warp = warps.iter().find(|(id, _)| *id == b.id).map(|(_, w)| Arc::clone(w)).expect("a stored cube has a warp");
+                Atlas::cube(c, half, at, ref_min, [2 * reach; 3], warp, b.id)
+            }
+            _ => unreachable!("a storage need matches its body's shape"),
+        }
+    }
+
+    /// Storage x and z the boxes span.
+    fn spans(self, b: &Body) -> (i64, i64) {
+        match (self, b.shape) {
+            (Need::Cube, Shape::Cube { half }) => (2 * (half + RELIEF), 2 * (half + RELIEF)),
+            (Need::Home | Need::Ball, Shape::Ball { r }) => {
+                let a = Atlas::new(DVec3::ZERO, r, r + RELIEF, false, STORAGE_X0);
+                (a.x_span(), a.z_span())
+            }
+            (Need::Outer, Shape::Shell { outer, inner }) => {
+                let a = Atlas::shell(DVec3::ZERO, outer, (outer + inner) / 2, outer + RELIEF, false, STORAGE_X0);
+                (a.x_span(), a.z_span())
+            }
+            (Need::Inner, Shape::Shell { outer, inner }) => {
+                let a = Atlas::shell(DVec3::ZERO, inner, inner - RELIEF, (outer + inner) / 2, true, STORAGE_X0);
+                (a.x_span(), a.z_span())
+            }
+            _ => unreachable!("a storage need matches its body's shape"),
+        }
+    }
+}
+
+/// Where every charted surface and stored cube goes, in build order: the start world, round bodies
+/// and shells in catalog order, then the cubes of `warped`. Boxes go first-fit along x from
+/// [`STORAGE_X0`] into shelf rows stacked in z below [`Z_END`]; a cube box also takes its own y
+/// range from the storage border, since PosX and NegX columns are keyed by (y, z) and physical y
+/// stays under 1e9. Row 0 alone is the end-to-end layout. `Err` names a body that did not fit.
+pub(crate) fn plan(bodies: &[Body], warped: &[u16]) -> Result<Vec<(u16, Need, [i64; 3])>, u16> {
+    let snap = |v: i64| v.div_euclid(CS) * CS;
+    let mut needs: Vec<(u16, Need)> = Vec::new();
+    for b in bodies {
+        match (b.traits.rank, b.traits.form, b.shape) {
+            (Rank::Start, _, Shape::Ball { .. }) => needs.push((b.id, Need::Home)),
+            (_, Form::Shell, Shape::Shell { .. }) => needs.extend([(b.id, Need::Outer), (b.id, Need::Inner)]),
+            (_, _, Shape::Ball { .. }) => needs.push((b.id, Need::Ball)),
+            _ => {}
+        }
+    }
+    needs.extend(warped.iter().map(|&id| (id, Need::Cube)));
+    // Rows: (z, height, next free x).
+    let mut rows: Vec<(i64, i64, i64)> = Vec::new();
+    let mut cube_y = STORAGE_X0;
+    let mut out = Vec::with_capacity(needs.len());
+    for (id, need) in needs {
+        let b = &bodies[usize::from(id)];
+        let (dx, dz) = need.spans(b);
+        let fits = |x: i64| x + dx < END;
+        // A lower row takes only what fits its height; the last row may grow.
+        let last = rows.len().checked_sub(1);
+        let row = match (0..rows.len()).find(|&k| fits(rows[k].2) && (dz <= rows[k].1 || (Some(k) == last && rows[k].0 + dz <= Z_END))) {
+            Some(k) => k,
+            None => {
+                let z = rows.last().map_or(0, |r| snap(r.0 + r.1 + ROW_GAP + CS - 1));
+                if z + dz > Z_END || !fits(STORAGE_X0) {
+                    return Err(id);
+                }
+                rows.push((z, dz, STORAGE_X0));
+                rows.len() - 1
+            }
+        };
+        let y = if need == Need::Cube {
+            if cube_y + dx > END {
+                return Err(id);
+            }
+            cube_y += dx;
+            cube_y - dx
+        } else {
+            0
+        };
+        let r = &mut rows[row];
+        let at = [r.2, y, r.0];
+        r.1 = r.1.max(dz);
+        r.2 = snap(r.2 + dx + ROW_GAP + CS - 1);
+        out.push((id, need, at));
+    }
+    Ok(out)
 }
 
 const CS: i64 = CHUNK_SIZE as i64;
@@ -78,70 +202,33 @@ fn boxes_of(atlas: &Atlas) -> Vec<(Patch, [i64; 3], [i64; 3])> {
 }
 
 impl StorageWorlds {
-    /// Chart every round body of `cosmos`, boxes end to end from [`STORAGE_X0`], then one box per
-    /// sagging cube in `warps` (its cells are an integer translation of the physical cube).
-    /// `home_fill` is the start world's uniform block below band 0 (the bulk mix's majority material).
-    pub fn new(cosmos: &Cosmos, m: &Arc<Materials>, home_fill: BlockId, warps: &[(u16, Arc<Warp>)]) -> Self {
+    /// Chart every round body of `cosmos` and give each sagging cube in `warps` one box (its cells are
+    /// an integer translation of the physical cube), placed by [`plan`]. `fills` holds each body's
+    /// deep fill and heart by id: the start world's uniform block below band 0, a round painter's
+    /// fill below its caves and in its core. `Err` names a body that does not fit.
+    pub fn new(cosmos: &Cosmos, m: &Arc<Materials>, fills: &[(BlockId, BlockId)], warps: &[(u16, Arc<Warp>)]) -> Result<Self, u16> {
+        let bodies = cosmos.bodies();
+        let warped: Vec<u16> = warps.iter().map(|(id, _)| *id).collect();
         let mut worlds = Vec::new();
-        let mut x = STORAGE_X0;
-        // Copied so a moon can look up its parent while the loop still holds a body.
-        let bodies = cosmos.bodies().to_vec();
-        for b in &bodies {
-            let c = b.centre_f();
-            let built = match (b.kind, b.shape) {
-                (Kind::Home, Shape::Ball { r }) => {
-                    Some((Atlas::new(c, r, r + RELIEF, false, x), None, true, home_fill))
+        for (id, need, at) in plan(bodies, &warped)? {
+            let b = &bodies[usize::from(id)];
+            let atlas = need.atlas(b, at, warps);
+            let round = match need {
+                Need::Home | Need::Cube => None,
+                Need::Outer => Some(Round::new(atlas.clone(), b.seed, Style::HollowOuter, m.clone(), DVec3::ZERO)),
+                Need::Inner => Some(Round::new(atlas.clone(), b.seed ^ 0x1A2B, Style::HollowInner, m.clone(), DVec3::ZERO)),
+                Need::Ball => {
+                    let style = style_of(b);
+                    let pole = if matches!(style, Style::Moon { .. }) { parent_pole(bodies, b) } else { DVec3::ZERO };
+                    Some(Round::new(atlas.clone(), b.seed, style, m.clone(), pole).filled(fills[usize::from(id)]))
                 }
-                (_, Shape::Cube { .. }) | (_, Shape::Shell { .. }) if b.kind != Kind::Hollow => None,
-                (Kind::Hollow, Shape::Shell { outer, inner }) => {
-                    let mid = (outer + inner) / 2;
-                    let outer_a = Atlas::shell(c, outer, mid, outer + RELIEF, false, x);
-                    let outer_r = Round::new(outer_a.clone(), b.seed, Style::HollowOuter, m.clone(), DVec3::ZERO);
-                    let next = outer_a.next_x();
-                    worlds.push(Charted { boxes: boxes_of(&outer_a), round: Some(outer_r), atlas: outer_a, home: false, fill: AIR });
-                    x = next;
-                    let inner_a = Atlas::shell(c, inner, inner - RELIEF, mid, true, x);
-                    let inner_r = Round::new(inner_a.clone(), b.seed ^ 0x1A2B, Style::HollowInner, m.clone(), DVec3::ZERO);
-                    Some((inner_a, Some(inner_r), false, AIR))
-                }
-                (kind, Shape::Ball { r }) => {
-                    let style = match kind {
-                        Kind::Verdant => Style::Verdant,
-                        Kind::Ember => Style::Ember,
-                        _ => Style::Moon { tone: (b.seed % 3) as u8 },
-                    };
-                    let pole = if kind == Kind::Moon { parent_pole(&bodies, b) } else { DVec3::ZERO };
-                    let atlas = Atlas::new(c, r, r + RELIEF, false, x);
-                    let round = Round::new(atlas.clone(), b.seed, style, m.clone(), pole);
-                    Some((atlas, Some(round), false, AIR))
-                }
-                _ => None,
             };
-            if let Some((atlas, round, home, fill)) = built {
-                x = atlas.next_x();
-                worlds.push(Charted { boxes: boxes_of(&atlas), round, atlas, home, fill });
-            }
-        }
-        // y starts at the storage border, one box after another. PosX and NegX columns are keyed by
-        // (y, z) only; stacking the boxes in x alone would alias the two cubes with each other and
-        // with physical columns, whose y stays under 1e9.
-        let mut cube_y = STORAGE_X0;
-        for (id, warp) in warps {
-            let Some(body) = bodies.iter().find(|b| b.id == *id) else { continue };
-            let Shape::Cube { half } = body.shape else { continue };
-            let reach = half + RELIEF;
-            let size = 2 * reach;
-            debug_assert!(size % CS == 0, "a cube box is chunk aligned");
-            let ref_min = [body.centre[0] - reach, body.centre[1] - reach, body.centre[2] - reach];
-            let origin = [x, cube_y, 0];
-            cube_y += size;
-            let atlas = Atlas::cube(body.centre_f(), half, origin, ref_min, [size; 3], Arc::clone(warp), body.id);
-            x = atlas.next_x();
-            worlds.push(Charted { boxes: boxes_of(&atlas), round: None, atlas, home: false, fill: AIR });
+            let (home, fill) = if need == Need::Home { (true, fills[usize::from(id)].0) } else { (false, AIR) };
+            worlds.push(Charted { boxes: boxes_of(&atlas), round, atlas, home, fill });
         }
         let atlases = worlds.iter().map(|w| Arc::new(w.atlas.clone())).collect();
         let cube_x0 = worlds.iter().filter_map(|w| w.atlas.grid.as_ref().map(|g| g.origin[0])).min().unwrap_or(i64::MAX);
-        Self { worlds, atlases, cube_x0 }
+        Ok(Self { worlds, atlases, cube_x0 })
     }
 
     fn round_of(w: &Charted) -> &Round {
@@ -532,7 +619,8 @@ mod tests {
         let mut reg = BlockRegistry::with_builtins();
         let m = Arc::new(Materials::intern(&mut reg));
         let cosmos = Cosmos::new(42, 1.0);
-        (StorageWorlds::new(&cosmos, &m, AIR, &[]), cosmos)
+        let fills = vec![(m.deeprock, m.magma); cosmos.bodies().len()];
+        (StorageWorlds::new(&cosmos, &m, &fills, &[]).expect("fits"), cosmos)
     }
 
     #[test]
@@ -570,6 +658,50 @@ mod tests {
         );
     }
 
+    /// Today's catalog fits row 0 end to end, as storage was laid out before rows: the start
+    /// world at the storage border, every chart after the last, the cube boxes after the charts
+    /// with their own y ranges.
+    #[test]
+    fn the_authored_catalog_lies_end_to_end_in_row_0() {
+        let cosmos = crate::world::terrain::cosmos::fixture::authored(|| Cosmos::new(42, 1.0));
+        let warped: Vec<u16> = cosmos.bodies().iter().filter(|b| b.traits.partner.is_some()).map(|b| b.id).collect();
+        assert_eq!(warped.len(), 2);
+        let placed = plan(cosmos.bodies(), &warped).expect("fits");
+        let (mut x, mut y) = (STORAGE_X0, STORAGE_X0);
+        for &(id, need, at) in &placed {
+            assert_eq!(at[2], 0, "row 0");
+            assert_eq!(at[0], x, "end to end");
+            let (dx, _) = need.spans(&cosmos.bodies()[usize::from(id)]);
+            x = (x + dx + ROW_GAP + CS - 1).div_euclid(CS) * CS;
+            if need == Need::Cube {
+                assert_eq!(at[1], y, "cube boxes stack in y from the border");
+                y += dx;
+            }
+        }
+        assert_eq!(placed.iter().filter(|p| p.1 == Need::Home).count(), 1);
+        assert_eq!(placed[0].1, Need::Home, "the start world comes first");
+    }
+
+    /// More charts than one row holds stack in rows along z below the cap, and a catalog past every
+    /// row names the body that does not fit.
+    #[test]
+    fn rows_stack_in_z_and_overflow_names_the_body() {
+        let cosmos = Cosmos::new(42, 1.0);
+        let home = *cosmos.home();
+        let big = |id: u16| Body { id, shape: Shape::Ball { r: 40_000_000 }, ..home };
+        let bodies: Vec<Body> = (0..10).map(big).collect();
+        let placed = plan(&bodies, &[]).expect("ten big worlds fit");
+        let rows: std::collections::BTreeSet<i64> = placed.iter().map(|p| p.2[2]).collect();
+        assert!(rows.len() > 1, "they need more than one row: {placed:?}");
+        for &(id, need, at) in &placed {
+            let (dx, dz) = need.spans(&bodies[usize::from(id)]);
+            assert!(at[0] + dx < crate::math::CELL_LIMIT as i64 && at[2] + dz <= Z_END, "{id} inside storage");
+        }
+        let many: Vec<Body> = (0..40).map(big).collect();
+        let err = plan(&many, &[]).expect_err("forty big worlds do not fit");
+        assert!(usize::from(err) < many.len());
+    }
+
     #[test]
     fn storage_chunks_are_the_painter_and_deep_ones_are_uniform() {
         let (w, _) = worlds();
@@ -602,7 +734,8 @@ mod tests {
     #[test]
     #[ignore]
     fn storage_chunk_cost() {
-        let (w, _) = worlds();
+        // `BENCH_AUTHORED=1`: the authored catalog's bodies, the content worldgen 10 painted.
+        let (w, _) = if std::env::var_os("BENCH_AUTHORED").is_some() { crate::world::terrain::cosmos::fixture::authored(worlds) } else { worlds() };
         for c in &w.worlds {
             let Some(round) = &c.round else { continue };
             let atlas = &c.atlas;

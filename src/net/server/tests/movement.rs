@@ -398,6 +398,16 @@ fn noclip_reads_a_chart_edge_like_the_client() {
         if inside == i32::MIN || outside == i32::MIN || outside > inside {
             continue;
         }
+        // A plant or landmark on either column stands where the body would.
+        let clear = |x: i32| {
+            (inside..inside + 3).all(|y| {
+                let g = seams.glue_cell(BlockCoord::new(x, y, z)).map_or((x, y, z), |g| (g.x, g.y, g.z));
+                !state.registry.is_solid(generator.voxel_at(g.0, g.1, g.2))
+            })
+        };
+        if !clear(edge) || !clear(edge + 1) {
+            continue;
+        }
         // Feet on the inside column's top, the body reaching past the box edge.
         let pos = DVec3::new(f64::from(edge) + 0.9, f64::from(inside) + eye, f64::from(z) + 0.5);
         assert!(

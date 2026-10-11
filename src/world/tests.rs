@@ -26,7 +26,7 @@ fn stand_on_twin(world: &mut World) -> ChunkCoord {
         .bodies()
         .iter()
         .copied()
-        .find(|b| b.kind == terrain::cosmos::Kind::Twin)
+        .find(|b| b.traits.form == terrain::cosmos::Form::Warped)
         .expect("a twin");
     let (center, ..) = face_centre_stand(world, &twin, Face::PosY);
     world.center = Some(center);
@@ -352,7 +352,7 @@ fn chunk_creation_arms_the_section_lane() {
 #[test]
 fn desired_frontier_responds_to_altitude() {
     let mut world = lod2_world();
-    let twin = world.terrain().cosmos().expect("cosmos").bodies().iter().copied().find(|b| b.kind == terrain::cosmos::Kind::Twin).expect("a twin");
+    let twin = world.terrain().cosmos().expect("cosmos").bodies().iter().copied().find(|b| b.traits.form == terrain::cosmos::Form::Warped).expect("a warped cube");
     let (center, cu, cv, surf) = face_centre_stand(&mut world, &twin, Face::PosY);
     let ground: FastSet<_> = world.desired_sections(center).into_iter().collect();
     let high = stand_at(&mut world, twin.id, Face::PosY, cu, surf + 4000, cv);
@@ -2962,7 +2962,7 @@ fn far_face_twin_plus_x_selects_sections_at_the_surface() {
         .bodies()
         .iter()
         .copied()
-        .find(|b| b.kind == terrain::cosmos::Kind::Twin)
+        .find(|b| b.traits.form == terrain::cosmos::Form::Warped)
         .expect("a twin");
     let (center, cu, cv, _) = face_centre_stand(&mut world, &twin, Face::PosX);
     let desired = world.desired_sections(center);
@@ -3038,14 +3038,14 @@ fn far_face_twin_selects_that_body() {
         .bodies()
         .iter()
         .copied()
-        .find(|b| b.kind == terrain::cosmos::Kind::Twin)
+        .find(|b| b.traits.form == terrain::cosmos::Form::Warped)
         .expect("a twin");
     let (center, cu, cv, _) = face_centre_stand(&mut world, &twin, Face::PosY);
     let desired = world.desired_sections(center);
     assert!(!desired.is_empty());
     let body = desired[0].body;
-    let kind = world.terrain().cosmos().unwrap().bodies().iter().find(|b| b.id == body).unwrap().kind;
-    assert_eq!(kind, terrain::cosmos::Kind::Twin);
+    let form = world.terrain().cosmos().unwrap().bodies().iter().find(|b| b.id == body).unwrap().traits.form;
+    assert_eq!(form, terrain::cosmos::Form::Warped);
     assert!(desired.iter().all(|s| s.body == body && s.face == Face::PosY));
     assert!(desired.iter().any(|s| (s.min_x() - cu).abs() < 50_000 && (s.min_z() - cv).abs() < 50_000));
 }
@@ -3056,7 +3056,7 @@ fn far_face_edge_unions_the_neighbour() {
     let mut world = lod2_world();
     let (twin_id, home_id, half, centre) = {
         let cosmos = world.terrain().cosmos().expect("cosmos");
-        let twin = cosmos.bodies().iter().copied().find(|b| b.kind == terrain::cosmos::Kind::Twin).expect("a twin");
+        let twin = cosmos.bodies().iter().copied().find(|b| b.traits.form == terrain::cosmos::Form::Warped).expect("a twin");
         let terrain::cosmos::Shape::Cube { half } = twin.shape else { panic!("a twin is a cube") };
         let centre = (
             i32::try_from(twin.centre[0]).expect("twin x"),
@@ -3089,8 +3089,8 @@ fn verdance_column(world: &World, from_pos_x: Option<i64>) -> (usize, std::sync:
         .bodies()
         .iter()
         .copied()
-        .find(|b| b.kind == terrain::cosmos::Kind::Verdant)
-        .expect("Verdance");
+        .find(|b| terrain::cosmos::fixture::Want::Living.matches(b))
+        .expect("a living world");
     let atlases = world.terrain().atlases();
     let index = atlases.iter().position(|a| (a.centre - verdant.centre_f()).length() < 1.0).expect("Verdance is charted");
     let atlas = atlases[index].clone();
@@ -3201,7 +3201,7 @@ fn far_face_plus_x_edit_dirties_the_face_section() {
         .bodies()
         .iter()
         .copied()
-        .find(|b| b.kind == terrain::cosmos::Kind::Twin)
+        .find(|b| b.traits.form == terrain::cosmos::Form::Warped)
         .expect("a twin");
     let (_, cu, cv, surf) = face_centre_stand(&mut world, &twin, Face::PosX);
     let (x, y, z) = FaceFrame::new(Face::PosX).cell_to_world((cu, surf - 1, cv));
@@ -3856,3 +3856,5 @@ fn ledger_install_probe() {
         }
     }
 }
+
+

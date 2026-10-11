@@ -29,6 +29,43 @@ pub struct Warp {
 }
 
 impl Warp {
+    /// The warp of a cube of half-size `half` centred at `centre` relaxed at `Π_g = pi`, read
+    /// straight from the genesis table: [`from_solved`](Self::from_solved) of
+    /// `genesis::tabulated(pi, half)`, bit for bit, without building and certifying the lattice.
+    pub fn tabulated(pi: f64, half: f64, centre: DVec3) -> Option<Self> {
+        use crate::mechanics::genesis::{canonical_index, canonical_of, tabulated_canonical};
+        let (elements, canon) = tabulated_canonical(pi)?;
+        let dims = elements + 2;
+        let m = dims / 2;
+        // The table lattice's element edge and half-size (`genesis::entry_solved`).
+        let cell_c = (1i64 << 20) as f64;
+        let half_c = elements as f64 * cell_c / 2.0;
+        let scale = half / half_c;
+        let cell = cell_c * scale;
+        let origin = centre - DVec3::new(m as f64, m as f64, m as f64) * cell;
+        let mut nodes = Vec::with_capacity((dims + 1) * (dims + 1) * (dims + 1));
+        for k in 0..=dims {
+            for j in 0..=dims {
+                for i in 0..=dims {
+                    let o = [i as i64 - m as i64, j as i64 - m as i64, k as i64 - m as i64];
+                    let (c, slot, sign) = canonical_of(o);
+                    let p = canon[canonical_index(c)];
+                    let relaxed = DVec3::new(sign[0] * p[slot[0]], sign[1] * p[slot[1]], sign[2] * p[slot[2]]) * half_c;
+                    let undeformed = DVec3::new(
+                        (i as f64 - m as f64) * cell_c,
+                        (j as f64 - m as f64) * cell_c,
+                        (k as f64 - m as f64) * cell_c,
+                    );
+                    nodes.push((relaxed - undeformed) * scale);
+                }
+            }
+        }
+        let max_disp = nodes.iter().fold(0.0_f64, |m, u| m.max(u.length()));
+        let mut warp = Self { origin, cell, dims: [dims; 3], nodes, max_disp, max_slope: 0.0 };
+        warp.max_slope = warp.slope_bound();
+        Some(warp)
+    }
+
     /// Scale a tabulated lattice onto a body centred at `centre` (the table's `Solved::scale`
     /// already carries the half-size). Node `(m, m, m)` of a genesis lattice is the origin.
     pub fn from_solved(solved: &Solved, centre: DVec3) -> Self {
@@ -285,6 +322,15 @@ mod tests {
     fn lcg(state: &mut u64) -> f64 {
         *state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
         ((*state >> 33) as f64) / (1u64 << 31) as f64
+    }
+
+    #[test]
+    fn a_tabulated_warp_is_the_solved_lattice_bit_for_bit() {
+        let centre = DVec3::new(3.0e8, -1.2e7, 5.5e6);
+        for (pi, half) in [(0.3, 2.0e5), (4.2, 7.5e6), (11.0, 1.1e6), (60.0, 3.0e7), (5000.0, 9.0e5)] {
+            let solved = crate::mechanics::genesis::tabulated(pi, half).expect("the genesis table");
+            assert_eq!(Warp::tabulated(pi, half, centre), Some(Warp::from_solved(&solved, centre)), "Π {pi} half {half}");
+        }
     }
 
     #[test]

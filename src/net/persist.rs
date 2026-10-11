@@ -223,15 +223,16 @@ fn open(path: &Path, mut doc: SaveDoc, flags: &Flags, rotate: bool) -> Result<Lo
     if doc.law_stamp != material::Law::current().stamp() {
         return Err(LoadError::new(path, "save belongs to a different universe (law stamp mismatch)"));
     }
-    if doc.worldgen_version != WORLDGEN_VERSION {
-        eprintln!(
-            "warning: {} was written by worldgen v{} (current v{WORLDGEN_VERSION})",
-            path.display(),
-            doc.worldgen_version
-        );
-    }
     let worldgen = WorldgenKind::from_wire(doc.worldgen.kind)
         .ok_or_else(|| LoadError::new(path, format!("unknown worldgen kind {}", doc.worldgen.kind)))?;
+    // Every generator version grows another universe from the seed (and moves the storage layout
+    // edits are keyed in), so a world of another version is refused, never re-grown under old edits.
+    if worldgen == WorldgenKind::Diffusion && doc.worldgen_version != WORLDGEN_VERSION {
+        return Err(LoadError::new(
+            path,
+            format!("was grown by world generator v{} (this server grows v{WORLDGEN_VERSION})", doc.worldgen_version),
+        ));
+    }
     let terrain = TerrainCfg::from_wire(doc.worldgen.knobs);
     if flags.warn && overrides(flags, doc.meta.seed, worldgen, terrain) {
         eprintln!(

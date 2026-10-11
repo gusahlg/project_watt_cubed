@@ -16,7 +16,6 @@
 //! element. The arithmetic is bit-identical on every peer (see [`noise`]).
 
 pub mod cosmos;
-#[cfg(feature = "dev-tools")]
 pub mod emergent;
 pub mod noise;
 pub mod palette;
@@ -55,8 +54,10 @@ use underground::{Grid, Underground};
 /// the cosmos, six faces, empty space. Home +Y keeps the v3 salts; provinces theme the field;
 /// 8 = surface landmarks, and the ruins, monuments and watchers on them;
 /// 9 = the start world on cube-sphere charts (unreleased, so the number stays);
-/// 10 = the twins on a warped cube grid in storage.
-pub const WORLDGEN_VERSION: u16 = 10;
+/// 10 = the twins on a warped cube grid in storage;
+/// 11 = the emergent cosmos (InfiniteDiffusion v5 P2): the seed's nebula grows the bodies, their
+/// minerals, sizes and shapes; each body's deep bulk is its own suite; storage rows by layout.
+pub const WORLDGEN_VERSION: u16 = 11;
 
 /// The old v3 space floor. No longer a realm boundary; the fade and tests still name it.
 pub const SPACE_FLOOR: i32 = 640;
@@ -64,6 +65,9 @@ pub const SPACE_FLOOR: i32 = 640;
 pub const MAX_GROUND: i32 = 470;
 /// Ground never sinks below this (the far-LOD floor is 0).
 pub const MIN_GROUND: i32 = 6;
+
+/// How far from the +Y chart's centre the spawn looks for a column clear of trees.
+const SPAWN_REACH: i32 = 24;
 
 /// Atlas index of a chart body id, if `body` is one.
 fn chart_body(body: u16) -> Option<usize> {
@@ -374,76 +378,36 @@ impl Materials {
 }
 
 
-/// The bulk mix as one material: fractions weighted by the prototype response, density forced to
-/// the amount the gravity primitive uses.
-fn bulk_matter(registry: &BlockRegistry, bulk: &cube::Bulk) -> crate::mechanics::material::Params {
-    use crate::mechanics::material;
-    let parts: Vec<(f64, material::Params)> = bulk
-        .fractions()
-        .iter()
-        .filter(|(_, f)| *f > 0.0)
-        .map(|&(id, f)| {
-            let cohesion = registry.observation(id).cohesion as i32;
-            (f, material::mechanical_response(registry.amount(id) as u32, material::cohesion01(cohesion)))
-        })
-        .collect();
-    let mut matter = material::Params::mix(&parts);
-    matter.density = cosmos::BULK_DENSITY;
-    matter
+/// Half-size of the cube of matter a body grew from.
+fn half_of_matter(b: &cosmos::Body) -> f64 {
+    crate::math::cbrt(b.traits.mass / b.density) * 0.5
 }
 
-/// The start world's relaxed datum about [`cosmos::HOME_RADIUS`]: its cube of bulk matter relaxed
-/// under its own gravity, read from the genesis table by `Π_g`. `None` without a table, or if the
-/// matter were strong enough to keep its cube grid (the start world is charted either way).
-fn home_shape(registry: &BlockRegistry, bulk: &cube::Bulk) -> Option<crate::space::datum::DatumField> {
+/// The start world's relaxed datum about its radius: its cube of matter relaxed under its own
+/// gravity, read from the genesis table by its `Π_g`, with that datum's relief expansion. `None`
+/// without a table, or if the matter were strong enough to keep its cube grid (the start world is
+/// charted either way).
+fn home_shape(home: &cosmos::Body) -> Option<(crate::space::datum::DatumField, Vec<f64>)> {
     use crate::mechanics::genesis;
-    let matter = bulk_matter(registry, bulk);
-    let half = cosmos::HOME_CUBE_HALF as f64;
-    let (layout, _) = genesis::tabulated_layout(genesis::pi_g(&matter, half), half)?;
+    let cosmos::Shape::Ball { r } = home.shape else { return None };
+    let half = half_of_matter(home);
+    let (layout, _) = genesis::tabulated_layout(home.traits.pi_g, half)?;
     let genesis::Layout::Round { radius, datum, .. } = layout else { return None };
-    let shift = (radius - cosmos::HOME_RADIUS as f64) as f32;
-    Some(crate::space::datum::DatumField { g: datum.g, offsets: datum.offsets.iter().map(|o| o + shift).collect() })
+    let shift = (radius - r as f64) as f32;
+    let harmonics = genesis::tabulated_harmonics(home.traits.pi_g, half, f64::from(shift))?;
+    Some((crate::space::datum::DatumField { g: datum.g, offsets: datum.offsets.iter().map(|o| o + shift).collect() }, harmonics))
 }
 
-/// Sagging cubes: a `Layout::Cube` body whose warp moves any point by more than half a block.
-fn cube_warps(
-    cosmos: &cosmos::Cosmos,
-    matter: &crate::mechanics::material::Params,
-) -> Vec<(u16, Arc<crate::space::warp::Warp>)> {
-    use crate::mechanics::genesis;
-    use crate::space::warp::{Warp, STORAGE_MOVE};
+/// The warps of the cubes whose matter sags past half a block (`Form::Warped`): the tabulated
+/// relaxed cube of each body's own `Π_g` and size.
+fn cube_warps(cosmos: &cosmos::Cosmos) -> Vec<(u16, Arc<crate::space::warp::Warp>)> {
     let mut out = Vec::new();
-    for b in cosmos.bodies() {
+    for b in cosmos.bodies().iter().filter(|b| b.traits.form == cosmos::Form::Warped) {
         let cosmos::Shape::Cube { half } = b.shape else { continue };
-        let half_f = half as f64;
-        let pi = genesis::pi_g(matter, half_f);
-        let Some((layout, _)) = genesis::tabulated_layout(pi, half_f) else { continue };
-        if !matches!(layout, genesis::Layout::Cube) {
-            continue;
-        }
-        let Some(solved) = genesis::tabulated(pi, half_f) else { continue };
-        let warp = Warp::from_solved(&solved, b.centre_f());
-        if warp.max_displacement() <= STORAGE_MOVE {
-            continue;
-        }
+        let warp = crate::space::warp::Warp::tabulated(b.traits.pi_g, half as f64, b.centre_f()).expect("the genesis table");
         out.push((b.id, Arc::new(warp)));
     }
     out
-}
-
-/// The start world's relief layer for gravity, computed once per process for each distinct datum
-/// (worlds of one palette share it; the projection is the costly part of creating a world).
-fn home_relief(centre: glam::DVec3, density: f64, datum: &crate::space::datum::DatumField) -> Arc<crate::gravity::relief::Relief> {
-    use std::sync::Mutex;
-    static CACHE: Mutex<Vec<(u64, Arc<crate::gravity::relief::Relief>)>> = Mutex::new(Vec::new());
-    let key = datum.offsets.iter().fold(centre.y.to_bits() ^ density.to_bits(), |h, o| (h ^ o.to_bits() as u64).wrapping_mul(0x100_0000_01B3));
-    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, layer)) = cache.iter().find(|(k, _)| *k == key) {
-        return Arc::clone(layer);
-    }
-    let layer = Arc::new(crate::gravity::relief::Relief::new(centre, cosmos::HOME_RADIUS as f64, density, datum));
-    cache.push((key, Arc::clone(&layer)));
-    layer
 }
 
 /// Blended columns of one start-world chart chunk. Face altitude of local `y0 + la` is
@@ -478,12 +442,15 @@ pub struct Terrain {
     cosmos: Arc<cosmos::Cosmos>,
     /// Indexed by `body.id * 6 + face`. `None` for bodies that are not cubes and not the start world.
     paints: Vec<Option<FacePaint>>,
-    bulk: cube::Bulk,
+    /// Each body's deep bulk, by id.
+    bulks: Vec<cube::Bulk>,
     /// Caverns, chambers, mantle bubbles and the Heart. Quiet deep chunks never consult it per voxel.
     deep: deep::Deep,
     /// The round bodies, painted on curved charts in storage.
     storage: storage::StorageWorlds,
     m: Arc<Materials>,
+    /// The start world's spawn, found on first use.
+    spawn: std::sync::OnceLock<Option<glam::DVec3>>,
 }
 
 /// Whether world cell x `x` lies in the storage region (curved charts), not physical space.
@@ -492,16 +459,21 @@ fn stored(x: i32) -> bool {
     x as i64 >= crate::space::atlas::STORAGE_X0
 }
 
-/// Centres of the other big bodies, the ones an observatory can point at. Moons are not big.
+/// Centres of the other big bodies an observatory can point at, nearest first. Satellites are
+/// not big.
 fn sky_aims(cosmos: &cosmos::Cosmos, id: u16) -> ([[i64; 3]; 8], usize) {
+    let from = cosmos.bodies()[usize::from(id)].centre_f();
+    let mut big: Vec<(u64, u16)> = cosmos
+        .bodies()
+        .iter()
+        .filter(|o| o.traits.rank != cosmos::Rank::Satellite && o.id != id)
+        .map(|o| ((o.centre_f() - from).length_squared().to_bits(), o.id))
+        .collect();
+    big.sort_unstable();
     let mut aims = [[0i64; 3]; 8];
-    let mut n = 0;
-    for o in cosmos.bodies() {
-        if o.kind == cosmos::Kind::Moon || o.id == id || n == aims.len() {
-            continue;
-        }
-        aims[n] = o.centre;
-        n += 1;
+    let n = big.len().min(aims.len());
+    for (aim, &(_, o)) in aims.iter_mut().zip(&big) {
+        *aim = cosmos.bodies()[usize::from(o)].centre;
     }
     (aims, n)
 }
@@ -544,13 +516,30 @@ impl Terrain {
         let s = (seed as u64 ^ (seed as u64 >> 32)) as u32 ^ 0x1D1F_F051;
         let m = Arc::new(Materials::intern(registry));
         let scale = cfg.deep as f32 / 100.0;
-        let mut cosmos = cosmos::Cosmos::with_deep(s, cfg.space as f32 / 100.0, scale);
-        let bulk = cube::choose_bulk(registry, &m, s ^ 0xB01C_D3E5);
+        let mut cosmos = cosmos::Cosmos::grow(seed as u64, &cfg);
+        // Every suite's minerals, interned in (suite, layer) order before any worker runs.
+        let minerals: Vec<Vec<BlockId>> = cosmos
+            .suites()
+            .iter()
+            .map(|suite| suite.minerals.iter().map(|m| registry.intern(&m.config).expect("the table holds every suite")).collect())
+            .collect();
+        // Each body's deep bulk is its suite's mantle (every layer of a suite of one or two).
+        let bulks: Vec<cube::Bulk> = cosmos
+            .bodies()
+            .iter()
+            .map(|b| {
+                let ids = &minerals[usize::from(b.traits.suite)];
+                let mantle = if ids.len() >= 3 { &ids[1..ids.len() - 1] } else { &ids[..] };
+                cube::Bulk::mix(mantle, s ^ 0xB01C_D3E5)
+            })
+            .collect();
+        // Round painters fill below their caves with the bulk's main mineral, their heart with the core.
+        let fills: Vec<(BlockId, BlockId)> =
+            cosmos.bodies().iter().map(|b| (bulks[usize::from(b.id)].majority(), minerals[usize::from(b.traits.suite)][0])).collect();
         // Sagging cubes keep their grid. Gravity is the warped surface, not the box they sagged from.
-        let matter = bulk_matter(registry, &bulk);
-        let warps = cube_warps(&cosmos, &matter);
+        let warps = cube_warps(&cosmos);
         for (id, warp) in &warps {
-            let Some(body) = cosmos.bodies().iter().find(|b| b.id == *id) else { continue };
+            let body = cosmos.bodies()[usize::from(*id)];
             let cosmos::Shape::Cube { half } = body.shape else { continue };
             let h = glam::DVec3::splat(half as f64);
             let c = body.centre_f();
@@ -560,53 +549,48 @@ impl Terrain {
             cosmos.set_shape(*id, Arc::new(shape));
             cosmos.set_warp(*id, Arc::clone(warp));
         }
-        // The start world's cube of bulk matter relaxed under its own gravity: its datum fits the
-        // chart grid to the shape, and its relief joins gravity.
-        let home_datum = home_shape(registry, &bulk);
-        if let Some(datum) = &home_datum {
+        // The start world's cube of matter relaxed under its own gravity: its datum fits the chart
+        // grid to the shape, and its relief joins gravity.
+        let home_datum = home_shape(cosmos.home()).map(|(datum, harmonics)| {
             cosmos.settle_home(datum.offset(2, 0.0, 0.0).round() as i64);
             let home = cosmos.home();
-            let layer = home_relief(home.centre_f(), home.density, datum);
+            let cosmos::Shape::Ball { r } = home.shape else { unreachable!("the start world is round") };
+            let layer = crate::gravity::relief::Relief::from_harmonics(home.centre_f(), r as f64, home.density, &harmonics);
             let id = home.id;
-            cosmos.set_relief(id, Arc::new(datum.clone()), layer);
-        }
+            cosmos.set_relief(id, Arc::new(datum.clone()), Arc::new(layer));
+            datum
+        });
         let cosmos = Arc::new(cosmos);
         let relief = cfg.relief as f32 / 100.0;
         let variety = cfg.variety as f32 / 100.0;
-        // The twin with the smaller seed is lush; the other is crystalline. One twin keeps lush.
-        let lush = cosmos
-            .bodies()
-            .iter()
-            .filter(|b| b.kind == cosmos::Kind::Twin)
-            .min_by_key(|b| (b.seed, b.id))
-            .map(|b| b.id);
         let n = cosmos.bodies().iter().map(|b| b.id as usize).max().unwrap_or(0) + 1;
         let mut paints = Vec::new();
         paints.resize_with(n * 6, || None);
         for b in cosmos.bodies() {
             let half = match b.shape {
                 cosmos::Shape::Cube { half } => half,
-                cosmos::Shape::Ball { .. } if b.kind == cosmos::Kind::Home => {
-                    crate::space::atlas::surface_n(cosmos::HOME_RADIUS) / 2
-                }
+                cosmos::Shape::Ball { r } if b.traits.rank == cosmos::Rank::Start => crate::space::atlas::surface_n(r) / 2,
                 _ => continue,
             };
-            let twin = b.kind == cosmos::Kind::Twin;
+            let start = b.traits.rank == cosmos::Rank::Start;
             let (aims, n_aims) = sky_aims(&cosmos, b.id);
             let facing_face = span::facing_face(&cosmos, b);
             for face in Face::ALL {
                 // Home +Y keeps the v3 salts. Every other face is a fresh field.
-                let s_face = if b.kind == cosmos::Kind::Home && face == Face::PosY {
+                let s_face = if start && face == Face::PosY {
                     s
                 } else {
                     hash3(s ^ 0x5A17, i32::from(b.id), face.index() as i32, 0x6A1E)
                 };
-                let realm = if twin {
-                    if Some(b.id) == lush { province::Realm::Lush } else { province::Realm::Crystal }
-                } else {
+                // A living cube is lush, a lifeless one crystalline; the start world has its realms.
+                let realm = if start {
                     province::Realm::of_home(face)
+                } else if b.traits.life > 0 {
+                    province::Realm::Lush
+                } else {
+                    province::Realm::Crystal
                 };
-                let garden = b.kind == cosmos::Kind::Home && face == Face::PosY;
+                let garden = start && face == Face::PosY;
                 // The facing canyon already carries spires. Structures stay on the other faces.
                 let struct_scale = if facing_face == Some(face) { 0.0 } else { cfg.structures as f32 / 100.0 };
                 let i = b.id as usize * 6 + face.index();
@@ -631,9 +615,7 @@ impl Terrain {
                 });
             }
         }
-        // Majority of the 24-bit mix: the uniform block under the start world's band 0.
-        let home_fill = bulk.majority();
-        let mut storage = storage::StorageWorlds::new(&cosmos, &m, home_fill, &warps);
+        let mut storage = storage::StorageWorlds::new(&cosmos, &m, &fills, &warps).expect("the cosmos was grown to fit storage");
         if let Some(datum) = home_datum {
             storage.set_home_datum(Arc::new(datum));
         }
@@ -642,9 +624,10 @@ impl Terrain {
             storage,
             cosmos,
             paints,
-            bulk,
+            bulks,
             deep: deep::Deep::new(scale, m.clone()),
             m,
+            spawn: std::sync::OnceLock::new(),
         }
     }
 
@@ -663,9 +646,9 @@ impl Terrain {
     fn owner_in(&self, p: [i64; 3], include: bool) -> Option<cosmos::Body> {
         let q = glam::DVec3::new(p[0] as f64, p[1] as f64, p[2] as f64);
         let mut best: Option<(f64, cosmos::Body)> = None;
-        for b in self.cosmos.bodies() {
+        for b in self.cosmos.bodies_touching(p, p) {
             // Round bodies are charted: their cells live in storage. A sagging cube's cells do too.
-            if !matches!(b.shape, cosmos::Shape::Cube { .. }) || !b.touches(p, p) {
+            if !matches!(b.shape, cosmos::Shape::Cube { .. }) {
                 continue;
             }
             if !include && self.storage.holds_cube(b.id) {
@@ -750,8 +733,8 @@ impl Terrain {
 
     /// Bulk, or the interior feature at `rel`. `depth` is the true depth when the caller already
     /// has the column; otherwise it is derived, and inside one band the block does not depend on it.
-    fn deep_at(&self, body: &cosmos::Body, rel: [i64; 3], depth: Option<i32>) -> BlockId {
-        let bulk = cube::bulk_id(&self.bulk, body, rel);
+    fn deep_at(&self, body: &cosmos::Body, face: Face, rel: [i64; 3], depth: Option<i32>) -> BlockId {
+        let bulk = cube::bulk_id(&self.bulks[usize::from(body.id)], body, face, rel);
         // A known depth means the chunk already intersects a feature; `might` would only repeat that test.
         if depth.is_none() && !self.deep.might(body, rel) {
             return bulk;
@@ -797,7 +780,7 @@ impl Terrain {
         let rel = [p[0] - body.centre[0], p[1] - body.centre[1], p[2] - body.centre[2]];
         let half = cube::half_of(body);
         if cube::in_deep(rel, half) {
-            return self.deep_at(body, rel, None);
+            return self.deep_at(body, cube::face_of(rel), rel, None);
         }
         let (Ok(x), Ok(y), Ok(z)) = (i32::try_from(rel[0]), i32::try_from(rel[1]), i32::try_from(rel[2])) else {
             return AIR;
@@ -861,15 +844,15 @@ impl Terrain {
                 }
             }
             // Home and the outward faces never ask. The facing face's spires sit above the ground.
-            if body.kind == cosmos::Kind::Twin && span::facing_face(&self.cosmos, body) == Some(face) {
-                if let Some(id) = span::block(&self.m, span::lush(&self.cosmos, body), span::face_seed(body), half, u, h, v) {
+            if span::facing_face(&self.cosmos, body) == Some(face) {
+                if let Some(id) = span::block(&self.m, span::lush(body), span::face_seed(body), half, u, h, v) {
                     return id;
                 }
             }
             return AIR;
         }
         if col.height - h > cube::CRUST {
-            return self.deep_at(body, rel, Some(col.height - h));
+            return self.deep_at(body, face, rel, Some(col.height - h));
         }
         // A dig replaces the crust cell, so a crater core is not opened back into a cave.
         // Structure shafts reach a mine level; landmark digs stay in their shallower band.
@@ -915,9 +898,8 @@ impl Terrain {
             return self.cube_cell(&body, p);
         }
         // A round body's reach, and a stored cube's old physical cells, are empty here.
-        if self.cosmos.bodies().iter().any(|b| {
-            let charted = !matches!(b.shape, cosmos::Shape::Cube { .. }) || (!include && self.storage.holds_cube(b.id));
-            charted && b.touches(p, p)
+        if self.cosmos.bodies_touching(p, p).any(|b| {
+            !matches!(b.shape, cosmos::Shape::Cube { .. }) || (!include && self.storage.holds_cube(b.id))
         }) {
             return AIR;
         }
@@ -951,7 +933,7 @@ impl Terrain {
         if self.deep.hits(&body, rlo, rhi) {
             return None;
         }
-        let id = cube::bulk_uniform(&self.bulk, &body, &rels)?;
+        let id = cube::bulk_uniform(&self.bulks[usize::from(body.id)], &body, cube::face_of(rels[0]), &rels)?;
         Some(ChunkData::Uniform(id))
     }
 
@@ -1065,7 +1047,7 @@ impl Terrain {
             at(0, 15, 15),
             at(15, 15, 15),
         ];
-        if let Some(id) = cube::bulk_uniform(&self.bulk, body, &rels) {
+        if let Some(id) = cube::bulk_uniform(&self.bulks[usize::from(body.id)], body, face, &rels) {
             return ChunkData::Uniform(id);
         }
         let frame = FaceFrame::new(face);
@@ -1074,7 +1056,7 @@ impl Terrain {
             for lv in 0..CHUNK_SIZE {
                 for lu in 0..CHUNK_SIZE {
                     let rel = at(lu as i32, la as i32, lv as i32);
-                    let id = cube::bulk_id(&self.bulk, body, rel);
+                    let id = cube::bulk_id(&self.bulks[usize::from(body.id)], body, face, rel);
                     let (lx, ly, lz) = if IDENTITY { (lu, la, lv) } else { frame.index_to_world(lu, la, lv) };
                     cells[Chunk::index(lx, ly, lz)] = id;
                 }
@@ -1119,7 +1101,7 @@ impl Terrain {
                     let rel = at(lu as i32, la as i32, lv as i32);
                     let depth = cols[lu + lv * CHUNK_SIZE].height - h;
                     let (lx, ly, lz) = if IDENTITY { (lu, la, lv) } else { frame.index_to_world(lu, la, lv) };
-                    cells[Chunk::index(lx, ly, lz)] = self.deep_at(body, rel, Some(depth));
+                    cells[Chunk::index(lx, ly, lz)] = self.deep_at(body, face, rel, Some(depth));
                 }
             }
         }
@@ -1144,7 +1126,7 @@ impl Terrain {
         // Unblended max keeps the v3 early-out. Blended max covers a rim that rose above it.
         // The facing canyon is taller: spires stop at `span::CLEAR`, still inside the relief.
         let max_h = cols.iter().map(|c| c.height).max().unwrap_or(i32::MIN);
-        let facing = body.kind == cosmos::Kind::Twin && span::facing_face(&self.cosmos, body) == Some(face);
+        let facing = span::facing_face(&self.cosmos, body) == Some(face);
         let landmarks = max_terrain.max(max_h) + features::MAX_ABOVE;
         let clearance = if facing { span::CLEAR.max(landmarks) } else { landmarks };
         if h0 >= clearance {
@@ -1183,7 +1165,7 @@ impl Terrain {
                             AIR
                         } else if !crust_only && col.height - h > cube::CRUST {
                             let rel = cube::local_to_rel(face, u, half + h, v);
-                            self.deep_at(body, rel, Some(col.height - h))
+                            self.deep_at(body, face, rel, Some(col.height - h))
                         } else {
                             let la_i = la as i32;
                             let ground = paint.shape.ground(col, u, h, v);
@@ -1318,7 +1300,7 @@ impl Terrain {
         }
         if facing && h0 < span::CLEAR {
             let half = cube::half_of(body);
-            let lush = span::lush(&self.cosmos, body);
+            let lush = span::lush(body);
             let seed = span::face_seed(body);
             let min_col = cols.iter().map(|c| c.height).min().unwrap_or(i32::MAX);
             if h0 + n > min_col {
@@ -1371,7 +1353,7 @@ impl Terrain {
         let body = self.cosmos.home();
         let half = cube::half_of(body);
         if cube::in_deep(rel, half) {
-            return self.deep_at(body, rel, None);
+            return self.deep_at(body, face, rel, None);
         }
         let paint = self.paint(body, face);
         let mut col = paint.shape.column(u, v);
@@ -1444,7 +1426,7 @@ impl Terrain {
             return Some(AIR);
         }
         if !self.deep.hits(body, lo, hi)
-            && let Some(id) = cube::bulk_uniform(&self.bulk, body, &rels)
+            && let Some(id) = cube::bulk_uniform(&self.bulks[usize::from(body.id)], body, face, &rels)
         {
             return Some(id);
         }
@@ -1486,7 +1468,7 @@ impl Terrain {
         if self.deep.all_air(body, lo, hi) {
             return Some(AIR);
         }
-        if !self.deep.hits(body, lo, hi) { cube::bulk_uniform(&self.bulk, body, &rels) } else { None }
+        if !self.deep.hits(body, lo, hi) { cube::bulk_uniform(&self.bulks[usize::from(body.id)], body, c.face, &rels) } else { None }
     }
 
     fn fill_chart(&self, c: &ChartCols) -> ChunkData {
@@ -1739,25 +1721,41 @@ impl Terrain {
         })
     }
 
-    /// Physical spawn: the +Y chart's centre column, two blocks above its first open cell.
+    /// Physical spawn: two blocks above the first open cell of the +Y chart column nearest its
+    /// centre whose three cells above the ground cell are open (a tree's canopy is not a spawn).
+    /// Found once.
     fn home_spawn(&self) -> Option<glam::DVec3> {
+        *self.spawn.get_or_init(|| self.find_spawn())
+    }
+
+    fn find_spawn(&self) -> Option<glam::DVec3> {
         let atlas = self.storage.home_atlas()?;
         let b = atlas.bands[0];
         let face = Face::PosY;
         let patch = crate::space::atlas::Patch::Shell { band: 0, face };
-        let (i, j) = (b.n / 2, b.n / 2);
         let half = b.n / 2;
         let body = self.cosmos.home();
         let paint = self.paint(body, face);
-        let h = cube::blend_height(paint.shape.height(0, 0), cube::rim_seed(body), face, half, 0, 0);
-        let y = i64::from(h) + atlas.radius - b.r_lo;
-        Some(atlas.embed(patch, glam::DVec3::new(i as f64 + 0.5, y as f64 + 2.0, j as f64 + 0.5)))
+        let rise = atlas.radius - b.r_lo;
+        let column = |u: i32, v: i32| {
+            let h = cube::blend_height(paint.shape.height(u, v), cube::rim_seed(body), face, half, i64::from(u), i64::from(v));
+            let (i, j) = (half + i64::from(u), half + i64::from(v));
+            let y = i64::from(h) + rise;
+            let open = (1..=3).all(|k| self.chart_voxel(face, [i, y + k, j]) == AIR);
+            (open, glam::DVec3::new(i as f64 + 0.5, y as f64 + 2.0, j as f64 + 0.5))
+        };
+        let rings = (0..=SPAWN_REACH).step_by(2).flat_map(|r| {
+            (-r..=r).step_by(2).flat_map(move |d| [(d, -r), (d, r), (-r, d), (r, d)])
+        });
+        let (_, at) = rings.map(|(u, v)| column(u, v)).find(|c| c.0).unwrap_or_else(|| column(0, 0));
+        Some(atlas.embed(patch, at))
     }
 
     /// Replace the start world's spherical datum. Tests use this; a relaxed field is data.
     #[cfg(test)]
     pub fn set_home_datum(&mut self, field: std::sync::Arc<crate::space::datum::DatumField>) {
         self.storage.set_home_datum(field);
+        self.spawn = std::sync::OnceLock::new();
     }
 
     fn face_columns(
@@ -1820,9 +1818,6 @@ impl Terrain {
     /// How high a uniform-air shortcut may start. The canyon's facing face keeps room for spires;
     /// every other face stops at the trees. Home never takes the tall path.
     fn face_clear(&self, body: &cosmos::Body, lo: [i64; 3], hi: [i64; 3]) -> i32 {
-        if body.kind != cosmos::Kind::Twin {
-            return cube::TREE_CLEAR;
-        }
         let Some(face) = span::facing_face(&self.cosmos, body) else { return cube::TREE_CLEAR };
         let on_face = cube::corners(lo, hi).into_iter().all(|p| {
             let rel = [p[0] - body.centre[0], p[1] - body.centre[1], p[2] - body.centre[2]];
@@ -1893,7 +1888,7 @@ impl Terrain {
                         return Classify::Uniform(AIR);
                     }
                     if !self.deep.hits(&body, rlo, rhi)
-                        && let Some(id) = cube::bulk_uniform(&self.bulk, &body, &rels)
+                        && let Some(id) = cube::bulk_uniform(&self.bulks[usize::from(body.id)], &body, cube::face_of(rels[0]), &rels)
                     {
                         return Classify::Uniform(id);
                     }

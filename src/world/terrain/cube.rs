@@ -4,11 +4,11 @@
 //! is 0 on the face plane. The rim height is 3-D noise at one surface point per body, so the two
 //! faces of an edge agree.
 
-use super::cosmos::{Body, Shape, BULK_DENSITY};
+use super::cosmos::{Body, Shape};
 use super::features::MAX_ABOVE;
 use super::noise::{hash3, perlin3, smoothstep};
-use super::{Materials, MAX_GROUND, MIN_GROUND};
-use crate::block::registry::{BlockId, BlockRegistry};
+use super::{MAX_GROUND, MIN_GROUND};
+use crate::block::registry::BlockId;
 use crate::coord::{ChunkCoord, Face};
 use crate::space::FaceFrame;
 
@@ -49,9 +49,7 @@ pub(super) fn half_of(body: &Body) -> i64 {
     match body.shape {
         Shape::Cube { half } => half,
         // The start world's charts use the band-0 face as a virtual cube of edge `surface_n`.
-        Shape::Ball { .. } if body.kind == super::cosmos::Kind::Home => {
-            crate::space::atlas::surface_n(super::cosmos::HOME_RADIUS) / 2
-        }
+        Shape::Ball { r } if body.traits.rank == super::cosmos::Rank::Start => crate::space::atlas::surface_n(r) / 2,
         _ => 0,
     }
 }
@@ -180,82 +178,76 @@ pub(super) fn blend_height(terrain: i32, seed: u32, face: Face, half: i64, ub: i
     (h.floor() as i32).clamp(MIN_GROUND, MAX_GROUND)
 }
 
-/// Two deep materials mixed so the mean amount is [`BULK_DENSITY`].
+/// A body's deep bulk: its suite's mantle minerals in equal shares by 64³ cell, so the mean amount
+/// is the body's density (to 2⁻²⁴).
 pub(super) struct Bulk {
-    lo: BlockId,
-    hi: BlockId,
-    /// `hi` when `(hash >> 8) < cut` (24-bit threshold).
-    cut: u32,
+    /// Each mineral with the 24-bit threshold below which a cell takes it (the last is 2²⁴).
+    layers: Vec<(u32, BlockId)>,
     seed: u32,
 }
 
 impl Bulk {
-    /// The material that fills at least half the mix (`lo` when the two agree).
+    /// Equal shares of `ids` (one id: that block everywhere).
+    pub(super) fn mix(ids: &[BlockId], seed: u32) -> Self {
+        assert!(!ids.is_empty(), "a bulk has a mineral");
+        let n = ids.len() as u64;
+        let layers = ids.iter().enumerate().map(|(k, &id)| ((((k as u64 + 1) << 24) / n) as u32, id)).collect();
+        Bulk { layers, seed }
+    }
+
+    /// The material with the largest share (the first on a tie).
     pub(super) fn majority(&self) -> BlockId {
-        if self.lo == self.hi || self.cut < 1 << 23 { self.lo } else { self.hi }
-    }
-
-    /// The two materials and their volume fractions.
-    pub(super) fn fractions(&self) -> [(BlockId, f64); 2] {
-        let hi = self.cut as f64 / (1u32 << 24) as f64;
-        [(self.lo, 1.0 - hi), (self.hi, hi)]
-    }
-}
-
-pub(super) fn choose_bulk(reg: &BlockRegistry, m: &Materials, seed: u32) -> Bulk {
-    let ids = [
-        m.rock[0], m.rock[1], m.rock[2], m.rock[3], m.sandstone[0], m.sandstone[1], m.sandstone[2],
-        m.sandstone[3], m.deeprock, m.abyss, m.basalt, m.gravel, m.ochre,
-    ];
-    if let Some(&id) = ids.iter().find(|&&id| reg.amount(id) == BULK_DENSITY as u8) {
-        return Bulk { lo: id, hi: id, cut: 0, seed };
-    }
-    let mut quiet: Option<(u8, BlockId, BlockId)> = None;
-    let mut any: Option<(u8, BlockId, BlockId)> = None;
-    for &lo in &ids {
-        for &hi in &ids {
-            let (a, b) = (reg.amount(lo), reg.amount(hi));
-            if a >= BULK_DENSITY as u8 || b <= BULK_DENSITY as u8 {
-                continue;
+        let mut prev = 0;
+        let mut best = (0, self.layers[0].1);
+        for &(cut, id) in &self.layers {
+            if cut - prev > best.0 {
+                best = (cut - prev, id);
             }
-            let gap = b - a;
-            if any.map(|(g, _, _)| gap < g).unwrap_or(true) {
-                any = Some((gap, lo, hi));
-            }
-            if reg.quiescent(lo, hi) && reg.quiescent(hi, lo) && quiet.map(|(g, _, _)| gap < g).unwrap_or(true) {
-                quiet = Some((gap, lo, hi));
-            }
+            prev = cut;
         }
+        best.1
     }
-    let Some((_, lo, hi)) = quiet.or(any) else {
-        let id = ids.into_iter().min_by_key(|&id| (reg.amount(id) as i16 - BULK_DENSITY as i16).unsigned_abs()).unwrap();
-        return Bulk { lo: id, hi: id, cut: 0, seed };
-    };
-    let (a, b) = (reg.amount(lo) as f64, reg.amount(hi) as f64);
-    let frac = (BULK_DENSITY - a) / (b - a);
-    let cut = (frac * 16_777_216.0).round() as u32;
-    Bulk { lo, hi, cut, seed }
+
+    /// The materials and their volume fractions.
+    #[cfg(test)]
+    pub(super) fn fractions(&self) -> Vec<(BlockId, f64)> {
+        let mut prev = 0;
+        self.layers
+            .iter()
+            .map(|&(cut, id)| {
+                let f = (cut - prev) as f64 / (1u32 << 24) as f64;
+                prev = cut;
+                (id, f)
+            })
+            .collect()
+    }
 }
 
+/// The bulk at virtual-cube cell `rel`, painted on `face`. Mix cells follow the grid chunks lie
+/// on, so a chunk sits in one cell: a cube's physical axes, or the start world's chart axes (its
+/// virtual cube's negative faces flip physical axes against the chart).
 #[inline]
-pub(super) fn bulk_id(bulk: &Bulk, body: &Body, rel: [i64; 3]) -> BlockId {
-    if bulk.lo == bulk.hi || bulk.cut == 0 {
-        return bulk.lo;
+pub(super) fn bulk_id(bulk: &Bulk, body: &Body, face: Face, rel: [i64; 3]) -> BlockId {
+    if bulk.layers.len() == 1 {
+        return bulk.layers[0].1;
     }
-    if bulk.cut >= 1 << 24 {
-        return bulk.hi;
-    }
+    let (salt, cell) = if body.traits.rank == super::cosmos::Rank::Start {
+        let (u, a, v) = FaceFrame::new(face).cell_to_local((rel[0] as i32, rel[1] as i32, rel[2] as i32));
+        (face.index() as u32, [i64::from(u), i64::from(a), i64::from(v)])
+    } else {
+        (0, rel)
+    };
     let h = hash3(
-        bulk.seed ^ body.seed,
-        rel[0].div_euclid(MIX) as i32,
-        rel[1].div_euclid(MIX) as i32,
-        rel[2].div_euclid(MIX) as i32,
-    );
-    if (h >> 8) < bulk.cut { bulk.hi } else { bulk.lo }
+        bulk.seed ^ body.seed ^ salt,
+        cell[0].div_euclid(MIX) as i32,
+        cell[1].div_euclid(MIX) as i32,
+        cell[2].div_euclid(MIX) as i32,
+    ) >> 8;
+    bulk.layers.iter().find(|&&(cut, _)| h < cut).map_or(bulk.layers[bulk.layers.len() - 1].1, |&(_, id)| id)
 }
 
 /// The one material of a deep chunk, when every coarse cell it touches agrees.
-pub(super) fn bulk_uniform(bulk: &Bulk, body: &Body, cells: &[[i64; 3]]) -> Option<BlockId> {
-    let id = bulk_id(bulk, body, cells[0]);
-    cells[1..].iter().all(|&r| bulk_id(bulk, body, r) == id).then_some(id)
+pub(super) fn bulk_uniform(bulk: &Bulk, body: &Body, face: Face, cells: &[[i64; 3]]) -> Option<BlockId> {
+    let id = bulk_id(bulk, body, face, cells[0]);
+    cells[1..].iter().all(|&r| bulk_id(bulk, body, face, r) == id).then_some(id)
 }

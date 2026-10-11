@@ -2,10 +2,10 @@
 //!
 //! Both faces use the cube painter. This only dresses the face that looks at the other twin, and
 //! only inside the face (clear of the rim blend). Everything it paints sits below [`CLEAR`], which
-//! is inside the body's relief bound, so the 1.5e6-block gap past that bound stays empty. The
-//! lower-id twin is lush (timber, leaves); the other is crystalline.
+//! is inside the body's relief bound, so the gap past that bound stays empty. A living side is lush
+//! (timber, leaves); a lifeless one is crystalline.
 
-use super::cosmos::{Body, Cosmos, Kind};
+use super::cosmos::{Body, Cosmos};
 use super::noise::{hash2, unit};
 use super::{Materials, MAX_GROUND};
 use super::cube::RIM;
@@ -25,12 +25,12 @@ struct Site {
     top: i32,
 }
 
-/// The face of `body` whose normal points at the other twin.
+/// The face of a binary's cube `body` whose normal points at its partner.
 pub(super) fn facing_face(cosmos: &Cosmos, body: &Body) -> Option<Face> {
-    if body.kind != Kind::Twin {
+    if !matches!(body.shape, super::cosmos::Shape::Cube { .. }) {
         return None;
     }
-    let other = cosmos.bodies().iter().find(|b| b.kind == Kind::Twin && b.id != body.id)?;
+    let other = cosmos.bodies().get(usize::from(body.traits.partner?))?;
     let axis = (0..3).max_by_key(|&a| (other.centre[a] - body.centre[a]).abs()).unwrap();
     let pos = other.centre[axis] > body.centre[axis];
     Some(match (axis, pos) {
@@ -43,9 +43,9 @@ pub(super) fn facing_face(cosmos: &Cosmos, body: &Body) -> Option<Face> {
     })
 }
 
-/// The lush twin is the one with the smaller id; its partner is crystalline.
-pub(super) fn lush(cosmos: &Cosmos, body: &Body) -> bool {
-    cosmos.bodies().iter().filter(|b| b.kind == Kind::Twin).map(|b| b.id).min() == Some(body.id)
+/// A living side of the canyon is lush; a lifeless one is crystalline (as its realm).
+pub(super) fn lush(body: &Body) -> bool {
+    body.traits.life > 0
 }
 
 /// Salt for the facing face. One per twin, shared by the batch fill and the per-cell query.

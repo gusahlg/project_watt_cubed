@@ -4,7 +4,7 @@ name = "pwc-mod-api"
 # checks that requirement against this version. A break old mods cannot compile through needs a
 # major bump. 3.0 is mods-v3: no switches, one options registry, screens, the frame hook, messages
 # and HUD facts (the changelog is at the top of src/lib.rs).
-version = "3.0.0"
+version = "3.1.0"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 description = "The interface PWC mods compile against: the mod trait, the registrar and the mod-facing parts of the game."

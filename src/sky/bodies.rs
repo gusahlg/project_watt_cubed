@@ -8,7 +8,7 @@ use voxel_engine::{
 
 use crate::sky::palette::Rgb;
 use crate::world::generation::TerrainGenerator;
-use crate::world::terrain::cosmos::{Body, Cosmos, Kind, Shape, AIR_TOP};
+use crate::world::terrain::cosmos::{Body, Cosmos, Form, Rank, Shape};
 
 /// Above this altitude the voxel terrain is not drawn, so the impostor takes over.
 const STREAM_ALTITUDE: f64 = 20_000.0;
@@ -32,6 +32,8 @@ struct HomeMap {
     centre: DVec3,
     /// `radius + max(datum)`. The horizon ball is this plus the air thickness.
     hi: f64,
+    /// The start world's air thickness.
+    air: f64,
 }
 
 /// What one body draws, apart from where it sits relative to the eye. Built once per world.
@@ -49,9 +51,10 @@ struct Static {
 }
 
 impl Static {
-    fn new(cosmos: &Cosmos, body: &Body, twin_ordinal: u32, atlases: &[std::sync::Arc<crate::space::atlas::Atlas>]) -> Self {
-        let (shape, albedo, atmosphere) = paint(body, twin_ordinal);
-        let (shape, radius) = if body.kind == Kind::Home {
+    fn new(cosmos: &Cosmos, body: &Body, atlases: &[std::sync::Arc<crate::space::atlas::Atlas>]) -> Self {
+        let (shape, albedo, atmosphere) = paint(cosmos, body);
+        let start = body.traits.rank == Rank::Start;
+        let (shape, radius) = if start {
             (shape, home_impostor(cosmos, body).1)
         } else if let Some(warped) = warped_impostor(atlases, body) {
             warped
@@ -62,7 +65,7 @@ impl Static {
             far: FarBody { radius: radius as f32, shape, albedo, atmosphere, seed: body.seed, ..FarBody::default() },
             radius,
             stream_reach: sink(body).is_none().then(|| stream_reach(cosmos, body)),
-            day_air: (body.kind == Kind::Home).then(daylight_air),
+            day_air: start.then(daylight_air),
         }
     }
 
@@ -89,7 +92,7 @@ impl Static {
         }
         let mut far = FarBody { dir, distance, ..self.far };
         // Air-shell thickness in blocks, the same unit as `radius` (engine `FarShape::Mapped`).
-        let air = AIR_TOP as f32;
+        let air = air_of(body);
         if let Some(day) = self.day_air
             && mapped
             && horizon.is_finite()
@@ -109,6 +112,8 @@ pub struct FarBodies {
     list: Vec<FarBody>,
     /// One per catalog body, in catalog order. Built on the first frame with a cosmos.
     statics: Vec<Static>,
+    /// Bodies by squared distance from the eye (bits, id), when there are more than the engine draws.
+    nearest: Vec<(u64, u16)>,
     /// Core light while the eye is in a Hollow's cavity. `None` outside it.
     sun: Option<SunOverride>,
     /// Looked up once. `None` when the generator has no relaxed home datum.
@@ -124,6 +129,7 @@ impl Default for FarBodies {
         Self {
             list: Vec::with_capacity(MAX_FAR_BODIES),
             statics: Vec::new(),
+            nearest: Vec::new(),
             sun: None,
             map: None,
             looked: false,
@@ -170,11 +176,19 @@ impl FarBodies {
             self.fill_cavity(cosmos, hollow, ember, eye);
             return &self.list;
         }
-        for (body, fixed) in cosmos.bodies().iter().zip(&self.statics) {
+        // Nearest first when the engine cannot draw them all; catalog order otherwise.
+        let bodies = cosmos.bodies();
+        self.nearest.clear();
+        if bodies.len() > MAX_FAR_BODIES {
+            self.nearest.extend(bodies.iter().map(|b| ((b.centre_f() - eye).length_squared().to_bits(), b.id)));
+            self.nearest.sort_unstable();
+        }
+        for k in 0..bodies.len() {
             if self.list.len() == MAX_FAR_BODIES {
                 break;
             }
-            if let Some(far) = fixed.place(cosmos, body, eye, mapped, horizon) {
+            let i = self.nearest.get(k).map_or(k, |&(_, id)| usize::from(id));
+            if let Some(far) = self.statics[i].place(cosmos, &bodies[i], eye, mapped, horizon) {
                 self.list.push(far);
             }
         }
@@ -186,20 +200,10 @@ impl FarBodies {
         if self.statics.len() == cosmos.bodies().len() {
             return;
         }
-        let mut twin = 0u32;
         self.statics = cosmos
             .bodies()
             .iter()
-            .map(|body| {
-                let ordinal = if body.kind == Kind::Twin {
-                    let i = twin;
-                    twin += 1;
-                    i
-                } else {
-                    0
-                };
-                Static::new(cosmos, body, ordinal, atlases)
-            })
+            .map(|body| Static::new(cosmos, body, atlases))
             .collect();
     }
 
@@ -211,7 +215,7 @@ impl FarBodies {
         self.looked = true;
         let Some(cosmos) = generator.cosmos() else { return };
         let body = cosmos.home();
-        if body.kind != Kind::Home {
+        if body.traits.rank != Rank::Start {
             return;
         }
         let centre = body.centre_f();
@@ -225,14 +229,14 @@ impl FarBodies {
         let radius = home_impostor(cosmos, body).1;
         let peak = datum.iter().fold(f32::NEG_INFINITY, |a, o| a.max(*o));
         let hi = if peak.is_finite() { radius + f64::from(peak) } else { radius };
-        self.map = Some(HomeMap { res, datum, radius, centre, hi });
+        self.map = Some(HomeMap { res, datum, radius, centre, hi, air: f64::from(air_of(body)) });
     }
 
     /// Closed form. The containing ball is fixed, so this is a few arithmetic ops.
     fn refresh_horizon(&mut self, eye: DVec3) {
         let Some(map) = self.map.as_ref() else { return };
         let dist = (map.centre - eye).length();
-        self.horizon = super::planet_map::horizon_sine(dist, map.hi, AIR_TOP);
+        self.horizon = super::planet_map::horizon_sine(dist, map.hi, map.air);
     }
 
     /// The shell's far wall and the Ember. Nothing outside the shell is visible.
@@ -357,59 +361,49 @@ fn home_faces() -> [LinearRgb; 6] {
     ]
 }
 
-/// The first catalog twin (side −1) is lush; the next is crystalline.
-fn twin_faces(ordinal: u32) -> [LinearRgb; 6] {
-    if ordinal == 0 {
-        [
-            srgb(64, 130, 52),
-            srgb(48, 112, 58),
-            srgb(86, 158, 64),
-            srgb(36, 84, 40),
-            srgb(70, 140, 90),
-            srgb(54, 120, 48),
-        ]
+/// Air-shell thickness of a body in blocks (0 without air).
+fn air_of(body: &Body) -> f32 {
+    body.traits.air_top.unwrap_or(0) as f32
+}
+
+/// A mineral's colour.
+fn rgb(c: [u8; 3]) -> LinearRgb {
+    srgb(c[0], c[1], c[2])
+}
+
+/// Halfway from `c` to `toward`.
+fn mixed(c: [u8; 3], toward: [u8; 3]) -> [u8; 3] {
+    std::array::from_fn(|k| ((c[k] as u16 + toward[k] as u16) / 2) as u8)
+}
+
+/// What a body reads as from afar: the start world its realms; every other body the colours of
+/// its own minerals, crust first, greened where it lives, with a burning air where it glows.
+fn paint(cosmos: &Cosmos, body: &Body) -> (FarShape, [LinearRgb; 6], LinearRgb) {
+    let t = &body.traits;
+    if t.rank == Rank::Start {
+        return (FarShape::Sphere, home_faces(), black());
+    }
+    let minerals = &cosmos.suite(body).minerals;
+    let tone = |k: usize| {
+        let c = minerals[minerals.len() - 1 - k % minerals.len()].rgb;
+        if t.life > 0 { mixed(c, [70, 140, 56]) } else { c }
+    };
+    let air = if t.glow {
+        hdr(1.8, 0.42, 0.06)
+    } else if t.life > 0 {
+        srgb(186, 216, 232)
     } else {
-        [
-            srgb(198, 220, 238),
-            srgb(176, 206, 230),
-            srgb(220, 234, 246),
-            srgb(150, 184, 214),
-            srgb(190, 216, 240),
-            srgb(180, 208, 232),
-        ]
+        black()
+    };
+    match t.form {
+        Form::Cube | Form::Warped => (FarShape::Cube, std::array::from_fn(|f| rgb(tone(f))), air),
+        _ => (FarShape::Sphere, tones(rgb(tone(0)), rgb(tone(1))), air),
     }
 }
 
-fn paint(body: &Body, twin_ordinal: u32) -> (FarShape, [LinearRgb; 6], LinearRgb) {
-    match body.kind {
-        Kind::Home => (FarShape::Sphere, home_faces(), black()),
-        Kind::Twin => (FarShape::Cube, twin_faces(twin_ordinal), black()),
-        // Meadow and forest green: Verdance has no seas.
-        Kind::Verdant => (
-            FarShape::Sphere,
-            tones(srgb(70, 140, 56), srgb(32, 92, 44)),
-            srgb(186, 216, 232),
-        ),
-        Kind::Hollow => (
-            FarShape::Sphere,
-            tones(srgb(220, 232, 238), srgb(160, 190, 210)),
-            black(),
-        ),
-        Kind::Ember => (
-            FarShape::Sphere,
-            tones(srgb(255, 120, 36), srgb(170, 48, 16)),
-            hdr(1.8, 0.42, 0.06),
-        ),
-        // The same three characters the moon painter gives them (`round::Style::Moon { tone }`).
-        Kind::Moon => {
-            let albedo = match body.seed % 3 {
-                0 => tones(srgb(150, 148, 152), srgb(60, 66, 72)),
-                1 => tones(srgb(200, 222, 240), srgb(150, 176, 220)),
-                _ => tones(srgb(186, 104, 90), srgb(170, 124, 110)),
-            };
-            (FarShape::Sphere, albedo, black())
-        }
-    }
+/// A round body painted as a cratered moon (neither glowing nor living, not a shell).
+fn moonlike(body: &Body) -> bool {
+    body.traits.form == Form::Round && body.traits.rank != Rank::Start && !body.traits.glow && body.traits.life == 0
 }
 
 fn radius_of(body: &Body) -> f64 {
@@ -441,9 +435,9 @@ fn shown_radius(atlases: &[std::sync::Arc<crate::space::atlas::Atlas>], body: &B
 /// without covering them (the sky pass draws only where no terrain was drawn). Round bodies have no
 /// far LOD of their own yet; cubes do, so theirs hide while streamed.
 fn sink(body: &Body) -> Option<f64> {
-    match (body.kind, body.shape) {
-        (_, Shape::Cube { .. }) => None,
-        (Kind::Moon, _) => Some(650.0),
+    match body.shape {
+        Shape::Cube { .. } => None,
+        _ if moonlike(body) => Some(650.0),
         _ => Some(150.0),
     }
 }
@@ -520,18 +514,17 @@ mod tests {
         cosmos: &Cosmos,
         body: &Body,
         eye: DVec3,
-        twin_ordinal: u32,
         atlases: &[std::sync::Arc<crate::space::atlas::Atlas>],
         mapped: bool,
         horizon: f32,
     ) -> Option<FarBody> {
         let delta = body.centre_f() - eye;
         let dist = delta.length();
-        let (mut shape, albedo, mut atmosphere) = paint(body, twin_ordinal);
-        let radius = if body.kind == Kind::Home {
+        let (mut shape, albedo, mut atmosphere) = paint(cosmos, body);
+        let radius = if body.traits.rank == Rank::Start {
             let (_, radius) = home_impostor(cosmos, body);
             // Air-shell thickness in blocks, the same unit as `radius` (engine `FarShape::Mapped`).
-            let air = AIR_TOP as f32;
+            let air = air_of(body);
             if mapped && horizon.is_finite() && air.is_finite() && air >= 0.0 {
                 shape = FarShape::Mapped { map: crate::sky::planet_map::HOME_MAP, horizon, air };
                 atmosphere = daylight_air();
@@ -582,22 +575,19 @@ mod tests {
                 far.atmosphere = LinearRgb(far.atmosphere.0.map(|c| c * CORE_GLOW));
                 far
             };
-            return impostor(cosmos, ember, eye, 0, &[], false, 1.0).map(glow).into_iter().collect();
+            return impostor(cosmos, ember, eye, &[], false, 1.0).map(glow).into_iter().collect();
+        }
+        // Catalog order, or nearest first past the engine's cap.
+        let mut order: Vec<&Body> = cosmos.bodies().iter().collect();
+        if order.len() > MAX_FAR_BODIES {
+            order.sort_by(|a, b| (a.centre_f() - eye).length_squared().total_cmp(&(b.centre_f() - eye).length_squared()).then(a.id.cmp(&b.id)));
         }
         let mut list = Vec::new();
-        let mut twin = 0u32;
-        for body in cosmos.bodies() {
-            let ordinal = if body.kind == Kind::Twin {
-                let i = twin;
-                twin += 1;
-                i
-            } else {
-                0
-            };
+        for body in order {
             if list.len() == MAX_FAR_BODIES {
                 break;
             }
-            if let Some(far) = impostor(cosmos, body, eye, ordinal, generator.atlases(), mapped, horizon) {
+            if let Some(far) = impostor(cosmos, body, eye, generator.atlases(), mapped, horizon) {
                 list.push(far);
             }
         }
@@ -605,7 +595,7 @@ mod tests {
     }
 
     fn radius_f(cosmos: &Cosmos, atlases: &[std::sync::Arc<crate::space::atlas::Atlas>], body: &Body) -> f32 {
-        let radius = if body.kind == Kind::Home {
+        let radius = if body.traits.rank == Rank::Start {
             home_impostor(cosmos, body).1
         } else if let Some((_, r)) = warped_impostor(atlases, body) {
             r
@@ -649,15 +639,11 @@ mod tests {
 
     #[test]
     fn spawn_lists_the_far_worlds_and_a_distant_eye_lists_home() {
+        use crate::world::terrain::cosmos::fixture::{self, Want};
         let mut registry = BlockRegistry::with_builtins();
-        let terrain = Terrain::new(&mut registry, 1);
+        let terrain = Terrain::new(&mut registry, fixture::seed(&[Want::Warped, Want::Living, Want::Glowing, Want::Moonlike]));
         let cosmos = terrain.cosmos().expect("the diffusion generator has a cosmos");
-        for kind in [Kind::Twin, Kind::Verdant, Kind::Hollow, Kind::Ember, Kind::Moon] {
-            assert!(
-                cosmos.bodies().iter().any(|b| b.kind == kind),
-                "catalog missing {kind:?}"
-            );
-        }
+        assert!(cosmos.bodies().len() <= MAX_FAR_BODIES, "every body fits the engine's list");
 
         let spawn = DVec3::new(0.5, 8.0, 0.5);
         let mut far = FarBodies::default();
@@ -667,58 +653,44 @@ mod tests {
         for body in cosmos.bodies() {
             let visible = expect_visible(cosmos, body, spawn);
             let got = find(cosmos, listed, terrain.atlases(), body);
-            assert!(visible, "{:?} should be a sky body from spawn", body.kind);
+            assert!(visible, "{} should be a sky body from spawn", body.name());
             let got = got.expect("missing far body");
             finite_unit(got);
-            let shape = match body.kind {
-                Kind::Twin => {
-                    let (rounded, _) = warped_impostor(terrain.atlases(), body).expect("the twins sag");
-                    let FarShape::Rounded { exponent } = rounded else { panic!("a twin draws rounded") };
-                    assert!((6.0..=16.0).contains(&exponent), "twin exponent {exponent}");
+            let shape = match body.traits.form {
+                Form::Warped => {
+                    let (rounded, _) = warped_impostor(terrain.atlases(), body).expect("a warped cube sags");
+                    let FarShape::Rounded { exponent } = rounded else { panic!("a warped cube draws rounded") };
+                    assert!(exponent >= 2.0, "exponent {exponent}");
                     rounded
                 }
+                Form::Cube => FarShape::Cube,
                 // Sphere: this list has not uploaded the datum. Mapped is the installed map.
-                Kind::Home => home_impostor(cosmos, body).0,
+                _ if body.traits.rank == Rank::Start => home_impostor(cosmos, body).0,
                 _ => FarShape::Sphere,
             };
-            assert_eq!(got.shape, shape, "{:?}", body.kind);
+            assert_eq!(got.shape, shape, "{}", body.name());
             expect += 1;
+            if body.traits.rank == Rank::Start {
+                continue;
+            }
+            // Tones come from the body's own minerals, crust first; living worlds are greened and
+            // wear a sky, glowing ones burn, the rest are bare.
+            let crust = cosmos.suite(body).minerals.last().expect("a mineral").rgb;
+            let t = &body.traits;
+            if t.life == 0 {
+                assert_eq!(got.albedo[0].0, srgb(crust[0], crust[1], crust[2]).0, "{} wears its crust", body.name());
+            }
+            if t.glow {
+                assert!(got.atmosphere.0[0] > 1.0 && got.atmosphere.0[0] > got.atmosphere.0[1], "{} burns", body.name());
+            } else if t.life > 0 {
+                assert!(got.atmosphere.0[2] > got.atmosphere.0[0] && got.atmosphere.0[0] > 0.0, "{} has a sky", body.name());
+            } else {
+                assert_eq!(got.atmosphere.0, [0.0, 0.0, 0.0], "{} is bare", body.name());
+            }
+            let a = got.albedo[0].0;
+            assert!(a.iter().all(|&c| (0.0..=1.0).contains(&c)), "a plain surface tone: {a:?}");
         }
         assert_eq!(listed.len(), expect);
-
-        let twins: Vec<_> = cosmos.bodies().iter().filter(|b| b.kind == Kind::Twin).collect();
-        assert!(twins.len() >= 2);
-        let lush = find(cosmos, listed, terrain.atlases(), twins[0]).unwrap();
-        let crystal = find(cosmos, listed, terrain.atlases(), twins[1]).unwrap();
-        assert!(lush.albedo[2].0[1] > lush.albedo[2].0[0] && lush.albedo[2].0[1] > lush.albedo[2].0[2]);
-        assert!(crystal.albedo[2].0[2] > crystal.albedo[2].0[0]);
-
-        let verdant = cosmos.bodies().iter().find(|b| b.kind == Kind::Verdant).unwrap();
-        let verdant = find(cosmos, listed, terrain.atlases(), verdant).unwrap();
-        assert!(verdant.albedo[0].0[1] > verdant.albedo[0].0[0]);
-        assert!(verdant.albedo[1].0[1] > verdant.albedo[1].0[2], "forest green, no seas");
-        assert!(verdant.atmosphere.0[2] > verdant.atmosphere.0[0]);
-        assert!(verdant.atmosphere.0[0] > 0.0);
-
-        let hollow = cosmos.bodies().iter().find(|b| b.kind == Kind::Hollow).unwrap();
-        let hollow = find(cosmos, listed, terrain.atlases(), hollow).unwrap();
-        assert_eq!(hollow.atmosphere.0, [0.0, 0.0, 0.0]);
-        assert!(hollow.albedo[0].0[2] > 0.5);
-
-        let ember = cosmos.bodies().iter().find(|b| b.kind == Kind::Ember).unwrap();
-        let ember = find(cosmos, listed, terrain.atlases(), ember).unwrap();
-        assert!(ember.atmosphere.0[0] > 1.0);
-        assert!(ember.atmosphere.0[0] > ember.atmosphere.0[1]);
-        assert!(ember.atmosphere.0[1] > ember.atmosphere.0[2]);
-        assert!(ember.albedo[0].0[0] > ember.albedo[0].0[1]);
-
-        for moon in cosmos.bodies().iter().filter(|b| b.kind == Kind::Moon) {
-            let moon = find(cosmos, listed, terrain.atlases(), moon).unwrap();
-            assert_eq!(moon.shape, FarShape::Sphere);
-            assert_eq!(moon.atmosphere.0, [0.0, 0.0, 0.0]);
-            let a = moon.albedo[0].0;
-            assert!(a.iter().all(|&c| c > 0.0 && c <= 1.0), "a lit, plain surface tone: {a:?}");
-        }
         assert!(far.sun_override().is_none());
 
         // Warm the buffer, then two more updates must not allocate.
@@ -792,7 +764,7 @@ mod tests {
                         let eye = c + dir * (body.reach() * k + extra);
                         let dist = (c - eye).length();
                         let exact = cosmos.altitude(body, eye) < STREAM_ALTITUDE;
-                        assert_eq!(dist < reach && exact, exact, "{:?} at {eye}", body.kind);
+                        assert_eq!(dist < reach && exact, exact, "{} at {eye}", body.name());
                     }
                 }
             }
@@ -800,11 +772,23 @@ mod tests {
     }
 
     /// Along a flight from spawn past every body, into the streaming band over each and through the
-    /// Hollow's cavity, with home's map off and on, the list is the old per-frame derivation's.
+    /// Hollow's cavity, with home's map off and on, the list is the old per-frame derivation's: in a
+    /// universe of more bodies than the engine draws (nearest first), and in the authored catalog
+    /// with its Hollow.
     #[test]
     fn the_list_matches_the_per_frame_derivation_along_a_flight() {
+        use crate::world::terrain::cosmos::fixture;
         let mut registry = BlockRegistry::with_builtins();
-        let terrain = Terrain::new(&mut registry, 42);
+        let crowded = Terrain::new(&mut registry, 157);
+        assert!(crowded.cosmos().expect("cosmos").bodies().len() > MAX_FAR_BODIES, "more bodies than the engine draws");
+        assert_eq!(flight(&crowded), 0);
+        let mut registry = BlockRegistry::with_builtins();
+        let authored = fixture::authored(|| Terrain::new(&mut registry, 42));
+        assert!(flight(&authored) > 10, "the flight crosses the cavity");
+    }
+
+    /// Fly past every body of `terrain` comparing the list with [`oracle`]; the eyes in a cavity.
+    fn flight(terrain: &Terrain) -> usize {
         let cosmos = terrain.cosmos().expect("cosmos");
         let mut eyes = vec![DVec3::new(0.5, 8.0, 0.5)];
         for body in cosmos.bodies() {
@@ -822,23 +806,23 @@ mod tests {
         let mut cavity = 0;
         for (i, &eye) in eyes.iter().enumerate() {
             far.set_live(i % 2 == 1);
-            let list = far.update(&terrain, eye).to_vec();
+            let list = far.update(terrain, eye).to_vec();
             let got = if cosmos.hollow_cavity(eye).is_some() {
                 cavity += 1;
                 &list[1..]
             } else {
                 &list[..]
             };
-            let want = oracle(&terrain, eye, i % 2 == 1, far.horizon);
+            let want = oracle(terrain, eye, i % 2 == 1, far.horizon);
             assert_eq!(format!("{got:?}"), format!("{want:?}"), "eye {eye}");
         }
-        assert!(cavity > 10, "the flight crosses the cavity");
+        cavity
     }
 
     #[test]
     fn inside_the_hollow_the_wall_and_the_ember_are_the_sky() {
         let mut registry = BlockRegistry::with_builtins();
-        let terrain = Terrain::new(&mut registry, 1);
+        let terrain = crate::world::terrain::cosmos::fixture::authored(|| Terrain::new(&mut registry, 1));
         let cosmos = terrain.cosmos().expect("cosmos");
         let hollow = cosmos.bodies().iter().find(|b| b.kind == Kind::Hollow).unwrap();
         let ember = cosmos.bodies().iter().find(|b| b.kind == Kind::Ember).unwrap();
@@ -955,8 +939,8 @@ mod tests {
         let mut registry = BlockRegistry::with_builtins();
         let terrain = Terrain::new(&mut registry, 42);
         let cosmos = terrain.cosmos().expect("cosmos");
-        let twin = cosmos.bodies().iter().find(|b| b.kind == Kind::Twin).unwrap();
-        let Shape::Cube { half } = twin.shape else { panic!("a twin is a cube") };
+        let twin = cosmos.bodies().iter().find(|b| b.traits.form == Form::Warped).unwrap();
+        let Shape::Cube { half } = twin.shape else { panic!("a warped body is a cube") };
         let eyes = [
             ("spawn", DVec3::new(0.5, 8.0, 0.5)),
             ("twin surface", twin.centre_f() + DVec3::new(half as f64 + 5_000.0, 300.0, -200.0)),

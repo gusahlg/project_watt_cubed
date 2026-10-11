@@ -97,11 +97,28 @@ pub fn cohesion01(cohesion: i32) -> f64 {
 /// 0..=32) and cohesion (normalised with [`cohesion01`]): density is the amount; yield rises over
 /// [`YIELD_DECADES`] decades with cohesion; stiffness follows yield.
 pub fn mechanical_response(amount: u32, cohesion01: f64) -> Params {
-    let c = cohesion01.clamp(0.0, 1.0);
-    // 10^(decades · c) without powf (generation arithmetic stays basic): exp(ln 10 · decades · c)
-    // is fine here because this runs once per material, not per voxel, and is never hashed.
-    let yield_stress = YIELD_FLOOR * (std::f64::consts::LN_10 * YIELD_DECADES * c).exp();
-    Params::from_yield(amount as f64, yield_stress)
+    let steps = (cohesion01.clamp(0.0, 1.0) * COHESION_STEPS as f64).round() as i32;
+    Params::from_yield(amount as f64, yield_of(COHESION_SPAN.0 as i32 + steps))
+}
+
+/// Cohesion units (Q8) across the yield decades.
+const COHESION_STEPS: i32 = (COHESION_SPAN.1 - COHESION_SPAN.0) as i32;
+/// Yield per unit of cohesion: `10^(YIELD_DECADES / COHESION_STEPS)`.
+const YIELD_STEP: f64 = 1.024_275_221_381_592_2;
+
+/// Yield stress of matter of cohesion `cohesion` (Q8): [`YIELD_FLOOR`] times an integer power of
+/// [`YIELD_STEP`], from IEEE basic operations only (it decides shapes, so every peer must agree).
+pub fn yield_of(cohesion: i32) -> f64 {
+    let mut k = (cohesion - COHESION_SPAN.0 as i32).clamp(0, COHESION_STEPS) as u32;
+    let (mut y, mut base) = (YIELD_FLOOR, YIELD_STEP);
+    while k > 0 {
+        if k & 1 == 1 {
+            y *= base;
+        }
+        base *= base;
+        k >>= 1;
+    }
+    y
 }
 
 #[cfg(test)]
@@ -116,6 +133,15 @@ mod tests {
         assert!((weak.yield_stress - YIELD_FLOOR).abs() < 1e-6);
         assert!((strong.yield_stress / weak.yield_stress - 10f64.powf(YIELD_DECADES)).abs() < 1e-6 * 10f64.powf(YIELD_DECADES));
         assert!((weak.shear - SHEAR_PER_YIELD * weak.yield_stress).abs() < 1e-6);
+    }
+
+    #[test]
+    fn yield_steps_match_the_decades() {
+        for c in 300..800 {
+            let k = ((c as f64 - COHESION_SPAN.0) / (COHESION_SPAN.1 - COHESION_SPAN.0)).clamp(0.0, 1.0);
+            let want = YIELD_FLOOR * 10f64.powf(YIELD_DECADES * k);
+            assert!((yield_of(c) / want - 1.0).abs() < 1e-12, "cohesion {c}");
+        }
     }
 
     #[test]
