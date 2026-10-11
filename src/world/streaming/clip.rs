@@ -88,15 +88,6 @@ impl World {
         }
     }
 
-    /// Every waiting clip as if its chunks had settled.
-    #[cfg(test)]
-    pub(in crate::world) fn settle_clip_waits(&mut self) {
-        for (s, bits) in std::mem::take(&mut self.clips.wait) {
-            let want = bits.iter().fold(ColumnClip::NONE, |m, (b, _)| m.union(*b));
-            self.clips.target.insert(s, want);
-        }
-    }
-
     /// Whether a clip still waits on chunks.
     pub(super) fn clips_waiting(&self) -> bool {
         !self.clips.wait.is_empty()

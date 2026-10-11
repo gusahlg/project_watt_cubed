@@ -259,7 +259,7 @@ impl World {
         let mut hits: Vec<(SectionPos, Option<(i32, i32)>, u64)> = Vec::new();
         for (x, y, z) in cells {
             let Some((body, face, u, v, a)) = self.edit_face_cell(x, y, z) else { continue };
-            for detail in self.section_pyramid.active_lods() {
+            for detail in self.rule_details(body) {
                 let span = super::section::section_span(detail);
                 let pos = SectionPos { body, face, detail, x: u.div_euclid(span), z: v.div_euclid(span) };
                 let at = match hits.iter().position(|hit| hit.0 == pos) {

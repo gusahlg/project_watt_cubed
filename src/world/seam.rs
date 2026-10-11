@@ -490,85 +490,10 @@ impl Seams {
         if !matches!(patch, Patch::Shell { band: 0, .. }) {
             return None;
         }
-        let (o, size) = atlas.storage_box(patch);
-        Some(ChartSeat {
-            index: r.atlas,
-            patch,
-            lo: o,
-            hi: [o[0] + size[0], o[1] + size[1], o[2] + size[2]],
-            radius: atlas.radius,
-        })
+        let (o, _) = atlas.storage_box(patch);
+        Some(ChartSeat { index: r.atlas, lo: o })
     }
 
-    /// Neighbour band-0 charts when `eye` (storage blocks) is within `band` blocks of a home side.
-    /// Only unit seams. A side whose cells are not a rotation of the home edge is skipped.
-    pub(in crate::world) fn seam_across(&self, home: ChartSeat, eye: [i64; 3], band: i64) -> Vec<SeamAcross> {
-        let centre = Coord::new(eye[0].div_euclid(CS) as i32, eye[1].div_euclid(CS) as i32, eye[2].div_euclid(CS) as i32);
-        let unfold = self.unfold_at(centre);
-        let atlas = &self.atlases[home.index];
-        let mut out = Vec::new();
-        // Same side order as [`Unfold`]: NegX, PosX, NegZ, PosZ.
-        let sides: [(usize, [i64; 3]); 4] = [(0, [-1, 0, 0]), (0, [1, 0, 0]), (2, [0, 0, -1]), (2, [0, 0, 1])];
-        for (i, (axis, side)) in sides.into_iter().enumerate() {
-            if unfold.sides[i].is_none() {
-                continue;
-            }
-            let steps = if side[axis] > 0 { home.hi[axis] - eye[axis] } else { eye[axis] - (home.lo[axis] - 1) };
-            if steps <= 0 || steps > band {
-                continue;
-            }
-            let tan = if axis == 0 { 2 } else { 0 };
-            let mut probe = eye;
-            probe[1] = probe[1].clamp(home.lo[1], home.hi[1] - 1);
-            probe[tan] = probe[tan].clamp(home.lo[tan] + 1, home.hi[tan] - 2);
-            probe[axis] = if side[axis] > 0 { home.hi[axis] } else { home.lo[axis] - 1 };
-            let Some(g) = atlas.glue(probe) else { continue };
-            if (g[1] - probe[1]).abs() > 4 {
-                continue;
-            }
-            let Some((npatch, _)) = atlas.locate(g) else { continue };
-            if npatch == home.patch || !matches!(npatch, Patch::Shell { band: 0, .. }) {
-                continue;
-            }
-            let (o, size) = atlas.storage_box(npatch);
-            let nlo = o;
-            let nhi = [o[0] + size[0], o[1] + size[1], o[2] + size[2]];
-            let Some(inward) = edge_inward(g, nlo, nhi) else { continue };
-            let mut g2 = None;
-            let mut home_step = 0i64;
-            for sign in [16i64, -16] {
-                let t = probe[tan] + sign;
-                if t < home.lo[tan] || t >= home.hi[tan] {
-                    continue;
-                }
-                let mut p2 = probe;
-                p2[tan] = t;
-                if let Some(gg) = atlas.glue(p2) {
-                    home_step = sign;
-                    g2 = Some(gg);
-                    break;
-                }
-            }
-            let Some(g2) = g2 else { continue };
-            let delta = [g2[0] - g[0], g2[1] - g[1], g2[2] - g[2]];
-            if delta[1].abs() > 2 {
-                continue;
-            }
-            let Some(tan_n) = unit_step(delta, home_step) else { continue };
-            let mut tan_h = [0i64; 3];
-            tan_h[tan] = 1;
-            out.push(SeamAcross {
-                seat: ChartSeat { index: home.index, patch: npatch, lo: nlo, hi: nhi, radius: home.radius },
-                g,
-                inward,
-                tan_n,
-                probe,
-                side,
-                tan_h,
-            });
-        }
-        out
-    }
 }
 
 /// How far `p` is above `a`'s stored top (outward charts: beyond `r_hi`; inward ones: inside
@@ -590,90 +515,11 @@ fn lifted(a: &Atlas, top: glam::DVec3, above: f64) -> Option<glam::DVec3> {
     Some(glam::DVec3::new(l.x + o[0] as f64, l.y + o[1] as f64 + above, l.z + o[2] as f64))
 }
 
-/// A band-0 shell chart: atlas index, patch, storage box (`hi` exclusive) and datum radius.
+/// A band-0 shell chart: its atlas index and its storage box's minimum corner.
 #[derive(Clone, Copy, Debug)]
 pub(in crate::world) struct ChartSeat {
     pub index: usize,
-    pub patch: Patch,
     pub lo: [i64; 3],
-    pub hi: [i64; 3],
-    pub radius: i64,
-}
-
-/// A neighbour chart joined across a unit seam, and the map back into the home storage frame.
-#[derive(Clone, Copy, Debug)]
-pub(in crate::world) struct SeamAcross {
-    pub seat: ChartSeat,
-    g: [i64; 3],
-    inward: [i64; 3],
-    tan_n: [i64; 3],
-    probe: [i64; 3],
-    side: [i64; 3],
-    tan_h: [i64; 3],
-}
-
-impl SeamAcross {
-    /// Home storage `(x, z)` of a neighbour storage `(x, z)`. The neighbour's interior continues
-    /// past the home edge (the full-res box only overlaps the first blocks beyond the seam).
-    /// The seam is a signed permutation.
-    pub(in crate::world) fn home_xz(self, x: i64, z: i64) -> (i64, i64) {
-        let d_in = (x - self.g[0]) * self.inward[0] + (z - self.g[2]) * self.inward[2];
-        let d_tan = (x - self.g[0]) * self.tan_n[0] + (z - self.g[2]) * self.tan_n[2];
-        let hx = self.probe[0] + self.side[0] * d_in + self.tan_h[0] * d_tan;
-        let hz = self.probe[2] + self.side[2] * d_in + self.tan_h[2] * d_tan;
-        (hx, hz)
-    }
-
-    /// Neighbour storage `(x, z)` of a home storage `(hx, hz)`. Inverse of [`home_xz`](Self::home_xz).
-    pub(in crate::world) fn storage_xz(self, hx: i64, hz: i64) -> (i64, i64) {
-        let d_in = (hx - self.probe[0]) * self.side[0] + (hz - self.probe[2]) * self.side[2];
-        let d_tan = (hx - self.probe[0]) * self.tan_h[0] + (hz - self.probe[2]) * self.tan_h[2];
-        let x = self.g[0] + self.inward[0] * d_in + self.tan_n[0] * d_tan;
-        let z = self.g[2] + self.inward[2] * d_in + self.tan_n[2] * d_tan;
-        (x, z)
-    }
-}
-
-fn edge_inward(g: [i64; 3], lo: [i64; 3], hi: [i64; 3]) -> Option<[i64; 3]> {
-    let mut found = None;
-    for a in [0usize, 2] {
-        let on_lo = g[a] - lo[a] <= 4;
-        let on_hi = hi[a] - 1 - g[a] <= 4;
-        if on_lo == on_hi {
-            continue;
-        }
-        if found.is_some() {
-            return None;
-        }
-        let mut u = [0i64; 3];
-        u[a] = if on_lo { 1 } else { -1 };
-        found = Some(u);
-    }
-    found
-}
-
-/// Neighbour units per one positive step of the home tangent. `home_step` is the probe offset.
-fn unit_step(delta: [i64; 3], home_step: i64) -> Option<[i64; 3]> {
-    let s = home_step.abs();
-    if s == 0 {
-        return None;
-    }
-    let mut axis = None;
-    for a in [0usize, 2] {
-        if delta[a].abs() <= 2 {
-            continue;
-        }
-        if (delta[a].abs() - s).abs() > 2 {
-            return None;
-        }
-        if axis.is_some() {
-            return None;
-        }
-        let mut u = [0i64; 3];
-        u[a] = delta[a].signum() * home_step.signum();
-        axis = Some(u);
-    }
-    axis
 }
 
 fn face_of(axis: usize, d: i32) -> Face {

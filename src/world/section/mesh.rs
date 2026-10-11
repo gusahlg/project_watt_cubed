@@ -598,6 +598,7 @@ pub(in crate::world) fn ring_floor<G: TerrainGenerator + ?Sized>(pos: SectionPos
 }
 
 /// [`extract_section_mesh_with`] leaving no column out, with `dy` on +Y.
+#[cfg(test)]
 pub(in crate::world) fn extract_section_mesh<G: TerrainGenerator + ?Sized>(
     pos: SectionPos,
     r#gen: &G,
@@ -1919,7 +1920,6 @@ mod tests {
         use crate::render_config::RenderConfig;
         use crate::world::generation::WorldgenKind;
         use crate::world::heightmip::BakeExtent;
-        use crate::world::quadtree;
         use crate::world::{World, DEFAULT_SEED};
         use std::collections::BTreeMap;
 
@@ -2337,26 +2337,6 @@ mod tests {
             dx += step;
         }
         (radius, void)
-    }
-
-    /// How far a frontier cut to the slot budget still tops all ground: the chart frontier keeps the
-    /// sections nearest the eye in the chart net, so every dropped one lies at least as far as the
-    /// farthest kept, and a sample it would have topped at most half its diagonal nearer. A seam
-    /// spends the budget early: a storage box's x edges are aligned to 256 blocks only, so each
-    /// coarse section straddling one splits into dozens down the seam.
-    fn capped_reach(world: &crate::world::World, desired: &[SectionPos], center: crate::coord::ChunkCoord) -> f64 {
-        let unfold = world.seams.unfold_at(center);
-        let eye = (i64::from(center.x) * 16 + 8, i64::from(center.z) * 16 + 8);
-        let kept = desired
-            .iter()
-            .map(|&s| {
-                let [x0, z0, x1, z1] = world.tile_rect(s);
-                let (x, z) = unfold.fold_column((x0 + x1) / 2, (z0 + z1) / 2).expect("a section in the net");
-                ((x - eye.0) as f64).hypot((z - eye.1) as f64)
-            })
-            .fold(0.0, f64::max);
-        let span = desired.iter().map(|s| s.span()).max().unwrap_or(0);
-        kept - f64::from(span) * std::f64::consts::FRAC_1_SQRT_2
     }
 
     fn assert_chart_closed(name: &str, f: &ChartFrontier) {

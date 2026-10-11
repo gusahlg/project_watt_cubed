@@ -5,7 +5,6 @@ use super::*;
 use crate::coord::ChunkCoord;
 use crate::world::fixtures::{ready_section, round_world, spawned_round_world};
 use crate::world::{light, mesh};
-use super::far::storage_eye_block;
 use super::headless::{Headless, finish_jobs, step, step_finished};
 use super::light::LIGHT_WAIT_DEGRADE;
 

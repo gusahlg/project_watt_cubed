@@ -19,13 +19,11 @@ use super::generation::{Classify, ColumnHeights};
 use crate::block::registry::{HotTables, AIR};
 use super::brick::ChunkPayload;
 use super::heightmip::{BakeExtent, HeightMip};
-use super::metric::{DyCap, EyeDist, EyeMetric, HeightEnvelope};
 use super::section::{ColumnClip, SectionPos};
-use super::summary::{CellError, CellSummary, SseBudget};
 use super::{
     ColumnKey, Coord, DIRTY_BUDGET, FastMap, FastSet, LightLane, Loaded, MeshLane, MeshState,
     SECTION_UPLOAD_BUDGET, SectionFrontierKey, SectionLane, SectionState, Sky, StreamLane,
-    UPLOAD_BUDGET_BYTES, UPLOAD_QUEUE_MAX, UPLOAD_SCAN_MAX, World, pipeline, pyramid, quadtree,
+    UPLOAD_BUDGET_BYTES, UPLOAD_QUEUE_MAX, UPLOAD_SCAN_MAX, World, pipeline, quadtree,
 };
 // What the stage modules name through `super::`.
 use super::{
@@ -59,8 +57,6 @@ pub(in crate::world) use near::NearField;
 pub(in crate::world) use generate::GenRun;
 use far::{eye_chunk, section_key};
 use pacer::{LoadWindow, travel_heading};
-#[cfg(test)]
-use pacer::FULL_EFFORT_SPEED_MPS;
 
 /// Exact upload placement for a chunk mesh: integer chunk origin, full detail.
 /// Pinned at upload so the GPU record is written once; draws only mark
@@ -101,14 +97,6 @@ pub(in crate::world) fn edits_in_footprint(
 /// (safer for fast motion, low cost) but never shrinks the view.
 const TAU_STREAM: f64 = 1.0;
 
-/// Chart prediction lands on whole chunks. A flight's velocity jitters frame to frame; an exact
-/// lookahead would move the predicted eye, and so recompute the frontier, every frame. Adding
-/// zero folds a rounded `-0` into `+0`, so equal deltas key equal bits.
-fn chart_delta(vel: DVec3) -> DVec3 {
-    let step = CHUNK_SIZE as f64;
-    (vel * TAU_STREAM / step).round() * step + DVec3::ZERO
-}
-
 /// Above this sample gap, treat eye motion as pause/teleport; discard velocity
 /// to zero prediction. Generous (streaming may legitimately run at 15 Hz under
 /// `stream_hz`); the speed cap below catches genuine discontinuities.
@@ -135,19 +123,8 @@ fn eye_sample(prev: Option<(DVec3, Instant)>, eye: DVec3, now: Instant) -> (DVec
     }
 }
 
-/// Above this speed the far-field key is bucketed so the sweep is not redone
-/// every chunk step. The sweep costs the same at any speed; running it on
-/// every step is what made a fast frame grow with speed. Slower flight keeps
-/// the exact key, so rest and the spawn frontier stay bit-identical.
-const FRONTIER_COARSE_SPEED: f64 = 1000.0;
 
-/// Fixed chunk grid for that key. A speed-scaled grid moves its edges when the
-/// sampled speed jitters, which rebuilds the sweep every frame.
-const FRONTIER_CHUNK_QUANTUM: i32 = 32;
 
-/// Fixed altitude grid, metres. Same reason: the eye's storage height is large,
-/// and a quantum that tracks speed does not land on one value.
-const FRONTIER_EYE_QUANTUM: f64 = 512.0;
 
 /// The phases of a stream pass, in order, as [`StreamSteps::lap`] marks them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

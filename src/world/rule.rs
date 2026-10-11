@@ -55,6 +55,7 @@ impl Rule {
 
     /// Distance out to which a tile of detail `d` and nominal span `32·2^d` splits into detail
     /// `d − 1`. Tied to the tile's size; it equals `R·2^(d − finest)` when `R = 64·2^k`.
+    #[cfg(test)]
     pub fn range(&self, d: i8) -> f64 {
         self.range_of(32.0 * 2f64.powi(i32::from(d)))
     }
@@ -104,6 +105,7 @@ impl PhysBox {
     }
 
     /// The box holding only `p`.
+    #[cfg(test)]
     pub fn point(p: DVec3) -> PhysBox {
         PhysBox { lo: p, hi: p, span: 0.0 }
     }
@@ -115,6 +117,7 @@ impl PhysBox {
     }
 
     /// Euclidean distance from `p` to the nearest point of the box (`0` inside).
+    #[cfg(test)]
     pub fn dist(&self, p: DVec3) -> f64 {
         (self.lo - p).max(p - self.hi).max(DVec3::ZERO).length()
     }

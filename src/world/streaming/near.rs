@@ -173,6 +173,7 @@ impl NearField {
     }
 
     /// Every near column: its real chunk column and shell.
+    #[cfg(test)]
     pub(in crate::world) fn near_columns(&self) -> impl Iterator<Item = (ColumnKey, [i32; 2])> + '_ {
         self.cols.iter().filter(|c| c.near).filter_map(|c| Some((c.real?, c.shell?)))
     }

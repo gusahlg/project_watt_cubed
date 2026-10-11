@@ -153,6 +153,7 @@ impl World {
     }
 
     /// Tile `s`'s footprint `[x0, z0, x1, z1)`: storage blocks on a chart, its face frame elsewhere.
+    #[cfg(test)]
     pub(in crate::world) fn tile_rect(&self, s: SectionPos) -> [i64; 4] {
         let (ox, oz) = self.generator.chart_origin(s.body, s.face).unwrap_or((0, 0));
         let (x0, z0, w) = (i64::from(ox) + i64::from(s.min_x()), i64::from(oz) + i64::from(s.min_z()), i64::from(s.span()));
@@ -176,13 +177,6 @@ impl World {
     pub(in crate::world) fn storage_rect(&self, body: u16, x0: i32, z0: i32, x1: i32, z1: i32) -> Option<(i32, i32)> {
         let (ox, oz) = self.generator.chart_origin(body, Face::PosY).unwrap_or((0, 0));
         self.generator.surface_rect(body, Face::PosY, x0 - ox, z0 - oz, x1 - ox, z1 - oz)
-    }
-
-    /// [`storage_rect`](Self::storage_rect) over the `span` square at storage `(x0, z0)`.
-    #[cfg(test)]
-    pub(in crate::world) fn storage_bounds(&self, body: u16, x0: i32, z0: i32, span: i32) -> Option<(i32, i32)> {
-        let (ox, oz) = self.generator.chart_origin(body, Face::PosY).unwrap_or((0, 0));
-        self.generator.surface_bounds(body, Face::PosY, x0 - ox, z0 - oz, span)
     }
 
     /// Ready tiles under an uncovered desired cell, once the section floor is full.

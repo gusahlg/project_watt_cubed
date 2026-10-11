@@ -215,14 +215,24 @@ impl World {
     /// Whether tile `s` is meshed with `dy`: a level with a coarser one beside it. The rule's
     /// coarsest level has none.
     pub(in crate::world) fn section_morphs(&self, s: SectionPos) -> bool {
-        let ground = if s.body >= CHART_BODY_BASE {
-            Ground::Chart { index: usize::from(s.body - CHART_BODY_BASE) }
+        s.detail.0 < self.rule_on(self.ground_of(s.body)).coarsest
+    }
+
+    /// The ground a body's tiles belong to.
+    pub(in crate::world) fn ground_of(&self, body: u16) -> Ground {
+        if body >= CHART_BODY_BASE {
+            Ground::Chart { index: usize::from(body - CHART_BODY_BASE) }
         } else if self.generator.cosmos().is_some() {
-            Ground::Cube { body: s.body }
+            Ground::Cube { body }
         } else {
             Ground::Flat
-        };
-        s.detail.0 < self.rule_on(ground).coarsest
+        }
+    }
+
+    /// Every detail the rule may draw on `body`'s tiles at this view.
+    pub(in crate::world) fn rule_details(&self, body: u16) -> impl Iterator<Item = Detail> + use<> {
+        let rule = self.rule_on(self.ground_of(body));
+        (rule.finest..=rule.coarsest).map(Detail)
     }
 
     /// The morph band of every level of the cut `leaves` seen from the eye's cell `eye`, by engine

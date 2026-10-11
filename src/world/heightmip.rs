@@ -16,9 +16,7 @@ use crate::coord::{ChunkCoord, Face};
 use crate::ident::Detail;
 use super::generation::TerrainGenerator;
 use super::lod;
-use super::metric::HeightEnvelope;
 use super::section::{FINEST_DETAIL, LOD_FLOOR_Y, SECTION_N, SectionPos, section_span};
-use super::summary::{CellError, CellSummary};
 
 /// The world region and detail band a bake covers. The finest level is always
 /// [`FINEST_DETAIL`] (the LOD extractor's own granularity); `coarsest` matches the
@@ -55,10 +53,6 @@ pub(in crate::world) struct MipCell {
 }
 
 impl MipCell {
-    /// The cell's relief (hi - lo). Zero for flat terrain, allowing coarse drawing at any distance.
-    fn err(&self) -> f32 {
-        self.hi - self.lo
-    }
 }
 
 /// One detail level's dense grid of cells, row-major over `[x0, x0+nx) × [z0, z0+nz)`
@@ -133,20 +127,6 @@ impl HeightMip {
             levels.push(build_level(terra, colors, detail, x0, z0, nx, nz, child, face, body, datum));
         }
         HeightMip { finest, coarsest, levels }
-    }
-
-    /// The summary for a cell: the baked envelope + recorded ε when the cell sits in
-    /// the extent, else the worst-case fallback (full domain envelope, `2^detail`
-    /// error) — a section beyond the bake is treated as maximally uncertain.
-    pub fn summary(&self, cell: SectionPos) -> CellSummary {
-        if let Some(c) = self.cell(cell) {
-            CellSummary { env: HeightEnvelope::new(c.lo, c.hi), err: CellError::from_metres(c.err()) }
-        } else {
-            CellSummary {
-                env: HeightEnvelope::new(0.0, super::section::DOMAIN_H as f32),
-                err: CellError::worst_case(cell.detail),
-            }
-        }
     }
 
     pub(in crate::world) fn allocated_bytes(&self) -> usize {
@@ -615,7 +595,6 @@ mod tests {
                     for q in 0..4 {
                         let Some(c) = child.get(2 * ax + (q & 1), 2 * az + (q >> 1)) else { continue };
                         assert!(p.lo <= c.lo && p.hi >= c.hi, "parent env does not contain child");
-                        assert!(p.err() >= c.err(), "parent ε {} < child ε {}", p.err(), c.err());
                         checked += 1;
                     }
                 }
@@ -635,14 +614,10 @@ mod tests {
         for w in mip.levels.windows(2) {
             assert!(w[0].cells.len() <= w[1].cells.len(), "finer level not sparser");
         }
-        // Section beyond finest coverage uses worst_case at finest detail, but coarser ancestor is baked.
+        // A section beyond the finest coverage is not baked, but its coarser ancestor is.
         let finest = &mip.levels[0];
         let past = SectionPos { body: 0, face: Face::PosY, detail: FINEST_DETAIL, x: finest.x0 + finest.nx as i32 + 1, z: 0 };
-        assert_eq!(
-            mip.summary(past).err.get(),
-            CellError::worst_case(FINEST_DETAIL).get(),
-            "finest section past coverage should be worst_case"
-        );
+        assert!(mip.relief_band(past).is_none(), "a finest section past coverage is not baked");
         // Its coarsest ancestor (same ground, largest coverage) is inside the bake.
         let anc = SectionPos { body: 0, face: Face::PosY, detail: mip.coarsest, x: past.x >> (mip.coarsest.0 - FINEST_DETAIL.0), z: 0 };
         assert!(mip.color(anc).is_some(), "coarse ancestor should be baked");
@@ -655,16 +630,6 @@ mod tests {
         let a = small(&reg, &g);
         let b = small(&reg, &g);
         assert!(a == b, "two bakes of one seed differ");
-    }
-
-    /// The worst-case fallback covers cells outside the baked extent.
-    #[test]
-    fn summary_falls_back_beyond_extent() {
-        let (reg, g) = terra(3);
-        let mip = small(&reg, &g);
-        let far = SectionPos { body: 0, face: Face::PosY, detail: FINEST_DETAIL, x: 1_000_000, z: 0 };
-        let s = mip.summary(far);
-        assert_eq!(s.err.get(), CellError::worst_case(FINEST_DETAIL).get());
     }
 
     /// Build a single-level mip from a per-cell `(lo, hi)` closure — full control

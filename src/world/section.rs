@@ -33,7 +33,9 @@ use super::lod;
 /// Submodule keeps mesh representation and consumer together.
 mod mesh;
 pub(in crate::world) use mesh::face_edits;
-pub(in crate::world) use mesh::{SectionMeshData, chart_slab_corners, extract_section_mesh, extract_section_mesh_with, warp_slab_corners};
+pub(in crate::world) use mesh::{SectionMeshData, chart_slab_corners, extract_section_mesh_with, warp_slab_corners};
+#[cfg(test)]
+pub(in crate::world) use mesh::extract_section_mesh;
 
 /// 32 not 64: reduces remesh cost under frequent edits.
 pub(in crate::world) const SECTION_N: usize = 32;
@@ -82,17 +84,10 @@ impl Quadrant {
     /// All four quadrants, ascending — the canonical iteration order.
     pub const ALL: [Quadrant; 4] = [Quadrant(0), Quadrant(1), Quadrant(2), Quadrant(3)];
 
-    #[cfg(test)]
-    pub fn new(q: u8) -> Quadrant {
-        debug_assert!(q < 4, "quadrant is a 2-bit index, got {q}");
-        Quadrant(q & 0b11)
-    }
     /// The quadrant a `(x, z)` grid coord occupies within its parent.
+    #[cfg(test)]
     pub fn of_coords(x: i32, z: i32) -> Quadrant {
         Quadrant((x.rem_euclid(2) | (z.rem_euclid(2) << 1)) as u8)
-    }
-    pub const fn get(self) -> u8 {
-        self.0
     }
     /// The +X bit as an offset (0 or 1).
     pub const fn dx(self) -> i32 {
@@ -167,6 +162,7 @@ impl SectionPos {
     }
 
     /// Which quadrant of its parent this section occupies.
+    #[cfg(test)]
     pub(in crate::world) fn quadrant(self) -> Quadrant {
         Quadrant::of_coords(self.x, self.z)
     }
@@ -228,10 +224,6 @@ impl ColumnClip {
 
     pub fn intersect(self, other: Self) -> Self {
         Self(self.0 & other.0)
-    }
-
-    pub fn without(self, other: Self) -> Self {
-        Self(self.0 & !other.0)
     }
 
     /// The left-out columns as `(cx, cz)` from the section's min corner.

@@ -62,7 +62,6 @@ mod fixtures;
 mod heightmip;
 mod lanes;
 mod ledger;
-mod metric;
 mod occlusion;
 mod quadtree;
 mod query;
@@ -71,7 +70,6 @@ mod rule;
 pub(crate) mod seam;
 mod settings;
 mod streaming;
-mod summary;
 mod textures;
 mod worklist;
 
@@ -82,7 +80,7 @@ use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use voxel_engine::producer::{Budget, Progress};
-use voxel_engine::{CoverageVolume, DVec3, Engine, FadeStyle, Frame3D, MeshHandle, Vec3};
+use voxel_engine::{DVec3, Engine, FadeStyle, Frame3D, MeshHandle, Vec3};
 use crate::ident::Detail;
 
 use crate::block::registry::{BlockId, BlockRegistry, HotTables};
@@ -257,16 +255,6 @@ impl ViewVolume {
     fn view(horizontal: i32) -> Self {
         Self::new(horizontal, Self::vertical_for(horizontal))
     }
-    /// The full-res coverage box in metres (horizontal half `rh` chunks, vertical
-    /// `rv`). The shader's LOD-cull volume must equal this streamed volume.
-    fn coverage(&self) -> CoverageVolume {
-        let r = (self.horizontal * CHUNK_SIZE as i32) as f32;
-        let rv = (self.vertical * CHUNK_SIZE as i32) as f32;
-        CoverageVolume {
-            half: Vec3::new(r, rv, r),
-        }
-    }
-
     /// The far-field LOD ring unit in metres. Cannot be zero even when the
     /// stripped near field draws only the current chunk column.
     pub(in crate::world) fn lod_unit(&self) -> f32 {
@@ -556,9 +544,6 @@ pub struct World {
     /// the left shell (old ∖ new). `None` after a radius change, so the next
     /// cross scans every loaded chunk.
     prev_unload_box: Option<ChunkBox>,
-    /// Settled chunks across a seam kept past the unload box until they leave the turn-back
-    /// skirt. The shell diff would not see them on a later pass.
-    far_wait: FastSet<Coord>,
     /// Loaded altitude-chunk indices per [`ColumnKey`], highest first. Empty
     /// vec is pruned so a column's cached ceiling drops exactly when its last
     /// chunk unloads. PosY altitudes are chunk Y. `Open` chunks are not entered.
@@ -862,7 +847,6 @@ impl World {
             dirty_worklist: FastSet::default(),
             prev_mesh_box: None,
             prev_unload_box: None,
-            far_wait: FastSet::default(),
             column_chunks: FastMap::default(),
             occlusion_active: false,
             occlusion_forced: render.occlusion,

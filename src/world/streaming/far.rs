@@ -22,17 +22,6 @@ pub(super) fn eye_chunk(p: DVec3) -> Coord {
     World::chunk_of(block_coord(p.x), block_coord(p.y), block_coord(p.z))
 }
 
-/// Storage block of the centre chunk's middle, plus `delta`. Y is the streamed altitude, not the
-/// chunk layer.
-#[cfg(test)]
-pub(super) fn storage_eye_block(center: Coord, eye_y: f64, delta: DVec3) -> (i64, i64, i64) {
-    let cs = CHUNK_SIZE as i64;
-    let x = center.x as i64 * cs + cs / 2 + delta.x.round() as i64;
-    let z = center.z as i64 * cs + cs / 2 + delta.z.round() as i64;
-    let y = (eye_y + delta.y).round() as i64;
-    (x, y, z)
-}
-
 pub(super) fn section_key(s: &SectionPos) -> (u16, u8, crate::ident::Detail, i32, i32) {
     (s.body, s.face as u8, s.detail, s.x, s.z)
 }
@@ -206,14 +195,6 @@ impl World {
             return (reference, eye_y, true);
         }
         (center, self.section_eye_y, false)
-    }
-
-    /// Cells added to a storage-frame altitude on `face` to reach the reference cube.
-    /// Zero when `reference` is `storage` (anything outside a cube box).
-    pub(in crate::world) fn face_alt_shift(storage: Coord, reference: Coord, face: Face) -> i64 {
-        let (_, sa) = ColumnKey::of(face, storage);
-        let (_, ra) = ColumnKey::of(face, reference);
-        (i64::from(ra) - i64::from(sa)) * i64::from(CHUNK_SIZE as i32)
     }
 
 
