@@ -622,3 +622,44 @@ fn morph_bands_hold_from_the_cut() {
         assert!(!w.section_morphs(coarsest), "{name}: the coarsest level is meshed with dy");
     }
 }
+
+/// Memory and load at the owner's site and at spawn, at render distance 16 and at the largest one
+/// (20; 32 is past the settings' range), vertical 5: chunks, far sections (the cut and its resident
+/// ancestors), CPU bytes, GPU vertex bytes of the far field, and the passes taken to settle.
+/// `cargo test --release --lib lod_rule_memory_census -- --ignored --nocapture --test-threads 1`
+#[test]
+#[ignore]
+fn lod_rule_memory_census() {
+    for (name, seed, h) in [("owner", OWNER_SEED, 16), ("spawn", 42, 16), ("owner", OWNER_SEED, 20), ("spawn", 42, 20)] {
+        let (lod_levels, lod_detail) = lod_for(h);
+        let render = RenderConfig { lod2: true, occlusion: true, lod_levels, lod_detail, ..RenderConfig::default() };
+        let mut world = round_world(seed, render);
+        world.set_view_distances(h, 5);
+        world.section_pyramid.unit = world.view.lod_unit();
+        let eye = if name == "owner" {
+            OWNER_EYE
+        } else {
+            let centre = world.generator.cosmos().expect("cosmos").home().centre_f();
+            world.home_eye(world.chart_spawn().expect("charted") - centre, 1.62)
+        };
+        world.prepare_around(eye);
+        world.drive_spawn_ready();
+        let t = std::time::Instant::now();
+        let passes = settle(&mut world, eye);
+        let secs = t.elapsed().as_secs_f64();
+        let c = world.memory_census();
+        let mib = |b: usize| b as f64 / f64::from(1 << 20);
+        let near = world.near.near_columns().count();
+        println!(
+            "{name} RD{h}/V5: {} chunks ({near} near columns), {} sections ({} in the cut, {} ancestors), {:.1} MiB CPU (chunks {:.1}, light {:.1}, sections {:.1}), settled in {passes} passes / {secs:.1} s",
+            world.chunks.len(),
+            world.sections.len(),
+            world.section_desired.len(),
+            world.section_ancestors.len(),
+            mib(c.total),
+            mib(c.chunk_uniform_bytes + c.chunk_paletted_bytes + c.chunk_dense_bytes),
+            mib(c.light_uniform_bytes + c.light_cells_bytes),
+            mib(c.section_lod_bytes),
+        );
+    }
+}
