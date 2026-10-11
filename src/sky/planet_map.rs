@@ -20,7 +20,7 @@ use crate::space::atlas::FACES;
 use crate::space::chart::{basis, Map};
 use crate::space::datum::DatumField;
 use crate::world::generation::TerrainGenerator;
-use crate::world::terrain::cosmos::{Body, Cosmos, Kind};
+use crate::world::terrain::cosmos::{Body, Cosmos, Rank};
 use crate::world::terrain::Generator;
 
 mod cache;
@@ -140,7 +140,7 @@ pub(crate) fn bake_face(
 /// `(datum_res, offsets)` in [`DatumField`] order, relative to the impostor's radius:
 /// `datum[i] = field[i] − lo`, so `R_imp + datum[i] = R + field[i] − sink`.
 pub(crate) fn impostor_datum(cosmos: &Cosmos, body: &Body, field: &DatumField) -> Option<(u32, Vec<f32>)> {
-    if body.kind != Kind::Home || field.g < 2 {
+    if body.traits.rank != Rank::Start || field.g < 2 {
         return None;
     }
     let lo = cosmos.relief_range(body).0.min(cosmos.face_offset(body));
@@ -183,7 +183,7 @@ struct Job {
 fn home_chart_n(generator: &dyn TerrainGenerator) -> Option<(u16, i64, i64)> {
     let cosmos = generator.cosmos()?;
     let body = cosmos.home();
-    if body.kind != Kind::Home {
+    if body.traits.rank != Rank::Start {
         return None;
     }
     let centre = body.centre_f();
@@ -200,7 +200,7 @@ fn home_chart_n(generator: &dyn TerrainGenerator) -> Option<(u16, i64, i64)> {
 fn home_datum(generator: &dyn TerrainGenerator) -> Option<&[f32]> {
     let cosmos = generator.cosmos()?;
     let body = cosmos.home();
-    if body.kind != Kind::Home {
+    if body.traits.rank != Rank::Start {
         return None;
     }
     let centre = body.centre_f();

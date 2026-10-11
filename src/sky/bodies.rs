@@ -8,7 +8,7 @@ use voxel_engine::{
 
 use crate::sky::palette::Rgb;
 use crate::world::generation::TerrainGenerator;
-use crate::world::terrain::cosmos::{Body, Cosmos, Kind, Shape, AIR_TOP};
+use crate::world::terrain::cosmos::{Body, Cosmos, Form, Rank, Shape, AIR_TOP};
 
 /// Above this altitude the voxel terrain is not drawn, so the impostor takes over.
 const STREAM_ALTITUDE: f64 = 20_000.0;
@@ -51,7 +51,8 @@ struct Static {
 impl Static {
     fn new(cosmos: &Cosmos, body: &Body, twin_ordinal: u32, atlases: &[std::sync::Arc<crate::space::atlas::Atlas>]) -> Self {
         let (shape, albedo, atmosphere) = paint(body, twin_ordinal);
-        let (shape, radius) = if body.kind == Kind::Home {
+        let start = body.traits.rank == Rank::Start;
+        let (shape, radius) = if start {
             (shape, home_impostor(cosmos, body).1)
         } else if let Some(warped) = warped_impostor(atlases, body) {
             warped
@@ -62,7 +63,7 @@ impl Static {
             far: FarBody { radius: radius as f32, shape, albedo, atmosphere, seed: body.seed, ..FarBody::default() },
             radius,
             stream_reach: sink(body).is_none().then(|| stream_reach(cosmos, body)),
-            day_air: (body.kind == Kind::Home).then(daylight_air),
+            day_air: start.then(daylight_air),
         }
     }
 
@@ -109,6 +110,8 @@ pub struct FarBodies {
     list: Vec<FarBody>,
     /// One per catalog body, in catalog order. Built on the first frame with a cosmos.
     statics: Vec<Static>,
+    /// Bodies by squared distance from the eye (bits, id), when there are more than the engine draws.
+    nearest: Vec<(u64, u16)>,
     /// Core light while the eye is in a Hollow's cavity. `None` outside it.
     sun: Option<SunOverride>,
     /// Looked up once. `None` when the generator has no relaxed home datum.
@@ -124,6 +127,7 @@ impl Default for FarBodies {
         Self {
             list: Vec::with_capacity(MAX_FAR_BODIES),
             statics: Vec::new(),
+            nearest: Vec::new(),
             sun: None,
             map: None,
             looked: false,
@@ -170,11 +174,19 @@ impl FarBodies {
             self.fill_cavity(cosmos, hollow, ember, eye);
             return &self.list;
         }
-        for (body, fixed) in cosmos.bodies().iter().zip(&self.statics) {
+        // Nearest first when the engine cannot draw them all; catalog order otherwise.
+        let bodies = cosmos.bodies();
+        self.nearest.clear();
+        if bodies.len() > MAX_FAR_BODIES {
+            self.nearest.extend(bodies.iter().map(|b| ((b.centre_f() - eye).length_squared().to_bits(), b.id)));
+            self.nearest.sort_unstable();
+        }
+        for k in 0..bodies.len() {
             if self.list.len() == MAX_FAR_BODIES {
                 break;
             }
-            if let Some(far) = fixed.place(cosmos, body, eye, mapped, horizon) {
+            let i = self.nearest.get(k).map_or(k, |&(_, id)| usize::from(id));
+            if let Some(far) = self.statics[i].place(cosmos, &bodies[i], eye, mapped, horizon) {
                 self.list.push(far);
             }
         }
@@ -186,18 +198,12 @@ impl FarBodies {
         if self.statics.len() == cosmos.bodies().len() {
             return;
         }
-        let mut twin = 0u32;
         self.statics = cosmos
             .bodies()
             .iter()
             .map(|body| {
-                let ordinal = if body.kind == Kind::Twin {
-                    let i = twin;
-                    twin += 1;
-                    i
-                } else {
-                    0
-                };
+                // A binary's lower id is its lush side.
+                let ordinal = body.traits.partner.map_or(0, |other| u32::from(other < body.id));
                 Static::new(cosmos, body, ordinal, atlases)
             })
             .collect();
@@ -211,7 +217,7 @@ impl FarBodies {
         self.looked = true;
         let Some(cosmos) = generator.cosmos() else { return };
         let body = cosmos.home();
-        if body.kind != Kind::Home {
+        if body.traits.rank != Rank::Start {
             return;
         }
         let centre = body.centre_f();
@@ -357,7 +363,7 @@ fn home_faces() -> [LinearRgb; 6] {
     ]
 }
 
-/// The first catalog twin (side −1) is lush; the next is crystalline.
+/// A binary's lush side (ordinal 0); the other is crystalline.
 fn twin_faces(ordinal: u32) -> [LinearRgb; 6] {
     if ordinal == 0 {
         [
@@ -380,28 +386,20 @@ fn twin_faces(ordinal: u32) -> [LinearRgb; 6] {
     }
 }
 
+/// The draw each painter's ground reads as (the same choice `storage` makes for round bodies).
 fn paint(body: &Body, twin_ordinal: u32) -> (FarShape, [LinearRgb; 6], LinearRgb) {
-    match body.kind {
-        Kind::Home => (FarShape::Sphere, home_faces(), black()),
-        Kind::Twin => (FarShape::Cube, twin_faces(twin_ordinal), black()),
-        // Meadow and forest green: Verdance has no seas.
-        Kind::Verdant => (
-            FarShape::Sphere,
-            tones(srgb(70, 140, 56), srgb(32, 92, 44)),
-            srgb(186, 216, 232),
-        ),
-        Kind::Hollow => (
-            FarShape::Sphere,
-            tones(srgb(220, 232, 238), srgb(160, 190, 210)),
-            black(),
-        ),
-        Kind::Ember => (
-            FarShape::Sphere,
-            tones(srgb(255, 120, 36), srgb(170, 48, 16)),
-            hdr(1.8, 0.42, 0.06),
-        ),
+    let t = &body.traits;
+    if t.rank == Rank::Start {
+        return (FarShape::Sphere, home_faces(), black());
+    }
+    match t.form {
+        Form::Cube | Form::Warped => (FarShape::Cube, twin_faces(twin_ordinal), black()),
+        Form::Shell => (FarShape::Sphere, tones(srgb(220, 232, 238), srgb(160, 190, 210)), black()),
+        _ if t.glow => (FarShape::Sphere, tones(srgb(255, 120, 36), srgb(170, 48, 16)), hdr(1.8, 0.42, 0.06)),
+        // Meadow and forest green: a living world has no seas.
+        _ if t.life > 0 => (FarShape::Sphere, tones(srgb(70, 140, 56), srgb(32, 92, 44)), srgb(186, 216, 232)),
         // The same three characters the moon painter gives them (`round::Style::Moon { tone }`).
-        Kind::Moon => {
+        _ => {
             let albedo = match body.seed % 3 {
                 0 => tones(srgb(150, 148, 152), srgb(60, 66, 72)),
                 1 => tones(srgb(200, 222, 240), srgb(150, 176, 220)),
@@ -410,6 +408,11 @@ fn paint(body: &Body, twin_ordinal: u32) -> (FarShape, [LinearRgb; 6], LinearRgb
             (FarShape::Sphere, albedo, black())
         }
     }
+}
+
+/// A round body painted as a cratered moon (neither glowing nor living, not a shell).
+fn moonlike(body: &Body) -> bool {
+    body.traits.form == Form::Round && body.traits.rank != Rank::Start && !body.traits.glow && body.traits.life == 0
 }
 
 fn radius_of(body: &Body) -> f64 {
@@ -441,9 +444,9 @@ fn shown_radius(atlases: &[std::sync::Arc<crate::space::atlas::Atlas>], body: &B
 /// without covering them (the sky pass draws only where no terrain was drawn). Round bodies have no
 /// far LOD of their own yet; cubes do, so theirs hide while streamed.
 fn sink(body: &Body) -> Option<f64> {
-    match (body.kind, body.shape) {
-        (_, Shape::Cube { .. }) => None,
-        (Kind::Moon, _) => Some(650.0),
+    match body.shape {
+        Shape::Cube { .. } => None,
+        _ if moonlike(body) => Some(650.0),
         _ => Some(150.0),
     }
 }

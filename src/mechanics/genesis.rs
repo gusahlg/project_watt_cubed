@@ -569,8 +569,9 @@ fn ray_triangle(origin: DVec3, d: DVec3, tri: [DVec3; 3]) -> Option<f64> {
 /// shape has the same field on every face) and the lattice's nodes in the fundamental domain of
 /// the cube's symmetry. All lengths in units of the cube's half-size.
 static TABLE: &[u8] = include_bytes!("genesis_table.bin");
-/// Format version of [`TABLE`] ([`read_table`] also reads version 1, nodes only).
-pub const TABLE_VERSION: u32 = 2;
+/// Format version of [`TABLE`] ([`read_table`] also reads version 1, nodes only, and 2, without
+/// relief harmonics).
+pub const TABLE_VERSION: u32 = 3;
 /// Half-size of the table's computational cube: 8 matter elements of 2^20 blocks each side.
 pub const TABLE_HALF: f64 = 8.0 * (1u64 << 20) as f64;
 /// Matter elements per axis of the table's lattices.
@@ -587,6 +588,8 @@ pub struct TableEntry {
     pub radius: f64,
     /// Datum offsets of one face (`g × g`, [`DatumField`] order).
     pub offsets: Vec<f32>,
+    /// The datum's relief expansion `h_lm` (`gravity::relief::harmonics_of`), version 3.
+    pub harmonics: Vec<f64>,
     /// Canonical nodes ([`canonical_nodes`] order).
     pub nodes: Vec<DVec3>,
 }
@@ -596,6 +599,9 @@ pub struct TableEntry {
 pub struct Table {
     pub elements: usize,
     pub samples: usize,
+    /// The relief expansion of a datum one block above the sphere everywhere (version 3): a
+    /// table datum shifted by `s` adds `s` times this.
+    pub ones: Vec<f64>,
     pub entries: Vec<TableEntry>,
 }
 
@@ -606,12 +612,14 @@ pub fn read_table(bytes: &[u8]) -> Option<Table> {
         return None;
     }
     let version = r.u32().ok()?;
-    if version != 1 && version != 2 {
+    if !(1..=3).contains(&version) {
         return None;
     }
     let elements = r.u32().ok()? as usize;
     let count = r.u32().ok()? as usize;
     let samples = if version >= 2 { r.u32().ok()? as usize } else { 0 };
+    let terms = if version >= 3 { r.u32().ok()? as usize } else { 0 };
+    let ones = (0..terms).map(|_| r.f64().ok()).collect::<Option<Vec<f64>>>()?;
     let canon = canonical_nodes((elements + 2) / 2).len();
     let mut entries = Vec::with_capacity(count);
     for _ in 0..count {
@@ -622,18 +630,22 @@ pub fn read_table(bytes: &[u8]) -> Option<Table> {
             e.radius = r.f32().ok()? as f64;
             e.offsets = (0..samples * samples).map(|_| r.f32().ok()).collect::<Option<_>>()?;
         }
+        e.harmonics = (0..terms).map(|_| r.f64().ok()).collect::<Option<_>>()?;
         e.nodes = (0..canon).map(|_| Some(DVec3::new(r.f32().ok()? as f64, r.f32().ok()? as f64, r.f32().ok()? as f64))).collect::<Option<_>>()?;
         entries.push(e);
     }
-    Some(Table { elements, samples, entries })
+    Some(Table { elements, samples, ones, entries })
 }
 
 /// Serialise a table in the current format.
 pub fn write_table(t: &Table) -> Vec<u8> {
     let mut w = Writer::new();
     w.raw(b"PWCG");
-    for v in [TABLE_VERSION, t.elements as u32, t.entries.len() as u32, t.samples as u32] {
+    for v in [TABLE_VERSION, t.elements as u32, t.entries.len() as u32, t.samples as u32, t.ones.len() as u32] {
         w.u32(v);
+    }
+    for &h in &t.ones {
+        w.f64(h);
     }
     for e in &t.entries {
         w.f32(e.log2_pi as f32);
@@ -643,6 +655,10 @@ pub fn write_table(t: &Table) -> Vec<u8> {
         }
         for &o in &e.offsets {
             w.f32(o);
+        }
+        assert_eq!(e.harmonics.len(), t.ones.len(), "every entry carries the table's harmonics");
+        for &h in &e.harmonics {
+            w.f64(h);
         }
         for p in &e.nodes {
             for a in 0..3 {
@@ -715,7 +731,7 @@ fn table() -> Option<&'static Table> {
 fn bracket(t: &Table, pi: f64) -> Option<(&TableEntry, &TableEntry, f64)> {
     let first = t.entries.first()?;
     let last = t.entries.last()?;
-    let x = pi.max(1e-300).log2().clamp(first.log2_pi, last.log2_pi);
+    let x = crate::math::log2(pi.max(1e-300)).clamp(first.log2_pi, last.log2_pi);
     let count = t.entries.len();
     if count == 1 {
         return Some((first, first, 0.0));
@@ -754,6 +770,19 @@ pub fn tabulated_layout(pi: f64, half: f64) -> Option<(Layout, f64)> {
     Some((Layout::Round { radius: lerp(a.radius, b.radius) * half, datum: DatumField { g, offsets }, inner: None }, tilt))
 }
 
+/// The relief expansion (`gravity::relief::harmonics_of`) of [`tabulated_layout`]'s datum for
+/// half-size `half`, lifted `lift` blocks everywhere: the same lerp of the entries' expansions (the
+/// projection is linear), in microseconds instead of a projection. `None` for a table without them.
+pub fn tabulated_harmonics(pi: f64, half: f64, lift: f64) -> Option<Vec<f64>> {
+    let t = table()?;
+    if t.ones.is_empty() {
+        return None;
+    }
+    let (a, b, w) = bracket(t, pi)?;
+    let lerp = |p: f64, q: f64| p * (1.0 - w) + q * w;
+    Some(a.harmonics.iter().zip(&b.harmonics).zip(&t.ones).map(|((&p, &q), &one)| lerp(p, q) * half + lift * one).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -778,7 +807,27 @@ mod tests {
     #[test]
     fn the_genesis_table_is_pinned_to_the_worldgen_version() {
         assert_eq!(crate::world::terrain::WORLDGEN_VERSION, 10);
-        assert_eq!(crate::hash::fnv1a_32(TABLE), 0xbf9b2d15, "the genesis table changed: bump WORLDGEN_VERSION and re-pin");
+        assert_eq!(crate::hash::fnv1a_32(TABLE), 0xa2f03b13, "the genesis table changed: bump WORLDGEN_VERSION and re-pin");
+    }
+
+    /// The tabulated expansion is the projection of the tabulated datum: a relaxed body's relief
+    /// gravity in microseconds, the same field to rounding.
+    #[test]
+    fn tabulated_harmonics_give_the_projected_relief() {
+        use crate::gravity::relief::Relief;
+        let centre = DVec3::new(1.0e8, -3.0e7, 2.0e8);
+        for (pi, half, lift) in [(45.0, 2.5e7, 5_120.0), (300.0, 4.0e6, -800.0), (90.0, 9.0e6, 0.0)] {
+            let Some((Layout::Round { radius, datum, .. }, _)) = tabulated_layout(pi, half) else { panic!("Π {pi} rounds") };
+            let lifted = DatumField { g: datum.g, offsets: datum.offsets.iter().map(|o| o + lift as f32).collect() };
+            let want = Relief::new(centre, radius, 7.0, &lifted);
+            let got = Relief::from_harmonics(centre, radius, 7.0, &tabulated_harmonics(pi, half, lift).expect("harmonics"));
+            for d in [DVec3::Y, DVec3::new(0.3, -0.8, 0.52), DVec3::ONE.normalize(), DVec3::new(-1.0, 0.1, 0.0)] {
+                for r in [radius * 0.5, radius + 100.0, radius * 3.0] {
+                    let (a, b) = (want.field(centre + d * r).0, got.field(centre + d * r).0);
+                    assert!((a - b).length() <= 1e-6 * a.length().max(1e-12), "Π {pi} at {d} × {r}: {a} vs {b}");
+                }
+            }
+        }
     }
 
     #[test]

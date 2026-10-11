@@ -16,7 +16,7 @@ use crate::space::datum::DatumField;
 /// Degree of the expansion (a relaxed body's relief is dominated by degrees 4–8).
 pub const L_MAX: usize = 24;
 /// Coefficients of an expansion to [`L_MAX`].
-const COUNT: usize = (L_MAX + 1) * (L_MAX + 1);
+pub const COUNT: usize = (L_MAX + 1) * (L_MAX + 1);
 /// Quadrature cells per face edge when projecting a datum (a datum has 33 samples per edge; 128
 /// cells around a great circle resolve degree 24 comfortably).
 const QUADRATURE: usize = 32;
@@ -30,37 +30,49 @@ pub struct Relief {
     coeff: Vec<f64>,
 }
 
+/// The expansion `h_lm` (blocks, index `l² + l + m`) of a datum: what [`Relief::new`] projects. It
+/// is linear in the offsets, so the expansion of a table datum is the same lerp of its entries'.
+pub fn harmonics_of(datum: &DatumField) -> Vec<f64> {
+    let mut h = vec![0.0f64; COUNT];
+    let mut y = [0.0f64; COUNT];
+    let step = 2.0 / QUADRATURE as f64;
+    let mut cells = Vec::with_capacity(6 * QUADRATURE * QUADRATURE);
+    for f in 0..6 {
+        let (tu, nn, tv) = basis(FACES[f]);
+        for j in 0..QUADRATURE {
+            for i in 0..QUADRATURE {
+                let (xi, eta) = (-1.0 + (i as f64 + 0.5) * step, -1.0 + (j as f64 + 0.5) * step);
+                let d = Map::Equiangular.dir(xi, eta);
+                let dir = (tu * d.x + nn * d.y + tv * d.z).normalize();
+                // Solid angle of an equiangular cell: dΩ = (1+x²)(1+y²)/(1+x²+y²)^{3/2} dα dβ.
+                let (x, z) = (d.x / d.y, d.z / d.y);
+                let w = (1.0 + x * x) * (1.0 + z * z) / (1.0 + x * x + z * z).powf(1.5);
+                cells.push((dir, w, datum.offset(f, xi, eta)));
+            }
+        }
+    }
+    let total: f64 = cells.iter().map(|c| c.1).sum();
+    let norm = 4.0 * std::f64::consts::PI / total;
+    for (dir, w, offset) in cells {
+        harmonics(dir, &mut y);
+        for (hk, yk) in h.iter_mut().zip(&y) {
+            *hk += offset * yk * w * norm;
+        }
+    }
+    h
+}
+
 impl Relief {
     /// The layer of a body of datum `radius` and bulk `density` whose surface sits `datum` above the
     /// sphere.
     pub fn new(centre: DVec3, radius: f64, density: f64, datum: &DatumField) -> Self {
-        let mut h = vec![0.0f64; COUNT];
-        let mut y = [0.0f64; COUNT];
-        let step = 2.0 / QUADRATURE as f64;
-        let mut cells = Vec::with_capacity(6 * QUADRATURE * QUADRATURE);
-        for f in 0..6 {
-            let (tu, nn, tv) = basis(FACES[f]);
-            for j in 0..QUADRATURE {
-                for i in 0..QUADRATURE {
-                    let (xi, eta) = (-1.0 + (i as f64 + 0.5) * step, -1.0 + (j as f64 + 0.5) * step);
-                    let d = Map::Equiangular.dir(xi, eta);
-                    let dir = (tu * d.x + nn * d.y + tv * d.z).normalize();
-                    // Solid angle of an equiangular cell: dΩ = (1+x²)(1+y²)/(1+x²+y²)^{3/2} dα dβ.
-                    let (x, z) = (d.x / d.y, d.z / d.y);
-                    let w = (1.0 + x * x) * (1.0 + z * z) / (1.0 + x * x + z * z).powf(1.5);
-                    cells.push((dir, w, datum.offset(f, xi, eta)));
-                }
-            }
-        }
-        let total: f64 = cells.iter().map(|c| c.1).sum();
-        let norm = 4.0 * std::f64::consts::PI / total;
-        for (dir, w, offset) in cells {
-            harmonics(dir, &mut y);
-            for (hk, yk) in h.iter_mut().zip(&y) {
-                *hk += offset * yk * w * norm;
-            }
-        }
-        let mut coeff = h;
+        Self::from_harmonics(centre, radius, density, &harmonics_of(datum))
+    }
+
+    /// The layer of a datum whose expansion is `h` ([`harmonics_of`]).
+    pub fn from_harmonics(centre: DVec3, radius: f64, density: f64, h: &[f64]) -> Self {
+        assert_eq!(h.len(), COUNT, "an expansion to degree {L_MAX}");
+        let mut coeff = h.to_vec();
         for l in 0..=L_MAX {
             let k = 4.0 * std::f64::consts::PI * G * radius * radius * density / (2 * l + 1) as f64;
             for m in 0..=2 * l {

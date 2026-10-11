@@ -176,36 +176,7 @@ params! {
     bodies_max: usize = 64,
 }
 
-/// Cube root of a non-negative number: six Newton steps from a bit-hack seed.
-pub fn cbrt(x: f64) -> f64 {
-    if x <= 0.0 {
-        return 0.0;
-    }
-    let mut y = f64::from_bits(x.to_bits() / 3 + 0x2A9F_7893_782D_A1CE);
-    for _ in 0..6 {
-        y = (2.0 * y + x / (y * y)) / 3.0;
-    }
-    y
-}
-
-/// `log₂` of a positive normal number: exponent bits plus an atanh series of the mantissa, taken
-/// in `[√½, √2)` so the series converges fast.
-pub fn log2(x: f64) -> f64 {
-    let bits = x.to_bits();
-    let mut e = ((bits >> 52) & 0x7FF) as i64 - 1023;
-    let mut m = f64::from_bits((bits & ((1 << 52) - 1)) | (1023 << 52));
-    if m > std::f64::consts::SQRT_2 {
-        m *= 0.5;
-        e += 1;
-    }
-    let s = (m - 1.0) / (m + 1.0);
-    let s2 = s * s;
-    let mut series = 1.0 / 17.0;
-    for k in [15.0, 13.0, 11.0, 9.0, 7.0, 5.0, 3.0, 1.0] {
-        series = 1.0 / k + s2 * series;
-    }
-    e as f64 + 2.0 * s * series * std::f64::consts::LOG2_E
-}
+pub use crate::math::{cbrt, log2};
 
 /// What a body's shape asks for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]

@@ -29,6 +29,38 @@ pub const PER_METER: f64 = 1.0 / BLOCK_METERS;
 /// math (`2.05e9 / 16` chunks, `chunk * 16 + 15` < 2^31).
 pub const CELL_LIMIT: f64 = 2.05e9;
 
+/// Cube root of a non-negative number from IEEE basic operations only (the same bits on every
+/// machine, unlike libm): six Newton steps from a bit-hack seed.
+pub fn cbrt(x: f64) -> f64 {
+    if x <= 0.0 {
+        return 0.0;
+    }
+    let mut y = f64::from_bits(x.to_bits() / 3 + 0x2A9F_7893_782D_A1CE);
+    for _ in 0..6 {
+        y = (2.0 * y + x / (y * y)) / 3.0;
+    }
+    y
+}
+
+/// `log₂` of a positive normal number from IEEE basic operations only: the exponent bits plus an
+/// atanh series of the mantissa, taken in `[√½, √2)` so the series converges fast.
+pub fn log2(x: f64) -> f64 {
+    let bits = x.to_bits();
+    let mut e = ((bits >> 52) & 0x7FF) as i64 - 1023;
+    let mut m = f64::from_bits((bits & ((1 << 52) - 1)) | (1023 << 52));
+    if m > std::f64::consts::SQRT_2 {
+        m *= 0.5;
+        e += 1;
+    }
+    let s = (m - 1.0) / (m + 1.0);
+    let s2 = s * s;
+    let mut series = 1.0 / 17.0;
+    for k in [15.0, 13.0, 11.0, 9.0, 7.0, 5.0, 3.0, 1.0] {
+        series = 1.0 / k + s2 * series;
+    }
+    e as f64 + 2.0 * s * series * std::f64::consts::LOG2_E
+}
+
 /// Hermite smoothstep on a unit interval: `t²(3−2t)`.
 #[inline]
 pub fn smooth(t: f32) -> f32 {

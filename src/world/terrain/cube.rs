@@ -49,7 +49,7 @@ pub(super) fn half_of(body: &Body) -> i64 {
     match body.shape {
         Shape::Cube { half } => half,
         // The start world's charts use the band-0 face as a virtual cube of edge `surface_n`.
-        Shape::Ball { .. } if body.kind == super::cosmos::Kind::Home => {
+        Shape::Ball { .. } if body.traits.rank == super::cosmos::Rank::Start => {
             crate::space::atlas::surface_n(super::cosmos::HOME_RADIUS) / 2
         }
         _ => 0,

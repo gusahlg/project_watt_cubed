@@ -377,16 +377,19 @@ fn bulk_matter(registry: &BlockRegistry, bulk: &cube::Bulk) -> crate::mechanics:
 }
 
 /// The start world's relaxed datum about [`cosmos::HOME_RADIUS`]: its cube of bulk matter relaxed
-/// under its own gravity, read from the genesis table by `Π_g`. `None` without a table, or if the
-/// matter were strong enough to keep its cube grid (the start world is charted either way).
-fn home_shape(registry: &BlockRegistry, bulk: &cube::Bulk) -> Option<crate::space::datum::DatumField> {
+/// under its own gravity, read from the genesis table by `Π_g`, with that datum's relief expansion.
+/// `None` without a table, or if the matter were strong enough to keep its cube grid (the start
+/// world is charted either way).
+fn home_shape(registry: &BlockRegistry, bulk: &cube::Bulk) -> Option<(crate::space::datum::DatumField, Vec<f64>)> {
     use crate::mechanics::genesis;
     let matter = bulk_matter(registry, bulk);
     let half = cosmos::HOME_CUBE_HALF as f64;
-    let (layout, _) = genesis::tabulated_layout(genesis::pi_g(&matter, half), half)?;
+    let pi = genesis::pi_g(&matter, half);
+    let (layout, _) = genesis::tabulated_layout(pi, half)?;
     let genesis::Layout::Round { radius, datum, .. } = layout else { return None };
     let shift = (radius - cosmos::HOME_RADIUS as f64) as f32;
-    Some(crate::space::datum::DatumField { g: datum.g, offsets: datum.offsets.iter().map(|o| o + shift).collect() })
+    let harmonics = genesis::tabulated_harmonics(pi, half, f64::from(shift))?;
+    Some((crate::space::datum::DatumField { g: datum.g, offsets: datum.offsets.iter().map(|o| o + shift).collect() }, harmonics))
 }
 
 /// Sagging cubes: a `Layout::Cube` body whose warp moves any point by more than half a block.
@@ -413,21 +416,6 @@ fn cube_warps(
         out.push((b.id, Arc::new(warp)));
     }
     out
-}
-
-/// The start world's relief layer for gravity, computed once per process for each distinct datum
-/// (worlds of one palette share it; the projection is the costly part of creating a world).
-fn home_relief(centre: glam::DVec3, density: f64, datum: &crate::space::datum::DatumField) -> Arc<crate::gravity::relief::Relief> {
-    use std::sync::Mutex;
-    static CACHE: Mutex<Vec<(u64, Arc<crate::gravity::relief::Relief>)>> = Mutex::new(Vec::new());
-    let key = datum.offsets.iter().fold(centre.y.to_bits() ^ density.to_bits(), |h, o| (h ^ o.to_bits() as u64).wrapping_mul(0x100_0000_01B3));
-    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, layer)) = cache.iter().find(|(k, _)| *k == key) {
-        return Arc::clone(layer);
-    }
-    let layer = Arc::new(crate::gravity::relief::Relief::new(centre, cosmos::HOME_RADIUS as f64, density, datum));
-    cache.push((key, Arc::clone(&layer)));
-    layer
 }
 
 /// Blended columns of one start-world chart chunk. Face altitude of local `y0 + la` is
@@ -476,12 +464,12 @@ fn stored(x: i32) -> bool {
     x as i64 >= crate::space::atlas::STORAGE_X0
 }
 
-/// Centres of the other big bodies, the ones an observatory can point at. Moons are not big.
+/// Centres of the other big bodies, the ones an observatory can point at. Satellites are not big.
 fn sky_aims(cosmos: &cosmos::Cosmos, id: u16) -> ([[i64; 3]; 8], usize) {
     let mut aims = [[0i64; 3]; 8];
     let mut n = 0;
     for o in cosmos.bodies() {
-        if o.kind == cosmos::Kind::Moon || o.id == id || n == aims.len() {
+        if o.traits.rank == cosmos::Rank::Satellite || o.id == id || n == aims.len() {
             continue;
         }
         aims[n] = o.centre;
@@ -546,51 +534,47 @@ impl Terrain {
         }
         // The start world's cube of bulk matter relaxed under its own gravity: its datum fits the
         // chart grid to the shape, and its relief joins gravity.
-        let home_datum = home_shape(registry, &bulk);
-        if let Some(datum) = &home_datum {
+        let home_datum = home_shape(registry, &bulk).map(|(datum, harmonics)| {
             cosmos.settle_home(datum.offset(2, 0.0, 0.0).round() as i64);
             let home = cosmos.home();
-            let layer = home_relief(home.centre_f(), home.density, datum);
+            let layer = crate::gravity::relief::Relief::from_harmonics(home.centre_f(), cosmos::HOME_RADIUS as f64, home.density, &harmonics);
             let id = home.id;
-            cosmos.set_relief(id, Arc::new(datum.clone()), layer);
-        }
+            cosmos.set_relief(id, Arc::new(datum.clone()), Arc::new(layer));
+            datum
+        });
         let cosmos = Arc::new(cosmos);
         let relief = cfg.relief as f32 / 100.0;
         let variety = cfg.variety as f32 / 100.0;
-        // The twin with the smaller seed is lush; the other is crystalline. One twin keeps lush.
-        let lush = cosmos
-            .bodies()
-            .iter()
-            .filter(|b| b.kind == cosmos::Kind::Twin)
-            .min_by_key(|b| (b.seed, b.id))
-            .map(|b| b.id);
         let n = cosmos.bodies().iter().map(|b| b.id as usize).max().unwrap_or(0) + 1;
         let mut paints = Vec::new();
         paints.resize_with(n * 6, || None);
         for b in cosmos.bodies() {
             let half = match b.shape {
                 cosmos::Shape::Cube { half } => half,
-                cosmos::Shape::Ball { .. } if b.kind == cosmos::Kind::Home => {
+                cosmos::Shape::Ball { .. } if b.traits.rank == cosmos::Rank::Start => {
                     crate::space::atlas::surface_n(cosmos::HOME_RADIUS) / 2
                 }
                 _ => continue,
             };
-            let twin = b.kind == cosmos::Kind::Twin;
+            let start = b.traits.rank == cosmos::Rank::Start;
             let (aims, n_aims) = sky_aims(&cosmos, b.id);
             let facing_face = span::facing_face(&cosmos, b);
             for face in Face::ALL {
                 // Home +Y keeps the v3 salts. Every other face is a fresh field.
-                let s_face = if b.kind == cosmos::Kind::Home && face == Face::PosY {
+                let s_face = if start && face == Face::PosY {
                     s
                 } else {
                     hash3(s ^ 0x5A17, i32::from(b.id), face.index() as i32, 0x6A1E)
                 };
-                let realm = if twin {
-                    if Some(b.id) == lush { province::Realm::Lush } else { province::Realm::Crystal }
-                } else {
+                // A living cube is lush, a lifeless one crystalline; the start world has its realms.
+                let realm = if start {
                     province::Realm::of_home(face)
+                } else if b.traits.life > 0 {
+                    province::Realm::Lush
+                } else {
+                    province::Realm::Crystal
                 };
-                let garden = b.kind == cosmos::Kind::Home && face == Face::PosY;
+                let garden = start && face == Face::PosY;
                 // The facing canyon already carries spires. Structures stay on the other faces.
                 let struct_scale = if facing_face == Some(face) { 0.0 } else { cfg.structures as f32 / 100.0 };
                 let i = b.id as usize * 6 + face.index();
@@ -617,7 +601,7 @@ impl Terrain {
         }
         // Majority of the 24-bit mix: the uniform block under the start world's band 0.
         let home_fill = bulk.majority();
-        let mut storage = storage::StorageWorlds::new(&cosmos, &m, home_fill, &warps);
+        let mut storage = storage::StorageWorlds::new(&cosmos, &m, home_fill, &warps).expect("the authored catalog fits storage row 0");
         if let Some(datum) = home_datum {
             storage.set_home_datum(Arc::new(datum));
         }
@@ -647,9 +631,9 @@ impl Terrain {
     fn owner_in(&self, p: [i64; 3], include: bool) -> Option<cosmos::Body> {
         let q = glam::DVec3::new(p[0] as f64, p[1] as f64, p[2] as f64);
         let mut best: Option<(f64, cosmos::Body)> = None;
-        for b in self.cosmos.bodies() {
+        for b in self.cosmos.bodies_touching(p, p) {
             // Round bodies are charted: their cells live in storage. A sagging cube's cells do too.
-            if !matches!(b.shape, cosmos::Shape::Cube { .. }) || !b.touches(p, p) {
+            if !matches!(b.shape, cosmos::Shape::Cube { .. }) {
                 continue;
             }
             if !include && self.storage.holds_cube(b.id) {
@@ -845,8 +829,8 @@ impl Terrain {
                 }
             }
             // Home and the outward faces never ask. The facing face's spires sit above the ground.
-            if body.kind == cosmos::Kind::Twin && span::facing_face(&self.cosmos, body) == Some(face) {
-                if let Some(id) = span::block(&self.m, span::lush(&self.cosmos, body), span::face_seed(body), half, u, h, v) {
+            if span::facing_face(&self.cosmos, body) == Some(face) {
+                if let Some(id) = span::block(&self.m, span::lush(body), span::face_seed(body), half, u, h, v) {
                     return id;
                 }
             }
@@ -899,9 +883,8 @@ impl Terrain {
             return self.cube_cell(&body, p);
         }
         // A round body's reach, and a stored cube's old physical cells, are empty here.
-        if self.cosmos.bodies().iter().any(|b| {
-            let charted = !matches!(b.shape, cosmos::Shape::Cube { .. }) || (!include && self.storage.holds_cube(b.id));
-            charted && b.touches(p, p)
+        if self.cosmos.bodies_touching(p, p).any(|b| {
+            !matches!(b.shape, cosmos::Shape::Cube { .. }) || (!include && self.storage.holds_cube(b.id))
         }) {
             return AIR;
         }
@@ -1128,7 +1111,7 @@ impl Terrain {
         // Unblended max keeps the v3 early-out. Blended max covers a rim that rose above it.
         // The facing canyon is taller: spires stop at `span::CLEAR`, still inside the relief.
         let max_h = cols.iter().map(|c| c.height).max().unwrap_or(i32::MIN);
-        let facing = body.kind == cosmos::Kind::Twin && span::facing_face(&self.cosmos, body) == Some(face);
+        let facing = span::facing_face(&self.cosmos, body) == Some(face);
         let landmarks = max_terrain.max(max_h) + features::MAX_ABOVE;
         let clearance = if facing { span::CLEAR.max(landmarks) } else { landmarks };
         if h0 >= clearance {
@@ -1302,7 +1285,7 @@ impl Terrain {
         }
         if facing && h0 < span::CLEAR {
             let half = cube::half_of(body);
-            let lush = span::lush(&self.cosmos, body);
+            let lush = span::lush(body);
             let seed = span::face_seed(body);
             let min_col = cols.iter().map(|c| c.height).min().unwrap_or(i32::MAX);
             if h0 + n > min_col {
@@ -1804,9 +1787,6 @@ impl Terrain {
     /// How high a uniform-air shortcut may start. The canyon's facing face keeps room for spires;
     /// every other face stops at the trees. Home never takes the tall path.
     fn face_clear(&self, body: &cosmos::Body, lo: [i64; 3], hi: [i64; 3]) -> i32 {
-        if body.kind != cosmos::Kind::Twin {
-            return cube::TREE_CLEAR;
-        }
         let Some(face) = span::facing_face(&self.cosmos, body) else { return cube::TREE_CLEAR };
         let on_face = cube::corners(lo, hi).into_iter().all(|p| {
             let rel = [p[0] - body.centre[0], p[1] - body.centre[1], p[2] - body.centre[2]];

@@ -5,7 +5,6 @@
 use super::globe::{self, Input};
 use super::nebula::Nebula;
 use super::*;
-use crate::mechanics::material::{cohesion01, mechanical_response};
 
 /// Seeds the digests are pinned for: GOLDEN_SEED, 42 and the owner's seed.
 const SEEDS: [u64; 3] = [0xC0FFEE, 42, 1_791_184_794_939_118_871];
@@ -75,14 +74,6 @@ fn layouts_match_the_genesis_table() {
                 genesis::Layout::Cube => assert_ne!(ours.form, Form::Round, "Π {pi}"),
             }
         }
-    }
-}
-
-#[test]
-fn yield_matches_the_prototype_response() {
-    for c in 300..800 {
-        let want = mechanical_response(5, cohesion01(c)).yield_stress;
-        assert!((minerals::yield_of(c) / want - 1.0).abs() < 1e-12, "cohesion {c}");
     }
 }
 

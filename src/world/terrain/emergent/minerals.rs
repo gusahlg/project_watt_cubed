@@ -13,16 +13,13 @@ use field::hash32_3;
 use material::{fit_raw, observe, visual, Block, Change, Configuration, Contact, Element, Law, CAPACITY};
 
 use super::Params;
-use crate::mechanics::material::{Params as Matter, YIELD_FLOOR};
+use crate::mechanics::material::{yield_of, Params as Matter};
 use crate::world::terrain::palette::{self, apart, by_axis0, cohesive, crowded, dormant, Need};
 
 /// Contact operations one pair may take per sweep.
 const MAX_OPS: u32 = 4 * CAPACITY as u32;
-/// Yield per unit of cohesion above the bottom of the span: `10^(4 decades / 384)`.
-const YIELD_STEP: f64 = 1.024_275_221_381_592_2;
-/// Cohesion (Q8) where yield leaves its floor, and the span of its four decades.
+/// Cohesion (Q8) where yield leaves its floor.
 const COHESION_FLOOR: i32 = 384;
-const COHESION_SPAN: i32 = 384;
 /// Share of the crust that must glow for the body to glow.
 const GLOW_CRUST: f64 = 0.3;
 /// The bulk candidates of `choose_bulk` and the rest of the palette's rock-like roles, per class
@@ -213,21 +210,6 @@ pub fn reactions(law: &Law, m: &Mineral, ground: Ground, p: &Params) -> [usize; 
         out[1 + into as usize] += 1;
     }
     out
-}
-
-/// Yield stress of matter of cohesion `cohesion` (Q8): the prototype response's four decades,
-/// as integer powers of [`YIELD_STEP`] (no libm).
-pub fn yield_of(cohesion: i32) -> f64 {
-    let mut k = (cohesion - COHESION_FLOOR).clamp(0, COHESION_SPAN) as u32;
-    let (mut y, mut base) = (YIELD_FLOOR, YIELD_STEP);
-    while k > 0 {
-        if k & 1 == 1 {
-            y *= base;
-        }
-        base *= base;
-        k >>= 1;
-    }
-    y
 }
 
 fn mineral(law: &Law, block: &Block, replaced: bool) -> Mineral {
