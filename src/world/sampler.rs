@@ -80,6 +80,13 @@ impl<K: Copy + Eq + Hash + Send + 'static, V: Send + 'static> Sampler<K, V> {
         std::thread::Builder::new()
             .name(name.into())
             .spawn(move || {
+                // Nice 19: the answers are the main thread's to take whenever it gets there, so
+                // the sampler must not take a core from it or from the workers.
+                #[cfg(target_os = "linux")]
+                // SAFETY: plain syscall on this thread's own id; failure is ignored.
+                unsafe {
+                    let _ = libc::setpriority(libc::PRIO_PROCESS, libc::gettid() as libc::id_t, 19);
+                }
                 while let Ok(batch) = todo.recv() {
                     if done.send(batch.into_iter().map(|k| (k, f(k))).collect()).is_err() {
                         break;
