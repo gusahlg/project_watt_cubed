@@ -210,12 +210,12 @@ fn ready_finer_section_draws_while_its_cut_is_meshing() {
     world.sections.insert(parent, SectionState::Meshing { token: pipeline::ClaimToken(1) });
     world.center = Some(center);
     world.rebuild_section_visible(None);
-    assert!(world.section_visible.iter().any(|&(s, _)| s == child), "the ready child stopped drawing");
-    assert!(!world.section_visible.iter().any(|&(s, _)| s == parent), "a meshing parent drew");
+    assert!(world.section_visible.iter().any(|&s| s == child), "the ready child stopped drawing");
+    assert!(!world.section_visible.iter().any(|&s| s == parent), "a meshing parent drew");
     world.sections.insert(parent, empty());
     world.rebuild_section_visible(None);
-    assert!(world.section_visible.iter().any(|&(s, _)| s == parent), "the landed parent does not draw");
-    assert!(!world.section_visible.iter().any(|&(s, _)| s == child), "the child kept drawing over its ready parent");
+    assert!(world.section_visible.iter().any(|&s| s == parent), "the landed parent does not draw");
+    assert!(!world.section_visible.iter().any(|&s| s == child), "the child kept drawing over its ready parent");
 
     // The child has left the visible set. Unload must keep it while the parent is meshing again,
     // and drop it once the parent is Ready.

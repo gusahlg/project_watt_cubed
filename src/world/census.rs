@@ -151,7 +151,7 @@ fn section_lod_bytes(world: &World) -> usize {
     n += map_cap::<SectionPos, super::heightmip::MipCell>(world.section_overlay.capacity());
     n += world.section_overlay.len() * std::mem::size_of::<super::heightmip::MipCell>();
     n += vec_cap::<SectionPos>(world.section_desired.capacity());
-    n += vec_cap::<(SectionPos, super::quadtree::QuadrantMask)>(world.section_visible.capacity());
+    n += vec_cap::<SectionPos>(world.section_visible.capacity());
     n += map_cap::<SectionPos, u64>(world.section_edit_rev.capacity());
     n += map_cap::<SectionPos, super::FastSet<Coord>>(world.section_edit_chunks.capacity());
     for set in world.section_edit_chunks.values() {

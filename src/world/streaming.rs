@@ -441,7 +441,8 @@ impl World {
 
     /// Record that `coord` is owed a light settle the reduced window dropped.
     pub(in crate::world) fn owe_light(&mut self, coord: Coord) {
-        if self.chunks.contains_key(&coord) {
+        // A chunk the near field does not load lights nothing drawn: it is owed nothing.
+        if self.chunks.contains_key(&coord) && self.near.loads(self.fold.fold(coord)) {
             self.light_owed.insert(coord);
         }
     }

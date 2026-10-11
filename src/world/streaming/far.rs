@@ -362,6 +362,19 @@ impl World {
             self.rule_memo = memo;
             let wanted = self.wanted_clips(&leaves);
             self.section_dist = leaves.iter().map(|l| (l.pos, l.dist)).collect();
+            let coarsest = ground.map_or(0, |g| self.rule_on(g).coarsest);
+            let mut ancestors = std::mem::take(&mut self.section_ancestors);
+            ancestors.clear();
+            for l in &leaves {
+                let mut p = l.pos;
+                while p.detail.0 < coarsest {
+                    p = p.parent();
+                    if !ancestors.insert(p) {
+                        break;
+                    }
+                }
+            }
+            self.section_ancestors = ancestors;
             self.wait_clips(wanted);
             self.clip_recheck.take();
             self.section_frontier_key = Some(key);
@@ -401,7 +414,7 @@ impl World {
         self.rule_cut(ground, eye, memo, leaves);
         let mut out: Vec<SectionPos> = leaves.iter().map(|l| l.pos).collect();
         out.sort_unstable_by_key(section_key);
-        debug_assert!(out.len() <= super::SECTION_SLOT_FLOOR, "the rule's cut holds {} tiles, past the section floor", out.len());
+        debug_assert!(out.len() * 4 / 3 <= super::SECTION_SLOT_FLOOR, "the rule's cut holds {} tiles, past the section floor", out.len());
         out
     }
 }

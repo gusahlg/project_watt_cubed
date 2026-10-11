@@ -37,7 +37,7 @@ impl Landing for Engine {
         // far field), so a section that Coverage does not draw — or draws only
         // in part — must be corrected here, at the transition that gave it slots
         // to correct. No frame intervenes: patches flush at submit.
-        state.set_visible(self, world.section_fade.drawn_mask(pos));
+        state.set_visible(self, world.section_fade.draws(pos));
         // Push the section's far-material style so it doesn't draw one frame at
         // the engine's post-upload default.
         state.push_style(self, FadeStyle { flat_color }, flat_rgba);

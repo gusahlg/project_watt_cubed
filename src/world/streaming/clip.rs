@@ -144,7 +144,7 @@ impl World {
     pub(in crate::world) fn clips_at_target(&self) -> bool {
         self.clips.wait.is_empty()
             && self.clips.reclip.is_empty()
-            && self.section_visible.iter().all(|&(s, m)| m.is_empty() || !self.section_ready(s) || !self.needs_reclip(s))
+            && self.section_visible.iter().all(|&s| !self.section_ready(s) || !self.needs_reclip(s))
     }
 
     /// A Ready tile whose mesh is not for its current clip, with no re-extract in flight.
@@ -155,7 +155,7 @@ impl World {
 
     /// Whether `s` draws now or is about to: drawn, or selected.
     pub(in crate::world) fn in_cut(&self, s: SectionPos) -> bool {
-        self.section_fade.drawn_mask(s).is_some() || self.section_desired.binary_search_by_key(&section_key(&s), section_key).is_ok()
+        self.section_fade.draws(s) || self.section_desired.binary_search_by_key(&section_key(&s), section_key).is_ok()
     }
 
     /// Visit the tiles in the cut to re-extract in place.

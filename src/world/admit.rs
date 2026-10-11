@@ -543,15 +543,17 @@ impl StreamLane for SectionLane {
         // only a few, so keep the nearest handful of holes. Residency is the
         // cheap filter and runs first: the nearest sections are almost always
         // resident.
+        // The cut's resident ancestors are candidates beside it; coarse first by the order.
+        let wanted = || world.section_desired.iter().chain(world.section_ancestors.iter()).copied().filter(hole);
         if world.stream_pacer.effort() >= 1.0 || world.stream_pacer.boosting() {
-            for s in world.section_desired.iter().copied().filter(hole) {
+            for s in wanted() {
                 visit(s);
             }
             return;
         }
         const CAP: usize = 32;
         rank.clear();
-        for s in world.section_desired.iter().copied().filter(hole) {
+        for s in wanted() {
             let d = Self::order(world, center, s);
             if rank.len() == CAP && d >= rank[CAP - 1].0 {
                 continue;

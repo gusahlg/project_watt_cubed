@@ -93,7 +93,6 @@ use generation::WorldgenKind;
 use heightmip::HeightMip;
 use light::LightGrid;
 use mesh::{ChunkMeshData, new_chunk_mesh_data};
-use quadtree::QuadrantMask;
 use section::{SectionMeshData, SectionPos};
 
 /// Engine CPU-cull live-count threshold (`mesh_stats().cpu_cull_max` fallback).
@@ -104,9 +103,9 @@ const CPU_CULL_MAX: u32 = 1024;
 /// Floor on the far lane's section-slot budget so a large near field cannot
 /// starve covering: chunks never count against sections. The rule's cut is bounded by
 /// construction: about ninety tiles a level, nine or ten levels between the finest far level and
-/// the horizon (under 800 at a chart corner at render distance 6), so a cut past this is a bug,
-/// asserted in debug builds.
-pub(in crate::world) const SECTION_SLOT_FLOOR: usize = 1024;
+/// the horizon (under 800 at a chart corner at render distance 6), and its resident ancestors add
+/// a third, so a cut past the floor is a bug, asserted in debug builds.
+pub(in crate::world) const SECTION_SLOT_FLOOR: usize = 1280;
 
 /// Default number of chunk rings meshed and drawn around the player.
 const DEFAULT_VIEW_RADIUS: i32 = 6;
@@ -675,7 +674,7 @@ pub struct World {
     section_desired: Vec<SectionPos>,
     /// Visible sections (covering-resolved) — the desired cut this frame. Feeds
     /// `unload_sections` and the coverage projection.
-    section_visible: Vec<(SectionPos, QuadrantMask)>,
+    section_visible: Vec<SectionPos>,
     /// Drawn-coverage projection over successive LOD cuts (hard pop). Presentation
     /// only; never affects selection logic.
     section_fade: coverage::Coverage,
@@ -687,6 +686,10 @@ pub struct World {
     rule_memo: rule::RuleMemo,
     /// The rule's cut: each desired section's distance from the eye cell, for load priority.
     section_dist: FastMap<SectionPos, f64>,
+    /// Every ancestor of the cut up to the rule's coarsest level. They are loaded (coarsest first)
+    /// and kept, so a tile whose children are still loading has its parent to draw, and a merge
+    /// draws at once.
+    section_ancestors: FastSet<SectionPos>,
     /// The far tiles' clips over the near columns.
     clips: streaming::Clips,
     /// A chunk settled since the waiting clips were last checked.
@@ -896,6 +899,7 @@ impl World {
             section_frontier_key: None,
             rule_memo: rule::RuleMemo::default(),
             section_dist: FastMap::default(),
+            section_ancestors: FastSet::default(),
             clips: streaming::Clips::default(),
             clip_recheck: Sticky::default(),
             retire_check: Sticky::default(),

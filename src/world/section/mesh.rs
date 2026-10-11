@@ -1691,8 +1691,7 @@ mod tests {
             let desired: Vec<SectionPos> = world.desired_sections(center).into_iter().filter(|s| s.face == Face::PosY).collect();
             // The ground the horizon reaches from this height.
             let outer = (horizon * horizon - (lift as f32) * (lift as f32)).sqrt();
-            let cut = quadtree::resolve_covering(&desired, Detail(9), &|_| true);
-            let drawn: Vec<SectionPos> = cut.iter().map(|(p, _)| *p).collect();
+            let drawn = desired.clone();
             let tables = world.registry.hot_tables();
             let mut tiles = Vec::with_capacity(drawn.len());
             let mesh_at = std::time::Instant::now();

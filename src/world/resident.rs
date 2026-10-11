@@ -425,14 +425,11 @@ impl SectionState {
         matches!(self, SectionState::Ready { .. })
     }
 
-    /// Project `mask` onto this region's slots. The slabs cover the whole
-    /// section: any non-empty mask draws them (overlap with finer children is
-    /// depth-biased); `None` / empty hides them.
-    pub(super) fn set_visible(&self, eng: &mut Engine, mask: Option<QuadrantMask>) {
+    /// Show or hide every slab of this section: a tile is drawn whole or not at all.
+    pub(super) fn set_visible(&self, eng: &mut Engine, on: bool) {
         let SectionState::Ready { meshes, .. } = self else {
             return;
         };
-        let on = mask.is_some_and(|m| !m.is_empty());
         for m in meshes {
             m.set_visible(eng, on);
         }

@@ -210,21 +210,6 @@ impl World {
         self.section_ready(s) && under_hole(s, holes)
     }
 
-    /// Ready sections strictly under a drawn cell that has no Ready self or ancestor.
-    /// [`resolve_covering`](quadtree::resolve_covering) only walks up, so a tile that just
-    /// left the cut would pop off before its replacement can draw.
-    fn ready_tiles_under(&self, drawn: &[SectionPos]) -> Vec<SectionPos> {
-        let holes = self.section_holes(drawn);
-        if holes.is_empty() {
-            return Vec::new();
-        }
-        self.sections
-            .iter()
-            .filter(|&(&s, st)| st.is_ready() && under_hole(s, &holes))
-            .map(|(&s, _)| s)
-            .collect()
-    }
-
     /// Section `p` is loaded and Ready.
     pub(in crate::world) fn section_ready(&self, p: SectionPos) -> bool {
         self.sections.get(&p).is_some_and(|s| s.is_ready())
@@ -273,28 +258,21 @@ impl World {
         if self.section_center().is_none() {
             return;
         }
-        let desired = std::mem::take(&mut self.section_desired);
         let ready = |p: SectionPos| self.section_ready(p);
-        let mut drawn: Vec<SectionPos> = desired.clone();
-        // A finer Ready tile keeps drawing while the cut that replaces it is still meshing.
-        // Dropping it first opens a hole; the coarser tile takes over the frame it lands.
-        let standins = self.ready_tiles_under(&drawn);
-        drawn.extend(standins);
-        let cut = quadtree::resolve_covering(&drawn, COARSEST, &ready);
-        let backlog = desired.iter().any(|&c| !self.sections.contains_key(&c) && quadtree::drawable_cover(c, COARSEST, &ready).is_none());
-        self.section_desired = desired;
+        let cut = quadtree::whole_cut(&self.section_desired, COARSEST, &ready);
+        let backlog = self.section_desired.iter().any(|&c| !self.sections.contains_key(&c) && quadtree::drawable_cover(c, COARSEST, &ready).is_none());
         if backlog {
             self.pending_sections.set();
         }
-        self.section_visible = cut.iter().copied().collect();
+        self.section_visible = cut;
         // Adopt the new cut (hard pop); it decides what actually draws.
         let changed = self.section_fade.update_now(&self.section_visible);
-        // The mask is a projection of that decision, so it follows the same diff —
-        // a region whose slots have not landed yet is caught by the upload site instead.
+        // Visibility follows the same diff; a tile whose slots have not landed yet is caught at
+        // its upload instead.
         if let Some(eng) = eng {
-            for (pos, mask) in changed {
+            for (pos, on) in changed {
                 if let Some(state) = self.sections.get(&pos) {
-                    state.set_visible(eng, mask);
+                    state.set_visible(eng, on);
                 }
             }
         }
@@ -346,7 +324,7 @@ impl World {
                 if !matches!(state, SectionState::Ready { .. }) {
                     return None;
                 }
-                (!covers.contains(&s) && !under_hole(s, &uncovered)).then_some(s)
+                (!covers.contains(&s) && !under_hole(s, &uncovered) && !self.section_ancestors.contains(&s)).then_some(s)
             })
             .collect();
         let mut victims: Vec<(u64, SectionPos)> = spare
@@ -396,7 +374,7 @@ impl World {
     pub(in crate::world) fn unload_sections_with(&mut self, center: Coord, mut free: impl FnMut(SectionState)) {
         let desired: FastSet<SectionPos> = self.section_desired.iter().copied().collect();
         let holes = self.section_holes(&self.section_desired);
-        let visible: FastSet<SectionPos> = self.section_visible.iter().map(|(p, _)| *p).collect();
+        let visible: FastSet<SectionPos> = self.section_visible.iter().copied().collect();
         // Fading sections still draw this frame. Keep meshes until fade completes
         // or outgoing section vanishes mid-fade.
         let fading: FastSet<SectionPos> = self.section_fade.tracked().collect();
@@ -407,7 +385,7 @@ impl World {
             .keys()
             .copied()
             .filter(|s| {
-                if visible.contains(s) || fading.contains(s) || desired.contains(s) {
+                if visible.contains(s) || fading.contains(s) || desired.contains(s) || self.section_ancestors.contains(s) {
                     return false;
                 }
                 // A finer tile still drawing a hole. The visible rebuild stands it in after this.

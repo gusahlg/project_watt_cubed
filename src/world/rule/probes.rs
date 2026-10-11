@@ -53,7 +53,7 @@ fn settle(world: &mut World, eye: DVec3) -> usize {
 
 /// The far tiles drawn now. The engine draws a section whole for any quadrant the cut gives it.
 fn drawn(world: &World) -> Vec<SectionPos> {
-    world.section_visible.iter().filter(|(_, m)| !m.is_empty()).map(|&(s, _)| s).collect()
+    world.section_visible.clone()
 }
 
 /// The columns tile `s`'s drawn mesh leaves to the full-res chunks.
@@ -204,6 +204,16 @@ pub(in crate::world) fn ground_columns(world: &World, eye: DVec3, margin: f64) -
 fn not_full_res(world: &World, eye: DVec3) -> (usize, usize) {
     let cols = ground_columns(world, eye, f64::from(CHUNK_SIZE as i32) * 0.75);
     (cols.len(), cols.iter().filter(|&&(settled, far)| !settled || far).count())
+}
+
+/// Drawn far tiles that overlap another drawn tile of their tree.
+fn overlapping(world: &World) -> usize {
+    let tiles = drawn(world);
+    let set: crate::world::FastSet<SectionPos> = tiles.iter().copied().collect();
+    tiles
+        .iter()
+        .filter(|&&s| std::iter::successors(Some(s), |p| (p.detail.0 < LOD_COARSEST_DETAIL as i8).then(|| p.parent())).skip(1).any(|p| set.contains(&p)))
+        .count()
 }
 
 /// Ground columns inside the render distance that nothing draws: no settled chunk and no far tile.
@@ -463,12 +473,14 @@ fn walking_and_descending_never_bare_the_ground() {
         world.near_eye_prev = None;
         step(&mut world, eye);
         assert_eq!(bare(&world, eye), 0, "walk pass {k}: bare ground");
+        assert_eq!(overlapping(&world), 0, "walk pass {k}: far tiles drawn over one another");
     }
     let descent: Vec<DVec3> = (0..=38).map(|k| arc_eye(&world, from, DVec3::Z, 400.0 / radius, (300.0 - 8.0 * f64::from(k)).max(1.62))).collect();
     for (k, &eye) in descent.iter().enumerate() {
         world.near_eye_prev = None;
         step(&mut world, eye);
         assert_eq!(bare(&world, eye), 0, "descent pass {k}: bare ground");
+        assert_eq!(overlapping(&world), 0, "descent pass {k}: far tiles drawn over one another");
     }
     let eye = *descent.last().expect("a descent");
     settle(&mut world, eye);
@@ -540,4 +552,32 @@ fn lod_rule_twin_near_report() {
         }
         println!("  {s:?} drawn clip {:#x} target {:#x} wanted {:?} col00 {:?} near {:?}", drawn_clip(&world, *s).0, world.clip_target(*s).0, clips.get(s), col, col.as_ref().and_then(|c| world.near.near_column(world.fold.fold(c[0]))));
     }
+}
+
+/// Flying 1.2 km at 100 m/s (a pass a frame) at render distance 6 and stopping: no two drawn far
+/// tiles ever overlap, nothing inside the render distance is bare, no drawn tile is finer than its
+/// distance gives, and stopped, the view settles full-res inside R.
+#[test]
+fn flying_never_overlaps_or_bares_and_settles() {
+    let mut world = view_of(42, 6, 3);
+    let spawn = world.chart_spawn().expect("charted");
+    let centre = world.generator.cosmos().expect("cosmos").home().centre_f();
+    let from = spawn - centre;
+    let radius = from.length();
+    let start = world.home_eye(from, 30.0);
+    world.prepare_around(start);
+    world.drive_spawn_ready();
+    settle(&mut world, start);
+    let mut eye = start;
+    for k in 1..=720 {
+        eye = arc_eye(&world, from, DVec3::X, 100.0 / 60.0 * f64::from(k) / radius, 30.0);
+        step(&mut world, eye);
+        assert_eq!(overlapping(&world), 0, "pass {k}: far tiles drawn over one another");
+        let a = audit_cut(&world, eye);
+        assert_eq!(a.finer, 0, "pass {k}: {a:?}");
+    }
+    settle(&mut world, eye);
+    let (inside, bad) = not_full_res(&world, eye);
+    assert_eq!(bad, 0, "stopped: {bad} of {inside} columns inside R not full-res");
+    assert_eq!(audit_cut(&world, eye).coarser, 0, "stopped: tiles coarser than their distance");
 }
