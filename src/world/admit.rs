@@ -642,6 +642,7 @@ impl StreamLane for SectionLane {
             edits: world.edits_for_section(key),
             tables: world.tables.get(),
             clip: world.clip_target(key),
+            morph: world.section_morphs(key),
         };
         Some((job, token))
     }

@@ -142,6 +142,8 @@ pub(in crate::world) enum Job {
         tables: Arc<HotTables>,
         /// Chunk columns the full-res chunks draw instead.
         clip: section::ColumnClip,
+        /// The level can morph: faces carry their parent `dy`.
+        morph: bool,
     },
     /// Test-only: panics inside `run`, reporting the given claim — the injector
     /// for the worker-panic → `Done::Failed` → claim-release path.
@@ -1626,6 +1628,7 @@ fn run(job: Job, stager: Option<&MeshStager>, stats: &StagingStats) -> Done {
             edits,
             tables,
             clip,
+            morph,
             ..
         } => {
             // Fused extract+mesh on owned data: the generator samples straight
@@ -1633,7 +1636,7 @@ fn run(job: Job, stager: Option<&MeshStager>, stats: &StagingStats) -> Done {
             // a result whose Section would be dropped after meshing anyway.
             // Pinned byte-identical to the storage path by the parity test in
             // `section::mesh`.
-            let meshes = section::extract_section_mesh_with(pos, &*generator, &edits, &tables, clip);
+            let meshes = section::extract_section_mesh_with(pos, &*generator, &edits, &tables, clip, morph);
             Done::Section {
                 pos,
                 epoch,
@@ -1672,6 +1675,7 @@ mod tests {
             edits: Vec::new(),
             tables: Arc::new(BlockRegistry::with_builtins().hot_tables()),
             clip: section::ColumnClip::NONE,
+            morph: true,
         }
     }
     /// The `x` id a `section_job` was tagged with.
@@ -3153,6 +3157,7 @@ mod tests {
                             edits: Vec::new(),
                             tables: Arc::clone(&tables),
                             clip: section::ColumnClip::NONE,
+                            morph: true,
                         };
                         if next(4) == 0 {
                             assert!(new.push(job()));

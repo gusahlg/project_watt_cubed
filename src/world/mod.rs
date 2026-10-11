@@ -686,6 +686,8 @@ pub struct World {
     rule_memo: rule::RuleMemo,
     /// The rule's cut: each desired section's distance from the eye cell, for load priority.
     section_dist: FastMap<SectionPos, f64>,
+    /// Morph band per engine detail: where a level's vertices blend to their parent's surface.
+    lod_morph: [voxel_engine::LodMorph; 16],
     /// Every ancestor of the cut up to the rule's coarsest level. They are loaded (coarsest first)
     /// and kept, so a tile whose children are still loading has its parent to draw, and a merge
     /// draws at once.
@@ -900,6 +902,7 @@ impl World {
             rule_memo: rule::RuleMemo::default(),
             section_dist: FastMap::default(),
             section_ancestors: FastSet::default(),
+            lod_morph: [voxel_engine::LodMorph::default(); 16],
             clips: streaming::Clips::default(),
             clip_recheck: Sticky::default(),
             retire_check: Sticky::default(),

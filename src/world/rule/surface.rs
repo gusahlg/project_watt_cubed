@@ -2,7 +2,7 @@
 //! coordinates), a cube's six faces, or a flat world's endless +Y plane, every node's box placed
 //! where it really is.
 
-use voxel_engine::DVec3;
+use voxel_engine::{DVec3, LodMorph};
 
 use super::select::{Leaf, Surface};
 use super::{PhysBox, Rule};
@@ -201,5 +201,66 @@ impl World {
         let boxes: Vec<(SectionPos, PhysBox)> = roots.iter().filter_map(|&s| Some((s, surface.node_box(s)?))).collect();
         let nearest = boxes.iter().map(|(s, b)| (b.dist_box(&cell), *s, *b)).min_by(|a, b| a.0.total_cmp(&b.0));
         format!("{rule:?}: {} roots, {} with boxes, nearest {nearest:?}", roots.len(), boxes.len())
+    }
+}
+
+/// Blocks a band keeps clear of the distances it was derived from: vertex rounding and the cage's
+/// float error.
+const BAND_SLACK: f64 = 1.0;
+
+/// Mesh detail is section detail plus the nesting shift (a 32-column section packs one bit).
+const MESH_SHIFT: usize = 1;
+
+impl World {
+    /// Whether tile `s` is meshed with `dy`: a level with a coarser one beside it. The rule's
+    /// coarsest level has none.
+    pub(in crate::world) fn section_morphs(&self, s: SectionPos) -> bool {
+        let ground = if s.body >= CHART_BODY_BASE {
+            Ground::Chart { index: usize::from(s.body - CHART_BODY_BASE) }
+        } else if self.generator.cosmos().is_some() {
+            Ground::Cube { body: s.body }
+        } else {
+            Ground::Flat
+        };
+        s.detail.0 < self.rule_on(ground).coarsest
+    }
+
+    /// The morph band of every level of the cut `leaves` seen from the eye's cell `eye`, by engine
+    /// detail. A level's vertices must be unmoved where a finer level meets it and fully on their
+    /// parent's surface where a coarser one does. A vertex next to a finer tile lies in the split
+    /// node that tile came from, so it is no farther from the camera (anywhere in the cell) than
+    /// that node's distance, its diameter and the cell's; next to the full-res chunks, no farther
+    /// than the near columns reach. A vertex on a coarser tile is no nearer than that tile. A level
+    /// whose two bounds cross does not morph (its skirts seal the step).
+    pub(in crate::world) fn morph_bands(&self, rule: &Rule, leaves: &[Leaf], eye: &PhysBox) -> [LodMorph; 16] {
+        let cell = (eye.hi - eye.lo).length();
+        let (mut inner, mut outer) = ([0.0f64; 16], [f64::INFINITY; 16]);
+        let mut split: Vec<SectionPos> = leaves.iter().filter(|l| l.pos.detail.0 < rule.coarsest).map(|l| l.pos.parent()).collect();
+        split.sort_unstable_by_key(|s| (s.body, s.face as u8, s.detail, s.x, s.z));
+        split.dedup();
+        for p in split {
+            let d = p.detail.0 as usize;
+            if let Some(b) = self.node_box(p) {
+                inner[d] = inner[d].max(b.dist_box(eye) + (b.hi - b.lo).length() + cell);
+            }
+        }
+        for l in leaves {
+            let d = l.pos.detail.0 as usize;
+            if d > 0 {
+                outer[d - 1] = outer[d - 1].min(l.dist);
+            }
+        }
+        let finest = rule.finest.max(0) as usize;
+        if self.near.active() {
+            inner[finest] = inner[finest].max(self.near.reach + cell);
+        }
+        let mut bands = [LodMorph::default(); 16];
+        for d in 0..16 - MESH_SHIFT {
+            let (start, end) = (inner[d] + BAND_SLACK, outer[d] - BAND_SLACK);
+            if end.is_finite() && end > start && (d as i8) < rule.coarsest {
+                bands[d + MESH_SHIFT] = LodMorph { start: start as f32, end: end as f32 };
+            }
+        }
+        bands
     }
 }

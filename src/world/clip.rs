@@ -16,6 +16,7 @@ impl World {
     /// columns out of their meshes, so the engine's LOD clip box clips nothing.
     pub fn render(&self, f: &mut Frame3D, _cam: DVec3) {
         f.set_lod_clip_box(Vec3::ZERO, Vec3::ZERO);
+        f.set_lod_morph(&self.lod_morph);
         // Set-size gauge: a spike localizes a regression to a grown set (view
         // volume / section frontier). See `profile::Gauge`.
         use voxel_engine::profile::{Gauge, gauge};

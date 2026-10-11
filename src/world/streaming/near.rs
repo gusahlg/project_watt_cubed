@@ -67,6 +67,9 @@ pub(in crate::world) struct NearField {
     boxes: FastMap<ColumnKey, ((i32, i32), Option<PhysBox>)>,
     /// The ground is to be read again (an edit landed).
     pub(in crate::world) stale: bool,
+    /// The farthest a point of a near column's box lies from the eye's cell: where the finest far
+    /// level meets the full-res chunks.
+    pub(in crate::world) reach: f64,
 }
 
 /// A memo past this many columns is dropped and refilled.
@@ -265,6 +268,7 @@ impl World {
         let n = 2 * near.half + 1;
         let keep_r = r + f64::from(UNLOAD_MARGIN * CHUNK_SIZE as i32);
         let mut cols = vec![Col::default(); (n * n) as usize];
+        near.reach = 0.0;
         for db in -near.half..=near.half {
             for da in -near.half..=near.half {
                 let folded = match frame {
@@ -305,6 +309,9 @@ impl World {
                 };
                 col.near = d < r;
                 col.keep = d < keep_r;
+                if col.near && let Some(b) = b {
+                    near.reach = near.reach.max(d + (b.hi - b.lo).length());
+                }
             }
         }
         // The data beside each column: its 3×3 neighbours' shells, one layer wider.

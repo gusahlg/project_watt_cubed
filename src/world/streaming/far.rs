@@ -362,6 +362,7 @@ impl World {
             self.rule_memo = memo;
             let wanted = self.wanted_clips(&leaves);
             self.section_dist = leaves.iter().map(|l| (l.pos, l.dist)).collect();
+            self.lod_morph = ground.map_or([voxel_engine::LodMorph::default(); 16], |g| self.morph_bands(&self.rule_on(g), &leaves, &cell));
             let coarsest = ground.map_or(0, |g| self.rule_on(g).coarsest);
             let mut ancestors = std::mem::take(&mut self.section_ancestors);
             ancestors.clear();
