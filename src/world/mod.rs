@@ -979,6 +979,7 @@ impl World {
             || !self.upload_queue.is_empty()
             || !self.light_apply_queue.is_empty()
             || !self.section_upload_queue.is_empty()
+            || self.reclips_in_flight()
     }
 }
 

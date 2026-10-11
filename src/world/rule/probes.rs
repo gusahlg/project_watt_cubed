@@ -45,7 +45,7 @@ fn settle(world: &mut World, eye: DVec3) -> usize {
         if world.loading_full() && world.entry_complete() {
             return pass;
         }
-        assert!(pass < 100_000, "did not settle: {}", world.entry_debug());
+        assert!(pass < 100_000, "did not settle: {} {}", world.entry_debug(), world.clips_debug());
         step_finished(world, eye);
     }
     unreachable!()

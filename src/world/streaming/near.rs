@@ -289,9 +289,13 @@ impl World {
                 };
                 // Without a far field the chunks are all the ground there is: every column of the
                 // near square draws.
+                // The view square holds the near columns: the mesh box is built from it.
                 let chess = da.abs().max(db.abs());
-                let d = if self.lod2 {
-                    b.map_or(f64::INFINITY, |b| b.dist_box(eye))
+                let d = if self.lod2 && chess <= h + UNLOAD_MARGIN {
+                    let d = b.map_or(f64::INFINITY, |b| b.dist_box(eye));
+                    if chess <= h { d } else { d.max(r) }
+                } else if self.lod2 {
+                    f64::INFINITY
                 } else if chess <= h {
                     0.0
                 } else if chess <= h + UNLOAD_MARGIN {

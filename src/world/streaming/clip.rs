@@ -107,6 +107,38 @@ impl World {
         self.clips.wait.len()
     }
 
+    /// The clips still waiting or re-extracting, with what they wait for, for a test's report.
+    #[cfg(test)]
+    pub(in crate::world) fn clips_debug(&self) -> String {
+        let mut out = String::new();
+        for (s, t) in &self.clips.reclip {
+            let state = match self.sections.get(s) {
+                Some(SectionState::Ready { clip, .. }) => format!("Ready asked {:#x} drawn {:#x}", clip.asked.0, clip.drawn.0),
+                Some(SectionState::Meshing { token }) => format!("Meshing {token:?}"),
+                None => "absent".into(),
+            };
+            out += &format!("reclip {s:?} {t:?} {state} target {:#x} in cut {}; ", self.clip_target(*s).0, self.in_cut(*s));
+        }
+        for (s, bits) in self.clips.wait.iter().take(3) {
+            let unsettled: Vec<String> = bits
+                .iter()
+                .flat_map(|(_, cols)| cols.iter())
+                .filter(|&&(real, shell)| !self.column_settled(real, shell))
+                .take(2)
+                .map(|&(real, [lo, hi])| {
+                    let bad: Vec<String> = (lo..=hi)
+                        .map(|a| real.chunk(a))
+                        .filter(|&c| !self.chunk_final(c))
+                        .map(|c| format!("{c:?} {:?}", self.chunks.get(&c).map(|l| &l.state)))
+                        .collect();
+                    format!("{real:?} {lo}..={hi}: {bad:?}")
+                })
+                .collect();
+            out += &format!("wait {s:?}: {unsettled:?}; ");
+        }
+        out
+    }
+
     /// Every clip settled and landed: nothing waits on chunks or is re-extracting, and every drawn
     /// Ready tile draws its target.
     pub(in crate::world) fn clips_at_target(&self) -> bool {

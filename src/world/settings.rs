@@ -137,6 +137,7 @@ impl World {
         self.section_frontier_key = None;
         self.section_visible.clear();
         self.section_fade = Default::default();
+        self.clear_clips();
         self.section_cover_dirty.set();
         if reset_mip {
             // Ladder/distance changes alter the required bake extent and levels.

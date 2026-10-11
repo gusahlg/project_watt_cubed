@@ -41,11 +41,7 @@ impl World {
         if pos.detail < FLAT_DETAIL {
             return (false, 0);
         }
-        let color = self
-            .section_overlay
-            .get(&pos)
-            .map(|c| c.color)
-            .or_else(|| self.section_mip.as_ref().and_then(|m| m.color(pos)));
+        let color = self.section_overlay.get(&pos).map(|c| c.color).or_else(|| self.baked_mip(pos)?.color(pos));
         match color {
             Some(c) => (
                 true,
@@ -58,10 +54,14 @@ impl World {
     /// Current vertical relief for one section footprint. Live edit-derived
     /// data takes precedence over the immutable background bake.
     pub(super) fn section_relief_band(&self, key: SectionPos) -> Option<(f32, f32)> {
-        self.section_overlay
-            .get(&key)
-            .map(|cell| (cell.lo, cell.hi))
-            .or_else(|| self.section_mip.as_ref()?.relief_band(key))
+        self.section_overlay.get(&key).map(|cell| (cell.lo, cell.hi)).or_else(|| self.baked_mip(key)?.relief_band(key))
+    }
+
+    /// The relief bake, when it was baked for `key`'s body and face (its cells are keyed by detail
+    /// and position alone).
+    fn baked_mip(&self, key: SectionPos) -> Option<&super::heightmip::HeightMip> {
+        let (body, face, _, _) = self.section_mip_anchor?;
+        (key.body == body && key.face == face).then_some(self.section_mip.as_ref()?)
     }
 
     /// Geometric altitude of one baked height. +Y with a zero datum stores world Y;
