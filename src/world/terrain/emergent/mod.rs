@@ -511,8 +511,10 @@ impl Work {
         if self.layout.form == Form::Round { self.layout.radius } else { self.half }
     }
 
+    /// Bounding radius including relief (as [`Body::reach`], plus a snap of slack).
     fn reach(&self) -> f64 {
-        if self.layout.form == Form::Round { self.layout.radius } else { self.half * SQRT3 }
+        let relief = (RELIEF + 16) as f64;
+        if self.layout.form == Form::Round { self.layout.radius + relief } else { (self.half + relief) * SQRT3 }
     }
 
     /// Pull at the surface (a cube's face centre).
@@ -680,6 +682,40 @@ fn hierarchy(ws: &mut [Work], suites: &mut Suites, law: &Law, p: &Params, start:
         }
         if falls == before {
             return (falls, lost);
+        }
+    }
+}
+
+/// Systems never pull on each other: a body too near another system's falls onto its primary
+/// (the start world's mass is ejecta with `keep_start`). Returns the falls and the mass lost.
+fn separate(ws: &mut [Work], suites: &mut Suites, law: &Law, p: &Params, start: usize, grounds: &[Ground], keep_start: bool) -> (u32, f64) {
+    let (mut falls, mut lost) = (0, 0.0);
+    loop {
+        let alive: Vec<usize> = (0..ws.len()).filter(|&i| ws[i].alive).collect();
+        let bad = alive.iter().flat_map(|&a| alive.iter().map(move |&b| (a, b))).find(|&(a, b)| {
+            a < b && ws[a].system != ws[b].system && dist(ws[a].b.pos, ws[b].b.pos) <= R_G + ws[a].reach() + ws[b].reach()
+        });
+        let Some((a, b)) = bad else { return (falls, lost) };
+        let light = if ws[a].b.mass <= ws[b].b.mass && a != start { a } else { b };
+        let mut root = light;
+        while let Some(up) = ws[root].parent.filter(|&u| ws[u].alive) {
+            root = up;
+        }
+        if root == light {
+            root = if light == a { b } else { a };
+        }
+        let from = ws[light].b.clone();
+        if keep_start && root == start {
+            lost += from.mass;
+        } else {
+            fuse(&mut ws[root].b, &from, true);
+        }
+        ws[light].alive = false;
+        falls += 1;
+        if root != start {
+            let k = suites.of(law, key(ws[root].b.comp), grounds[root], p);
+            ws[root].suite = k;
+            ws[root].shape(&suites.list[k]);
         }
     }
 }
@@ -900,45 +936,36 @@ fn settle(
     // Settle what the last falls move, until nothing does: a body too near another system's falls
     // onto its primary (systems never pull on each other), a fall onto the start world rescales the
     // universe (the spawn contract holds its mass), and a satellite the rescale left under its
-    // parent's pull falls. In the last round what falls onto the start world is ejecta.
-    for round in 0..=CALIBRATIONS {
-        loop {
-            let alive: Vec<usize> = (0..ws.len()).filter(|&i| ws[i].alive).collect();
-            let bad = alive.iter().flat_map(|&a| alive.iter().map(move |&b| (a, b))).find(|&(a, b)| {
-                a < b && ws[a].system != ws[b].system && dist(ws[a].b.pos, ws[b].b.pos) <= R_G + ws[a].reach() + ws[b].reach()
-            });
-            let Some((a, b)) = bad else { break };
-            let light = if ws[a].b.mass <= ws[b].b.mass && a != start { a } else { b };
-            let mut root = light;
-            while let Some(up) = ws[root].parent.filter(|&u| ws[u].alive) {
-                root = up;
-            }
-            if root == light {
-                root = if light == a { b } else { a };
-            }
-            let from = ws[light].b.clone();
-            fuse(&mut ws[root].b, &from, true);
-            ws[light].alive = false;
-            fell += 1;
-            if root != start {
-                let k = suites.of(law, key(ws[root].b.comp), grounds[root], p);
-                ws[root].suite = k;
-                ws[root].shape(&suites.list[k]);
-            }
-        }
+    // parent's pull falls. Past the rounds, what falls onto the start world is ejecta, and the
+    // two rules repeat until neither moves a body.
+    let rescale = |ws: &mut Vec<Work>, suites: &mut Suites, calibration: &mut f64| {
         if ws[start].b.mass != m_s {
             let f = m_s / ws[start].b.mass;
-            calibration *= f;
+            *calibration *= f;
             for w in ws.iter_mut() {
                 w.b.mass *= f;
             }
             ws[start].b.mass = m_s;
-            assign(&mut ws, suites, law, p, start, s_suite, &grounds);
+            assign(ws, suites, law, p, start, s_suite, &grounds);
         }
-        let (falls, ejecta) = hierarchy(&mut ws, suites, law, p, start, &grounds, round == CALIBRATIONS);
+    };
+    for _ in 0..=CALIBRATIONS {
+        let (merged, _) = separate(&mut ws, suites, law, p, start, &grounds, false);
+        fell += merged;
+        rescale(&mut ws, suites, &mut calibration);
+        let (falls, _) = hierarchy(&mut ws, suites, law, p, start, &grounds, false);
         fell += falls;
-        lost += ejecta;
         if falls == 0 {
+            break;
+        }
+    }
+    rescale(&mut ws, suites, &mut calibration);
+    loop {
+        let (merged, ejecta) = separate(&mut ws, suites, law, p, start, &grounds, true);
+        let (falls, more) = hierarchy(&mut ws, suites, law, p, start, &grounds, true);
+        fell += merged + falls;
+        lost += ejecta + more;
+        if merged + falls == 0 {
             break;
         }
     }
