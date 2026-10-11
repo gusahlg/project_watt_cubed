@@ -203,7 +203,8 @@ fn fly(speed: f64, secs: f64, settle: f64, view: (i32, i32), lod2: bool, hz: f64
     }
     println!("{line}");
     let mut line = format!(
-        "  costliest pass (#{} of {}): {:.2} ms on the CPU, {:.2} ms wall (longest wall {:.2} ms), by phase:",
+        "  CPU ms/frame mean={:.3} | costliest pass (#{} of {}): {:.2} ms on the CPU, {:.2} ms wall (longest wall {:.2} ms), by phase:",
+        laps.cpu_sum.as_secs_f64() * 1e3 / frames.max(1) as f64,
         laps.passes.1,
         laps.passes.0,
         laps.cpu.0.as_secs_f64() * 1e3,

@@ -146,6 +146,8 @@ pub(in crate::world) struct Laps {
     /// longest wall time of any pass.
     cpu_start: Duration,
     pub(in crate::world) cpu: (Duration, Duration),
+    /// CPU time over every pass.
+    pub(in crate::world) cpu_sum: Duration,
 }
 
 /// This thread's CPU time.
@@ -176,6 +178,7 @@ impl Default for Laps {
             passes: (0, 0),
             cpu_start: Duration::ZERO,
             cpu: (Duration::ZERO, Duration::ZERO),
+            cpu_sum: Duration::ZERO,
         }
     }
 }
@@ -203,6 +206,7 @@ impl Laps {
             }
             self.last = (now - self.start, self.full_pass);
             let cpu = thread_cpu().saturating_sub(self.cpu_start);
+            self.cpu_sum += cpu;
             if cpu > self.cpu.0 {
                 self.worst = (self.last.0, self.pass);
                 self.passes.1 = self.passes.0;
@@ -220,6 +224,7 @@ impl Laps {
         self.worst = (Duration::ZERO, [Duration::ZERO; PHASES]);
         self.passes = (0, 0);
         self.cpu = (Duration::ZERO, Duration::ZERO);
+        self.cpu_sum = Duration::ZERO;
     }
 }
 
