@@ -581,3 +581,44 @@ fn flying_never_overlaps_or_bares_and_settles() {
     assert_eq!(bad, 0, "stopped: {bad} of {inside} columns inside R not full-res");
     assert_eq!(audit_cut(&world, eye).coarser, 0, "stopped: tiles coarser than their distance");
 }
+
+/// Settled at spawn (render distance 6) and on a flat world, every level from two above the finest
+/// to the next-to-coarsest morphs over a band that starts past where the finer level reaches and
+/// ends short of where the coarser one begins; the coarsest level does not morph and is meshed
+/// flat.
+#[test]
+fn morph_bands_hold_from_the_cut() {
+    use crate::world::generation::{FLAT_HEIGHT, WorldgenKind};
+    let mut world = view_of(42, 6, 3);
+    let spawn = world.chart_spawn().expect("charted");
+    let centre = world.generator.cosmos().expect("cosmos").home().centre_f();
+    let eye = world.home_eye(spawn - centre, 1.62);
+    world.prepare_around(eye);
+    world.drive_spawn_ready();
+    settle(&mut world, eye);
+    let render = RenderConfig { lod2: true, occlusion: true, ..RenderConfig::default() };
+    let mut flat = World::with_kind(1, render, WorldgenKind::Flat, false);
+    flat.set_view_distances(6, 3);
+    let flat_eye = DVec3::new(8.5, f64::from(FLAT_HEIGHT) + 1.62, 8.5);
+    flat.prepare_around(flat_eye);
+    flat.drive_spawn_ready();
+    settle(&mut flat, flat_eye);
+    for (name, w) in [("spawn", &world), ("flat world", &flat)] {
+        let ground = w.far_ground(w.section_center().expect("a far centre")).expect("ground");
+        let rule = w.rule_on(ground);
+        let bands = w.lod_morph;
+        println!("{name}: {:?}", &bands[..10]);
+        // The two finest levels may not: the eye's cell and their relief fill their whole band. The
+        // coarsest level drawn has no coarser one to meet.
+        let top_drawn = w.section_desired.iter().map(|s| s.detail.0).max().expect("a cut");
+        for d in rule.finest + 2..top_drawn {
+            let b = bands[d as usize + 1];
+            assert!(b.end > b.start && b.start >= 0.0, "{name}: level d{d} does not morph: {b:?}");
+            assert!(f64::from(b.start) >= rule.range(d) * 0.5, "{name}: level d{d} starts before its level does: {b:?}");
+        }
+        let top = bands[top_drawn as usize + 1];
+        assert!(!(top.end > top.start), "{name}: the coarsest level drawn morphs");
+        let coarsest = SectionPos { detail: crate::ident::Detail(rule.coarsest), ..w.section_desired[0] };
+        assert!(!w.section_morphs(coarsest), "{name}: the coarsest level is meshed with dy");
+    }
+}

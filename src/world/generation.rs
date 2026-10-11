@@ -471,6 +471,12 @@ impl TerrainGenerator for FlatTerrain {
         FLAT_HEIGHT
     }
 
+    /// The plane's ground is one height everywhere on the slab.
+    fn surface_bounds(&self, _body: u16, face: Face, u0: i32, v0: i32, span: i32) -> Option<(i32, i32)> {
+        let off = |a: i32| i64::from(a) + i64::from(span) <= -i64::from(FLAT_HALF) || i64::from(a) >= i64::from(FLAT_HALF);
+        (face == Face::PosY && !off(u0) && !off(v0)).then_some((FLAT_HEIGHT, FLAT_HEIGHT + 1))
+    }
+
     fn surface_at(&self, _wx: i32, _wz: i32) -> BlockId {
         self.grass
     }
