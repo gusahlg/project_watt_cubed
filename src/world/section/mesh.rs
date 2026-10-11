@@ -1682,7 +1682,11 @@ mod tests {
         for lift in [1500.0_f64, 3000.0] {
             let eye_y = ground as f64 + lift;
             world.section_eye_y = eye_y;
-            let center = ChunkCoord::new(au.div_euclid(16), (eye_y as i32).div_euclid(16), av.div_euclid(16));
+            // Where that eye really is: the twin's warp moves its reference cells.
+            let warp = world.terrain().atlases().iter().find(|a| a.grid.as_ref().is_some_and(|g| g.body == body)).and_then(|a| a.warp.clone());
+            let reference = voxel_engine::DVec3::new(f64::from(au) + 0.5, eye_y, f64::from(av) + 0.5);
+            let (near, _) = world.place_eyes(warp.map_or(reference, |w| w.apply(reference)));
+            let center = ChunkCoord::new((near.x / 16.0).floor() as i32, (near.y / 16.0).floor() as i32, (near.z / 16.0).floor() as i32);
             // The +Y face around the eye's column: the cut's other faces are another plane.
             let desired: Vec<SectionPos> = world.desired_sections(center).into_iter().filter(|s| s.face == Face::PosY).collect();
             // The ground the horizon reaches from this height.
@@ -2074,7 +2078,7 @@ mod tests {
     /// Start-world chart far field at spawn and from altitude: every tile's columns have tops or
     /// are left to the near columns, the seams between tiles are closed, and each column of the
     /// near square is drawn one way: by the far field, or (near, at spawn ground level) by the
-    /// chunks. Bytes re-pinned to `0x0` when the cut became the distance rule's: chart tiles count
+    /// chunks. Bytes re-pinned to `0xafd5f6cb` when the cut became the distance rule's: chart tiles count
     /// from their own patch and the finest tiles over near columns leave them out (seed 42,
     /// diffusion, default view).
     #[test]
@@ -2089,7 +2093,7 @@ mod tests {
         world.section_eye_y = storage.y;
         let spawn = frontier_counts(&mut world, center);
         println!("spawn: hash {:#x}, {} sections, {} of {} near-square columns near", spawn.hash, spawn.sections, spawn.near_n, spawn.under_n);
-        assert_eq!(spawn.hash, 0x0, "spawn ground-level far-field bytes changed");
+        assert_eq!(spawn.hash, 0xafd5f6cb, "spawn ground-level far-field bytes changed");
         assert!(spawn.near_n > 0, "no column near spawn is near");
         assert_chart_closed("spawn", &spawn);
 

@@ -1635,7 +1635,7 @@ fn hover(world: &mut World, dir: DVec3, above: f64, name: &str) -> bool {
         assert!(world.section_desired.is_empty(), "{name}: {} sections past the horizon", world.section_desired.len());
         return false;
     }
-    assert!(!world.section_desired.is_empty(), "{name}: no chart sections");
+    assert!(!world.section_desired.is_empty(), "{name}: no chart sections: {}", world.rule_roots_debug(world.far_ground(far_c).expect("ground"), world.phys_eye(far_c, true)));
     true
 }
 

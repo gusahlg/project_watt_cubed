@@ -84,10 +84,6 @@ impl WorldSurface<'_> {
         let tiles = n / span;
         let rel = eye - atlas.centre;
         let radius = atlas.radius.max(1) as f64;
-        let top = radius + terrain::cosmos::RELIEF as f64;
-        if rel.length() - top >= rule.horizon() {
-            return;
-        }
         // The horizon's arc on the datum sphere, and the cells it spans on a patch (a cell is a
         // quarter turn over `n` at the patch centre, down to about 1/√2 of that at a corner).
         let theta = (rule.horizon() / radius).min(std::f64::consts::PI);
@@ -188,5 +184,22 @@ impl Surface for WorldSurface<'_> {
             None => (*self.memo.bounds.entry(s).or_insert_with(|| self.world.generator_bounds(s)))?,
         };
         self.world.place_box(s, lo, hi)
+    }
+}
+
+impl World {
+    /// The roots of `ground` seen from `eye`, how many have a box, and the nearest box: a test's
+    /// report when a cut comes back empty.
+    #[cfg(test)]
+    pub(in crate::world) fn rule_roots_debug(&self, ground: Ground, eye: DVec3) -> String {
+        let rule = self.rule_on(ground);
+        let mut memo = RuleMemo::default();
+        let mut surface = WorldSurface { world: self, ground, memo: &mut memo };
+        let mut roots = Vec::new();
+        surface.roots(&rule, eye, &mut roots);
+        let cell = PhysBox::eye_cell(eye);
+        let boxes: Vec<(SectionPos, PhysBox)> = roots.iter().filter_map(|&s| Some((s, surface.node_box(s)?))).collect();
+        let nearest = boxes.iter().map(|(s, b)| (b.dist_box(&cell), *s, *b)).min_by(|a, b| a.0.total_cmp(&b.0));
+        format!("{rule:?}: {} roots, {} with boxes, nearest {nearest:?}", roots.len(), boxes.len())
     }
 }

@@ -456,7 +456,9 @@ impl World {
         let mut seeded = false;
         owed.retain(|&coord| {
             if !self.admits_light(coord) {
-                return true;
+                // A chunk the near field no longer loads is drawn by nothing and lights nothing
+                // drawn: it is owed nothing.
+                return self.near.loads(self.fold.fold(coord));
             }
             self.seed_light(coord, super::LightSeed::Store);
             seeded = true;
