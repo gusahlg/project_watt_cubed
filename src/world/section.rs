@@ -33,12 +33,16 @@ use super::lod;
 /// Submodule keeps mesh representation and consumer together.
 mod mesh;
 pub(in crate::world) use mesh::face_edits;
-pub(in crate::world) use mesh::{SectionMeshData, chart_slab_corners, extract_section_mesh, warp_slab_corners};
+pub(in crate::world) use mesh::{SectionMeshData, chart_slab_corners, extract_section_mesh_with, warp_slab_corners};
+#[cfg(test)]
+pub(in crate::world) use mesh::extract_section_mesh;
 
 /// 32 not 64: reduces remesh cost under frequent edits.
 pub(in crate::world) const SECTION_N: usize = 32;
 
 /// Body id of a charted round world: `CHART_BODY_BASE + atlas index`. Above every cosmos catalog id.
+/// A chart tile's face is its band-0 patch's face, and its `(x, z)` count from that patch's
+/// [`chart_origin`](super::generation::TerrainGenerator::chart_origin) in storage.
 pub(in crate::world) const CHART_BODY_BASE: u16 = 1 << 15;
 
 /// Finest LOD detail level: cell size is 2^k metres. Zone-1 full-res chunks are finer.
@@ -80,17 +84,10 @@ impl Quadrant {
     /// All four quadrants, ascending — the canonical iteration order.
     pub const ALL: [Quadrant; 4] = [Quadrant(0), Quadrant(1), Quadrant(2), Quadrant(3)];
 
-    #[cfg(test)]
-    pub fn new(q: u8) -> Quadrant {
-        debug_assert!(q < 4, "quadrant is a 2-bit index, got {q}");
-        Quadrant(q & 0b11)
-    }
     /// The quadrant a `(x, z)` grid coord occupies within its parent.
+    #[cfg(test)]
     pub fn of_coords(x: i32, z: i32) -> Quadrant {
         Quadrant((x.rem_euclid(2) | (z.rem_euclid(2) << 1)) as u8)
-    }
-    pub const fn get(self) -> u8 {
-        self.0
     }
     /// The +X bit as an offset (0 or 1).
     pub const fn dx(self) -> i32 {
@@ -165,6 +162,7 @@ impl SectionPos {
     }
 
     /// Which quadrant of its parent this section occupies.
+    #[cfg(test)]
     pub(in crate::world) fn quadrant(self) -> Quadrant {
         Quadrant::of_coords(self.x, self.z)
     }
@@ -180,6 +178,57 @@ impl SectionPos {
     #[cfg(test)]
     fn num_bricks(self) -> usize {
         (self.n_cells() as usize).div_ceil(BRICK_DIM).max(1)
+    }
+}
+
+// ColumnClip: the chunk columns a section leaves to the full-res chunks.
+
+/// Widest section that leaves chunk columns out: eight columns a side, one bit each.
+pub(in crate::world) const CLIP_MAX_SPAN: i32 = 8 * CS;
+
+/// Chunk columns a section leaves out of its mesh for the full-res chunks to draw. Bit
+/// `cz * 8 + cx` is the 16-block column `(cx, cz)` from the section's min corner, in its own frame.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug, Hash)]
+pub(in crate::world) struct ColumnClip(pub(in crate::world) u64);
+
+impl ColumnClip {
+    pub const NONE: Self = Self(0);
+
+    /// Columns of `s` a side, when it can leave columns out.
+    pub fn side(s: SectionPos) -> Option<i32> {
+        (s.span() <= CLIP_MAX_SPAN).then(|| (s.span() / CS).max(1))
+    }
+
+    /// Column `(cx, cz)` alone.
+    pub fn of_column(cx: i32, cz: i32) -> Self {
+        debug_assert!((0..8).contains(&cx) && (0..8).contains(&cz), "column ({cx}, {cz}) is outside a clip");
+        Self(1 << (cz * 8 + cx))
+    }
+
+    /// Whether column `(cx, cz)` is left out.
+    pub fn masks(self, cx: i32, cz: i32) -> bool {
+        (0..8).contains(&cx) && (0..8).contains(&cz) && self.0 >> (cz * 8 + cx) & 1 != 0
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    pub fn is_subset_of(self, other: Self) -> bool {
+        self.0 & !other.0 == 0
+    }
+
+    pub fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    pub fn intersect(self, other: Self) -> Self {
+        Self(self.0 & other.0)
+    }
+
+    /// The left-out columns as `(cx, cz)` from the section's min corner.
+    pub fn offsets(self) -> impl Iterator<Item = (i32, i32)> {
+        (0..64).filter(move |&b| self.0 >> b & 1 != 0).map(|b| (b % 8, b / 8))
     }
 }
 
@@ -414,6 +463,20 @@ pub(in crate::world) fn flatten_edits(
     }
     out.sort_unstable_by_key(|&(x, y, z, _)| (y, x, z));
     out
+}
+
+/// Flattened `edits` in `pos`'s own frame, ordered as [`apply_edits`] requires: a chart tile's
+/// counted from its patch origin, a cube face's rotated into face-local `(u, a, v)`.
+pub(in crate::world) fn frame_edits<G: super::generation::TerrainGenerator + ?Sized>(
+    pos: SectionPos,
+    r#gen: &G,
+    edits: &[(ChunkCoord, Vec<(usize, BlockId)>)],
+) -> Vec<(i32, i32, i32, BlockId)> {
+    let flat = flatten_edits(edits);
+    if let Some((ox, oz)) = r#gen.chart_origin(pos.body, pos.face) {
+        return flat.into_iter().map(|(x, y, z, id)| (x - ox, y, z - oz, id)).collect();
+    }
+    if pos.face == Face::PosY { flat } else { face_edits(&flat, pos.face) }
 }
 
 /// Apply edits to one column's coarse cells — an ORDER-INDEPENDENT reduction.

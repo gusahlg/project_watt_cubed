@@ -11,6 +11,16 @@ use crate::world::chunk::Chunk;
 use crate::world::generation::Classify;
 use crate::world::layout::{ColumnKey, Sky};
 
+/// The world a bench times: the seed's, or with `BENCH_AUTHORED=1` the authored catalog of seed 42
+/// (the content worldgen 10 painted, so a bench compares code with code on the same cells).
+fn bench_world(seed: i64) -> (BlockRegistry, Terrain) {
+    if std::env::var_os("BENCH_AUTHORED").is_some() {
+        cosmos::fixture::authored(|| make(42))
+    } else {
+        make(seed)
+    }
+}
+
 /// A pinned seed whose universe holds a contact binary of cubes and a moon-painted body.
 fn pair_seed() -> i64 {
     cosmos::fixture::seed(&[cosmos::fixture::Want::Pair, cosmos::fixture::Want::Moonlike])
@@ -2516,7 +2526,7 @@ fn warped_twins_keep_the_cube_painter_and_sag() {
 #[test]
 #[ignore]
 fn home_chart_chunk_cost() {
-    let (_reg, t) = make(42);
+    let (_reg, t) = bench_world(42);
     let home = *t.cosmos.home();
     let half = cube::half_of(&home) as i32;
     let spots = [(Face::PosY, 0, 0), (Face::PosX, 0, 0), (Face::PosY, half - 8, 0)];
@@ -2619,7 +2629,7 @@ fn a_warped_twin_has_air_on_its_bowed_face() {
 #[test]
 #[ignore]
 fn column_generation_costs() {
-    let (_reg, t) = make(pair_seed());
+    let (_reg, t) = bench_world(pair_seed());
     let mut columns = Vec::new();
     let (sx, sz, _) = home_column(&t, Face::PosY, 1_000, 2_000);
     columns.push(("home chart", sx, sz));

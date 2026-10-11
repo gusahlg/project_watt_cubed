@@ -1,66 +1,42 @@
-//! Coverage for the section far field — at most one mask drawn per region. LOD cuts
-//! hard-pop: adopting a new cut replaces the prior assignment in the same frame, no
-//! cross-fade dissolve. Selection (the desired cut) is unchanged; this is a view of it
-//! that also emits the per-region drawn-quadrant diff callers need to patch GPU
-//! visibility slots.
-//!
-//! Terrain and hierarchy levels are untouched: this is a view of the selection state,
-//! not part of it.
+//! The far field's drawn tiles. A new cut replaces the previous one in the same frame (hard pop,
+//! no cross-fade), and every tile is drawn whole. This is a view of the selection that also emits
+//! the diff callers need to patch GPU visibility.
 
-use super::FastMap;
-use super::quadtree::QuadrantMask;
+use super::FastSet;
 use super::section::SectionPos;
 
-/// A region whose drawn quadrants changed: the new mask, or `None` once it draws nothing.
-pub(in crate::world) type VisibilityChange = (SectionPos, Option<QuadrantMask>);
+/// A tile whose visibility changed, and whether it now draws.
+pub(in crate::world) type VisibilityChange = (SectionPos, bool);
 
-/// The far-field's coverage: one mask per drawn region, replaced wholesale each cut.
+/// The tiles the far field draws, replaced wholesale each cut.
 #[derive(Default)]
 pub(in crate::world) struct Coverage {
-    settled: FastMap<SectionPos, QuadrantMask>,
-    /// The previous cut's map, kept for its allocation.
-    spare: FastMap<SectionPos, QuadrantMask>,
+    drawn: FastSet<SectionPos>,
+    /// The previous cut's set, kept for its allocation.
+    spare: FastSet<SectionPos>,
 }
 
 impl Coverage {
-    pub fn update_now(&mut self, cut: &[(SectionPos, QuadrantMask)]) -> Vec<VisibilityChange> {
-        self.update(cut)
-    }
-
-    /// Adopt a new desired `cut`, replacing the prior assignment. Returns every region
-    /// whose drawn quadrants changed — a DIFF across the update, so an in-place mask
-    /// change (same region, different quadrants) is caught even though it is neither an
-    /// enter nor a leave. Diffing the projection cannot omit a case it did not think of.
-    pub fn update(&mut self, cut: &[(SectionPos, QuadrantMask)]) -> Vec<VisibilityChange> {
-        let mut desired = std::mem::take(&mut self.spare);
-        desired.clear();
-        desired.extend(cut.iter().copied());
-        let mut changes: Vec<VisibilityChange> = self
-            .settled
-            .iter()
-            .filter(|&(pos, m)| desired.get(pos) != Some(m))
-            .map(|(&pos, _)| (pos, desired.get(&pos).copied()))
-            .collect();
-        changes.extend(desired.iter().filter(|(pos, _)| !self.settled.contains_key(pos)).map(|(&pos, &m)| (pos, Some(m))));
-        self.spare = std::mem::replace(&mut self.settled, desired);
+    /// Adopt a new `cut`, replacing the prior one. Returns every tile whose visibility changed.
+    pub fn update_now(&mut self, cut: &[SectionPos]) -> Vec<VisibilityChange> {
+        let mut next = std::mem::take(&mut self.spare);
+        next.clear();
+        next.extend(cut.iter().copied());
+        let mut changes: Vec<VisibilityChange> = self.drawn.iter().filter(|p| !next.contains(p)).map(|&p| (p, false)).collect();
+        changes.extend(next.iter().filter(|p| !self.drawn.contains(p)).map(|&p| (p, true)));
+        self.spare = std::mem::replace(&mut self.drawn, next);
         changes
     }
 
-    /// The regions to draw this frame with their masks.
-    #[cfg(test)]
-    pub fn draws(&self) -> impl Iterator<Item = (SectionPos, QuadrantMask)> + '_ {
-        self.settled.iter().map(|(&p, &m)| (p, m))
+    /// Whether `pos` draws now: what a section consults when it lands Ready, since its slots did
+    /// not exist at the transition that decided it.
+    pub fn draws(&self, pos: SectionPos) -> bool {
+        self.drawn.contains(&pos)
     }
 
-    /// The quadrants `pos` currently draws, if any — the projection a section consults
-    /// when it lands Ready, since its slots did not exist at the transition that decided it.
-    pub fn drawn_mask(&self, pos: SectionPos) -> Option<QuadrantMask> {
-        self.settled.get(&pos).copied()
-    }
-
-    /// Every tracked region — the set selection must keep loaded.
+    /// Every drawn tile: the set selection must keep loaded.
     pub fn tracked(&self) -> impl Iterator<Item = SectionPos> + '_ {
-        self.settled.keys().copied()
+        self.drawn.iter().copied()
     }
 }
 
@@ -69,99 +45,29 @@ mod tests {
     use super::*;
     use crate::coord::Face;
     use crate::ident::Detail;
-    use crate::world::section::FINEST_DETAIL;
 
-    fn cell(x: i32, detail: i8) -> (SectionPos, QuadrantMask) {
-        (SectionPos { body: 0, face: Face::PosY, detail: Detail(detail), x, z: 0 }, QuadrantMask::ALL)
+    fn cell(x: i32, detail: i8) -> SectionPos {
+        SectionPos { body: 0, face: Face::PosY, detail: Detail(detail), x, z: 0 }
     }
 
-    /// A cut replaces the prior one wholesale in one frame (hard pop): exactly the new
-    /// cut draws, the old regions are gone.
+    /// The visibility a tile holds, maintained only by applying the diffs `update_now` returns,
+    /// is exactly the cut adopted, through enters, leaves and a full clear.
     #[test]
-    fn cut_hard_pops_to_exactly_the_new_cut() {
+    fn diffs_reproduce_the_cut() {
+        let script = [vec![cell(0, 3), cell(1, 3)], vec![cell(1, 3), cell(2, 4)], vec![], vec![cell(5, 2)]];
         let mut c = Coverage::default();
-        let old = [cell(0, FINEST_DETAIL.0 + 1), cell(1, FINEST_DETAIL.0 + 1)];
-        c.update(&old);
-        let new = [cell(5, FINEST_DETAIL.0 + 2), cell(6, FINEST_DETAIL.0 + 2)];
-        c.update(&new);
-        let drawn: std::collections::HashMap<_, _> = c.draws().collect();
-        assert_eq!(drawn.len(), new.len(), "exactly the new cut draws");
-        for (pos, _) in new {
-            assert!(drawn.contains_key(&pos), "new region present");
-        }
-        for (pos, _) in old {
-            assert!(!drawn.contains_key(&pos), "old region gone");
-        }
-        assert_eq!(c.tracked().count(), new.len());
-    }
-
-    /// Build the mask with bits `b` (`0b1101` = quadrants 0, 2, 3).
-    fn mask(b: u8) -> QuadrantMask {
-        let mut m = QuadrantMask::EMPTY;
-        for q in crate::world::section::Quadrant::ALL {
-            if b & (1 << q.get()) != 0 {
-                m.insert(q);
+        let mut patched: std::collections::HashSet<SectionPos> = Default::default();
+        for cut in &script {
+            for (pos, on) in c.update_now(cut) {
+                if on {
+                    assert!(patched.insert(pos), "{pos:?} shown twice");
+                } else {
+                    assert!(patched.remove(&pos), "{pos:?} hidden while hidden");
+                }
             }
+            let want: std::collections::HashSet<SectionPos> = cut.iter().copied().collect();
+            assert_eq!(patched, want);
+            assert!(cut.iter().all(|&p| c.draws(p)) && c.tracked().count() == cut.len());
         }
-        m
-    }
-
-    /// Invariant: a mask maintained ONLY by applying the patches `update` returns is
-    /// identical to one a reference draw walk rebuilds from scratch — over enter / leave /
-    /// in-place-mask-change crossed with every quadrant mask `1..=15`.
-    ///
-    /// The mask the GPU holds is this projection resolved to slots, so an omission here
-    /// is a stranded slot there. Covers the in-place quadrant-mask change specifically:
-    /// step 2 mutates a region's mask without an enter/leave transition at all.
-    #[test]
-    fn patch_stream_reproduces_the_reference_draw_walk() {
-        let pos = |x: i32| SectionPos { body: 0, face: Face::PosY, detail: Detail(FINEST_DETAIL.0 + 1), x, z: 0 };
-        let script: Vec<Vec<(SectionPos, QuadrantMask)>> = (1..=15u8)
-            .flat_map(|b| {
-                [
-                    // two regions at mask `b`
-                    vec![(pos(0), mask(b)), (pos(1), mask(b))],
-                    // in-place mask change on region 0, no enter/leave: THE TRAP
-                    vec![(pos(0), mask(15 - b + 1)), (pos(1), mask(b))],
-                    // region 1 leaves, region 2 enters
-                    vec![(pos(0), mask(b)), (pos(2), mask(b))],
-                    // everything leaves
-                    vec![],
-                ]
-            })
-            .collect();
-
-        let mut c = Coverage::default();
-        let mut patched: std::collections::HashMap<SectionPos, QuadrantMask> = Default::default();
-        for (step, cut) in script.iter().enumerate() {
-            for (pos, m) in c.update(cut) {
-                match m {
-                    Some(m) => patched.insert(pos, m),
-                    None => patched.remove(&pos),
-                };
-            }
-            let reference: std::collections::HashMap<SectionPos, QuadrantMask> = c.draws().collect();
-            assert_eq!(patched, reference, "patch stream diverged from the draw walk at step {step}");
-        }
-    }
-
-    /// Equal inputs produce equal draw sets (order-independent).
-    #[test]
-    fn update_is_deterministic() {
-        let seq = [
-            vec![cell(0, 3), cell(1, 3)],
-            vec![cell(1, 3), cell(2, 4)],
-            vec![cell(2, 4)],
-        ];
-        let run = || {
-            let mut c = Coverage::default();
-            for cut in &seq {
-                c.update(cut);
-            }
-            let mut v: Vec<_> = c.draws().collect();
-            v.sort_by_key(|(p, _)| (p.detail, p.x, p.z));
-            v
-        };
-        assert_eq!(run(), run());
     }
 }

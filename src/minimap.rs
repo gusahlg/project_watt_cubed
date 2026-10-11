@@ -7,8 +7,9 @@
 //! where storage +Y is up. PosY on a flat world is world XZ, unchanged.
 //!
 //! The CPU rebuild ([`Minimap::refresh`]) scans the loaded columns' top solid
-//! blocks, folds in slope shading, and hands the pixels to the engine on a
-//! throttle. The per-frame [`Minimap::draw`] is just one textured quad, so it
+//! blocks (the generator's ground where no loaded chunk holds one, see
+//! [`World::top_solids_on_face`]), folds in slope shading, and hands the pixels to
+//! the engine on a throttle. The per-frame [`Minimap::draw`] is just one textured quad, so it
 //! costs two triangles regardless of the raster resolution.
 
 use std::time::Duration;
@@ -125,6 +126,9 @@ pub struct Minimap {
     cfg: MinimapConfig,
     /// Latest RGBA raster (`size² * 4`), reused across refreshes.
     rgba: Vec<u8>,
+    /// The raster's colours before slope shading (`size² * 4`): an edge whose neighbours changed
+    /// is shaded again from these, whether its column was loaded or read from the generator.
+    base: Vec<u8>,
     /// Per-texel top-solid height, scratch for slope shading (`size²`).
     top_y: Vec<i32>,
     /// The block column the current raster is centered on (`None` = never built).
@@ -145,6 +149,7 @@ impl Minimap {
         Self {
             cfg,
             rgba: vec![0u8; texels * 4],
+            base: vec![0u8; texels * 4],
             top_y: vec![i32::MIN; texels],
             center: None,
             face: Face::PosY,
@@ -250,6 +255,7 @@ impl Minimap {
         let sz = self.cfg.size as usize;
         shift(&mut self.top_y, sz, 1, dx, dz);
         shift(&mut self.rgba, sz, 4, dx, dz);
+        shift(&mut self.base, sz, 4, dx, dz);
 
         if dx > 0 {
             self.paint_rect(world, player_col, sz - dx as usize, 0, sz, sz);
@@ -280,12 +286,12 @@ impl Minimap {
         let (v_lo, v_hi) = kept_range(sz, dz);
         if dx != 0 {
             let u = if dx > 0 { 0 } else { (-dx) as usize };
-            self.restore_unshaded(world, player_col, u, v_lo, u + 1, v_hi);
+            self.restore_unshaded(u, v_lo, u + 1, v_hi);
             self.shade_rect(u, v_lo, u + 1, v_hi);
         }
         if dz != 0 {
             let v = if dz > 0 { 0 } else { (-dz) as usize };
-            self.restore_unshaded(world, player_col, u_lo, v, u_hi, v + 1);
+            self.restore_unshaded(u_lo, v, u_hi, v + 1);
             self.shade_rect(u_lo, v, u_hi, v + 1);
         }
     }
@@ -333,41 +339,21 @@ impl Minimap {
                         let idx = (v - origin_v) as usize * sz + tu;
                         let (ty, color) = tops[lv][lu].unwrap_or((i32::MIN, void));
                         self.top_y[idx] = ty;
-                        self.rgba[idx * 4..idx * 4 + 4].copy_from_slice(&[color.r, color.g, color.b, color.a]);
+                        let texel = [color.r, color.g, color.b, color.a];
+                        self.rgba[idx * 4..idx * 4 + 4].copy_from_slice(&texel);
+                        self.base[idx * 4..idx * 4 + 4].copy_from_slice(&texel);
                     }
                 }
             }
         }
     }
 
-    fn restore_unshaded(
-        &mut self,
-        world: &World,
-        player_col: IVec2,
-        u0: usize,
-        v0: usize,
-        u1: usize,
-        v1: usize,
-    ) {
-        let size = self.cfg.size as i32;
-        let sz = size as usize;
-        let origin_u = player_col.x - size / 2;
-        let origin_v = player_col.y - size / 2;
-        let frame = FaceFrame::new(self.face);
-        let void = self.cfg.void;
+    /// Put texels `[u0, u1) × [v0, v1)` back to their unshaded colours.
+    fn restore_unshaded(&mut self, u0: usize, v0: usize, u1: usize, v1: usize) {
+        let sz = self.cfg.size as usize;
         for v in v0..v1 {
-            for u in u0..u1 {
-                let idx = v * sz + u;
-                let ty = self.top_y[idx];
-                let color = if ty == i32::MIN {
-                    void
-                } else {
-                    let (x, y, z) = frame.cell_to_world((origin_u + u as i32, ty, origin_v + v as i32));
-                    world.registry().color(world.block_at(x, y, z))
-                };
-                self.rgba[idx * 4..idx * 4 + 4]
-                    .copy_from_slice(&[color.r, color.g, color.b, color.a]);
-            }
+            let (a, b) = ((v * sz + u0) * 4, (v * sz + u1) * 4);
+            self.rgba[a..b].copy_from_slice(&self.base[a..b]);
         }
     }
 

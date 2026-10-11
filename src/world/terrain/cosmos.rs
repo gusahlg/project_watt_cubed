@@ -664,7 +664,23 @@ impl Cosmos {
             }
         }
         link(&mut bodies);
+        // Every body is a cube of `rock` (the start world the old 25e6 one, a ball the cube of its
+        // volume): its Π_g decides whether a cube sags into storage, as the old twins did.
         let rock = super::emergent::minerals::role_suite(&material::Law::current(), "rock");
+        for b in &mut bodies {
+            let half = match b.shape {
+                Shape::Cube { half } => half as f64,
+                _ if b.traits.rank == Rank::Start => HOME_CUBE_HALF as f64,
+                Shape::Ball { r } | Shape::Shell { outer: r, .. } => r as f64 * HOME_CUBE_HALF as f64 / HOME_RADIUS as f64,
+            };
+            let t = &mut b.traits;
+            t.mass = rock.density * 8.0 * half * half * half;
+            t.yield_stress = rock.yield_stress;
+            t.pi_g = G * rock.density * rock.density * half * half / rock.yield_stress;
+            if t.form == Form::Cube && super::emergent::layout(t.pi_g, half).form == Form::Warped {
+                t.form = Form::Warped;
+            }
+        }
         Self::assemble(seed, bodies, vec![rock], space, deep)
     }
 

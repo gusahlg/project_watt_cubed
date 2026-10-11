@@ -734,7 +734,8 @@ mod tests {
     #[test]
     #[ignore]
     fn storage_chunk_cost() {
-        let (w, _) = worlds();
+        // `BENCH_AUTHORED=1`: the authored catalog's bodies, the content worldgen 10 painted.
+        let (w, _) = if std::env::var_os("BENCH_AUTHORED").is_some() { crate::world::terrain::cosmos::fixture::authored(worlds) } else { worlds() };
         for c in &w.worlds {
             let Some(round) = &c.round else { continue };
             let atlas = &c.atlas;

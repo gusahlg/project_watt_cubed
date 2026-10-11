@@ -5,7 +5,6 @@ use super::*;
 use crate::coord::ChunkCoord;
 use crate::world::fixtures::{ready_section, round_world, spawned_round_world};
 use crate::world::{light, mesh};
-use super::far::{inside_xz, storage_eye_block};
 use super::headless::{Headless, finish_jobs, step, step_finished};
 use super::light::LIGHT_WAIT_DEGRADE;
 
@@ -230,7 +229,7 @@ fn flight_then_stop_fills_the_whole_view() {
     for pass in 0.. {
         step_finished(&mut world, eye);
         let center = world.center.expect("streamed");
-        let whole = world.view_coords(world.mesh_box(center)).all(|c| drawn(&world, c));
+        let whole = world.view_coords(world.mesh_box(center)).all(|c| !world.near.draws(world.fold.fold(c)) || drawn(&world, c));
         if whole && world.light_owed.is_empty() && world.entry_complete() {
             break;
         }
@@ -1183,140 +1182,6 @@ fn unload_leaving_is_the_old_minus_new_shell() {
     }
 }
 
-/// Far from every seam a trailing chunk unloads with the box, as on any world. Near a seam,
-/// settled chunks past the unload box (home or across the seam) wait for a turn-back out to
-/// the skirt, also while a section is on screen over them, and leave past it.
-#[test]
-fn chunks_wait_for_a_turn_back_only_near_a_seam() {
-    use super::super::quadtree::QuadrantMask;
-    use crate::ident::Detail;
-    use crate::render_config::{RenderConfig, lod_for};
-
-    let (lod_levels, lod_detail) = lod_for(6);
-    let render = RenderConfig { lod2: true, occlusion: true, lod_levels, lod_detail, ..RenderConfig::default() };
-    let world_at = |dir: DVec3| {
-        let mut world = round_world(42, render);
-        world.set_view_distances(6, 3);
-        let eye = world.home_eye(dir, 100.0);
-        let (home, _, _, _) = world.begin_stream(eye, None);
-        assert!(!world.fold.is_identity(), "the eye is on a chart");
-        (world, home)
-    };
-    // Settled and drawing: a fake one-pass mesh.
-    let settle = |world: &mut World, c: Coord| {
-        world.ensure_data(c);
-        let h = voxel_engine::MeshHandle::from_raw_parts(1, 1);
-        let meshes = super::super::ChunkMeshes::from_upload_handles(ByPass::from_fn(|p| {
-            (p == voxel_engine::Pass::Opaque).then_some(h)
-        }))
-        .expect("one pass present");
-        world.chunks.get_mut(&c).expect("ensure_data stores the chunk").state = MeshState::Ready(meshes);
-    };
-    let walk = |world: &mut World, from: Coord, to: Coord| {
-        world.prev_unload_box = Some(world.unload_box(from));
-        world.center = Some(to);
-        world.unload_far_with(to, |state, _| drop(state));
-    };
-
-    // A face's middle: a straight walk holds nothing past the unload box.
-    let (mut world, home) = world_at(DVec3::new(0.0, 1.0, 0.0));
-    assert!(!world.near_a_seam(home), "the face middle is far from every seam");
-    settle(&mut world, home);
-    walk(&mut world, home, Coord::new(home.x, home.y, home.z - 11));
-    assert!(!world.chunks.contains_key(&home), "a trailing chunk unloads with the box");
-    assert!(world.far_wait.is_empty(), "nothing waits away from a seam");
-
-    // Beside the +Z seam: the home chunk and the chunk just across the seam both wait.
-    let (mut world, home) = world_at(DVec3::new(0.0, 1.0, 1.0 - 6.5e-6));
-    assert!(world.near_a_seam(home));
-    let seat = world.seams.chart_seat(home).expect("a chart seat");
-    let edge = Coord::new(home.x, home.y, (seat.hi[2] / 16) as i32 - 1);
-    let across = world.seams.across(edge, Face::PosZ).expect("a neighbour across +Z").chunk;
-    assert_ne!(world.fold.fold(across), across, "the neighbour chunk folds beyond the seam");
-    settle(&mut world, home);
-    settle(&mut world, across);
-    let folded = world.fold.fold(across);
-    let skirt = world.skirt();
-    let inland = Coord::new(home.x, home.y, home.z - 11);
-    assert!(folded.across(inland, Face::PosY) <= skirt);
-    walk(&mut world, home, inland);
-    assert!(world.chunks.contains_key(&home), "a home chunk near the seam waits");
-    assert!(world.chunks.contains_key(&across), "the chunk across the seam waits");
-    assert_eq!(world.far_wait.len(), 2);
-
-    let span = 32;
-    let (bx, bz) = (home.x * 16 + 8, home.z * 16 + 8);
-    let pos = SectionPos { detail: Detail(0), body: 0, face: Face::PosY, x: bx.div_euclid(span), z: bz.div_euclid(span) };
-    world.sections.insert(pos, ready_section());
-    world.section_visible.push((pos, QuadrantMask::ALL));
-    world.unload_far_with(inland, |state, _| drop(state));
-    assert!(world.chunks.contains_key(&home), "a section on screen does not drop a waiting chunk");
-
-    let gone = Coord::new(home.x, home.y, home.z - skirt - 2);
-    world.center = Some(gone);
-    world.unload_far_with(gone, |state, _| drop(state));
-    assert!(!world.chunks.contains_key(&home), "past the skirt the home chunk unloads");
-    assert!(!world.chunks.contains_key(&across), "past the skirt the neighbour chunk unloads");
-    assert!(world.far_wait.is_empty());
-}
-
-/// The skirt is sideways only: near a seam, a layer the player climbs or digs away from unloads
-/// as anywhere else. And with the far field turned off, nothing keeps waiting.
-#[test]
-fn waiting_chunks_respect_the_layers_and_the_far_field_switch() {
-    use crate::render_config::{RenderConfig, lod_for};
-
-    let (lod_levels, lod_detail) = lod_for(6);
-    let render = RenderConfig { lod2: true, occlusion: true, lod_levels, lod_detail, ..RenderConfig::default() };
-    let mut world = round_world(42, render);
-    world.set_view_distances(6, 3);
-    let eye = world.home_eye(DVec3::new(0.0, 1.0, 1.0 - 6.5e-6), 100.0);
-    let (home, _, _, _) = world.begin_stream(eye, None);
-    assert!(world.near_a_seam(home));
-    // Settled and drawing: a fake one-pass mesh.
-    let settle = |world: &mut World, c: Coord| {
-        world.ensure_data(c);
-        let h = voxel_engine::MeshHandle::from_raw_parts(1, 1);
-        let meshes = super::super::ChunkMeshes::from_upload_handles(ByPass::from_fn(|p| {
-            (p == voxel_engine::Pass::Opaque).then_some(h)
-        }))
-        .expect("one pass present");
-        world.chunks.get_mut(&c).expect("ensure_data stores the chunk").state = MeshState::Ready(meshes);
-    };
-    settle(&mut world, home);
-
-    // Dig past the skirt straight down: the drawing chunk left above unloads.
-    world.window = Window::default();
-    let down = Coord::new(home.x, home.y - world.skirt() - 2, home.z);
-    world.prev_unload_box = Some(world.unload_box(home));
-    world.center = Some(down);
-    world.unload_far_with(down, |state, _| drop(state));
-    assert!(!world.chunks.contains_key(&home), "a layer past the skirt vertically unloads near a seam");
-    assert!(world.far_wait.is_empty());
-
-    // Air draws nothing, so it never waits, even inside the skirt near a seam.
-    world.ensure_data(home);
-    world.chunks.get_mut(&home).expect("stored").state = MeshState::Air;
-    let inland = Coord::new(home.x, home.y, home.z - 11);
-    world.prev_unload_box = Some(world.unload_box(home));
-    world.center = Some(inland);
-    world.unload_far_with(inland, |state, _| drop(state));
-    assert!(!world.chunks.contains_key(&home), "an air chunk does not wait");
-    assert!(world.far_wait.is_empty());
-
-    // Walk inland so the home chunk waits, then turn the far field off: it unloads on the next pass.
-    settle(&mut world, home);
-    let inland = Coord::new(home.x, home.y, home.z - 11);
-    world.prev_unload_box = Some(world.unload_box(home));
-    world.center = Some(inland);
-    world.unload_far_with(inland, |state, _| drop(state));
-    assert!(world.chunks.contains_key(&home), "the home chunk waits near the seam");
-    world.lod2 = false;
-    world.unload_far_with(inland, |state, _| drop(state));
-    assert!(!world.chunks.contains_key(&home), "with the far field off a waiting chunk unloads");
-    assert!(world.far_wait.is_empty());
-}
-
 /// Sync `ensure_data` (headless region, unclaimed boundary-cross centre)
 /// also installs from `generate_column` heights, so `trivial_light` never
 /// calls `height()`.
@@ -1410,281 +1275,6 @@ fn skipped_remesh_pushes_visibility_when_the_chunk_was_hidden() {
         super::super::vis_log::take().is_empty(),
         "unchanged vis must not push set_visible"
     );
-}
-
-/// Valley or hilltop columns inside the near square, below or above the full-res window,
-/// that neither a full-res chunk nor a far section draws. Seed 42, diffusion, the bench
-/// camera on the start world's +Z chart: ground level, that eye, and 300 above it.
-#[test]
-fn far_chart_strip_hole_is_closed() {
-    use crate::render_config::RenderConfig;
-
-    let mut world = round_world(42, RenderConfig::default());
-    let eye = world.chart_eye(on_home(&world, DVec3::new(0.0, -8_640_801.0, 22_107_307.0))).expect("symptom chart eye");
-    let ground = world.terrain().surface(Face::PosY, eye.x as i32, eye.z as i32);
-    assert_ne!(ground, i32::MIN, "symptom column has no surface");
-    // `expect_outside`: the window must miss some column, or a punch of the whole square
-    // would still report zero holes.
-    let sites = [
-        ("ground", DVec3::new(eye.x, ground as f64, eye.z), false),
-        ("eye", eye, true),
-        ("+300", DVec3::new(eye.x, ground as f64 + 300.0, eye.z), true),
-    ];
-    for (name, storage, expect_outside) in sites {
-        let center = Coord::new(
-            (storage.x / 16.0).floor() as i32,
-            (storage.y / 16.0).floor() as i32,
-            (storage.z / 16.0).floor() as i32,
-        );
-        world.section_eye_y = storage.y;
-        world.adopt_fold(center);
-        let seat = world.seams.chart_seat(center).unwrap_or_else(|| panic!("{name}: no chart seat"));
-        let near = world.near_block_box(center);
-        assert!(
-            near.0 >= seat.lo[0] && near.1 <= seat.hi[0] && near.2 >= seat.lo[2] && near.3 <= seat.hi[2],
-            "{name}: the near square meets a seam"
-        );
-        let (y0, y1) = world.near_y_range(center);
-        let desired = world.desired_sections(center);
-        let mut rects = Vec::new();
-        for s in &desired {
-            let span = s.span() as i64;
-            let (x, z) = (s.min_x() as i64, s.min_z() as i64);
-            if inside_xz(*s, seat.lo, seat.hi) {
-                rects.push((x, z, x + span, z + span));
-            }
-        }
-        let covered = |x: i64, z: i64| {
-            rects.iter().any(|&(x0, z0, x1, z1)| x >= x0 && x < x1 && z >= z0 && z < z1)
-        };
-        let mut holes = 0i32;
-        let mut outside = 0i32;
-        let mut x = near.0 + 8;
-        while x < near.1 {
-            let mut z = near.2 + 8;
-            while z < near.3 {
-                let surf = world.terrain().surface(Face::PosY, x as i32, z as i32);
-                if surf != i32::MIN {
-                    let solid = i64::from(surf) - 1;
-                    if solid < y0 || solid >= y1 {
-                        outside += 1;
-                        if !covered(x, z) {
-                            holes += 1;
-                        }
-                    }
-                }
-                z += 16;
-            }
-            x += 16;
-        }
-        assert_eq!(
-            holes, 0,
-            "{name}: {holes} strip holes of {outside} columns outside the window, desired {}",
-            desired.len()
-        );
-        if expect_outside {
-            assert!(outside > 0, "{name}: no column sits outside the full-res window");
-        }
-    }
-}
-
-/// Columns of the far-field disk that draw neither a chart section nor a full-res chunk.
-/// Across a seam the neighbour chart is in the disk, and the near window's chunks there are
-/// real storage chunks (or a section covers them). A section wholly inside the near square is
-/// dropped only when that square's surface sits inside the full-res window. The band just
-/// outside the box, out to one coarse-ring span, is part of the same count: a straddler is
-/// replaced by its descendants, so that band is drawn.
-#[test]
-fn far_chart_seam_has_no_hole() {
-    use crate::render_config::RenderConfig;
-    use crate::space::atlas::Patch;
-    use crate::space::chart::{self, Map};
-    use crate::ident::Detail;
-    use crate::world::section::{section_span, FINEST_DETAIL};
-
-    let mut world = round_world(42, RenderConfig::default());
-    let centre = world.generator.cosmos().expect("cosmos").home().centre_f();
-    let atlas = world
-        .generator
-        .atlases()
-        .iter()
-        .find(|a| (a.centre - centre).length() < 1.0)
-        .expect("charted")
-        .clone();
-
-    let storage_from_dir = |world: &World, dir: DVec3, above: f64| -> DVec3 {
-        let dir = dir.normalize();
-        let face = Face::from_dominant(dir);
-        let (tu, nn, tv) = chart::basis(face);
-        let (xi, eta) = Map::Equiangular.inverse(DVec3::new(dir.dot(tu), dir.dot(nn), dir.dot(tv)));
-        let n = atlas.bands[0].n;
-        let step = 2.0 / n as f64;
-        // An exact seam parameter floors to n, one cell past the box. Stand on the last cell.
-        let i = (((xi + 1.0) / step).floor() as i64).clamp(0, n - 1);
-        let j = (((eta + 1.0) / step).floor() as i64).clamp(0, n - 1);
-        let patch = Patch::Shell { band: 0, face };
-        let (origin, _) = atlas.storage_box(patch);
-        let stored = atlas.storage(patch, [i, 0, j]);
-        let ground = world.terrain().surface(Face::PosY, stored[0] as i32, stored[2] as i32);
-        let local_y = ground as f64 - origin[1] as f64;
-        let surf = atlas.embed(patch, DVec3::new(i as f64 + 0.5, local_y, j as f64 + 0.5));
-        let up = (surf - atlas.centre).normalize();
-        let fallback = DVec3::new(stored[0] as f64 + 0.5, ground as f64 + above, stored[2] as f64 + 0.5);
-        world.chart_eye(surf + up * above).unwrap_or(fallback)
-    };
-
-    let mut sites: Vec<(String, DVec3)> = Vec::new();
-    let symptom = world.chart_eye(on_home(&world, DVec3::new(0.0, -8_640_801.0, 22_107_307.0))).expect("symptom chart eye");
-    sites.push(("symptom".to_string(), symptom));
-    let sym_ground = world.terrain().surface(Face::PosY, symptom.x as i32, symptom.z as i32);
-    sites.push(("symptom-ground".to_string(), DVec3::new(symptom.x, sym_ground as f64, symptom.z)));
-    sites.push(("symptom+300".to_string(), DVec3::new(symptom.x, sym_ground as f64 + 300.0, symptom.z)));
-    for above in [0.0_f64, 300.0] {
-        let tag = if above == 0.0 { "ground" } else { "+300" };
-        sites.push((format!("seam-yz-{tag}"), storage_from_dir(&world, DVec3::new(0.0, 1.0, 1.0), above)));
-        sites.push((format!("seam-yx-{tag}"), storage_from_dir(&world, DVec3::new(1.0, 1.0, 0.0), above)));
-        sites.push((format!("corner-{tag}"), storage_from_dir(&world, DVec3::new(1.0, 0.985, 0.97), above)));
-        sites.push((format!("face-{tag}"), storage_from_dir(&world, DVec3::new(0.0, 1.0, 0.0), above)));
-    }
-    let seam = storage_from_dir(&world, DVec3::new(0.0, 1.0, 1.0), 0.0);
-    let seam_c = Coord::new((seam.x / 16.0).floor() as i32, 0, (seam.z / 16.0).floor() as i32);
-    let seam_seat = world.seams.chart_seat(seam_c).expect("seam seat");
-    let inset = if (seam.z as i64 - seam_seat.lo[2]).abs() < (seam_seat.hi[2] - seam.z as i64).abs() {
-        100 * 16
-    } else {
-        -100 * 16
-    };
-    let (ix, iz) = (seam.x, seam.z + inset as f64);
-    let ig = world.terrain().surface(Face::PosY, ix as i32, iz as i32);
-    sites.push(("inset100-ground".to_string(), DVec3::new(ix, ig as f64, iz)));
-    sites.push(("inset100+300".to_string(), DVec3::new(ix, ig as f64 + 300.0, iz)));
-
-    let cs = 16i64;
-    // The ring outside the finest one. A punched section of that span leaves a wider overhang
-    // than a finest tile when the finest annulus does not reach past the full-res box.
-    let sliver = section_span(Detail(FINEST_DETAIL.0 + 1)) as i64;
-    let outer = world.section_pyramid.outer_m() as i64;
-    for (name, storage) in sites {
-        let center = Coord::new(
-            (storage.x / 16.0).floor() as i32,
-            (storage.y / 16.0).floor() as i32,
-            (storage.z / 16.0).floor() as i32,
-        );
-        world.section_eye_y = storage.y;
-        world.adopt_fold(center);
-        let seat = world.seams.chart_seat(center).unwrap_or_else(|| panic!("{name}: no chart seat"));
-        let desired = world.desired_sections(center);
-        let (ex, _, ez) = storage_eye_block(center, storage.y, DVec3::ZERO);
-        let across = world.seams.seam_across(seat, [ex, storage.y.round() as i64, ez], outer);
-        let near = world.near_block_box(center);
-        let v = world.view.vertical as i64;
-        let mut rects: Vec<(i64, i64, i64, i64)> = Vec::new();
-        for s in &desired {
-            let span = s.span() as i64;
-            let (x, z) = (s.min_x() as i64, s.min_z() as i64);
-            let (x0, z0, x1, z1) = if inside_xz(*s, seat.lo, seat.hi) {
-                (x, z, x + span, z + span)
-            } else if let Some(m) = across.iter().find(|m| inside_xz(*s, m.seat.lo, m.seat.hi)) {
-                let (a, c) = m.home_xz(x, z);
-                let (b, d) = m.home_xz(x + span, z + span);
-                (a.min(b), c.min(d), a.max(b), c.max(d))
-            } else {
-                continue;
-            };
-            rects.push((x0, x1, z0, z1));
-        }
-        let covered = |x: i64, z: i64| rects.iter().any(|&(x0, x1, z0, z1)| x >= x0 && x < x1 && z >= z0 && z < z1);
-        let mut holes = 0i32;
-        let mut hole_ex = String::new();
-        let mut across_cols = 0i32;
-        let mut across_bad = 0i32;
-        let mut x = ex - outer;
-        let step = 64i64;
-        while x <= ex + outer {
-            let mut z = ez - outer;
-            while z <= ez + outer {
-                let (dx, dz) = (x - ex, z - ez);
-                if dx * dx + dz * dz > outer * outer {
-                    z += step;
-                    continue;
-                }
-                let virt = Coord::new(x.div_euclid(cs) as i32, center.y, z.div_euclid(cs) as i32);
-                let real = world.fold.unfold(virt);
-                let in_near = x >= near.0 && x < near.1 && z >= near.2 && z < near.3;
-                let section_hit = covered(x, z);
-                let mut chunk_hit = false;
-                if in_near {
-                    if let Some(rc) = real {
-                        let surf = world.terrain().surface(Face::PosY, rc.x * 16 + 8, rc.z * 16 + 8);
-                        if rc != virt {
-                            across_cols += 1;
-                            if surf == i32::MIN || world.seams.chart_seat(rc).is_none() {
-                                across_bad += 1;
-                            }
-                        }
-                        let gy = if surf == i32::MIN { i64::MIN } else { (surf as i64 - 1).div_euclid(cs) };
-                        chunk_hit = gy >= center.y as i64 - v && gy <= center.y as i64 + v;
-                    }
-                }
-                if !section_hit && !chunk_hit {
-                    let past_home = x < seat.lo[0] || x >= seat.hi[0] || z < seat.lo[2] || z >= seat.hi[2];
-                    let ox = if x < near.0 { near.0 - x } else if x >= near.1 { x - (near.1 - 1) } else { 0 };
-                    let oz = if z < near.2 { near.2 - z } else if z >= near.3 { z - (near.3 - 1) } else { 0 };
-                    holes += 1;
-                    if holes <= 6 {
-                        hole_ex.push_str(&format!(
-                            " at ({x},{z}) past_home {past_home} in_near {in_near} ox {ox} oz {oz} real {real:?};"
-                        ));
-                    }
-                }
-                z += step;
-            }
-            x += step;
-        }
-        // Chunk centres in the overhang band. Step 64 misses a sliver narrower than the stride.
-        let mut fine = 0i32;
-        let mut fine_n = 0i32;
-        let mut fx = near.0 - sliver + 8;
-        while fx < near.1 + sliver {
-            let mut fz = near.2 - sliver + 8;
-            while fz < near.3 + sliver {
-                let ox = if fx < near.0 { near.0 - fx } else if fx >= near.1 { fx - (near.1 - 1) } else { 0 };
-                let oz = if fz < near.2 { near.2 - fz } else if fz >= near.3 { fz - (near.3 - 1) } else { 0 };
-                let outside = ox.max(oz) > 0 && ox.max(oz) < sliver;
-                if outside {
-                    fine_n += 1;
-                    if !covered(fx, fz) {
-                        fine += 1;
-                    }
-                }
-                fz += 16;
-            }
-            fx += 16;
-        }
-        let edge = [seat.hi[0] - ex, ex - (seat.lo[0] - 1), seat.hi[2] - ez, ez - (seat.lo[2] - 1)];
-        let reaches_seam = edge.iter().any(|&d| d < (near.1 - near.0) / 2);
-        assert!(fine_n > 0, "{name}: the overhang band was not sampled");
-        assert_eq!(
-            fine, 0,
-            "{name}: {fine} overhang columns of {fine_n} within one coarse span, desired {} holes {holes}{hole_ex}",
-            desired.len()
-        );
-        assert_eq!(
-            holes, 0,
-            "{name}: {holes} uncovered columns, desired {} near {near:?} eye ({ex},{ez}) center {center:?} edges {edge:?};{hole_ex}",
-            desired.len()
-        );
-        assert!(
-            desired.len() <= world.sections_allowed(),
-            "{name}: {} sections over the slot budget {}",
-            desired.len(),
-            world.sections_allowed()
-        );
-        if reaches_seam {
-            assert!(across_cols > 0, "{name}: the near window does not cross the seam");
-            assert_eq!(across_bad, 0, "{name}: {across_bad} near columns across the seam are not real chunks");
-        }
-    }
 }
 
 /// A full section floor must not disarm the lane, and must drop Ready sections
@@ -1856,108 +1446,6 @@ fn mesh_seeds_only_admissible_chunks() {
     );
 }
 
-/// On a chart the frontier is a function of whole blocks and whole-chunk prediction: an eye
-/// that moves inside one block, or a velocity that jitters inside one chunk of lookahead,
-/// keeps the cached selection, and that selection is what a fresh sweep returns. The surface
-/// memo keeps only the rects the last sweep read.
-#[test]
-fn chart_frontier_holds_within_a_block() {
-    use crate::render_config::RenderConfig;
-
-    let mut world = round_world(42, RenderConfig::default());
-    let spawn = world.chart_spawn().expect("the start world is charted");
-    let eye = world.chart_eye(spawn).expect("spawn stands on a chart");
-    let center = Coord::new(
-        (eye.x / 16.0).floor() as i32,
-        (eye.y / 16.0).floor() as i32,
-        (eye.z / 16.0).floor() as i32,
-    );
-    world.adopt_fold(center);
-    world.center = Some(center);
-    world.update_lod_face(center);
-    assert!(world.section_on_chart(center), "spawn streams from a chart's storage");
-    let y = eye.y.floor() + 0.25;
-    let refresh = |world: &mut World, eye_y: f64, vel: DVec3| {
-        world.section_eye_y = eye_y;
-        world.section_vel = vel;
-        let key = world.section_frontier_key;
-        world.refresh_frontier(center);
-        let fresh = world.desired_sections(center);
-        // Held sections still wait on chunks no test loads; the rest is the selection.
-        let selected: Vec<_> = world.section_desired.iter().copied().filter(|s| !world.section_held.contains_key(s)).collect();
-        assert_eq!(selected, fresh, "the cached frontier is the fresh one");
-        let memo = &world.near_bounds;
-        assert!(memo.rects.values().all(|e| e.1 == memo.pass), "stale rects kept");
-        world.section_frontier_key != key
-    };
-    assert!(refresh(&mut world, y, DVec3::ZERO), "first pass selects");
-    assert!(!world.section_desired.is_empty());
-    assert!(!refresh(&mut world, y + 0.2, DVec3::ZERO), "same block");
-    assert!(refresh(&mut world, y + 1.0, DVec3::ZERO), "next block");
-    assert!(refresh(&mut world, y + 1.0, DVec3::new(100.3, 0.0, 0.0)), "prediction starts");
-    assert!(!refresh(&mut world, y + 1.0, DVec3::new(100.6, 0.0, -0.4)), "jitter in one chunk");
-    assert!(refresh(&mut world, y + 1.0, DVec3::new(120.0, 0.0, 0.0)), "next chunk of lookahead");
-}
-
-/// Several km/s keeps the far-field sweep on a fixed grid. One chunk and a
-/// few metres of altitude do not rebuild it. The same chunk step below that
-/// speed does, and so does a step onto the next grid cell.
-#[test]
-fn fast_frontier_holds_on_a_fixed_grid() {
-    use crate::render_config::RenderConfig;
-
-    let mut world = round_world(42, RenderConfig::default());
-    let spawn = world.chart_spawn().expect("the start world is charted");
-    let eye = world.chart_eye(spawn).expect("spawn stands on a chart");
-    let center = Coord::new(
-        (eye.x / 16.0).floor() as i32,
-        (eye.y / 16.0).floor() as i32,
-        (eye.z / 16.0).floor() as i32,
-    );
-    world.adopt_fold(center);
-    world.center = Some(center);
-    world.update_lod_face(center);
-    assert!(world.section_on_chart(center), "spawn streams from a chart's storage");
-    let inside = if center.x.rem_euclid(FRONTIER_CHUNK_QUANTUM) + 1 < FRONTIER_CHUNK_QUANTUM {
-        Coord::new(center.x + 1, center.y, center.z)
-    } else {
-        Coord::new(center.x - 1, center.y, center.z)
-    };
-    assert!(world.section_on_chart(inside), "one chunk stays on the chart");
-
-    // Mid-bucket altitude, so a few metres cannot cross the 512 m grid.
-    let y = 256.0;
-    world.stream_pacer.update(DVec3::new(2000.0, 0.0, 0.0), 0.0);
-    assert_eq!(world.frontier_bucket(inside.x), world.frontier_bucket(center.x));
-    world.section_eye_y = y;
-    world.section_vel = DVec3::ZERO;
-    world.refresh_frontier(center);
-    let held = world.section_frontier_key;
-    let desired = world.section_desired.clone();
-    world.section_eye_y = y + 20.0;
-    world.refresh_frontier(inside);
-    assert_eq!(world.section_frontier_key, held, "inside the grid the key holds");
-    assert_eq!(world.section_desired, desired, "the sweep is not redone");
-
-    world.stream_pacer.update(DVec3::new(100.0, 0.0, 0.0), 0.0);
-    world.section_eye_y = y;
-    world.refresh_frontier(center);
-    let slow = world.section_frontier_key;
-    world.refresh_frontier(inside);
-    assert_ne!(world.section_frontier_key, slow, "below the coarse speed one chunk rebuilds");
-
-    world.stream_pacer.update(DVec3::new(2000.0, 0.0, 0.0), 0.0);
-    world.section_eye_y = y;
-    world.refresh_frontier(center);
-    let again = world.section_frontier_key;
-    let jumped = Coord::new(center.x + FRONTIER_CHUNK_QUANTUM, center.y, center.z);
-    world.refresh_frontier(jumped);
-    assert_ne!(world.section_frontier_key, again, "a chunk-grid step rebuilds the sweep");
-    world.section_eye_y = y + FRONTIER_EYE_QUANTUM;
-    world.refresh_frontier(center);
-    assert_ne!(world.section_frontier_key, again, "an altitude-grid step rebuilds the sweep");
-}
-
 /// Desired sections with no Ready self or ancestor.
 fn uncovered(world: &World) -> usize {
     world.section_desired.iter().filter(|&&c| !world.section_covered(c)).count()
@@ -2124,65 +1612,11 @@ fn far_chart_seam_readiness_converges() {
     }
 }
 
-/// The far field's thresholds hold while hovering. The chart rings' scale rises with the height
-/// over the ground and falls back only well below where it rose; the chart under the eye is kept
-/// past the far reach once the far field stands on it; and just below the near window's reach
-/// the far field is the frontier it stays just above it.
-#[test]
-fn far_eye_thresholds_hold() {
-    use crate::render_config::RenderConfig;
-
-    let mut world = round_world(42, RenderConfig::default());
-    let up = DVec3::new(0.0, 1.0, 0.0);
-    let climb = |world: &mut World, above: f64| {
-        world.place_eyes(world.home_eye(up, above));
-        (world.far_scale, world.far_atlas.is_some())
-    };
-    // Default ladder: the rings reach 12,288 blocks, so a doubling is taken past 4,096 · 2^s of
-    // height and dropped below 4,096 · 2^s / 1.25.
-    let path = [
-        (0.0, 0, "ground"),
-        (4_600.0, 1, "past the first step"),
-        (3_700.0, 1, "held below the first step"),
-        (2_800.0, 0, "dropped well below it"),
-        (9_000.0, 2, "past the second step"),
-        (7_200.0, 2, "held below the second step"),
-        (6_000.0, 1, "dropped one step"),
-        (20_000.0, 3, "at the candidate cap"),
-        (200_000.0, 3, "held at the cap"),
-    ];
-    for (above, scale, what) in path {
-        assert_eq!(climb(&mut world, above), (scale, true), "+{above}: {what}");
-    }
-    // Past the far reach (262,144 above the stored top, ~2,000 over the ground): kept once
-    // stood on, left past the hold, and not taken again until back under the reach.
-    assert!(climb(&mut world, 280_000.0).1, "held past the far reach");
-    assert!(!climb(&mut world, 340_000.0).1, "left past the hold");
-    assert!(!climb(&mut world, 280_000.0).1, "not re-taken above the reach");
-    assert!(climb(&mut world, 250_000.0).1, "re-taken under the reach");
-
-    // The highest eye the near window still streams on the chart, and the far field there with
-    // the near window on the chart and in physical space.
-    let mut above = 1_000.0;
-    while world.chart_eye(world.home_eye(up, above + 16.0)).is_some() {
-        above += 16.0;
-    }
-    let eye = world.home_eye(up, above);
-    let (near, far) = world.place_eyes(eye);
-    assert_eq!(near, far, "the near window stands on the chart at +{above}");
-    let far_c = eye_chunk(far);
-    world.adopt_fold(far_c);
-    let on_chart = world.desired_sections(far_c);
-    world.adopt_fold(eye_chunk(eye));
-    assert!(world.fold.is_identity());
-    assert!(!on_chart.is_empty(), "+{above}: no chart sections");
-    assert_eq!(world.desired_sections(far_c), on_chart, "+{above}: the far field changes at the near window's reach");
-}
-
 /// Stand the eye `above` blocks over the start world in direction `dir`, the way `stream`
 /// places it: the near window back in physical space, the far field on the chart under it,
-/// and no sections resident.
-fn hover(world: &mut World, dir: DVec3, above: f64, name: &str) {
+/// and no sections resident. Returns whether the ground is within the rule's horizon: past it
+/// nothing is selected (the body's impostor draws it).
+fn hover(world: &mut World, dir: DVec3, above: f64, name: &str) -> bool {
     let (near, far) = world.place_eyes(world.home_eye(dir, above));
     let near_c = eye_chunk(near);
     world.sections.clear();
@@ -2194,7 +1628,14 @@ fn hover(world: &mut World, dir: DVec3, above: f64, name: &str) {
     assert!(world.fold.is_identity(), "{name}: the near window is not in physical space");
     assert!(!world.far_fold.is_identity(), "{name}: the far field does not stand on a chart");
     publish_far(world);
-    assert!(!world.section_desired.is_empty(), "{name}: no chart sections");
+    let far_c = world.section_center().expect("a far centre");
+    let horizon = world.far_ground(far_c).map(|g| world.rule_on(g).horizon()).expect("a chart under the far eye");
+    if above >= horizon {
+        assert!(world.section_desired.is_empty(), "{name}: {} sections past the horizon", world.section_desired.len());
+        return false;
+    }
+    assert!(!world.section_desired.is_empty(), "{name}: no chart sections: {}", world.rule_roots_debug(world.far_ground(far_c).expect("ground"), world.phys_eye(far_c, true)));
+    true
 }
 
 /// Select the far frontier around the far centre and publish the view to the worker gate, as
@@ -2221,7 +1662,9 @@ fn far_chart_altitude_readiness_converges() {
     for (site, dir, heights) in World::FAR_SITES {
         for &above in heights {
             let name = &format!("{site} +{above}");
-            hover(&mut world, dir, above, name);
+            if !hover(&mut world, dir, above, name) {
+                continue;
+            }
             let mut landed = Landed::default();
             let passes = drive_sections(&mut world, name, &mut landed);
             println!(
@@ -2235,7 +1678,7 @@ fn far_chart_altitude_readiness_converges() {
     }
 }
 
-/// The far centre moving while the frontier fills, 50 km over every far site: one chunk every
+/// The far centre moving while the frontier fills, 8 km over every far site: one chunk every
 /// few passes, re-publishing the view each time as `stream` does, and stopping well before the
 /// frontier has landed. Every view change re-measures the queued far work, so a horizon short
 /// of the coarsest ring's corners, or a neighbour chart measured a face box away, would
@@ -2248,10 +1691,10 @@ fn far_chart_altitude_readiness_converges_while_moving() {
     const MOVES: usize = 48;
     const PASSES_PER_MOVE: usize = 12;
     let mut world = round_world(42, RenderConfig::default());
-    let above = 50_000.0;
+    let above = 8_000.0;
     for (site, dir, _) in World::FAR_SITES {
         let name = &format!("{site} +{above} moving");
-        hover(&mut world, dir, above, name);
+        assert!(hover(&mut world, dir, above, name), "{name}: past the horizon");
         let mut landed = Landed::default();
         for _ in 0..MOVES {
             let c = world.section_center().expect("a far centre");
@@ -2270,19 +1713,6 @@ fn far_chart_altitude_readiness_converges_while_moving() {
         assert_eq!(landed.wanted, 0, "{name}: the gate descheduled wanted sections");
         assert_eq!(uncovered(&world), 0, "{name}: sections left uncovered");
     }
-}
-
-/// Far tiles: block distances in the millions, whose squares overflow i32.
-#[test]
-fn span_reach_holds_far_tiles_without_overflow() {
-    use super::super::section::SectionPos;
-    let s = SectionPos { body: 2, face: Face::PosY, detail: crate::ident::Detail(6), x: 1000, z: -1000 };
-    let (far, near) = span_reach(s, 0, 0);
-    let (x0, z1) = (f64::from(s.min_x()), f64::from(s.min_z() + s.span()));
-    let near_want = x0.hypot(z1) as f32;
-    assert!(near > 1.0e6 && (near - near_want).abs() < 1.0, "near {near} vs {near_want}");
-    assert!(far > near);
-    assert_eq!(span_reach(s, s.min_x() + 1, s.min_z() + 1).1, 0.0, "inside the tile");
 }
 
 /// Records the steps a stream pass takes, in order, and runs them headless.

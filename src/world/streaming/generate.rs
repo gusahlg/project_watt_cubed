@@ -104,6 +104,8 @@ pub(in crate::world) struct GenCursor {
 struct GenKey {
     center: Coord,
     data_box: ChunkBox,
+    /// The near field's revision: which columns load inside the box.
+    near: u32,
     lh: i32,
     lv: i32,
     heading: i8,
@@ -348,6 +350,7 @@ impl World {
         GenKey {
             center,
             data_box: self.data_box(center),
+            near: self.near.rev,
             lh: self.load_h,
             lv: self.load_v,
             heading: self.load_heading,
@@ -358,7 +361,8 @@ impl World {
     /// Classify the data box once, store uniform chunks, and queue the rest.
     fn rebuild_gen_cursor(&mut self, center: Coord) {
         self.counters.gen_cursor_rebuilds += 1;
-        let mut coords: Vec<Coord> = self.view_coords(self.load_data_box(center)).collect();
+        let (near, fold) = (&self.near, self.fold);
+        let mut coords: Vec<Coord> = self.view_coords(self.load_data_box(center)).filter(|&c| near.loads(fold.fold(c))).collect();
         if let Some(slab) = self.spawn_slab {
             coords.extend(self.view_coords(slab));
         }
@@ -456,7 +460,8 @@ impl World {
     /// Ensure every chunk within the data box of `center` exists (voxel data
     /// only). Cheap and GPU-free, so it also seeds headless queries.
     pub(in crate::world) fn ensure_region_data(&mut self, center: Coord) {
-        let coords: Vec<Coord> = self.view_coords(self.data_box(center)).collect();
+        let (near, fold) = (&self.near, self.fold);
+        let coords: Vec<Coord> = self.view_coords(self.data_box(center)).filter(|&c| near.loads(fold.fold(c))).collect();
         for coord in coords {
             self.ensure_data(coord);
         }

@@ -79,7 +79,7 @@ impl World {
         };
         self.edit_generation += 1;
         // The window's ground may have moved with this edit.
-        self.window.stale = true;
+        self.near.stale = true;
         // Skylight ceiling upkeep: a roof appearing above a column's
         // current ceiling raises it; the topmost edited roof disappearing
         // lowers it. Either way the cached window is stale, and every loaded
@@ -196,8 +196,9 @@ impl World {
     }
 
     /// The body, face, face-local `(u, v)` and altitude of an edited cell's section grid.
-    /// A storage cell dirties its chart section (storage +Y is the chart's up). A cube face maps
-    /// the cell through the face frame. A flat world keeps the `[0, 512)` window.
+    /// A storage cell on a band-0 chart dirties that patch's tile, counted from its origin, at its
+    /// storage altitude (storage +Y is the chart's up). A cube face maps the cell through the face
+    /// frame. A flat world keeps the `[0, 512)` window.
     fn edit_face_cell(&self, x: i32, y: i32, z: i32) -> Option<(u16, Face, i32, i32, i32)> {
         let s = [i64::from(x), i64::from(y), i64::from(z)];
         for (index, atlas) in self.generator.atlases().iter().enumerate() {
@@ -218,9 +219,11 @@ impl World {
                 let (u, a, v) = FaceFrame::new(face).cell_to_local((px, py, pz));
                 return Some((g.body, face, u, v, a));
             }
-            if atlas.locate(s).is_some() {
+            if let Some((patch, _)) = atlas.locate(s) {
+                let crate::space::atlas::Patch::Shell { band: 0, face } = patch else { return None };
                 let body = super::section::CHART_BODY_BASE + index as u16;
-                return Some((body, Face::PosY, x, z, y));
+                let (ox, oz) = self.generator.chart_origin(body, face)?;
+                return Some((body, face, x - ox, z - oz, y));
             }
         }
         let Some(cosmos) = self.generator.cosmos() else {
@@ -256,7 +259,7 @@ impl World {
         let mut hits: Vec<(SectionPos, Option<(i32, i32)>, u64)> = Vec::new();
         for (x, y, z) in cells {
             let Some((body, face, u, v, a)) = self.edit_face_cell(x, y, z) else { continue };
-            for detail in self.section_pyramid.active_lods() {
+            for detail in self.rule_details(body) {
                 let span = super::section::section_span(detail);
                 let pos = SectionPos { body, face, detail, x: u.div_euclid(span), z: v.div_euclid(span) };
                 let at = match hits.iter().position(|hit| hit.0 == pos) {

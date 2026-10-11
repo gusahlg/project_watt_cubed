@@ -16,9 +16,7 @@ use crate::coord::{ChunkCoord, Face};
 use crate::ident::Detail;
 use super::generation::TerrainGenerator;
 use super::lod;
-use super::metric::HeightEnvelope;
 use super::section::{FINEST_DETAIL, LOD_FLOOR_Y, SECTION_N, SectionPos, section_span};
-use super::summary::{CellError, CellSummary};
 
 /// The world region and detail band a bake covers. The finest level is always
 /// [`FINEST_DETAIL`] (the LOD extractor's own granularity); `coarsest` matches the
@@ -55,10 +53,6 @@ pub(in crate::world) struct MipCell {
 }
 
 impl MipCell {
-    /// The cell's relief (hi - lo). Zero for flat terrain, allowing coarse drawing at any distance.
-    fn err(&self) -> f32 {
-        self.hi - self.lo
-    }
 }
 
 /// One detail level's dense grid of cells, row-major over `[x0, x0+nx) × [z0, z0+nz)`
@@ -133,20 +127,6 @@ impl HeightMip {
             levels.push(build_level(terra, colors, detail, x0, z0, nx, nz, child, face, body, datum));
         }
         HeightMip { finest, coarsest, levels }
-    }
-
-    /// The summary for a cell: the baked envelope + recorded ε when the cell sits in
-    /// the extent, else the worst-case fallback (full domain envelope, `2^detail`
-    /// error) — a section beyond the bake is treated as maximally uncertain.
-    pub fn summary(&self, cell: SectionPos) -> CellSummary {
-        if let Some(c) = self.cell(cell) {
-            CellSummary { env: HeightEnvelope::new(c.lo, c.hi), err: CellError::from_metres(c.err()) }
-        } else {
-            CellSummary {
-                env: HeightEnvelope::new(0.0, super::section::DOMAIN_H as f32),
-                err: CellError::worst_case(cell.detail),
-            }
-        }
     }
 
     pub(in crate::world) fn allocated_bytes(&self) -> usize {
@@ -284,9 +264,23 @@ fn sample_section<G: TerrainGenerator + ?Sized>(
     body: u16,
     datum: i32,
 ) -> MipCell {
-    let cell = lod::cell(detail);
     let span = section_span(detail);
-    let (min_x, min_z) = (ax * span, az * span);
+    sample_section_at(terra, colors, detail, ax * span, az * span, face, body, datum)
+}
+
+/// [`sample_section`] of the square whose min corner is `(min_x, min_z)`.
+#[allow(clippy::too_many_arguments)]
+fn sample_section_at<G: TerrainGenerator + ?Sized>(
+    terra: &G,
+    colors: &[Color],
+    detail: Detail,
+    min_x: i32,
+    min_z: i32,
+    face: Face,
+    body: u16,
+    datum: i32,
+) -> MipCell {
+    let cell = lod::cell(detail);
     let mut fold = MipFold::new();
     let mut below = [AIR; 1];
     for iz in 0..SECTION_N as i32 {
@@ -411,14 +405,7 @@ fn resample_face_cell<G: TerrainGenerator + ?Sized>(
     let (alo, ahi) = super::section::sample_window(lo, hi, cell);
     let n = ((ahi - alo) / cell).max(1);
     let ys = super::section::column_ys(pos.detail, alo, n, cell);
-    let flat = super::section::flatten_edits(edits);
-    let remapped;
-    let used: &[_] = if pos.face == Face::PosY {
-        &flat
-    } else {
-        remapped = super::section::face_edits(&flat, pos.face);
-        &remapped
-    };
+    let used = super::section::frame_edits(pos, terra, edits);
     let mut column = vec![AIR; ys.len()];
     let mut fold = MipFold::new();
     for iz in 0..SECTION_N as i32 {
@@ -430,7 +417,7 @@ fn resample_face_cell<G: TerrainGenerator + ?Sized>(
             } else {
                 terra.lod_column_face(pos.body, pos.face, u, v, &ys, &mut column);
             }
-            super::section::apply_edits(&mut column, used, fx, fz, cell, alo);
+            super::section::apply_edits(&mut column, &used, fx, fz, cell, alo);
             let (h, block) = match column.iter().rposition(|&id| id != AIR) {
                 Some(j) => (alo + (j as i32 + 1) * cell, column[j]),
                 None => (alo, AIR),
@@ -451,6 +438,9 @@ fn resample_face_cell<G: TerrainGenerator + ?Sized>(
 
 /// The block whose colour the bake records for column `(u, v)` ([`sample_section`]).
 fn bake_surface_block<G: TerrainGenerator + ?Sized>(terra: &G, body: u16, face: Face, u: i32, v: i32) -> crate::block::registry::BlockId {
+    if let Some((ox, oz)) = terra.chart_origin(body, face) {
+        return terra.surface_at(u + ox, v + oz);
+    }
     if face == Face::PosY {
         return terra.surface_at(u, v);
     }
@@ -605,7 +595,6 @@ mod tests {
                     for q in 0..4 {
                         let Some(c) = child.get(2 * ax + (q & 1), 2 * az + (q >> 1)) else { continue };
                         assert!(p.lo <= c.lo && p.hi >= c.hi, "parent env does not contain child");
-                        assert!(p.err() >= c.err(), "parent ε {} < child ε {}", p.err(), c.err());
                         checked += 1;
                     }
                 }
@@ -625,14 +614,10 @@ mod tests {
         for w in mip.levels.windows(2) {
             assert!(w[0].cells.len() <= w[1].cells.len(), "finer level not sparser");
         }
-        // Section beyond finest coverage uses worst_case at finest detail, but coarser ancestor is baked.
+        // A section beyond the finest coverage is not baked, but its coarser ancestor is.
         let finest = &mip.levels[0];
         let past = SectionPos { body: 0, face: Face::PosY, detail: FINEST_DETAIL, x: finest.x0 + finest.nx as i32 + 1, z: 0 };
-        assert_eq!(
-            mip.summary(past).err.get(),
-            CellError::worst_case(FINEST_DETAIL).get(),
-            "finest section past coverage should be worst_case"
-        );
+        assert!(mip.relief_band(past).is_none(), "a finest section past coverage is not baked");
         // Its coarsest ancestor (same ground, largest coverage) is inside the bake.
         let anc = SectionPos { body: 0, face: Face::PosY, detail: mip.coarsest, x: past.x >> (mip.coarsest.0 - FINEST_DETAIL.0), z: 0 };
         assert!(mip.color(anc).is_some(), "coarse ancestor should be baked");
@@ -645,16 +630,6 @@ mod tests {
         let a = small(&reg, &g);
         let b = small(&reg, &g);
         assert!(a == b, "two bakes of one seed differ");
-    }
-
-    /// The worst-case fallback covers cells outside the baked extent.
-    #[test]
-    fn summary_falls_back_beyond_extent() {
-        let (reg, g) = terra(3);
-        let mip = small(&reg, &g);
-        let far = SectionPos { body: 0, face: Face::PosY, detail: FINEST_DETAIL, x: 1_000_000, z: 0 };
-        let s = mip.summary(far);
-        assert_eq!(s.err.get(), CellError::worst_case(FINEST_DETAIL).get());
     }
 
     /// Build a single-level mip from a per-cell `(lo, hi)` closure — full control
@@ -843,17 +818,13 @@ mod tests {
             .expect("spawn is charted");
         let body = super::super::section::CHART_BODY_BASE + index as u16;
         for detail in [FINEST_DETAIL, Detail(FINEST_DETAIL.0 + 4)] {
-            let span = section_span(detail);
-            let pos = SectionPos {
-                body,
-                face: Face::PosY,
-                detail,
-                x: (eye.x as i32).div_euclid(span),
-                z: (eye.z as i32).div_euclid(span),
-            };
-            let datum = terra.face_datum(body, Face::PosY);
+            // The overlay reads the tile counted from its patch; the bake reads its storage square.
+            let pos = world.tile_at(body, detail, eye.x as i64, eye.z as i64).expect("a chart tile");
+            let [x0, z0, ..] = world.tile_rect(pos);
+            let (x0, z0) = (x0 as i32, z0 as i32);
+            let datum = terra.face_datum(body, pos.face);
             assert!(datum > 1_000_000, "the chart datum sits far up storage +Y: {datum}");
-            let bake = sample_section(terra, &colors, detail, pos.x, pos.z, Face::PosY, body, datum);
+            let bake = sample_section_at(terra, &colors, detail, x0, z0, Face::PosY, body, datum);
             let got = resample_cell(pos, terra, &[], &colors).expect("the chart has a surface here");
             let cell = pos.cell_size() as f32;
             assert!(
@@ -872,9 +843,9 @@ mod tests {
             // Fill the first column's top sample cell of the window: the overlay sees it.
             let rock = world.registry().id_by_label("rock").unwrap();
             let c = pos.cell_size();
-            let (lo, hi) = terra.surface_bounds(body, Face::PosY, pos.min_x(), pos.min_z(), pos.span()).unwrap();
+            let (lo, hi) = terra.surface_bounds(body, pos.face, pos.min_x(), pos.min_z(), pos.span()).unwrap();
             let (_, ahi) = super::super::section::sample_window(lo, hi, c);
-            let (wx, wz) = (pos.min_x() + c / 2, pos.min_z() + c / 2);
+            let (wx, wz) = (x0 + c / 2, z0 + c / 2);
             let edits: Vec<_> = (ahi - c..ahi)
                 .map(|y| {
                     let (coord, local) = BlockCoord::new(wx, y, wz).split();

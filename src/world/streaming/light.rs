@@ -476,7 +476,7 @@ impl World {
             && Face::ALL.iter().all(|&f| {
                 // A grid, or the reduced window will not schedule the flood.
                 let n = self.neighbour(coord, f);
-                lit(n) || !self.window_admits(*window.get_or_insert_with(|| self.load_window()), n, true)
+                lit(n) || !self.near.loads(self.fold.fold(n)) || !self.window_admits(*window.get_or_insert_with(|| self.load_window()), n, true)
             })
     }
 

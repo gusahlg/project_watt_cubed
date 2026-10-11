@@ -908,6 +908,20 @@ Families are migrated one per commit behind P11's site engine, and the old famil
 7. **Body count targets** for the lab to tune toward: the proposal is a median of 8-20 and a cap of 64. The engine caps stay at 32 impostors (nearest-first), 8 far maps and 8 observatory aims.
 8. **Breaking the mod API.** dev-toolkit /bodies and /tp move to names and traits. `Kind` stays for one release.
 
+**The owner's answers (2026-10-11):**
+- **A. Suites gate:** ship P2 with the palette-suite fallback. The own-suite share (62% in the P1b lab) is a metric
+  to raise, not a gate.
+- **B. Dense start world:** allowed (radius about 4,850 km at the same spawn pull). Judge it in game.
+- **1. Wonders:** outcomes only, never guaranteed.
+- **2. Cube moons:** the law decides.
+- **3. Spawn:** the pull stays exact and the garden is the one exception. Structures near spawn appear only if a
+  culture exists.
+- **4. Start world surface:** stays on palette roles until the owner sees P4. Its deep bulk uses its suite from P2.
+- **5. Saves:** each phase ships on its own. P2-P6 each bump WORLDGEN_VERSION under the end-of-day release rule.
+- **6. Interest filter:** kept.
+- **7. Body count:** median 8-20, cap 64.
+- **8. Mod API:** /tp and /bodies move to names and traits. `Kind` stays one release.
+
 ### 7.2 Technical risks
 
 | Risk | Mitigation |

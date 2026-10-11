@@ -24,6 +24,8 @@ pub struct Warp {
     nodes: Vec<DVec3>,
     /// Largest nodal displacement, in blocks.
     max_disp: f64,
+    /// Bound on how fast the displacement changes: `|u(x) − u(y)| ≤ max_slope · |x − y|`.
+    max_slope: f64,
 }
 
 impl Warp {
@@ -59,7 +61,9 @@ impl Warp {
             }
         }
         let max_disp = nodes.iter().fold(0.0_f64, |m, u| m.max(u.length()));
-        Some(Self { origin, cell, dims: [dims; 3], nodes, max_disp })
+        let mut warp = Self { origin, cell, dims: [dims; 3], nodes, max_disp, max_slope: 0.0 };
+        warp.max_slope = warp.slope_bound();
+        Some(warp)
     }
 
     /// Scale a tabulated lattice onto a body centred at `centre` (the table's `Solved::scale`
@@ -86,12 +90,63 @@ impl Warp {
             }
         }
         let max_disp = nodes.iter().fold(0.0_f64, |m, u| m.max(u.length()));
-        Self { origin, cell, dims, nodes, max_disp }
+        let mut warp = Self { origin, cell, dims, nodes, max_disp, max_slope: 0.0 };
+        warp.max_slope = warp.slope_bound();
+        warp
     }
 
     /// Largest nodal displacement, in blocks.
     pub fn max_displacement(&self) -> f64 {
         self.max_disp
+    }
+
+    /// Bound on the displacement's rate of change ([`Warp::max_slope`]): inside an element the
+    /// trilinear field's derivative along an axis is a blend of that axis's edge differences over
+    /// the edge, so `√3 · max edge difference / cell` bounds it; outside the box it is zero, and
+    /// across the box's faces the field steps by at most a boundary node's displacement over no
+    /// distance, so points straddling a face are bounded by [`max_displacement`] instead.
+    fn slope_bound(&self) -> f64 {
+        let mut worst = 0.0_f64;
+        for k in 0..=self.dims[2] {
+            for j in 0..=self.dims[1] {
+                for i in 0..=self.dims[0] {
+                    let u = self.nodes[self.node(i, j, k)];
+                    let steps = [(i < self.dims[0], (i + 1, j, k)), (j < self.dims[1], (i, j + 1, k)), (k < self.dims[2], (i, j, k + 1))];
+                    for (ok, (a, b, c)) in steps {
+                        if ok {
+                            worst = worst.max((self.nodes[self.node(a, b, c)] - u).length());
+                        }
+                    }
+                }
+            }
+        }
+        3f64.sqrt() * worst / self.cell
+    }
+
+    /// The physical box holding every point of reference box `[lo, hi]` once warped: the box
+    /// moved by the least and the most displacement found at the corners, edge and face midpoints
+    /// and centre of its part inside the lattice, widened by how far the field can change between
+    /// those samples. Outside the lattice nothing moves.
+    pub fn bound_box(&self, lo: DVec3, hi: DVec3) -> (DVec3, DVec3) {
+        let (clo, chi) = (lo.max(self.origin), hi.min(self.hi()));
+        if (0..3).any(|a| clo[a] > chi[a]) {
+            return (lo, hi);
+        }
+        let outside = clo != lo || chi != hi;
+        let (mut umin, mut umax) = if outside { (DVec3::ZERO, DVec3::ZERO) } else { (DVec3::splat(f64::INFINITY), DVec3::splat(f64::NEG_INFINITY)) };
+        for k in 0..3 {
+            for j in 0..3 {
+                for i in 0..3 {
+                    let t = DVec3::new(i as f64, j as f64, k as f64) * 0.5;
+                    let u = self.displacement((clo + (chi - clo) * t).min(self.hi() - DVec3::splat(1e-9)));
+                    umin = umin.min(u);
+                    umax = umax.max(u);
+                }
+            }
+        }
+        // Every point lies within a quarter of the extent of a sample on each axis.
+        let pad = self.max_slope * ((chi - clo) * 0.25).length();
+        (lo + umin - DVec3::splat(pad), hi + umax + DVec3::splat(pad))
     }
 
     #[inline]

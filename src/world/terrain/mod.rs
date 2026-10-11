@@ -75,6 +75,22 @@ fn chart_body(body: u16) -> Option<usize> {
     (body >= base).then(|| (body - base) as usize)
 }
 
+/// A chart tile's patch-local `(u, v)` in storage: `None` off charts or past the atlas.
+fn chart_storage(storage: &storage::StorageWorlds, body: u16, face: Face, u: i32, v: i32) -> Option<(usize, i32, i32)> {
+    let index = chart_body(body)?;
+    let (ox, oz) = chart_patch_origin(storage, index, face)?;
+    Some((index, ox.checked_add(u)?, oz.checked_add(v)?))
+}
+
+/// Storage `(x, z)` atlas `index`'s band-0 patch `face` counts its tiles from: its storage box's
+/// corner, so every tile of every level lies inside the patch.
+fn chart_patch_origin(storage: &storage::StorageWorlds, index: usize, face: Face) -> Option<(i32, i32)> {
+    let atlas = storage.chart(index)?;
+    atlas.bands.first()?;
+    let (o, _) = atlas.storage_box(crate::space::atlas::Patch::Shell { band: 0, face });
+    Some((i32::try_from(o[0]).ok()?, i32::try_from(o[2]).ok()?))
+}
+
 /// The generator's knobs, in percent of the default (100 = as designed).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TerrainCfg {
@@ -2211,11 +2227,11 @@ impl TerrainGenerator for Terrain {
     }
 
     fn lod_column_face(&self, body: u16, face: Face, u: i32, v: i32, alts: &[i32], out: &mut [BlockId]) {
-        if let Some(index) = chart_body(body) {
-            if face != Face::PosY {
+        if chart_body(body).is_some() {
+            let Some((index, u, v)) = chart_storage(&self.storage, body, face, u, v) else {
                 out.iter_mut().take(alts.len()).for_each(|o| *o = AIR);
                 return;
-            }
+            };
             if self.storage.home_index() == Some(index) {
                 let _ = self.home_lod_column(u, v, alts, out);
                 return;
@@ -2251,10 +2267,10 @@ impl TerrainGenerator for Terrain {
         if u1 <= u0 || v1 <= v0 {
             return None;
         }
-        if let Some(index) = chart_body(body) {
-            if face != Face::PosY {
-                return None;
-            }
+        if chart_body(body).is_some() {
+            let (index, x0, z0) = chart_storage(&self.storage, body, face, u0, v0)?;
+            let (u1, v1) = (u1 - u0 + x0, v1 - v0 + z0);
+            let (u0, v0) = (x0, z0);
             if self.storage.home_index() == Some(index) {
                 return self.home_rect(u0, v0, u1, v1);
             }
@@ -2266,10 +2282,8 @@ impl TerrainGenerator for Terrain {
     }
 
     fn surface_bounds(&self, body: u16, face: Face, u0: i32, v0: i32, span: i32) -> Option<(i32, i32)> {
-        if let Some(index) = chart_body(body) {
-            if face != Face::PosY {
-                return None;
-            }
+        if chart_body(body).is_some() {
+            let (index, u0, v0) = chart_storage(&self.storage, body, face, u0, v0)?;
             if self.storage.home_index() == Some(index) {
                 return self.home_bounds(u0, v0, span);
             }
@@ -2293,9 +2307,23 @@ impl TerrainGenerator for Terrain {
         Some((lo.min(hi), lo.max(hi)))
     }
 
+    fn chart_origin(&self, body: u16, face: Face) -> Option<(i32, i32)> {
+        chart_patch_origin(&self.storage, chart_body(body)?, face)
+    }
+
+    fn surface_on(&self, body: u16, face: Face, u: i32, v: i32) -> i32 {
+        if chart_body(body).is_none() {
+            return self.surface(face, u, v);
+        }
+        match chart_storage(&self.storage, body, face, u, v) {
+            Some((_, x, z)) => self.surface(Face::PosY, x, z),
+            None => i32::MIN,
+        }
+    }
+
     fn face_datum(&self, body: u16, face: Face) -> i32 {
         if let Some(index) = chart_body(body) {
-            return if face == Face::PosY { self.storage.datum(index).unwrap_or(0) } else { 0 };
+            return self.storage.datum(index).unwrap_or(0);
         }
         let Some(body) = self.cosmos.bodies().iter().find(|b| b.id == body) else { return 0 };
         let cosmos::Shape::Cube { half } = body.shape else { return 0 };
