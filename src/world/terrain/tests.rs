@@ -2330,17 +2330,31 @@ fn every_seed_spawns_on_its_start_world_and_fits_storage() {
 fn world_creation_cost() {
     let n: i64 = std::env::var("CREATION_SEEDS").ok().and_then(|v| v.parse().ok()).unwrap_or(200);
     let _ = make(0);
-    let mut ms: Vec<f64> = (1..=n)
-        .map(|seed| {
-            let mut reg = BlockRegistry::with_builtins();
-            let start = std::time::Instant::now();
-            std::hint::black_box(Terrain::new(&mut reg, seed));
-            start.elapsed().as_secs_f64() * 1e3
-        })
-        .collect();
-    ms.sort_by(f64::total_cmp);
-    let q = |f: f64| ms[((ms.len() - 1) as f64 * f) as usize];
-    println!("world creation over {n} seeds: p50 {:.1} ms, p90 {:.1} ms, p99 {:.1} ms, max {:.1} ms", q(0.5), q(0.9), q(0.99), q(1.0));
+    let time = |f: &mut dyn FnMut(i64)| {
+        let mut ms: Vec<f64> = (1..=n)
+            .map(|seed| {
+                let start = std::time::Instant::now();
+                f(seed);
+                start.elapsed().as_secs_f64() * 1e3
+            })
+            .collect();
+        ms.sort_by(f64::total_cmp);
+        let q = |f: f64| ms[((ms.len() - 1) as f64 * f) as usize];
+        format!("p50 {:.1} ms, p90 {:.1} ms, p99 {:.1} ms, max {:.1} ms", q(0.5), q(0.9), q(0.99), q(1.0))
+    };
+    let cfg = TerrainCfg::default();
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(4);
+    let universe = time(&mut |seed| {
+        std::hint::black_box(emergent::Universe::new(seed as u64, &cfg, &emergent::Params::default(), threads));
+    });
+    let grown = time(&mut |seed| {
+        std::hint::black_box(cosmos::Cosmos::grow(seed as u64, &cfg));
+    });
+    let world = time(&mut |seed| {
+        let mut reg = BlockRegistry::with_builtins();
+        std::hint::black_box(Terrain::new(&mut reg, seed));
+    });
+    println!("over {n} seeds, {threads} threads:\n  universe {universe}\n  cosmos (+ clusters, storage) {grown}\n  world creation (+ suites, warps, relief, painters) {world}");
 }
 
 /// A datum lifts the start world's band-0 cells, not its painting: storage heights stay where the

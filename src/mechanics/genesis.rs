@@ -745,9 +745,23 @@ fn bracket(t: &Table, pi: f64) -> Option<(&TableEntry, &TableEntry, f64)> {
 /// interpolated linearly in `log₂ Π` between the bracketing entries. `None` without a table.
 pub fn tabulated(pi: f64, half: f64) -> Option<Solved> {
     let t = table()?;
+    let (a, b, _) = bracket(t, pi)?;
+    let (elements, nodes) = tabulated_canonical(pi)?;
+    Some(entry_solved(elements, &nodes, a.converged && b.converged, pi, half))
+}
+
+/// The table's matter elements per axis and its canonical nodes (units of the half-size)
+/// interpolated linearly in `log₂ Π` at `Π_g = pi`, as [`tabulated`] reads them. `None` without a
+/// table.
+pub fn tabulated_canonical(pi: f64) -> Option<(usize, Vec<DVec3>)> {
+    let t = table()?;
     let (a, b, w) = bracket(t, pi)?;
-    let nodes: Vec<DVec3> = a.nodes.iter().zip(&b.nodes).map(|(p, q)| *p * (1.0 - w) + *q * w).collect();
-    Some(entry_solved(t.elements, &nodes, a.converged && b.converged, pi, half))
+    Some((t.elements, a.nodes.iter().zip(&b.nodes).map(|(p, q)| *p * (1.0 - w) + *q * w).collect()))
+}
+
+/// Index of canonical node `[p, q, r]` (`p ≤ q ≤ r`) in [`canonical_nodes`] order.
+pub fn canonical_index([p, q, r]: [usize; 3]) -> usize {
+    r * (r + 1) * (r + 2) / 6 + q * (q + 1) / 2 + p
 }
 
 /// The layout the table gives a solid cube of half-size `half` at `Π_g = pi`, with its interpolated
@@ -833,6 +847,13 @@ mod tests {
     #[test]
     fn the_table_writes_back_byte_for_byte() {
         assert_eq!(write_table(table().expect("the table parses")), TABLE);
+    }
+
+    #[test]
+    fn canonical_index_is_the_listing_order() {
+        for (i, &c) in canonical_nodes(9).iter().enumerate() {
+            assert_eq!(canonical_index(c), i, "{c:?}");
+        }
     }
 
     #[test]

@@ -385,12 +385,11 @@ fn home_shape(home: &cosmos::Body) -> Option<(crate::space::datum::DatumField, V
 /// The warps of the cubes whose matter sags past half a block (`Form::Warped`): the tabulated
 /// relaxed cube of each body's own `Π_g` and size.
 fn cube_warps(cosmos: &cosmos::Cosmos) -> Vec<(u16, Arc<crate::space::warp::Warp>)> {
-    use crate::mechanics::genesis;
     let mut out = Vec::new();
     for b in cosmos.bodies().iter().filter(|b| b.traits.form == cosmos::Form::Warped) {
         let cosmos::Shape::Cube { half } = b.shape else { continue };
-        let solved = genesis::tabulated(b.traits.pi_g, half as f64).expect("the genesis table");
-        out.push((b.id, Arc::new(crate::space::warp::Warp::from_solved(&solved, b.centre_f()))));
+        let warp = crate::space::warp::Warp::tabulated(b.traits.pi_g, half as f64, b.centre_f()).expect("the genesis table");
+        out.push((b.id, Arc::new(warp)));
     }
     out
 }
