@@ -23,6 +23,10 @@ pub(in crate::world) struct Leaf {
     pub dist: f64,
 }
 
+/// Most leaves a cut may hold. The rule bounds the cut by construction (about 640 tiles); a cut
+/// that runs past this is a broken box, and the traversal stops rather than exhaust memory.
+const LEAF_GUARD: usize = 1 << 14;
+
 impl Rule {
     /// The cut around `eye` on `surface`, into `out` (cleared first). `stack` is reused scratch.
     pub fn select(&self, eye: &PhysBox, surface: &mut impl Surface, stack: &mut Vec<SectionPos>, out: &mut Vec<Leaf>) {
@@ -31,6 +35,10 @@ impl Rule {
         surface.roots(self, eye.centre(), stack);
         let horizon = self.horizon();
         while let Some(s) = stack.pop() {
+            if out.len() + stack.len() > LEAF_GUARD {
+                debug_assert!(false, "the rule's cut ran past {LEAF_GUARD} nodes at {s:?}");
+                break;
+            }
             let Some(b) = surface.node_box(s) else { continue };
             let dist = b.dist_box(eye);
             if dist >= horizon {

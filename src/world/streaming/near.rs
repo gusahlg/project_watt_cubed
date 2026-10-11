@@ -461,8 +461,14 @@ impl World {
                     let v = if c & 4 == 0 { v0 } else { v1 + 1 };
                     f.point_to_world(DVec3::new(f64::from(u), if c & 2 == 0 { y0 } else { y1 }, f64::from(v)))
                 });
-                let pad = warp.as_ref().map_or(0.0, |w| w.max_displacement()) + 1.0;
-                PhysBox::around(corners, pad)
+                let b = PhysBox::around(corners, 1.0)?;
+                Some(match warp {
+                    Some(w) => {
+                        let (lo, hi) = w.bound_box(b.lo, b.hi);
+                        PhysBox { lo, hi }
+                    }
+                    None => b,
+                })
             }
             Frame::Flat => {
                 let (x0, z0) = (f64::from(real.a * cs), f64::from(real.b * cs));

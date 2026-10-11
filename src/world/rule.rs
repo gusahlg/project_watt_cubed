@@ -160,9 +160,15 @@ impl World {
             let (x, y, z) = frame.cell_to_world((p.x as i32, p.y as i32, p.z as i32));
             DVec3::new(f64::from(x), f64::from(y), f64::from(z))
         };
-        // A warp moves every point by at most its largest displacement.
-        let pad = bend.as_ref().and_then(|b| b.atlas.warp.as_ref()).map_or(0.0, |w| w.max_displacement()) + 1.0;
-        PhysBox::around(corners.map(world), pad)
+        let b = PhysBox::around(corners.map(world), 1.0)?;
+        // A warped cube: the box its warp can move the tile to.
+        Some(match bend.as_ref().and_then(|b| b.atlas.warp.as_ref()) {
+            Some(w) => {
+                let (lo, hi) = w.bound_box(b.lo, b.hi);
+                PhysBox { lo, hi }
+            }
+            None => b,
+        })
     }
 }
 
