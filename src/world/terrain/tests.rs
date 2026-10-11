@@ -2558,3 +2558,107 @@ fn column_generation_costs() {
         println!("{name}: {:.0} µs per 4-chunk column", start.elapsed().as_secs_f64() * 1e6 / reps as f64);
     }
 }
+
+/// Seeds the worldgen digest is pinned for: the golden seed, 42 and the owner's seed.
+const DIGEST_SEEDS: [i64; 3] = [0xC0FFEE, 42, 1_791_184_794_939_118_871];
+/// [`worldgen_digest`] of [`DIGEST_SEEDS`] at the current `WORLDGEN_VERSION`.
+const DIGEST_PINS: [u64; 3] = [0x1f71eba60b4ff3a8, 0x460ca935f8e6e11f, 0xae29e197774929c9];
+
+/// What a seed generates, as bytes: the catalog, then chunks at every body's surface (each face of
+/// a cube, each band-0 chart of a round body), a deep chunk per cube, rocks of the first clusters,
+/// the spawn column with its heights, and the sky and class of every chunk. Bodies are read by
+/// shape only, so the same digest covers any catalog.
+fn worldgen_digest(seed: i64) -> u64 {
+    let (_reg, t) = make(seed);
+    let mut h = crate::hash::Fnv64::new();
+    let mut chunks: Vec<(i32, i32, i32)> = Vec::new();
+    for b in t.cosmos.bodies() {
+        h.bytes(&b.id.to_le_bytes()).bytes(&b.seed.to_le_bytes()).bytes(&b.density.to_bits().to_le_bytes());
+        for c in b.centre {
+            h.bytes(&c.to_le_bytes());
+        }
+        let size = match b.shape {
+            cosmos::Shape::Cube { half } => [0, half, 0],
+            cosmos::Shape::Ball { r } => [1, r, 0],
+            cosmos::Shape::Shell { outer, inner } => [2, outer, inner],
+        };
+        for v in size {
+            h.bytes(&v.to_le_bytes());
+        }
+        if let cosmos::Shape::Cube { half } = b.shape {
+            for face in Face::ALL {
+                let (cx, cy, cz) = face_centre_chunk(&t, b, face);
+                chunks.extend([(cx, cy, cz), (cx, cy - 1, cz), (cx, cy + 1, cz)]);
+            }
+            let deep = occupy(&t, b, face_world(b, Face::PosY, 40, -(half as i32) / 2, -24));
+            chunks.push(chunk_of(deep.map(i64::from)));
+            continue;
+        }
+        for atlas in t.atlases().iter().filter(|a| a.grid.is_none() && (a.centre - b.centre_f()).length() < 1.0) {
+            let n = atlas.bands[0].n;
+            for face in Face::ALL {
+                for (i, j) in [(n / 2, n / 2), (n / 5, n * 3 / 4)] {
+                    let s = atlas.storage(Patch::Shell { band: 0, face }, [i, 0, j]);
+                    let (sx, sz) = (s[0] as i32, s[2] as i32);
+                    let y = t.surface(Face::PosY, sx, sz);
+                    for hv in t.heights_16(sx.div_euclid(16), sz.div_euclid(16)) {
+                        h.bytes(&hv.to_le_bytes());
+                    }
+                    if y == i32::MIN || y >= storage::BURIED {
+                        continue;
+                    }
+                    chunks.extend([(sx.div_euclid(16), (y - 1).div_euclid(16), sz.div_euclid(16)), (sx.div_euclid(16), (y - 33).div_euclid(16), sz.div_euclid(16))]);
+                }
+            }
+        }
+    }
+    for c in t.cosmos.clusters().iter().take(4) {
+        let p = [c.centre.x as i64, c.centre.y as i64, c.centre.z as i64];
+        let mut rocks = Vec::new();
+        t.cosmos.rocks_touching(p, p, &mut rocks);
+        for r in rocks.iter().take(3) {
+            let (cx, cy, cz, _) = solid_chunk(&t, r);
+            chunks.push((cx, cy, cz));
+        }
+    }
+    if let Some(spawn) = t.chart_spawn() {
+        let p = [spawn.x.floor() as i64, spawn.y.floor() as i64, spawn.z.floor() as i64];
+        let (cx, cy, cz) = chunk_of(p);
+        let (column, heights) = t.generate_column(ColumnKey { face: Face::PosY, a: cx, b: cz }, cy - 3..=cy + 1);
+        for (alt, data) in &column {
+            h.bytes(&alt.to_le_bytes());
+            for i in 0..CHUNK_VOLUME {
+                h.bytes(&data.get(i).0.to_le_bytes());
+            }
+        }
+        for hv in heights {
+            h.bytes(&hv.to_le_bytes());
+        }
+    }
+    for (cx, cy, cz) in chunks {
+        let coord = ChunkCoord::new(cx, cy, cz);
+        let class = match t.classify(coord) {
+            Classify::Air => 0u32,
+            Classify::Uniform(id) => 1 + u32::from(id.0),
+            Classify::Mixed => u32::MAX,
+        };
+        let sky = match t.sky(coord) {
+            Sky::Open => 6u8,
+            Sky::Axis(f) => f.index() as u8,
+        };
+        h.bytes(&class.to_le_bytes()).bytes(&[sky]);
+        let data = t.generate(cx, cy, cz);
+        for i in 0..CHUNK_VOLUME {
+            h.bytes(&data.get(i).0.to_le_bytes());
+        }
+    }
+    h.finish()
+}
+
+/// The bytes three pinned seeds generate. A change here is a content change: bump
+/// `WORLDGEN_VERSION` (older saves are refused) and re-pin.
+#[test]
+fn worldgen_digest_is_pinned() {
+    let got: Vec<u64> = DIGEST_SEEDS.iter().map(|&s| worldgen_digest(s)).collect();
+    assert_eq!(got, DIGEST_PINS, "worldgen digest changed; if intended, pin: [{:#018x}, {:#018x}, {:#018x}]", got[0], got[1], got[2]);
+}
