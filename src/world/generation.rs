@@ -224,6 +224,11 @@ pub trait TerrainGenerator: Send + Sync {
         Classify::Mixed
     }
 
+    /// Every cell of `c` is air. A cheap bound for a server's sweep: false when unsure.
+    fn only_air(&self, c: ChunkCoord) -> bool {
+        matches!(self.classify(c), Classify::Air | Classify::Uniform(AIR))
+    }
+
     /// Altitude of the first open cell above the ground along `face` at face-local `(u, v)`.
     /// PosY is [`height`](Self::height). Any other face is open (`i32::MIN`) unless overridden.
     fn surface(&self, face: Face, u: i32, v: i32) -> i32 {
@@ -440,11 +445,17 @@ impl TerrainGenerator for FlatTerrain {
         }
     }
 
+    fn only_air(&self, c: ChunkCoord) -> bool {
+        let n = CHUNK_SIZE as i32;
+        let (x0, y0, z0) = (c.x * n, c.y * n, c.z * n);
+        // FLAT_HALF is a multiple of the chunk size, so a chunk is wholly on or off the slab.
+        y0 >= FLAT_HEIGHT || y0 + n <= self.floor || !Self::on_slab(x0, z0)
+    }
+
     fn generate(&self, cx: i32, cy: i32, cz: i32) -> ChunkData {
         let n = CHUNK_SIZE as i32;
         let (x0, y0, z0) = (cx * n, cy * n, cz * n);
-        // FLAT_HALF is a multiple of the chunk size, so a chunk is wholly on or off the slab.
-        if y0 >= FLAT_HEIGHT || y0 + n <= self.floor || !Self::on_slab(x0, z0) {
+        if self.only_air(ChunkCoord::new(cx, cy, cz)) {
             return ChunkData::Uniform(AIR);
         }
         if y0 + n <= FLAT_HEIGHT - 3 && y0 >= self.floor {

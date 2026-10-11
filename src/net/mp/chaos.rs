@@ -1519,7 +1519,6 @@ fn a_chain_with_no_rival_lands_whole() {
 }
 
 #[test]
-#[ignore = "BUG: a break-then-place chain whose break loses a race is committed on top of the winner, but the chainer keeps showing the winner's block"]
 fn a_chain_that_loses_its_first_edit_to_a_peer_leaves_the_chainer_out_of_step() {
     let panics = panics_so_far();
     let lobby = Lobby::start(config(7, None));
@@ -1547,7 +1546,7 @@ fn a_chain_that_loses_its_first_edit_to_a_peer_leaves_the_chainer_out_of_step() 
 }
 
 #[test]
-#[ignore = "BUG: one novel block in the soil starts a reaction front that never settles; the ledger grows ~1000 cells/s without bound"]
+#[ignore = "LAW: one novel block in the soil starts a reaction front that never settles (selective transfer v1 keeps a disturbed soil reacting with fresh soil); the ledger grows ~1000 cells/s without bound"]
 fn one_novel_block_settles() {
     let panics = panics_so_far();
     let lobby = Lobby::start(config(1, None));
@@ -1573,7 +1572,7 @@ fn one_novel_block_settles() {
 }
 
 #[test]
-#[ignore = "BUG: the silence watchdog ignores snapshot frames, so a join overlay that takes over 5 s to apply reads as a dead link"]
+#[ignore = "slow: a join overlay applied over about 7 s"]
 fn a_long_join_overlay_is_not_a_quiet_link() {
     const CELLS: i32 = 60_000;
     let path = crate::save::store::test_temp_path("chaos-overlay");

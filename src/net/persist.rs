@@ -415,7 +415,7 @@ fn clock_of(mods: &[(String, String)]) -> f32 {
     if day.is_finite() { day.rem_euclid(1.0) } else { DEFAULT_DAY }
 }
 
-/// `ops.txt` (one name a line, `#` comments) and `mods.toml` (`allow` / `deny`
+/// `ops.txt` (one `name` or `name: secret` a line, `#` comments) and `mods.toml` (`allow` / `deny`
 /// string arrays) in the world's directory. A missing file is empty. A
 /// `mods.toml` that is not that shape is an error.
 pub(crate) fn read_side_files(world: &Path) -> Result<SideFiles, String> {
@@ -438,8 +438,8 @@ fn read_ops(path: &Path) -> Result<Ops, String> {
     Ok(parse_ops(&text))
 }
 
-/// One operator a line: `name`, or `name secret` where the last word is the secret.
-/// Names are lowercased; the first line for a name wins.
+/// One operator a line: `name`, trusted by name, or `name: secret`, proved with `/op secret`.
+/// A name may hold spaces but no colon. Names are lowercased; the first line for a name wins.
 pub(crate) fn parse_ops(text: &str) -> Ops {
     let clean = |part: &str| part.chars().filter(|c| !c.is_control()).collect::<String>();
     let mut ops: Vec<String> = Vec::new();
@@ -449,8 +449,8 @@ pub(crate) fn parse_ops(text: &str) -> Ops {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let (name, secret) = match line.rsplit_once(char::is_whitespace) {
-            Some((name, secret)) => (name, Some(clean(secret))),
+        let (name, secret) = match line.split_once(':') {
+            Some((name, secret)) => (name, Some(clean(secret.trim()))),
             None => (line, None),
         };
         let name: String = clean(name).chars().take(super::MAX_NAME).collect();
@@ -609,14 +609,14 @@ mod tests {
     fn side_files_union_ops_and_mod_lists() {
         let dir = crate::save::store::test_temp_path("side");
         fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("ops.txt"), "# staff\nAda\n\n bob \nAda\ncara  s3cret \nCara other\n").unwrap();
+        fs::write(dir.join("ops.txt"), "# staff\nAda\n\n bob \nAda\ncara:  s3cret \nCara: other\nBig Ada\n").unwrap();
         fs::write(
             dir.join("mods.toml"),
             "allow = [\"pwc.hotbar\", \"pwc.hotbar\"]\ndeny = [\"pwc.dev-toolkit\"]\n",
         )
         .unwrap();
         let side = read_side_files(&dir.join("world.save")).unwrap();
-        assert_eq!(side.ops, vec!["ada".to_string(), "bob".to_string()]);
+        assert_eq!(side.ops, vec!["ada".to_string(), "bob".to_string(), "big ada".to_string()], "a name may hold a space");
         assert_eq!(side.op_secrets, vec![("cara".to_string(), "s3cret".to_string())], "the first line for a name wins");
         assert_eq!(side.allow, vec!["pwc.hotbar".to_string()]);
         assert_eq!(side.deny, vec!["pwc.dev-toolkit".to_string()]);

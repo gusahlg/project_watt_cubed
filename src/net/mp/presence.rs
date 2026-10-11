@@ -827,9 +827,8 @@ fn an_honest_flight_at_twenty_km_s_passes_the_speed_envelope() {
 }
 
 /// The same flight where bodies are checked against the ground, through open sky. A report at
-/// 20 km/s covers about 780 blocks, past the 512-block sweep.
+/// 20 km/s covers about 780 blocks, past the 512-block cell sweep, so it is walked a chunk at a time.
 #[test]
-#[ignore = "BUG: a non-cruise move longer than SWEEP_LIMIT fails closed, so flight above ~13 km/s is snapped back every report"]
 fn an_honest_flight_at_twenty_km_s_passes_the_collision_check() {
     let corrections = fly_fast(NoclipPolicy::Off);
     assert!(corrections.is_empty(), "an honest flight was corrected {} times", corrections.len());
@@ -862,7 +861,6 @@ fn an_honest_cruise_through_open_sky_is_never_corrected() {
 /// A cruise slowed tenfold eases down to its new speed over a few frames, as the game's flight
 /// does. Noclip is open, so only the speed envelope judges it.
 #[test]
-#[ignore = "BUG: a lowered cruise cap applies at once, so the client's deceleration toward it is snapped back"]
 fn slowing_a_cruise_is_never_corrected() {
     let lobby = Lobby::flat();
     let (mut ada, mut body) = airborne(&lobby);
@@ -878,7 +876,6 @@ fn slowing_a_cruise_is_never_corrected() {
 /// other frame at 60 Hz). `Game::net_phase` then sends the end of the cruise before the move that
 /// still carries the last cruise step. Noclip is open, so only the speed envelope judges it.
 #[test]
-#[ignore = "BUG: Cruise{0} lands before the move carrying the last cruise step, which is then snapped back"]
 fn ending_a_cruise_is_never_corrected() {
     let lobby = Lobby::flat();
     let (mut ada, mut body) = airborne(&lobby);
@@ -904,7 +901,6 @@ fn ending_a_cruise_is_never_corrected() {
 /// shortfall of a few tens of milliseconds at speed. Noclip is open, so only the speed envelope
 /// judges it.
 #[test]
-#[ignore = "BUG: the envelope's slack is MOVE_FLOOR, not scaled by speed, so a frame-rate rise at speed is snapped back"]
 fn fast_flight_survives_a_rising_frame_rate() {
     let lobby = Lobby::flat();
     let (mut ada, mut body) = airborne(&lobby);

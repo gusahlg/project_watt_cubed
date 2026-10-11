@@ -536,7 +536,6 @@ fn racing_edits_on_one_cell_have_one_winner_and_the_loser_rolls_back() {
 }
 
 #[test]
-#[ignore = "BUG: a break-then-place chain whose break loses to a peer keeps the placement on the server but shows air"]
 fn a_chain_that_loses_its_first_edit_to_a_peer_converges() {
     let lobby = Lobby::flat();
     let mut ps = peers(&lobby, &["ada", "bob"]);
@@ -583,7 +582,6 @@ fn edits_over_the_rate_budget_are_answered_and_rolled_back() {
 }
 
 #[test]
-#[ignore = "BUG: two refused edits on one cell roll back in arrival order, leaving the first edit's prediction"]
 fn a_refused_chain_on_one_cell_rolls_back_to_the_server_block() {
     let lobby = Lobby::flat();
     let mut ps = peers(&lobby, &["ada"]);
@@ -612,7 +610,6 @@ impl ServerMod for Stall {
 }
 
 #[test]
-#[ignore = "BUG: an edit accepted after the client's 3 s expiry stays on the server but is rolled back on the sender"]
 fn an_edit_accepted_after_the_client_gave_up_converges() {
     // Past the client's three-second expiry.
     let stall = Stall(Duration::from_millis(3500));
@@ -728,7 +725,6 @@ fn tool_uses_over_the_budget_are_answered() {
 }
 
 #[test]
-#[ignore = "BUG: a tool use refused over the budget names an empty cell spec for an unedited cell"]
 fn a_tool_use_refused_over_the_budget_names_the_cell() {
     let lobby = Lobby::flat();
     let mut ps = peers(&lobby, &["ada"]);
@@ -775,7 +771,6 @@ fn a_tool_use_racing_a_break_has_one_winner() {
 }
 
 #[test]
-#[ignore = "BUG: a break sent before a tool use's result is accepted on the server, but the result overwrites the predicted air"]
 fn a_break_right_after_a_tool_use_converges() {
     let lobby = Lobby::flat();
     let mut ps = peers(&lobby, &["ada", "bob"]);
@@ -934,7 +929,6 @@ fn every_client_converges_after_a_burst_on_a_diffusion_world() {
 }
 
 #[test]
-#[ignore = "BUG: break-then-place chains diverge after a refusal or a lost race (rollback restores a prediction)"]
 fn every_client_converges_after_a_chained_burst() {
     converge_after_a_burst(&Lobby::flat(), true, 13);
 }

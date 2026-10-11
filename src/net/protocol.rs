@@ -264,19 +264,34 @@ impl Wire for ModOffer {
     }
 }
 
-/// The enabled packages a `Hello` carries: at most [`MAX_MOD_OFFERS`], each id and version
-/// 1..=[`MAX_MOD_ID`] bytes, so the encoder never writes a list its decoder refuses. Also how
-/// many packages were left out.
-pub(crate) fn hello_offers(mods: &[(String, String)]) -> (Vec<ModOffer>, usize) {
-    let fits = |text: &str| (1..=MAX_MOD_ID).contains(&text.len());
-    let offers: Vec<ModOffer> = mods
+/// The enabled packages a `Hello` carries, within what its decoder accepts: a version is cut to
+/// [`MAX_MOD_ID`] bytes (only the id decides admission). A package the join cannot name (an id
+/// outside 1..=[`MAX_MOD_ID`] bytes, or past [`MAX_MOD_OFFERS`]) would slip past a server's deny
+/// list, so the join is refused with a reason naming them.
+pub(crate) fn hello_offers(mods: &[(String, String)]) -> Result<Vec<ModOffer>, String> {
+    let fits = |id: &str| (1..=MAX_MOD_ID).contains(&id.len());
+    let unnamed: Vec<&str> = mods
         .iter()
-        .filter(|(id, version)| fits(id) && fits(version))
-        .take(MAX_MOD_OFFERS)
-        .map(|(id, version)| ModOffer { id: id.as_str().into(), version: version.as_str().into() })
+        .enumerate()
+        .filter(|(i, (id, _))| *i >= MAX_MOD_OFFERS || !fits(id))
+        .map(|(_, (id, _))| id.as_str())
         .collect();
-    let dropped = mods.len() - offers.len();
-    (offers, dropped)
+    if !unnamed.is_empty() {
+        return Err(format!(
+            "a join reports at most {MAX_MOD_OFFERS} enabled mods with ids of 1 to {MAX_MOD_ID} bytes; turn off: {}",
+            unnamed.join(", ")
+        ));
+    }
+    Ok(mods.iter().map(|(id, version)| ModOffer { id: id.as_str().into(), version: clip_version(version).into() }).collect())
+}
+
+/// `version` within [`MAX_MOD_ID`] bytes, cut at a character boundary; never empty.
+fn clip_version(version: &str) -> &str {
+    let mut end = version.len().min(MAX_MOD_ID);
+    while !version.is_char_boundary(end) {
+        end -= 1;
+    }
+    if end == 0 { "?" } else { &version[..end] }
 }
 
 fn bounded_mod_str(r: &mut codec::Reader) -> Option<Arc<str>> {
@@ -1941,13 +1956,14 @@ mod tests {
         zero.extend_from_slice(&[9]); // trailing unread bytes are the caller's problem
     }
 
-    /// The packages a client reports always decode on the server: over-long ones and those past
-    /// the count are left out and counted, and ones at the limits stay.
+    /// The packages a client reports always decode on the server: a long version is cut, ids at
+    /// the limit stay, and a package the join cannot name refuses the join.
     #[test]
     fn hello_offers_stay_within_the_decoder_limits() {
-        let mut mods: Vec<(String, String)> = (0..=MAX_MOD_OFFERS).map(|i| (format!("pkg.{i}"), "1.0.0".into())).collect();
-        mods.insert(0, ("pkg.long".into(), "1".repeat(MAX_MOD_ID + 1)));
-        mods.insert(1, ("x".repeat(MAX_MOD_ID), "v".repeat(MAX_MOD_ID)));
+        let mut mods: Vec<(String, String)> = (0..MAX_MOD_OFFERS - 3).map(|i| (format!("pkg.{i}"), "1.0.0".into())).collect();
+        mods.insert(0, ("x".repeat(MAX_MOD_ID), "v".repeat(MAX_MOD_ID)));
+        mods.insert(1, ("pkg.long".into(), format!("1.0.0+{}", "é".repeat(MAX_MOD_ID))));
+        mods.push(("pkg.empty".into(), String::new()));
         let hello = |mods: Vec<ModOffer>| ClientMessage::Hello {
             protocol: 1,
             worldgen: 0,
@@ -1960,10 +1976,17 @@ mod tests {
         };
         let raw = mods.iter().map(|(id, version)| ModOffer { id: id.as_str().into(), version: version.as_str().into() }).collect();
         assert_eq!(ClientMessage::decode(&hello(raw).encode()), None, "the unfitted list is refused");
-        let (offers, dropped) = hello_offers(&mods);
-        assert_eq!((offers.len(), dropped), (MAX_MOD_OFFERS, mods.len() - MAX_MOD_OFFERS));
+        let offers = hello_offers(&mods).expect("every package fits");
+        assert_eq!(offers.len(), MAX_MOD_OFFERS);
         assert_eq!(offers[0].id.len(), MAX_MOD_ID, "an id and version at the limit are kept");
+        assert!(offers[1].version.len() <= MAX_MOD_ID && offers[1].version.starts_with("1.0.0+é"), "{}", offers[1].version);
+        assert_eq!(offers[MAX_MOD_OFFERS - 1].version.as_ref(), "?");
         let sent = hello(offers);
         assert_eq!(ClientMessage::decode(&sent.encode()), Some(sent));
+
+        mods.push(("pkg.past".into(), "1".into()));
+        mods.insert(2, ("y".repeat(MAX_MOD_ID + 1), "1".into()));
+        let refused = hello_offers(&mods).expect_err("three packages cannot be named");
+        assert!(refused.ends_with(&format!("turn off: {}, pkg.empty, pkg.past", "y".repeat(MAX_MOD_ID + 1))), "{refused}");
     }
 }

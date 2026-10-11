@@ -15,9 +15,10 @@
 //! A stored seed and generator win over the flags. The world is written every
 //! few minutes and on shutdown (SIGINT, SIGTERM). Next to that file, `ops.txt`
 //! and `mods.toml` are read and united with the flags. An `ops.txt` line is
-//! `name secret`: that player becomes an operator by sending the chat line
+//! `name: secret`: that player becomes an operator by sending the chat line
 //! `/op secret`. A line with a name alone, like `--ops`, trusts the name, so
 //! anyone who joins under it is an operator; the server warns about those.
+//! A name may hold spaces but no colon.
 //! A `mods.toml`:
 //! ```toml
 //! deny = ["pwc.dev-toolkit"]

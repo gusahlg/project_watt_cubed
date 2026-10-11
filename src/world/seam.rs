@@ -252,6 +252,16 @@ impl Seams {
     /// For a storage cell just outside every box (within the atlas glue reach of one), the cell of
     /// the neighbouring patch at the same physical point. `None` for physical cells, cells inside a
     /// box and cells beyond the glue (open space around a body's storage).
+    /// Whether some cell of chunk `c` reads through a seam ([`glue_cell`](Self::glue_cell)):
+    /// a chunk just outside a box. Boxes are chunk aligned and the glue is under a chunk deep.
+    pub fn glues_chunk(&self, c: Coord) -> bool {
+        if c.x < self.min_cx - 1 || self.region_of(c).is_some() {
+            return false;
+        }
+        let c = [c.x, c.y, c.z];
+        self.regions.iter().any(|r| (0..3).all(|a| c[a] >= r.lo[a] - 1 && c[a] <= r.hi[a]))
+    }
+
     pub fn glue_cell(&self, cell: BlockCoord) -> Option<BlockCoord> {
         let c = Coord::new(cell.x.div_euclid(CS as i32), cell.y.div_euclid(CS as i32), cell.z.div_euclid(CS as i32));
         if c.x < self.min_cx - 1 {

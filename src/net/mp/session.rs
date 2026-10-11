@@ -749,11 +749,9 @@ fn a_denied_mod_is_named_and_the_client_rejoins_once_without_it() {
     assert!(left(room.seen("bob")).is_empty());
 }
 
-/// `hello_offers` leaves out an offer whose version is over 64 bytes, and every offer past
-/// the 128th, with only a console warning. The server never hears of those mods, so an honest
-/// client joins with a denied mod still on.
+/// A version over the Hello's 64 bytes is cut, so the id still reaches the whitelist; a 129th
+/// enabled mod cannot be named at all, so the client refuses the join itself and names it.
 #[test]
-#[ignore = "BUG: a mod the Hello cannot carry (long version, or past 128 offers) is not reported, so a denied mod joins enabled"]
 fn a_denied_mod_the_hello_cannot_carry_still_keeps_the_client_out() {
     let lobby = flat(Config { mods_deny: vec!["pwc.dev-toolkit".into()], ..Config::default() });
     let long = vec![("pwc.dev-toolkit".to_string(), format!("1.0.0+{}", "f".repeat(64)))];
@@ -835,11 +833,9 @@ fn a_guest_cannot_set_the_clock_and_only_they_hear_why() {
     assert!(day.is_some_and(|d| near(d, FRESH_DAY, 0.02)), "the shared clock did not move: {day:?}");
 }
 
-/// The game moves its own sky before it sends `SetTime` (`Game::run_line`), so a refusal that
-/// carries only a chat line leaves the guest's sky off the shared clock until the next minute
-/// broadcast. A refused teleport is answered with the authoritative `Position`; this is its twin.
+/// The game moves its own sky before it sends `SetTime` (`Game::run_line`), so a refusal also
+/// carries the shared clock, as a refused teleport carries the authoritative `Position`.
 #[test]
-#[ignore = "BUG: a refused SetTime gets no Time back, so the guest's own sky stays where they set it"]
 fn a_refused_set_time_puts_the_guests_clock_back() {
     let lobby = flat(Config { ops: vec!["ada".into()], ..Config::default() });
     let (bob, _) = enter(lobby.port, "bob", "", &[]);
@@ -850,11 +846,9 @@ fn a_refused_set_time_puts_the_guests_clock_back() {
     assert!(near(day, FRESH_DAY, 0.02), "bob is put back on the shared clock, got {day}");
 }
 
-/// `SetTime` over its one-per-second budget is dropped without an answer (`charge` returns
-/// `Drop`), unlike an edit or a teleport over budget, so the operator's sky, already moved
-/// locally, leaves everyone else's.
+/// `SetTime` over its one-per-second budget is answered with the shared clock, like an edit or
+/// a teleport over budget, so the operator's sky, already moved locally, comes back to it.
 #[test]
-#[ignore = "BUG: an operator's second SetTime within a second is dropped silently, so their sky leaves the shared clock"]
 fn a_set_time_over_its_budget_still_gets_an_answer() {
     let lobby = flat(Config { ops: vec!["ada".into()], ..Config::default() });
     let (ada, _) = enter(lobby.port, "ada", "", &[]);
@@ -948,7 +942,7 @@ fn operator_status_ends_with_the_session() {
 #[test]
 fn operators_and_mod_policy_beside_the_world_file_apply() {
     let dir = Dir::new("side-files");
-    fs::write(dir.file("ops.txt"), "# operators\nbob\nada s3cret\n").expect("ops.txt");
+    fs::write(dir.file("ops.txt"), "# operators\nbob\nada: s3cret\n").expect("ops.txt");
     fs::write(dir.file("mods.toml"), "deny = [\"pwc.dev-toolkit\"]\n").expect("mods.toml");
     let mut config = Config { seed: 1, worldgen: WorldgenKind::Flat, world: Some(dir.file("world.save")), ..Config::default() };
     server::load_world_policy(&mut config).expect("side files load");
@@ -971,11 +965,9 @@ fn operators_and_mod_policy_beside_the_world_file_apply() {
     room.until(WAIT, "the proved operator's time", |_, _, seen| heard_time(seen, 0.5));
 }
 
-/// `parse_ops` splits a line at its last space, so a name-only line for a player whose name has
-/// a space lists the first word as an operator with the last word as its secret. `--ops "Big Ada"`
-/// trusts the whole name.
+/// A secret follows a colon, so a name-only line for a player whose name has a space trusts the
+/// whole name, as `--ops "Big Ada"` does.
 #[test]
-#[ignore = "BUG: an ops.txt line naming a player whose name has a space is read as name + secret, so that player is never an operator"]
 fn an_operator_whose_name_has_a_space_can_be_listed_alone_in_ops_txt() {
     let dir = Dir::new("spaced-op");
     fs::write(dir.file("ops.txt"), "Big Ada\n").expect("ops.txt");
@@ -1073,10 +1065,9 @@ fn a_silent_server_raises_interrupted_and_its_next_message_clears_it() {
 
 /// The server reads nothing from a joiner until its overlay is queued, so over a slow link
 /// the join's snapshot batches are all the client hears, and no Pong comes back until the
-/// end. `Connection::poll` holds a `Snapshot` aside without going through `apply`, the one
-/// place `last_heard` is refreshed, so the batches never count as proof of life.
+/// end. Every frame the reader takes off the link is proof of life, batches included.
 #[test]
-#[ignore = "BUG: snapshot batches do not refresh the silence watchdog, so a long join warns Interrupted (and gives up at 12 s) while data flows"]
+#[ignore = "slow: batches for 5.6 s, past the silence warning"]
 fn snapshot_batches_alone_keep_a_joining_link_alive() {
     let mute = Mute::start(vec![welcome(protocol::law_stamp())]);
     let mut conn = [Connection::connect(HOST, mute.port, "ada", "").expect("the welcome admits ada")];
@@ -1142,19 +1133,17 @@ fn a_cut_link_is_given_up_by_the_client_and_reaped_by_the_server() {
         _ => left(seen) == ["ada"],
     });
     assert_eq!(interruptions(room.seen("ada")), 1);
-    assert_eq!(reasons(room.seen("ada")).len(), 1);
+    assert_eq!(reasons(room.seen("ada")), [INTERRUPTED]);
     assert!(room.seen("bob").iter().all(|e| !matches!(e, Incoming::Disconnected { .. } | Incoming::Interrupted)));
     room.leave("ada");
     room.join("ada");
     room.until(WAIT, "ada is back", |_, c, _| c.peers().count() == 1);
 }
 
-/// The watchdog and quinn's idle timeout both give up 12 s after the last packet. When the
-/// reader thread sees quinn's timeout first, `connection_close_text` records quinn's own
-/// "timed out" and the watchdog keeps it. Polling every frame only narrows the race (the test
-/// above saw both reasons); a client that is not polling when the link dies always loses it.
+/// The watchdog and quinn's idle timeout both give up 12 s after the last packet. Whichever
+/// notices first, a client that was not polling when the link died hears the same reason.
 #[test]
-#[ignore = "BUG: a dead link's disconnect reason is quinn's \"timed out\", not \"connection interrupted\", whenever the transport idle timeout is noticed first"]
+#[ignore = "slow: waits out the transport's twelve-second idle timeout"]
 fn a_dead_link_is_reported_as_interrupted_whichever_timer_notices_first() {
     let lobby = Lobby::flat();
     let relay = Relay::to(lobby.port);

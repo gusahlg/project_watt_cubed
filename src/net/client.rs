@@ -8,7 +8,7 @@
 //! Teleport echo (`Position` after `Teleport`) is part of protocol v9.
 use std::collections::{HashMap, VecDeque};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
@@ -31,7 +31,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const OUT_QUEUE: usize = 64;
 /// Nothing from the server for this long: tell the player the link has gone quiet.
 const SILENCE_WARN: Duration = Duration::from_secs(5);
-/// Nothing from the server for this long: give up. Matches the QUIC idle timeout.
+/// Nothing from the server for this long: give up. Matches the QUIC idle timeout, whose
+/// expiry reads as the same [`INTERRUPTED`].
 const SILENCE_GIVE_UP: Duration = Duration::from_secs(12);
 /// HUD, console, and the disconnect reason share this phrase.
 pub const INTERRUPTED: &str = "connection interrupted";
@@ -190,13 +191,14 @@ fn lerp_angle(a: f32, b: f32, t: f32) -> f32 {
 pub enum Incoming {
     /// A player's edit (stale revisions were already filtered out by the connection).
     Edit { x: i32, y: i32, z: i32, spec: Arc<str> },
-    /// World state from a snapshot: the bootstrap ledger or a reaction commit. Applied
-    /// like an edit but nobody placed or broke anything, so no block cue is played.
+    /// World state nobody acted on here: the bootstrap ledger, a reaction commit, or our own
+    /// accepted edit put back over content that hid it. Applied like an edit, with no block cue.
     Mutation { x: i32, y: i32, z: i32, spec: Arc<str> },
     /// The server accepted our own edit `req`: prediction can forget it.
     EditAccepted { req: u32 },
-    /// `restore` is set when no newer authoritative content has landed on the
-    /// cell since, so the optimistic apply should roll back.
+    /// `restore` is set when the optimistic apply is still what the cell shows and nothing newer
+    /// has landed on it, so the cell goes back to what it held before. Refusals on one cell
+    /// arrive newest first, once no later edit there is still waiting.
     EditRejected { req: u32, restore: bool },
     Position { pos: DVec3, frame: DQuat, up: Face },
     Chat { from_name: Arc<str>, channel: u8, text: Arc<str> },
@@ -245,18 +247,229 @@ impl std::error::Error for ConnectError {}
 
 /// How long an edit or tool request may sit unanswered before it rolls back.
 const PENDING_TTL: Duration = Duration::from_secs(3);
+/// Requests given up after [`PENDING_TTL`] that a late answer can still land.
+const LATE_CAP: usize = 64;
+
+type Pos = (i32, i32, i32);
 
 enum PendingKind {
-    Edit,
+    /// The spec the game predicted.
+    Edit(Arc<str>),
     Tool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Answer {
+    Waiting,
+    /// Refused by the server, or given up after [`PENDING_TTL`]. Handed to the game once no
+    /// later edit on the cell is waiting, so a chain rolls back newest first.
+    Refused { expired: bool },
 }
 
 struct PendingReq {
     req: u32,
-    cell: (i32, i32, i32),
+    cell: Pos,
     expect: u32,
     sent: Instant,
     kind: PendingKind,
+    answer: Answer,
+    /// Authoritative content has replaced the prediction on screen since it was sent.
+    covered: bool,
+}
+
+/// Our own edits and tool uses in flight, against the revisions the server has confirmed. The
+/// events it emits keep each cell the game shows equal to the server's: a verdict leaves the
+/// newest prediction on a cell showing, or hands back the server's content.
+#[derive(Default)]
+struct Requests {
+    /// CONFIRMED cell revisions (snapshot, broadcasts, accepted acks): what new expectations
+    /// are computed against.
+    revs: HashMap<Pos, u32>,
+    /// In send order.
+    pending: Vec<PendingReq>,
+    /// Given up after [`PENDING_TTL`], oldest first.
+    late: VecDeque<PendingReq>,
+}
+
+impl Requests {
+    /// The confirmed revision plus every request still waiting on the cell, so a quick
+    /// break-then-place chain expects the revisions its earlier requests will commit.
+    fn push(&mut self, req: u32, cell: Pos, kind: PendingKind) -> u32 {
+        let confirmed = self.revs.get(&cell).copied().unwrap_or(0);
+        let waiting = self.pending.iter().filter(|p| p.cell == cell && p.answer == Answer::Waiting).count() as u32;
+        let expect = confirmed + waiting;
+        self.pending.push(PendingReq { req, cell, expect, sent: Instant::now(), kind, answer: Answer::Waiting, covered: false });
+        expect
+    }
+
+    /// The game is about to show authoritative content at `cell`, over every prediction there.
+    fn cover(&mut self, cell: Pos) {
+        for p in self.pending.iter_mut().filter(|p| p.cell == cell) {
+            p.covered = true;
+        }
+    }
+
+    fn snapshot_cell(&mut self, (x, y, z, rev, spec): (i32, i32, i32, u32, Arc<str>), out: &mut Vec<Incoming>) {
+        self.revs.insert((x, y, z), rev);
+        self.cover((x, y, z));
+        out.push(Incoming::Mutation { x, y, z, spec });
+    }
+
+    /// Per-cell revisions make application order-independent: only strictly newer content
+    /// lands, so a stale or reordered frame never reverts a newer cell.
+    fn edit(&mut self, x: i32, y: i32, z: i32, rev: u32, spec: Arc<str>, out: &mut Vec<Incoming>) {
+        let known = self.revs.entry((x, y, z)).or_insert(0);
+        if rev > *known {
+            *known = rev;
+            self.cover((x, y, z));
+            out.push(Incoming::Edit { x, y, z, spec });
+        }
+    }
+
+    /// An accepted edit whose prediction was covered is shown again, unless newer content holds
+    /// the cell. A refusal waits in place until the later edits on its cell are answered.
+    fn ack(&mut self, req: u32, accepted: bool, rev: u32, out: &mut Vec<Incoming>) {
+        let Some(at) = self.pending.iter().position(|p| p.req == req) else {
+            if accepted
+                && let Some(p) = self.take_late(req)
+                && let PendingKind::Edit(spec) = p.kind
+            {
+                self.land(p.cell, rev, spec, out);
+            }
+            return;
+        };
+        let cell = self.pending[at].cell;
+        if accepted {
+            let p = self.pending.remove(at);
+            let known = self.revs.entry(cell).or_insert(0);
+            let newest = rev >= *known;
+            *known = (*known).max(rev);
+            out.push(Incoming::EditAccepted { req });
+            if p.covered
+                && newest
+                && let PendingKind::Edit(spec) = p.kind
+            {
+                let (x, y, z) = cell;
+                out.push(Incoming::Mutation { x, y, z, spec });
+            }
+        } else {
+            self.pending[at].answer = Answer::Refused { expired: false };
+        }
+        self.unwind(cell, out);
+    }
+
+    fn tool_result(
+        &mut self,
+        req: u32,
+        reacted: bool,
+        rev: u32,
+        cell_spec: Arc<str>,
+        tool_spec: Arc<str>,
+        out: &mut Vec<Incoming>,
+    ) {
+        let Some(at) = self.pending.iter().position(|p| p.req == req) else {
+            if reacted && let Some(p) = self.take_late(req) {
+                self.land(p.cell, rev, cell_spec, out);
+            }
+            return;
+        };
+        let cell = self.pending.remove(at).cell;
+        if reacted {
+            let known = self.revs.entry(cell).or_insert(0);
+            *known = (*known).max(rev);
+            self.cover(cell);
+        }
+        out.push(Incoming::ToolResult { req, reacted, cell, cell_spec, tool_spec });
+    }
+
+    /// Hand over the refusals on `cell` that no waiting edit follows, newest first. A rollback
+    /// restores only a prediction still on screen with nothing newer confirmed.
+    fn unwind(&mut self, cell: Pos, out: &mut Vec<Incoming>) {
+        let mut i = self.pending.len();
+        while i > 0 {
+            i -= 1;
+            let p = &self.pending[i];
+            if p.cell != cell {
+                continue;
+            }
+            let Answer::Refused { expired } = p.answer else {
+                if matches!(p.kind, PendingKind::Edit(_)) {
+                    return;
+                }
+                continue;
+            };
+            let p = self.pending.remove(i);
+            let confirmed = self.revs.get(&cell).copied().unwrap_or(0);
+            out.push(Incoming::EditRejected { req: p.req, restore: !p.covered && confirmed <= p.expect });
+            if expired {
+                self.remember(p);
+            }
+        }
+    }
+
+    /// Requests unanswered for [`PENDING_TTL`] are refused here, and remembered so a late
+    /// answer still lands.
+    fn expire(&mut self, now: Instant, out: &mut Vec<Incoming>) {
+        while let Some(i) = self
+            .pending
+            .iter()
+            .position(|p| p.answer == Answer::Waiting && now.saturating_duration_since(p.sent) >= PENDING_TTL)
+        {
+            let cell = self.pending[i].cell;
+            if let PendingKind::Tool = self.pending[i].kind {
+                let p = self.pending.remove(i);
+                let none: Arc<str> = Arc::from("");
+                out.push(Incoming::ToolResult { req: p.req, reacted: false, cell, cell_spec: none.clone(), tool_spec: none });
+                self.remember(p);
+            } else {
+                self.pending[i].answer = Answer::Refused { expired: true };
+                self.unwind(cell, out);
+            }
+        }
+    }
+
+    /// A late verdict: the server holds `spec` at `rev`, unless newer content already landed.
+    fn land(&mut self, (x, y, z): Pos, rev: u32, spec: Arc<str>, out: &mut Vec<Incoming>) {
+        let known = self.revs.entry((x, y, z)).or_insert(0);
+        if rev > *known {
+            *known = rev;
+            self.cover((x, y, z));
+            out.push(Incoming::Mutation { x, y, z, spec });
+        }
+    }
+
+    fn remember(&mut self, p: PendingReq) {
+        if self.late.len() >= LATE_CAP {
+            self.late.pop_front();
+        }
+        self.late.push_back(p);
+    }
+
+    fn take_late(&mut self, req: u32) -> Option<PendingReq> {
+        let at = self.late.iter().position(|p| p.req == req)?;
+        self.late.remove(at)
+    }
+}
+
+/// When the reader last took a frame off the link, in milliseconds since `base`. Every frame
+/// proves the link alive, applied yet or not: a long join overlay waits in the inbox.
+struct Heard {
+    base: Instant,
+    ms: AtomicU64,
+}
+
+impl Heard {
+    fn new() -> Self {
+        Self { base: Instant::now(), ms: AtomicU64::new(0) }
+    }
+
+    fn stamp(&self) {
+        self.ms.store(self.base.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
+
+    fn last(&self) -> Instant {
+        self.base + Duration::from_millis(self.ms.load(Ordering::Relaxed))
+    }
 }
 
 /// Dropping it closes the QUIC connection, which ends the reader thread and
@@ -289,13 +502,7 @@ pub struct Connection {
     ping_sent: Option<(u32, Instant)>,
     ping_seq: u32,
     ping_ms: Option<u32>,
-    /// CONFIRMED cell revisions from the server (snapshot, broadcasts, and
-    /// accepted acks) — what future edit expectations are computed against.
-    cell_revs: HashMap<(i32, i32, i32), u32>,
-    /// In-flight edits and tool uses, in send order. Counted per cell so a
-    /// quick break-then-place chain expects the revisions its earlier requests
-    /// will commit. Dropped as rejected after [`PENDING_TTL`] with no answer.
-    pending_edits: Vec<PendingReq>,
+    requests: Requests,
     next_req: u32,
     /// Last cruise speed told to the server. `None` means "not cruising" was sent, or nothing yet.
     sent_cruise: Option<f64>,
@@ -306,8 +513,7 @@ pub struct Connection {
     disconnect_emitted: bool,
     /// Filled by the reader when the stream ends, before the inbox disconnects.
     close_reason: Arc<Mutex<String>>,
-    /// Last message from the server. Set at connect and on every message.
-    last_heard: Instant,
+    heard: Arc<Heard>,
     /// [`Incoming::Interrupted`] already surfaced for the current gap.
     warned: bool,
     /// The join overlay has arrived ([`ServerMessage::SnapshotEnd`]). Stays set.
@@ -448,6 +654,7 @@ fn connect_cancellable(
     stop: &Stop,
 ) -> Result<Connection, ConnectError> {
     stop.check()?;
+    let mods = protocol::hello_offers(mods).map_err(ConnectError::plain)?;
     let addrs: Vec<SocketAddr> = (host, port)
         .to_socket_addrs()
         .map_err(|e| ConnectError::plain(format!("bad address: {e}")))?
@@ -467,7 +674,7 @@ fn connect_cancellable(
     let mut last = ConnectError::plain("could not connect");
     for addr in addrs {
         stop.check()?;
-        match connect_one(&rt, addr, name, password, mods, stop) {
+        match connect_one(&rt, addr, name, password, &mods, stop) {
             Ok(conn) => return Ok(conn),
             Err(e) if e.message == "cancelled" => return Err(e),
             Err(e) => last = e,
@@ -481,7 +688,7 @@ fn connect_one(
     addr: SocketAddr,
     name: &str,
     password: &str,
-    mods: &[(String, String)],
+    mods: &[protocol::ModOffer],
     stop: &Stop,
 ) -> Result<Connection, ConnectError> {
     let bind = if addr.is_ipv4() {
@@ -505,10 +712,6 @@ fn connect_one(
     })?;
 
     let id = crate::net::content_id(&crate::block::BlockRegistry::with_builtins());
-    let (mods, dropped) = protocol::hello_offers(mods);
-    if dropped > 0 {
-        eprintln!("warning: {dropped} enabled mods are not reported to the server (past the join's count or length limits)");
-    }
     let hello = ClientMessage::Hello {
         protocol: PROTOCOL_VERSION,
         worldgen: id.worldgen,
@@ -517,7 +720,7 @@ fn connect_one(
         palette: id.palette,
         name: name.into(),
         password: password.into(),
-        mods,
+        mods: mods.to_vec(),
     };
     let hello_bytes = hello.encode();
     with_stop(rt, stop, "connect timed out", async {
@@ -553,8 +756,11 @@ fn connect_one(
         let close_reason = Arc::new(Mutex::new(String::new()));
         let reason_slot = close_reason.clone();
         let watched = conn.clone();
+        let heard = Arc::new(Heard::new());
+        let stamps = heard.clone();
         thread::spawn(move || {
             while reader_rt.block_on(protocol::read_frame_async(&mut recv, &mut frame)).is_ok() {
+                stamps.stamp();
                 match ServerMessage::decode(&frame) {
                     // A hung-up game side stops draining but channel frames just
                     // roll over; the connection close ends the loop.
@@ -608,14 +814,13 @@ fn connect_one(
             ping_sent: None,
             ping_seq: 0,
             ping_ms: None,
-            cell_revs: HashMap::new(),
-            pending_edits: Vec::new(),
+            requests: Requests::default(),
             next_req: 0,
             sent_cruise: None,
             pending_teleport: None,
             disconnect_emitted: false,
             close_reason,
-            last_heard: Instant::now(),
+            heard,
             warned: false,
             snapshot_ready: false,
             held: VecDeque::new(),
@@ -631,6 +836,8 @@ fn connection_close_text(conn: &quinn::Connection) -> String {
                 quinn::ConnectionError::ApplicationClosed(frame) => {
                     String::from_utf8_lossy(&frame.reason).into_owned()
                 }
+                // The transport's idle timeout and the silence watch see the same dead link.
+                quinn::ConnectionError::TimedOut => INTERRUPTED.to_string(),
                 other => other.to_string(),
             };
         }
@@ -695,12 +902,12 @@ impl Connection {
 
         let mut out = Vec::new();
         let mut budget = APPLY_BUDGET;
-        release_held(&mut self.held, &mut self.cell_revs, &mut budget, &mut out);
+        release_held(&mut self.held, &mut self.requests, &mut budget, &mut out);
         while self.held.is_empty() {
             match self.inbox.try_recv() {
                 Ok(ServerMessage::Snapshot { edits }) => {
                     self.held.extend(edits);
-                    release_held(&mut self.held, &mut self.cell_revs, &mut budget, &mut out);
+                    release_held(&mut self.held, &mut self.requests, &mut budget, &mut out);
                 }
                 Ok(msg) => self.apply(msg, &mut out),
                 Err(TryRecvError::Empty) => break,
@@ -710,10 +917,11 @@ impl Connection {
                 }
             }
         }
-        expire_pending(&mut self.pending_edits, &self.cell_revs, Instant::now(), &mut out);
+        let now = Instant::now();
+        self.requests.expire(now, &mut out);
         {
             let mut reason = self.close_reason.lock().unwrap_or_else(PoisonError::into_inner);
-            consider_silence(self.last_heard, Instant::now(), &mut self.warned, &mut self.alive, &mut reason, &mut out);
+            consider_silence(self.heard.last(), now, &mut self.warned, &mut self.alive, &mut reason, &mut out);
         }
         let reason = self.close_reason.lock().unwrap_or_else(PoisonError::into_inner).clone();
         emit_disconnect(&mut self.alive, &mut self.disconnect_emitted, &reason, &mut out);
@@ -726,44 +934,30 @@ impl Connection {
             msg,
             self.spawn,
             &mut self.peers,
-            &mut self.cell_revs,
-            &mut self.pending_edits,
+            &mut self.requests,
             &mut self.pending_teleport,
             &mut self.ping_sent,
             &mut self.ping_ms,
             &mut self.alive,
             &mut self.disconnect_emitted,
-            &mut self.last_heard,
-            &mut self.warned,
             &mut self.snapshot_ready,
             out,
         );
     }
 }
 
-/// Hand the game up to `budget` held snapshot cells.
+/// Hand the game up to `budget` held snapshot cells: world state, not a player's act.
 fn release_held(
     held: &mut VecDeque<(i32, i32, i32, u32, Arc<str>)>,
-    cell_revs: &mut HashMap<(i32, i32, i32), u32>,
+    requests: &mut Requests,
     budget: &mut usize,
     out: &mut Vec<Incoming>,
 ) {
     while *budget > 0 {
         let Some(cell) = held.pop_front() else { return };
-        snapshot_cell(cell, cell_revs, out);
+        requests.snapshot_cell(cell, out);
         *budget -= 1;
     }
-}
-
-/// Authoritative world state (bootstrap ledger, reaction commits): not a
-/// player's act, so it carries no place/break semantics or cue.
-fn snapshot_cell(
-    (x, y, z, rev, spec): (i32, i32, i32, u32, Arc<str>),
-    cell_revs: &mut HashMap<(i32, i32, i32), u32>,
-    out: &mut Vec<Incoming>,
-) {
-    cell_revs.insert((x, y, z), rev);
-    out.push(Incoming::Mutation { x, y, z, spec });
 }
 
 fn welcome_from(
@@ -778,35 +972,6 @@ fn welcome_from(
         }
         Some(ServerMessage::Reject { reason }) => Err(ConnectError::plain(reason.to_string())),
         _ => Err(ConnectError::plain("unexpected reply from server")),
-    }
-}
-
-fn expire_pending(
-    pending: &mut Vec<PendingReq>,
-    cell_revs: &HashMap<(i32, i32, i32), u32>,
-    now: Instant,
-    out: &mut Vec<Incoming>,
-) {
-    let mut i = 0;
-    while i < pending.len() {
-        if now.saturating_duration_since(pending[i].sent) < PENDING_TTL {
-            i += 1;
-            continue;
-        }
-        let expired = pending.remove(i);
-        match expired.kind {
-            PendingKind::Edit => {
-                let confirmed = cell_revs.get(&expired.cell).copied().unwrap_or(0);
-                out.push(Incoming::EditRejected { req: expired.req, restore: confirmed <= expired.expect });
-            }
-            PendingKind::Tool => out.push(Incoming::ToolResult {
-                req: expired.req,
-                reacted: false,
-                cell: expired.cell,
-                cell_spec: Arc::from(""),
-                tool_spec: Arc::from(""),
-            }),
-        }
     }
 }
 
@@ -836,6 +1001,9 @@ fn consider_silence(
     reason: &mut String,
     out: &mut Vec<Incoming>,
 ) {
+    if now.saturating_duration_since(last_heard) < SILENCE_WARN {
+        *warned = false;
+    }
     match link_silence(last_heard, now, *warned) {
         LinkFate::Ok => {}
         LinkFate::Warn => {
@@ -887,56 +1055,23 @@ fn apply_server_message(
     msg: ServerMessage,
     spawn: DVec3,
     peers: &mut HashMap<u32, RemotePlayer>,
-    cell_revs: &mut HashMap<(i32, i32, i32), u32>,
-    pending_edits: &mut Vec<PendingReq>,
+    requests: &mut Requests,
     pending_teleport: &mut Option<Instant>,
     ping_sent: &mut Option<(u32, Instant)>,
     ping_ms: &mut Option<u32>,
     alive: &mut bool,
     disconnect_emitted: &mut bool,
-    last_heard: &mut Instant,
-    warned: &mut bool,
     snapshot_ready: &mut bool,
     out: &mut Vec<Incoming>,
 ) {
-    // Any message proves the link is alive. A long join's snapshot batches can
-    // hold the Pong back for many seconds.
-    *last_heard = Instant::now();
-    *warned = false;
     match msg {
             ServerMessage::Snapshot { edits } => {
                 for cell in edits {
-                    snapshot_cell(cell, cell_revs, out);
+                    requests.snapshot_cell(cell, out);
                 }
             }
-            ServerMessage::Edit { x, y, z, rev, spec } => {
-                // Per-cell revisions make application order-independent: only
-                // strictly newer content lands, so a stale or reordered frame
-                // can never revert a newer cell.
-                let cell = (x, y, z);
-                if rev > cell_revs.get(&cell).copied().unwrap_or(0) {
-                    cell_revs.insert(cell, rev);
-                    out.push(Incoming::Edit { x, y, z, spec });
-                }
-            }
-            ServerMessage::EditAck { req, accepted, rev } => {
-                let Some(at) = pending_edits.iter().position(|p| p.req == req) else {
-                    return;
-                };
-                let pending = pending_edits.remove(at);
-                let (cell, expect) = (pending.cell, pending.expect);
-                if accepted {
-                    let known = cell_revs.entry(cell).or_insert(0);
-                    *known = (*known).max(rev);
-                    out.push(Incoming::EditAccepted { req });
-                } else {
-                    // Restore our optimistic apply only if nothing newer has
-                    // confirmed on the cell meanwhile (the race winner's Edit
-                    // broadcast may land before or after this ack).
-                    let confirmed = cell_revs.get(&cell).copied().unwrap_or(0);
-                    out.push(Incoming::EditRejected { req, restore: confirmed <= expect });
-                }
-            }
+            ServerMessage::Edit { x, y, z, rev, spec } => requests.edit(x, y, z, rev, spec, out),
+            ServerMessage::EditAck { req, accepted, rev } => requests.ack(req, accepted, rev, out),
             ServerMessage::Position { pos, frame, up } => {
                 *pending_teleport = None;
                 // TODO: echo a teleport request id so a snap-back Position from an earlier poll cannot still snap the player (wire change).
@@ -1022,15 +1157,7 @@ fn apply_server_message(
             // into the per-channel rings, not the inbox this drains.
             ServerMessage::PeerModData { .. } => {}
             ServerMessage::ToolResult { req, reacted, rev, cell_spec, tool_spec } => {
-                let Some(at) = pending_edits.iter().position(|p| p.req == req) else {
-                    return;
-                };
-                let cell = pending_edits.remove(at).cell;
-                if reacted {
-                    let known = cell_revs.entry(cell).or_insert(0);
-                    *known = (*known).max(rev);
-                }
-                out.push(Incoming::ToolResult { req, reacted, cell, cell_spec, tool_spec });
+                requests.tool_result(req, reacted, rev, cell_spec, tool_spec, out)
             }
         }
 }
@@ -1104,13 +1231,9 @@ impl Connection {
         if !self.alive || spec.len() > MAX_SPEC {
             return None;
         }
-        let cell = (x, y, z);
-        let confirmed = self.cell_revs.get(&cell).copied().unwrap_or(0);
-        let in_flight = self.pending_edits.iter().filter(|p| p.cell == cell).count() as u32;
-        let expect = confirmed + in_flight;
         self.next_req = self.next_req.wrapping_add(1);
         let req = self.next_req;
-        self.pending_edits.push(PendingReq { req, cell, expect, sent: Instant::now(), kind: PendingKind::Edit });
+        let expect = self.requests.push(req, (x, y, z), PendingKind::Edit(spec.clone()));
         self.dispatch(&ClientMessage::Edit { req, x, y, z, expect, spec });
         Some(req)
     }
@@ -1173,13 +1296,9 @@ impl Connection {
         if tool_spec.len() > MAX_SPEC {
             return None;
         }
-        let cell = (x, y, z);
-        let confirmed = self.cell_revs.get(&cell).copied().unwrap_or(0);
-        let in_flight = self.pending_edits.iter().filter(|p| p.cell == cell).count() as u32;
-        let expect = confirmed + in_flight;
         self.next_req = self.next_req.wrapping_add(1);
         let req = self.next_req;
-        self.pending_edits.push(PendingReq { req, cell, expect, sent: Instant::now(), kind: PendingKind::Tool });
+        let expect = self.requests.push(req, (x, y, z), PendingKind::Tool);
         self.dispatch(&ClientMessage::ToolUse { req, x, y, z, expect, tool_spec });
         Some(req)
     }
@@ -1355,15 +1474,12 @@ mod tests {
     struct View {
         spawn: DVec3,
         peers: HashMap<u32, RemotePlayer>,
-        cell_revs: HashMap<(i32, i32, i32), u32>,
-        pending_edits: Vec<PendingReq>,
+        requests: Requests,
         pending_teleport: Option<Instant>,
         ping_sent: Option<(u32, Instant)>,
         ping_ms: Option<u32>,
         alive: bool,
         disconnect_emitted: bool,
-        last_heard: Instant,
-        warned: bool,
         snapshot_ready: bool,
     }
 
@@ -1372,15 +1488,12 @@ mod tests {
             Self {
                 spawn: DVec3::new(0.5, 40.0, 0.5),
                 peers: HashMap::new(),
-                cell_revs: HashMap::new(),
-                pending_edits: Vec::new(),
+                requests: Requests::default(),
                 pending_teleport: None,
                 ping_sent: None,
                 ping_ms: None,
                 alive: true,
                 disconnect_emitted: false,
-                last_heard: Instant::now(),
-                warned: false,
                 snapshot_ready: false,
             }
         }
@@ -1396,15 +1509,12 @@ mod tests {
                     msg,
                     self.spawn,
                     &mut self.peers,
-                    &mut self.cell_revs,
-                    &mut self.pending_edits,
+                    &mut self.requests,
                     &mut self.pending_teleport,
                     &mut self.ping_sent,
                     &mut self.ping_ms,
                     &mut self.alive,
                     &mut self.disconnect_emitted,
-                    &mut self.last_heard,
-                    &mut self.warned,
                     &mut self.snapshot_ready,
                     &mut out,
                 );
@@ -1523,7 +1633,7 @@ mod tests {
             matches!(events.as_slice(), [Incoming::Mutation { x: 1, y: 2, z: 3, .. }]),
             "snapshot cells are world state, not a player's edit"
         );
-        assert_eq!(v.cell_revs.get(&(1, 2, 3)), Some(&4));
+        assert_eq!(v.requests.revs.get(&(1, 2, 3)), Some(&4));
     }
 
     #[test]
@@ -1592,31 +1702,31 @@ mod tests {
         assert_eq!(v.peers.len(), 1);
     }
 
+    fn waiting(req: u32, cell: Pos, expect: u32, spec: Option<&str>) -> PendingReq {
+        PendingReq {
+            req,
+            cell,
+            expect,
+            sent: Instant::now(),
+            kind: spec.map_or(PendingKind::Tool, |s| PendingKind::Edit(s.into())),
+            answer: Answer::Waiting,
+            covered: false,
+        }
+    }
+
     #[test]
     fn unanswered_edit_expires_as_rejected_and_unsent_spec_returns_no_id() {
-        let mut pending = vec![PendingReq {
-            req: 3,
-            cell: (1, 2, 3),
-            expect: 0,
-            sent: Instant::now() - Duration::from_secs(4),
-            kind: PendingKind::Edit,
-        }];
+        let mut requests = Requests::default();
+        requests.pending.push(PendingReq { sent: Instant::now() - Duration::from_secs(4), ..waiting(3, (1, 2, 3), 0, Some("air")) });
         let mut out = Vec::new();
-        expire_pending(&mut pending, &HashMap::new(), Instant::now(), &mut out);
-        assert!(pending.is_empty());
+        requests.expire(Instant::now(), &mut out);
+        assert!(requests.pending.is_empty());
         assert!(matches!(out.as_slice(), [Incoming::EditRejected { req: 3, restore: true }]));
 
-        pending.push(PendingReq {
-            req: 9,
-            cell: (1, 2, 3),
-            expect: 4,
-            sent: Instant::now() - PENDING_TTL,
-            kind: PendingKind::Tool,
-        });
+        requests.pending.push(PendingReq { sent: Instant::now() - PENDING_TTL, ..waiting(9, (1, 2, 3), 4, None) });
+        requests.revs.insert((1, 2, 3), 4);
         out.clear();
-        let mut revs = HashMap::new();
-        revs.insert((1, 2, 3), 4);
-        expire_pending(&mut pending, &revs, Instant::now(), &mut out);
+        requests.expire(Instant::now(), &mut out);
         assert!(matches!(
             out.as_slice(),
             [Incoming::ToolResult { req: 9, reacted: false, .. }]
@@ -1626,23 +1736,98 @@ mod tests {
         let mut conn = Connection::connect("127.0.0.1", handle.addr().port(), "ada", "").unwrap();
         let huge: Arc<str> = "x".repeat(MAX_SPEC + 1).into();
         assert!(conn.send_edit(0, 0, 0, huge).is_none());
-        assert!(conn.pending_edits.is_empty());
+        assert!(conn.requests.pending.is_empty());
         assert_eq!(conn.next_req, 0);
         // Never sent, so a server ack cannot remove it before the expiry path runs.
-        conn.pending_edits.push(PendingReq {
-            req: 7,
-            cell: (1, 2, 3),
-            expect: 0,
+        conn.requests.pending.push(PendingReq {
             sent: Instant::now() - PENDING_TTL - Duration::from_millis(1),
-            kind: PendingKind::Edit,
+            ..waiting(7, (1, 2, 3), 0, Some("air"))
         });
         let events = conn.poll();
         assert!(
             events.iter().any(|e| matches!(e, Incoming::EditRejected { req: 7, restore: true })),
             "a few seconds with no ack rolls the edit back"
         );
-        assert!(conn.pending_edits.is_empty());
+        assert!(conn.requests.pending.is_empty());
         handle.stop();
+    }
+
+    /// A break and a placement on one cell, both refused: the placement rolls back first, so
+    /// the cell ends on what it held before the break.
+    #[test]
+    fn a_refused_chain_rolls_back_newest_first() {
+        let mut v = View::new();
+        let cell = (1, 2, 3);
+        assert_eq!(v.requests.push(1, cell, PendingKind::Edit("air".into())), 0);
+        assert_eq!(v.requests.push(2, cell, PendingKind::Edit("c:01".into())), 1);
+        assert!(v.apply(ServerMessage::EditAck { req: 1, accepted: false, rev: 0 }).is_empty(), "held until the placement is answered");
+        let events = v.apply(ServerMessage::EditAck { req: 2, accepted: false, rev: 0 });
+        assert!(matches!(
+            events.as_slice(),
+            [Incoming::EditRejected { req: 2, restore: true }, Incoming::EditRejected { req: 1, restore: true }]
+        ));
+        assert!(v.requests.pending.is_empty());
+    }
+
+    /// A peer's edit lands between our break and our placement on its cell. The break is
+    /// refused, the placement is accepted on top of the peer's: the placement shows again.
+    #[test]
+    fn an_accepted_edit_hidden_by_a_peer_is_shown_again() {
+        let mut v = View::new();
+        let cell = (1, 2, 3);
+        v.requests.push(1, cell, PendingKind::Edit("air".into()));
+        v.requests.push(2, cell, PendingKind::Edit("c:01".into()));
+        let events = v.apply_all([
+            ServerMessage::Edit { x: 1, y: 2, z: 3, rev: 1, spec: "air".into() },
+            ServerMessage::EditAck { req: 1, accepted: false, rev: 1 },
+            ServerMessage::EditAck { req: 2, accepted: true, rev: 2 },
+        ]);
+        match events.as_slice() {
+            [
+                Incoming::Edit { .. },
+                Incoming::EditAccepted { req: 2 },
+                Incoming::Mutation { spec, .. },
+                Incoming::EditRejected { req: 1, restore: false },
+            ] => assert_eq!(spec.as_ref(), "c:01"),
+            _ => panic!("expected the peer's edit, the placement shown again, then an unrestored break; got {} events", events.len()),
+        }
+        assert_eq!(v.requests.revs[&cell], 2);
+    }
+
+    /// A tool's result lands over a break sent behind it; the accepted break shows again.
+    #[test]
+    fn a_break_behind_a_tool_use_shows_again_over_its_result() {
+        let mut v = View::new();
+        let cell = (1, 2, 3);
+        v.requests.revs.insert(cell, 1);
+        v.requests.push(1, cell, PendingKind::Tool);
+        assert_eq!(v.requests.push(2, cell, PendingKind::Edit("air".into())), 2);
+        let events = v.apply_all([
+            ServerMessage::ToolResult { req: 1, reacted: true, rev: 2, cell_spec: "c:02".into(), tool_spec: "c:03".into() },
+            ServerMessage::EditAck { req: 2, accepted: true, rev: 3 },
+        ]);
+        assert!(matches!(
+            events.as_slice(),
+            [Incoming::ToolResult { req: 1, reacted: true, .. }, Incoming::EditAccepted { req: 2 }, Incoming::Mutation { .. }]
+        ));
+    }
+
+    /// An edit given up after the expiry and accepted later lands, revision and content.
+    #[test]
+    fn an_edit_accepted_after_its_expiry_still_lands() {
+        let mut v = View::new();
+        let cell = (1, 2, 3);
+        v.requests.pending.push(PendingReq { sent: Instant::now() - PENDING_TTL, ..waiting(5, cell, 0, Some("c:01")) });
+        let mut out = Vec::new();
+        v.requests.expire(Instant::now(), &mut out);
+        assert!(matches!(out.as_slice(), [Incoming::EditRejected { req: 5, restore: true }]));
+        let events = v.apply(ServerMessage::EditAck { req: 5, accepted: true, rev: 1 });
+        match events.as_slice() {
+            [Incoming::Mutation { x: 1, y: 2, z: 3, spec }] => assert_eq!(spec.as_ref(), "c:01"),
+            _ => panic!("expected the late edit to land, got {} events", events.len()),
+        }
+        assert_eq!(v.requests.revs[&cell], 1);
+        assert!(v.apply(ServerMessage::EditAck { req: 5, accepted: true, rev: 1 }).is_empty(), "landed once");
     }
 
     /// Two-process check: set `WATT_LIVE_ADDR=host:port` (and optional `WATT_LIVE_PW`)
@@ -1768,37 +1953,19 @@ mod tests {
         assert_eq!(reason, "server shutting down");
     }
 
+    /// The reader stamps every frame it takes off the link, applied yet or not; a fresh stamp
+    /// clears the warning and the link is not silent.
     #[test]
-    fn a_pong_clears_the_silence_warning() {
-        let mut v = View::new();
-        v.warned = true;
-        v.last_heard = Instant::now() - SILENCE_WARN;
-        v.apply(ServerMessage::Pong { nonce: 1 });
-        assert!(!v.warned);
-        assert!(v.last_heard.elapsed() < Duration::from_millis(50));
-    }
-
-    /// A long join over a slow link: snapshot batches keep arriving and the Pong waits
-    /// behind them. Every message is proof of life, so the link neither warns nor gives up.
-    #[test]
-    fn snapshot_batches_without_a_pong_keep_the_link_alive() {
-        let mut v = View::new();
-        let messages = [
-            ServerMessage::Snapshot { edits: vec![(1, 2, 3, 1, "air".into())] },
-            ServerMessage::Edit { x: 4, y: 5, z: 6, rev: 1, spec: "air".into() },
-            ServerMessage::Time { day: 0.5, day_secs: 600.0 },
-            ServerMessage::SnapshotEnd,
-        ];
-        for msg in messages {
-            v.warned = true;
-            v.last_heard = Instant::now() - (SILENCE_GIVE_UP - Duration::from_secs(1));
-            v.apply(msg);
-            assert!(!v.warned, "a message clears the silence warning");
-            let mut out = Vec::new();
-            let mut reason = String::new();
-            consider_silence(v.last_heard, Instant::now() + Duration::from_secs(2), &mut v.warned, &mut v.alive, &mut reason, &mut out);
-            assert!(v.alive && out.is_empty() && reason.is_empty(), "a link that just spoke is not silent");
-        }
+    fn a_fresh_stamp_clears_the_silence_warning() {
+        let heard = Heard::new();
+        let (mut warned, mut alive, mut reason, mut out) = (true, true, String::new(), Vec::new());
+        consider_silence(heard.last(), heard.base + SILENCE_WARN, &mut warned, &mut alive, &mut reason, &mut out);
+        assert!(warned && alive && out.is_empty(), "still the same gap");
+        thread::sleep(Duration::from_millis(5));
+        heard.stamp();
+        assert!(heard.last() > heard.base);
+        consider_silence(heard.last(), Instant::now(), &mut warned, &mut alive, &mut reason, &mut out);
+        assert!(!warned && alive && out.is_empty() && reason.is_empty(), "a link that just spoke is not silent");
     }
 
     #[test]
