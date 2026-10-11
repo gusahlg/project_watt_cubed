@@ -1574,19 +1574,6 @@ fn far_chart_seam_readiness_converges() {
         world.gpu_live_slots = 512;
         let tight_allowed = world.sections_allowed();
         let tight = world.desired_sections(center);
-        {
-            let mut per: std::collections::BTreeMap<(u8, i8), usize> = Default::default();
-            for t in &tight {
-                *per.entry((t.face as u8, t.detail.0)).or_default() += 1;
-            }
-            println!("{name}: {} tiles by (face, detail) {per:?}", tight.len());
-            let eye = world.phys_eye(center, true);
-            let mut d0: Vec<_> = tight.iter().filter(|t| t.detail.0 == 0).filter_map(|&t| Some((t, world.node_box(t)?))).collect();
-            d0.sort_by(|a, b| a.1.dist(eye).total_cmp(&b.1.dist(eye)));
-            for (t, b) in d0.iter().take(3).chain(d0.iter().rev().take(3)) {
-                println!("  {t:?} extent {:?} dist {:.0}", b.hi - b.lo, b.dist(eye));
-            }
-        }
         let far_m = f64::from(world.section_pyramid.outer_m());
         let radius = world.view.horizontal;
         let (fold, far_view) = (world.fold, world.far_view(center));

@@ -2078,7 +2078,7 @@ mod tests {
     /// Start-world chart far field at spawn and from altitude: every tile's columns have tops or
     /// are left to the near columns, the seams between tiles are closed, and each column of the
     /// near square is drawn one way: by the far field, or (near, at spawn ground level) by the
-    /// chunks. Bytes re-pinned to `0xafd60fcb` when the cut became the distance rule's: chart tiles count
+    /// chunks. Bytes re-pinned to `0xc84d8aad` when the cut became the distance rule's: chart tiles count
     /// from their own patch and the finest tiles over near columns leave them out (seed 42,
     /// diffusion, default view).
     #[test]
@@ -2093,7 +2093,7 @@ mod tests {
         world.section_eye_y = storage.y;
         let spawn = frontier_counts(&mut world, center);
         println!("spawn: hash {:#x}, {} sections, {} of {} near-square columns near", spawn.hash, spawn.sections, spawn.near_n, spawn.under_n);
-        assert_eq!(spawn.hash, 0xafd60fcb, "spawn ground-level far-field bytes changed");
+        assert_eq!(spawn.hash, 0xc84d8aad, "spawn ground-level far-field bytes changed");
         assert!(spawn.near_n > 0, "no column near spawn is near");
         assert_chart_closed("spawn", &spawn);
 

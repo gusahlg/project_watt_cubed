@@ -103,9 +103,10 @@ use section::{SectionMeshData, SectionPos};
 const CPU_CULL_MAX: u32 = 1024;
 /// Floor on the far lane's section-slot budget so a large near field cannot
 /// starve covering: chunks never count against sections. The rule's cut is bounded by
-/// construction (about 640 tiles on a chart at the largest render distance), so a cut past this
-/// is a bug, asserted in debug builds.
-pub(in crate::world) const SECTION_SLOT_FLOOR: usize = 768;
+/// construction: about ninety tiles a level, nine or ten levels between the finest far level and
+/// the horizon (under 800 at a chart corner at render distance 6), so a cut past this is a bug,
+/// asserted in debug builds.
+pub(in crate::world) const SECTION_SLOT_FLOOR: usize = 1024;
 
 /// Default number of chunk rings meshed and drawn around the player.
 const DEFAULT_VIEW_RADIUS: i32 = 6;
