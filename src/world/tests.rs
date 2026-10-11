@@ -28,9 +28,7 @@ fn stand_on_twin(world: &mut World) -> ChunkCoord {
         .copied()
         .find(|b| b.kind == terrain::cosmos::Kind::Twin)
         .expect("a twin");
-    let (center, cu, cv, surf) = face_centre_stand(world, &twin, Face::PosY);
-    let (_, y, _) = FaceFrame::new(Face::PosY).cell_to_world((cu, surf - 1, cv));
-    world.section_eye_y = y as f64;
+    let (center, ..) = face_centre_stand(world, &twin, Face::PosY);
     world.center = Some(center);
     center
 }
@@ -349,17 +347,15 @@ fn chunk_creation_arms_the_section_lane() {
 #[test]
 fn desired_frontier_responds_to_altitude() {
     let mut world = lod2_world();
-    let center = stand_on_twin(&mut world);
+    let twin = world.terrain().cosmos().expect("cosmos").bodies().iter().copied().find(|b| b.kind == terrain::cosmos::Kind::Twin).expect("a twin");
+    let (center, cu, cv, surf) = face_centre_stand(&mut world, &twin, Face::PosY);
     let ground: FastSet<_> = world.desired_sections(center).into_iter().collect();
-    world.section_eye_y += 4000.0;
-    let sky: FastSet<_> = world.desired_sections(center).into_iter().collect();
+    let high = stand_at(&mut world, twin.id, Face::PosY, cu, surf + 4000, cv);
+    let sky: FastSet<_> = world.desired_sections(high).into_iter().collect();
     assert_ne!(ground, sky, "altitude must reshape the desired frontier");
     assert!(!sky.is_empty(), "high altitude still selects a (coarser) far field");
-    let finest = world.section_pyramid.finest;
-    assert!(
-        sky.iter().all(|s| s.detail > finest),
-        "wholly-overhead near rings must drop out at altitude"
-    );
+    let finest = world.rule_on(crate::world::rule::Ground::Cube { body: twin.id }).finest;
+    assert!(sky.iter().all(|s| s.detail.0 > finest), "the finest tiles must drop out 4000 blocks up");
 }
 
 /// A `Ready` state drawing a single opaque mesh `h` (the common test shape).
@@ -2925,7 +2921,7 @@ fn chunk_holding(x: i32, y: i32, z: i32) -> Coord {
 }
 
 /// Top solid cell at the centre of `body`'s `face`, and the chunk that holds it.
-fn face_centre_stand(world: &World, body: &terrain::cosmos::Body, face: Face) -> (Coord, i32, i32, i32) {
+fn face_centre_stand(world: &mut World, body: &terrain::cosmos::Body, face: Face) -> (Coord, i32, i32, i32) {
     let centre = (
         i32::try_from(body.centre[0]).expect("centre x"),
         i32::try_from(body.centre[1]).expect("centre y"),
@@ -2934,8 +2930,18 @@ fn face_centre_stand(world: &World, body: &terrain::cosmos::Body, face: Face) ->
     let (cu, _, cv) = FaceFrame::new(face).cell_to_local(centre);
     let a = world.terrain().surface(face, cu, cv);
     assert_ne!(a, i32::MIN, "body {} {face:?} has no surface", body.id);
-    let (x, y, z) = FaceFrame::new(face).cell_to_world((cu, a - 1, cv));
-    (chunk_holding(x, y, z), cu, cv, a)
+    (stand_at(world, body.id, face, cu, a + 1, cv), cu, cv, a)
+}
+
+/// Stand the eye at face-local reference cell `(u, a, v)` of cube `body`, where it really is (its
+/// warp moves it): the storage centre streaming stands on, with both eyes placed.
+fn stand_at(world: &mut World, body: u16, face: Face, u: i32, a: i32, v: i32) -> Coord {
+    let (x, y, z) = FaceFrame::new(face).cell_to_world((u, a, v));
+    let p = DVec3::new(f64::from(x) + 0.5, f64::from(y) + 0.5, f64::from(z) + 0.5);
+    let warp = world.terrain().atlases().iter().find(|at| at.grid.as_ref().is_some_and(|g| g.body == body)).and_then(|at| at.warp.clone());
+    let physical = warp.map_or(p, |w| w.apply(p));
+    let (near, _) = world.place_eyes(physical);
+    World::chunk_of(near.x.floor() as i32, near.y.floor() as i32, near.z.floor() as i32)
 }
 
 /// Camera on a twin cube's +X face: the frontier is that face, and a mesh
@@ -2953,9 +2959,7 @@ fn far_face_twin_plus_x_selects_sections_at_the_surface() {
         .copied()
         .find(|b| b.kind == terrain::cosmos::Kind::Twin)
         .expect("a twin");
-    let (center, cu, cv, surf) = face_centre_stand(&world, &twin, Face::PosX);
-    // World Y of this column is the +X tangent. Altitude comes from the chunk's X.
-    world.section_eye_y = FaceFrame::new(Face::PosX).cell_to_world((cu, surf - 1, cv)).1 as f64;
+    let (center, cu, cv, _) = face_centre_stand(&mut world, &twin, Face::PosX);
     let desired = world.desired_sections(center);
     assert!(!desired.is_empty(), "no sections on +X");
     assert!(desired.iter().all(|s| s.body == twin.id && s.face == Face::PosX), "frontier left +X: {desired:?}");
@@ -3031,9 +3035,7 @@ fn far_face_twin_selects_that_body() {
         .copied()
         .find(|b| b.kind == terrain::cosmos::Kind::Twin)
         .expect("a twin");
-    let (center, cu, cv, surf) = face_centre_stand(&world, &twin, Face::PosY);
-    let (_, y, _) = FaceFrame::new(Face::PosY).cell_to_world((cu, surf - 1, cv));
-    world.section_eye_y = y as f64;
+    let (center, cu, cv, _) = face_centre_stand(&mut world, &twin, Face::PosY);
     let desired = world.desired_sections(center);
     assert!(!desired.is_empty());
     let body = desired[0].body;
@@ -3064,8 +3066,7 @@ fn far_face_edge_unions_the_neighbour() {
     let z = cv;
     let y = world.terrain().surface(Face::PosY, x, z);
     assert_ne!(y, i32::MIN);
-    world.section_eye_y = y as f64;
-    let center = chunk_holding(x, y, z);
+    let center = stand_at(&mut world, twin_id, Face::PosY, x, y + 1, z);
     let desired = world.desired_sections(center);
     assert!(desired.iter().any(|s| s.body == twin_id && s.face == Face::PosY), "missing +Y");
     assert!(desired.iter().any(|s| s.body == twin_id && s.face == Face::PosX), "missing the +X neighbour");
@@ -3197,7 +3198,7 @@ fn far_face_plus_x_edit_dirties_the_face_section() {
         .copied()
         .find(|b| b.kind == terrain::cosmos::Kind::Twin)
         .expect("a twin");
-    let (_, cu, cv, surf) = face_centre_stand(&world, &twin, Face::PosX);
+    let (_, cu, cv, surf) = face_centre_stand(&mut world, &twin, Face::PosX);
     let (x, y, z) = FaceFrame::new(Face::PosX).cell_to_world((cu, surf - 1, cv));
     let atlas = world
         .terrain()

@@ -287,7 +287,18 @@ impl World {
                         b
                     }
                 };
-                let d = b.map_or(f64::INFINITY, |b| b.dist_box(eye));
+                // Without a far field the chunks are all the ground there is: every column of the
+                // near square draws.
+                let chess = da.abs().max(db.abs());
+                let d = if self.lod2 {
+                    b.map_or(f64::INFINITY, |b| b.dist_box(eye))
+                } else if chess <= h {
+                    0.0
+                } else if chess <= h + UNLOAD_MARGIN {
+                    r
+                } else {
+                    f64::INFINITY
+                };
                 col.near = d < r;
                 col.keep = d < keep_r;
             }

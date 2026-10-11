@@ -230,7 +230,7 @@ fn flight_then_stop_fills_the_whole_view() {
     for pass in 0.. {
         step_finished(&mut world, eye);
         let center = world.center.expect("streamed");
-        let whole = world.view_coords(world.mesh_box(center)).all(|c| drawn(&world, c));
+        let whole = world.view_coords(world.mesh_box(center)).all(|c| !world.near.draws(world.fold.fold(c)) || drawn(&world, c));
         if whole && world.light_owed.is_empty() && world.entry_complete() {
             break;
         }
@@ -1615,8 +1615,9 @@ fn far_chart_seam_readiness_converges() {
 
 /// Stand the eye `above` blocks over the start world in direction `dir`, the way `stream`
 /// places it: the near window back in physical space, the far field on the chart under it,
-/// and no sections resident.
-fn hover(world: &mut World, dir: DVec3, above: f64, name: &str) {
+/// and no sections resident. Returns whether the ground is within the rule's horizon: past it
+/// nothing is selected (the body's impostor draws it).
+fn hover(world: &mut World, dir: DVec3, above: f64, name: &str) -> bool {
     let (near, far) = world.place_eyes(world.home_eye(dir, above));
     let near_c = eye_chunk(near);
     world.sections.clear();
@@ -1628,7 +1629,14 @@ fn hover(world: &mut World, dir: DVec3, above: f64, name: &str) {
     assert!(world.fold.is_identity(), "{name}: the near window is not in physical space");
     assert!(!world.far_fold.is_identity(), "{name}: the far field does not stand on a chart");
     publish_far(world);
+    let far_c = world.section_center().expect("a far centre");
+    let horizon = world.far_ground(far_c).map(|g| world.rule_on(g).horizon()).expect("a chart under the far eye");
+    if above >= horizon {
+        assert!(world.section_desired.is_empty(), "{name}: {} sections past the horizon", world.section_desired.len());
+        return false;
+    }
     assert!(!world.section_desired.is_empty(), "{name}: no chart sections");
+    true
 }
 
 /// Select the far frontier around the far centre and publish the view to the worker gate, as
@@ -1655,7 +1663,9 @@ fn far_chart_altitude_readiness_converges() {
     for (site, dir, heights) in World::FAR_SITES {
         for &above in heights {
             let name = &format!("{site} +{above}");
-            hover(&mut world, dir, above, name);
+            if !hover(&mut world, dir, above, name) {
+                continue;
+            }
             let mut landed = Landed::default();
             let passes = drive_sections(&mut world, name, &mut landed);
             println!(
@@ -1669,7 +1679,7 @@ fn far_chart_altitude_readiness_converges() {
     }
 }
 
-/// The far centre moving while the frontier fills, 50 km over every far site: one chunk every
+/// The far centre moving while the frontier fills, 8 km over every far site: one chunk every
 /// few passes, re-publishing the view each time as `stream` does, and stopping well before the
 /// frontier has landed. Every view change re-measures the queued far work, so a horizon short
 /// of the coarsest ring's corners, or a neighbour chart measured a face box away, would
@@ -1682,10 +1692,10 @@ fn far_chart_altitude_readiness_converges_while_moving() {
     const MOVES: usize = 48;
     const PASSES_PER_MOVE: usize = 12;
     let mut world = round_world(42, RenderConfig::default());
-    let above = 50_000.0;
+    let above = 8_000.0;
     for (site, dir, _) in World::FAR_SITES {
         let name = &format!("{site} +{above} moving");
-        hover(&mut world, dir, above, name);
+        assert!(hover(&mut world, dir, above, name), "{name}: past the horizon");
         let mut landed = Landed::default();
         for _ in 0..MOVES {
             let c = world.section_center().expect("a far centre");
