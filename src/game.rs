@@ -1392,18 +1392,17 @@ impl Game {
     }
 
     /// Altitude above the datum of the nearest body (the sky fades to space with it); far from every
-    /// body, or over an airless one (a moon), effectively infinite. Inside a Hollow's cavity the
+    /// body, or over an airless one, effectively infinite. Inside a Hollow's cavity the
     /// shell is the sky, so this is the same sentinel and the blue atmosphere stays outside. A flat
     /// world's datum is `y = 0`.
     pub fn sky_altitude(&self, eye: DVec3) -> f64 {
-        use crate::world::terrain::cosmos::Rank;
         match self.world.terrain().cosmos() {
             Some(cosmos) => {
                 if cosmos.hollow_cavity(eye).is_some() {
                     return 1.0e9;
                 }
                 match cosmos.body_at(eye) {
-                    Some(b) if b.traits.rank != Rank::Satellite => cosmos.altitude(b, eye),
+                    Some(b) if b.traits.air_top.is_some() => cosmos.altitude(b, eye),
                     _ => 1.0e9,
                 }
             }

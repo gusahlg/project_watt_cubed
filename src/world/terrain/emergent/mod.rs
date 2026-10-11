@@ -9,6 +9,7 @@
 //! bits plus an atanh series.
 
 pub mod accrete;
+#[cfg(feature = "dev-tools")]
 pub mod globe;
 pub mod minerals;
 pub mod nebula;
@@ -22,6 +23,7 @@ use material::{Element, Law};
 use self::accrete::{fuse, half_of, Impact, Proto};
 use self::minerals::{Found, Ground, Suite};
 use self::nebula::Nebula;
+pub use super::cosmos::{Form, Rank, Traits};
 use super::cosmos::{HOME_CUBE_HALF, HOME_RADIUS, RELIEF};
 use super::TerrainCfg;
 use crate::gravity::{window, G, R_G};
@@ -178,17 +180,6 @@ params! {
 
 pub use crate::math::{cbrt, log2};
 
-/// What a body's shape asks for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Form {
-    /// Keeps its cube grid, sagging at most half a block.
-    Cube,
-    /// Keeps its cube grid but sags: a warp and a storage box.
-    Warped,
-    /// Charted on a cube-sphere.
-    Round,
-}
-
 /// A body's layout from the genesis table.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Layout {
@@ -259,39 +250,6 @@ fn pi_g(s: &Suite, half: f64) -> f64 {
     G * s.density * s.density * half * half / s.yield_stress
 }
 
-/// Where a body sits in its system.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Rank {
-    Start,
-    Primary,
-    Partner,
-    Satellite,
-}
-
-/// What a body is, derived after the fact (design §3.4).
-#[derive(Clone, Debug, PartialEq)]
-pub struct Traits {
-    pub rank: Rank,
-    pub form: Form,
-    pub parent: Option<u16>,
-    pub partner: Option<u16>,
-    pub mass: f64,
-    pub yield_stress: f64,
-    pub pi_g: f64,
-    pub pi_clamped: bool,
-    /// Surface pull, m/s².
-    pub gravity: f32,
-    /// Q8.8, 1.0 = the start world.
-    pub heat: u16,
-    pub glow: bool,
-    pub air_top: Option<i32>,
-    pub temp: i16,
-    pub wet: u8,
-    pub life: u8,
-    pub suite: u16,
-    pub name: [u8; 12],
-}
-
 /// A body's past: what hit it and how hot that left it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct History {
@@ -316,6 +274,8 @@ pub struct Body {
     pub comp: [i8; 4],
     /// The painter ground its suite was checked against.
     pub ground: Ground,
+    /// Π fell outside the genesis table and was clamped.
+    pub pi_clamped: bool,
     pub traits: Traits,
     pub history: History,
 }
@@ -331,8 +291,7 @@ impl Body {
 
     /// The name as text.
     pub fn name(&self) -> &str {
-        let end = self.traits.name.iter().position(|&b| b == 0).unwrap_or(12);
-        std::str::from_utf8(&self.traits.name[..end]).unwrap_or("?")
+        self.traits.name()
     }
 }
 
@@ -645,7 +604,8 @@ fn expand(ws: &mut Vec<Work>, suites: &mut Suites, law: &Law, p: &Params) {
         }
         let rho = [0, 1].map(|k| suites.list[parts[k].suite].density);
         let half = [0, 1].map(|k| parts[k].half);
-        let gap = binary_gap(rho, half, p.k_dom);
+        // Each part's relief stays on its own side of the canyon.
+        let gap = binary_gap(rho, half, p.k_dom).max(2.0 * RELIEF as f64);
         let total = pair.masses[0] + pair.masses[1];
         let sep = half[0] + half[1] + gap;
         for k in 0..2 {
@@ -750,7 +710,7 @@ fn name(seed: u32) -> [u8; 12] {
 /// along x (from the storage border to `i32::MAX`), rows stacked in z below 1e9; warped boxes also
 /// need unique y ranges. What does not fit is demoted.
 fn storage(bodies: &[Body]) -> Storage {
-    let x_budget = i32::MAX as i64 - STORAGE_X0;
+    let x_budget = crate::math::CELL_LIMIT as i64 - STORAGE_X0;
     let z_budget = 1_000_000_000i64;
     let mut items: Vec<(i64, i64, bool)> = Vec::new();
     let mut demoted = 0;
@@ -771,7 +731,7 @@ fn storage(bodies: &[Body]) -> Storage {
                 let size = 2 * (b.half + RELIEF);
                 items.push((size, size, true));
             }
-            Form::Cube => {}
+            Form::Cube | Form::Shell => {}
         }
     }
     items.sort_by(|a, b| b.1.cmp(&a.1).then(b.0.cmp(&a.0)));
@@ -999,15 +959,16 @@ fn settle(
             seed: seed_b,
             comp: key(w.b.comp),
             ground: grounds[i],
+            pi_clamped: w.layout.clamped,
             traits: Traits {
                 rank: rank(i),
                 form,
                 parent: w.parent.and_then(id_of),
                 partner: w.partner.and_then(id_of),
+                core_of: None,
                 mass: w.b.mass,
                 yield_stress: s.yield_stress,
                 pi_g: w.pi,
-                pi_clamped: w.layout.clamped,
                 gravity: t.g as f32,
                 heat: (t.heat * 256.0).clamp(0.0, 65_535.0) as u16,
                 glow: t.glow,

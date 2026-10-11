@@ -806,7 +806,7 @@ mod tests {
     /// bump `WORLDGEN_VERSION` (older saves are then refused) and re-pin this hash.
     #[test]
     fn the_genesis_table_is_pinned_to_the_worldgen_version() {
-        assert_eq!(crate::world::terrain::WORLDGEN_VERSION, 10);
+        assert_eq!(crate::world::terrain::WORLDGEN_VERSION, 11);
         assert_eq!(crate::hash::fnv1a_32(TABLE), 0xa2f03b13, "the genesis table changed: bump WORLDGEN_VERSION and re-pin");
     }
 

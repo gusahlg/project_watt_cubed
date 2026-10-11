@@ -2,8 +2,8 @@
 //!
 //! Both faces use the cube painter. This only dresses the face that looks at the other twin, and
 //! only inside the face (clear of the rim blend). Everything it paints sits below [`CLEAR`], which
-//! is inside the body's relief bound, so the 1.5e6-block gap past that bound stays empty. The
-//! lower-id twin is lush (timber, leaves); the other is crystalline.
+//! is inside the body's relief bound, so the gap past that bound stays empty. A living side is lush
+//! (timber, leaves); a lifeless one is crystalline.
 
 use super::cosmos::{Body, Cosmos};
 use super::noise::{hash2, unit};
@@ -40,9 +40,9 @@ pub(super) fn facing_face(cosmos: &Cosmos, body: &Body) -> Option<Face> {
     })
 }
 
-/// The canyon's lush side is the twin with the smaller id; its partner is crystalline.
+/// A living side of the canyon is lush; a lifeless one is crystalline (as its realm).
 pub(super) fn lush(body: &Body) -> bool {
-    body.traits.partner.is_some_and(|other| body.id < other)
+    body.traits.life > 0
 }
 
 /// Salt for the facing face. One per twin, shared by the batch fill and the per-cell query.

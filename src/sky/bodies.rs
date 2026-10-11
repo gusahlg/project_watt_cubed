@@ -8,7 +8,7 @@ use voxel_engine::{
 
 use crate::sky::palette::Rgb;
 use crate::world::generation::TerrainGenerator;
-use crate::world::terrain::cosmos::{Body, Cosmos, Form, Rank, Shape, AIR_TOP};
+use crate::world::terrain::cosmos::{Body, Cosmos, Form, Rank, Shape};
 
 /// Above this altitude the voxel terrain is not drawn, so the impostor takes over.
 const STREAM_ALTITUDE: f64 = 20_000.0;
@@ -32,6 +32,8 @@ struct HomeMap {
     centre: DVec3,
     /// `radius + max(datum)`. The horizon ball is this plus the air thickness.
     hi: f64,
+    /// The start world's air thickness.
+    air: f64,
 }
 
 /// What one body draws, apart from where it sits relative to the eye. Built once per world.
@@ -49,8 +51,8 @@ struct Static {
 }
 
 impl Static {
-    fn new(cosmos: &Cosmos, body: &Body, twin_ordinal: u32, atlases: &[std::sync::Arc<crate::space::atlas::Atlas>]) -> Self {
-        let (shape, albedo, atmosphere) = paint(body, twin_ordinal);
+    fn new(cosmos: &Cosmos, body: &Body, atlases: &[std::sync::Arc<crate::space::atlas::Atlas>]) -> Self {
+        let (shape, albedo, atmosphere) = paint(cosmos, body);
         let start = body.traits.rank == Rank::Start;
         let (shape, radius) = if start {
             (shape, home_impostor(cosmos, body).1)
@@ -90,7 +92,7 @@ impl Static {
         }
         let mut far = FarBody { dir, distance, ..self.far };
         // Air-shell thickness in blocks, the same unit as `radius` (engine `FarShape::Mapped`).
-        let air = AIR_TOP as f32;
+        let air = air_of(body);
         if let Some(day) = self.day_air
             && mapped
             && horizon.is_finite()
@@ -201,11 +203,7 @@ impl FarBodies {
         self.statics = cosmos
             .bodies()
             .iter()
-            .map(|body| {
-                // A binary's lower id is its lush side.
-                let ordinal = body.traits.partner.map_or(0, |other| u32::from(other < body.id));
-                Static::new(cosmos, body, ordinal, atlases)
-            })
+            .map(|body| Static::new(cosmos, body, atlases))
             .collect();
     }
 
@@ -231,14 +229,14 @@ impl FarBodies {
         let radius = home_impostor(cosmos, body).1;
         let peak = datum.iter().fold(f32::NEG_INFINITY, |a, o| a.max(*o));
         let hi = if peak.is_finite() { radius + f64::from(peak) } else { radius };
-        self.map = Some(HomeMap { res, datum, radius, centre, hi });
+        self.map = Some(HomeMap { res, datum, radius, centre, hi, air: f64::from(air_of(body)) });
     }
 
     /// Closed form. The containing ball is fixed, so this is a few arithmetic ops.
     fn refresh_horizon(&mut self, eye: DVec3) {
         let Some(map) = self.map.as_ref() else { return };
         let dist = (map.centre - eye).length();
-        self.horizon = super::planet_map::horizon_sine(dist, map.hi, AIR_TOP);
+        self.horizon = super::planet_map::horizon_sine(dist, map.hi, map.air);
     }
 
     /// The shell's far wall and the Ember. Nothing outside the shell is visible.
@@ -363,50 +361,43 @@ fn home_faces() -> [LinearRgb; 6] {
     ]
 }
 
-/// A binary's lush side (ordinal 0); the other is crystalline.
-fn twin_faces(ordinal: u32) -> [LinearRgb; 6] {
-    if ordinal == 0 {
-        [
-            srgb(64, 130, 52),
-            srgb(48, 112, 58),
-            srgb(86, 158, 64),
-            srgb(36, 84, 40),
-            srgb(70, 140, 90),
-            srgb(54, 120, 48),
-        ]
-    } else {
-        [
-            srgb(198, 220, 238),
-            srgb(176, 206, 230),
-            srgb(220, 234, 246),
-            srgb(150, 184, 214),
-            srgb(190, 216, 240),
-            srgb(180, 208, 232),
-        ]
-    }
+/// Air-shell thickness of a body in blocks (0 without air).
+fn air_of(body: &Body) -> f32 {
+    body.traits.air_top.unwrap_or(0) as f32
 }
 
-/// The draw each painter's ground reads as (the same choice `storage` makes for round bodies).
-fn paint(body: &Body, twin_ordinal: u32) -> (FarShape, [LinearRgb; 6], LinearRgb) {
+/// A mineral's colour.
+fn rgb(c: [u8; 3]) -> LinearRgb {
+    srgb(c[0], c[1], c[2])
+}
+
+/// Halfway from `c` to `toward`.
+fn mixed(c: [u8; 3], toward: [u8; 3]) -> [u8; 3] {
+    std::array::from_fn(|k| ((c[k] as u16 + toward[k] as u16) / 2) as u8)
+}
+
+/// What a body reads as from afar: the start world its realms; every other body the colours of
+/// its own minerals, crust first, greened where it lives, with a burning air where it glows.
+fn paint(cosmos: &Cosmos, body: &Body) -> (FarShape, [LinearRgb; 6], LinearRgb) {
     let t = &body.traits;
     if t.rank == Rank::Start {
         return (FarShape::Sphere, home_faces(), black());
     }
+    let minerals = &cosmos.suite(body).minerals;
+    let tone = |k: usize| {
+        let c = minerals[minerals.len() - 1 - k % minerals.len()].rgb;
+        if t.life > 0 { mixed(c, [70, 140, 56]) } else { c }
+    };
+    let air = if t.glow {
+        hdr(1.8, 0.42, 0.06)
+    } else if t.life > 0 {
+        srgb(186, 216, 232)
+    } else {
+        black()
+    };
     match t.form {
-        Form::Cube | Form::Warped => (FarShape::Cube, twin_faces(twin_ordinal), black()),
-        Form::Shell => (FarShape::Sphere, tones(srgb(220, 232, 238), srgb(160, 190, 210)), black()),
-        _ if t.glow => (FarShape::Sphere, tones(srgb(255, 120, 36), srgb(170, 48, 16)), hdr(1.8, 0.42, 0.06)),
-        // Meadow and forest green: a living world has no seas.
-        _ if t.life > 0 => (FarShape::Sphere, tones(srgb(70, 140, 56), srgb(32, 92, 44)), srgb(186, 216, 232)),
-        // The same three characters the moon painter gives them (`round::Style::Moon { tone }`).
-        _ => {
-            let albedo = match body.seed % 3 {
-                0 => tones(srgb(150, 148, 152), srgb(60, 66, 72)),
-                1 => tones(srgb(200, 222, 240), srgb(150, 176, 220)),
-                _ => tones(srgb(186, 104, 90), srgb(170, 124, 110)),
-            };
-            (FarShape::Sphere, albedo, black())
-        }
+        Form::Cube | Form::Warped => (FarShape::Cube, std::array::from_fn(|f| rgb(tone(f))), air),
+        _ => (FarShape::Sphere, tones(rgb(tone(0)), rgb(tone(1))), air),
     }
 }
 
@@ -523,18 +514,17 @@ mod tests {
         cosmos: &Cosmos,
         body: &Body,
         eye: DVec3,
-        twin_ordinal: u32,
         atlases: &[std::sync::Arc<crate::space::atlas::Atlas>],
         mapped: bool,
         horizon: f32,
     ) -> Option<FarBody> {
         let delta = body.centre_f() - eye;
         let dist = delta.length();
-        let (mut shape, albedo, mut atmosphere) = paint(body, twin_ordinal);
-        let radius = if body.kind == Kind::Home {
+        let (mut shape, albedo, mut atmosphere) = paint(cosmos, body);
+        let radius = if body.traits.rank == Rank::Start {
             let (_, radius) = home_impostor(cosmos, body);
             // Air-shell thickness in blocks, the same unit as `radius` (engine `FarShape::Mapped`).
-            let air = AIR_TOP as f32;
+            let air = air_of(body);
             if mapped && horizon.is_finite() && air.is_finite() && air >= 0.0 {
                 shape = FarShape::Mapped { map: crate::sky::planet_map::HOME_MAP, horizon, air };
                 atmosphere = daylight_air();
@@ -585,22 +575,19 @@ mod tests {
                 far.atmosphere = LinearRgb(far.atmosphere.0.map(|c| c * CORE_GLOW));
                 far
             };
-            return impostor(cosmos, ember, eye, 0, &[], false, 1.0).map(glow).into_iter().collect();
+            return impostor(cosmos, ember, eye, &[], false, 1.0).map(glow).into_iter().collect();
+        }
+        // Catalog order, or nearest first past the engine's cap.
+        let mut order: Vec<&Body> = cosmos.bodies().iter().collect();
+        if order.len() > MAX_FAR_BODIES {
+            order.sort_by(|a, b| (a.centre_f() - eye).length_squared().total_cmp(&(b.centre_f() - eye).length_squared()).then(a.id.cmp(&b.id)));
         }
         let mut list = Vec::new();
-        let mut twin = 0u32;
-        for body in cosmos.bodies() {
-            let ordinal = if body.kind == Kind::Twin {
-                let i = twin;
-                twin += 1;
-                i
-            } else {
-                0
-            };
+        for body in order {
             if list.len() == MAX_FAR_BODIES {
                 break;
             }
-            if let Some(far) = impostor(cosmos, body, eye, ordinal, generator.atlases(), mapped, horizon) {
+            if let Some(far) = impostor(cosmos, body, eye, generator.atlases(), mapped, horizon) {
                 list.push(far);
             }
         }

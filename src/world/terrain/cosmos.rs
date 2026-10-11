@@ -12,6 +12,7 @@ use std::collections::HashMap;
 
 use glam::DVec3;
 
+use super::emergent::minerals::Suite;
 use super::noise::{hash3, unit};
 use crate::gravity::{MassOracle, Primitive, Shape as MassShape, Summary, Visitor, G};
 
@@ -142,8 +143,9 @@ pub struct Traits {
 }
 
 impl Traits {
-    /// The traits of today's authored catalog entry: `kind` and `shape` say everything; the links
+    /// The traits of an authored catalog entry: `kind` and `shape` say everything; the links
     /// (parent, partner, core) are filled once the catalog is known.
+    #[cfg(test)]
     pub fn of(kind: Kind, shape: Shape) -> Self {
         let form = match shape {
             Shape::Cube { .. } => Form::Cube,
@@ -202,6 +204,24 @@ impl Traits {
         }
     }
 
+    /// A label of what the body is, for the UI, mods and tests: "start world", "binary cube",
+    /// "cube moon", "glowing world", "living moon", "airless world", ...
+    pub fn class(&self) -> &'static str {
+        let moon = self.rank == Rank::Satellite;
+        let pick = |m: &'static str, w: &'static str| if moon { m } else { w };
+        match (self.rank, self.form) {
+            (Rank::Start, _) => "start world",
+            _ if self.core_of.is_some() => "core",
+            (Rank::Partner, _) => "binary cube",
+            (_, Form::Shell) => "hollow world",
+            (_, Form::Cube | Form::Warped) => pick("cube moon", "cube world"),
+            _ if self.glow => pick("glowing moon", "glowing world"),
+            _ if self.life > 0 => pick("living moon", "living world"),
+            _ if self.air_top.is_none() => pick("airless moon", "airless world"),
+            _ => pick("barren moon", "barren world"),
+        }
+    }
+
     /// The name as text.
     pub fn name(&self) -> &str {
         let end = self.name.iter().position(|&b| b == 0).unwrap_or(self.name.len());
@@ -226,6 +246,7 @@ pub struct Body {
 
 impl Body {
     /// An entry of the authored catalog: its traits follow from `kind` and `shape`.
+    #[cfg(test)]
     fn authored(id: u16, kind: Kind, centre: [i64; 3], shape: Shape, seed: u32) -> Self {
         Body { id, kind, centre, shape, density: BULK_DENSITY, seed, traits: Traits::of(kind, shape) }
     }
@@ -389,6 +410,8 @@ const CLASSES: [(i64, f32, f32, f64); 4] = [
 pub struct Cosmos {
     seed: u32,
     bodies: Vec<Body>,
+    /// What the bodies are made of, indexed by [`Traits::suite`].
+    suites: Vec<Suite>,
     clusters: Vec<Cluster>,
     by_cell: HashMap<[i32; 3], u32>,
     /// Clusters grouped by super-cell, with their summed expected mass.
@@ -437,6 +460,26 @@ fn direction(seed: u32, k: i32) -> DVec3 {
     DVec3::Y
 }
 
+/// Take body `id` out of the catalog (its matter becomes debris): later ids move down one, and what
+/// it held or was bound to stands alone.
+fn demote(bodies: &mut Vec<Body>, id: u16) {
+    bodies.remove(usize::from(id));
+    let fix = |link: Option<u16>| link.filter(|&l| l != id).map(|l| if l > id { l - 1 } else { l });
+    for b in bodies.iter_mut() {
+        if b.id > id {
+            b.id -= 1;
+        }
+        let t = &mut b.traits;
+        let (parent, partner) = (fix(t.parent), fix(t.partner));
+        if (t.parent.is_some() && parent.is_none()) || (t.partner.is_some() && partner.is_none()) {
+            t.rank = Rank::Primary;
+        }
+        (t.parent, t.partner, t.core_of) = (parent, partner, fix(t.core_of));
+        b.kind = t.legacy_kind(b.id);
+    }
+}
+
+#[cfg(test)]
 /// Fill the links between authored bodies: the twins are each other's partners, a moon's parent is
 /// the nearest body that is neither a moon nor the Ember, and the Ember is the Hollow's core.
 fn link(bodies: &mut [Body]) {
@@ -466,6 +509,7 @@ fn link(bodies: &mut [Body]) {
     }
 }
 
+#[cfg(test)]
 /// A position snapped to the chunk grid (multiples of 16), so a body's faces and columns align
 /// with chunks.
 fn to_i64(v: DVec3) -> [i64; 3] {
@@ -474,13 +518,79 @@ fn to_i64(v: DVec3) -> [i64; 3] {
 }
 
 impl Cosmos {
-    /// The catalog for `seed`, with the asteroid-cluster density scaled by `space` (1 = designed).
-    pub fn new(seed: u32, space: f32) -> Self {
+    /// The universe of `seed`, with the asteroid-cluster density scaled by `space` (1 = designed).
+    pub fn new(seed: u64, space: f32) -> Self {
         Self::with_deep(seed, space, 1.0)
     }
 
     /// [`new`](Self::new), with the interior-feature density scaled by `deep` (1 = designed).
-    pub fn with_deep(seed: u32, space: f32, deep: f32) -> Self {
+    pub fn with_deep(seed: u64, space: f32, deep: f32) -> Self {
+        let percent = |v: f32| (v * 100.0).round().clamp(0.0, 200.0) as u16;
+        Self::grow(seed, &super::TerrainCfg { space: percent(space), deep: percent(deep), ..super::TerrainCfg::default() })
+    }
+
+    /// The universe grown from `seed` (all 64 bits) under the knobs `cfg` (design v5 stages 1-7):
+    /// a nebula collapses into systems, their matter accretes into bodies, each body's minerals
+    /// come from the law, and its matter decides its shape. Bodies that do not fit storage become
+    /// debris, smallest first.
+    pub fn grow(seed: u64, cfg: &super::TerrainCfg) -> Self {
+        let (space, deep) = (cfg.space as f32 / 100.0, cfg.deep as f32 / 100.0);
+        let seed32 = (seed ^ (seed >> 32)) as u32;
+        #[cfg(test)]
+        if fixture::AUTHORED.with(std::cell::Cell::get) {
+            return Self::authored(seed32 ^ 0x1D1F_F051, space, deep);
+        }
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(4);
+        let universe = super::emergent::Universe::new(seed, cfg, &super::emergent::Params::default(), threads);
+        let mut bodies: Vec<Body> = universe
+            .bodies
+            .iter()
+            .map(|b| {
+                let shape = if b.traits.form == Form::Round { Shape::Ball { r: b.radius } } else { Shape::Cube { half: b.half } };
+                Body { id: b.id, kind: b.traits.legacy_kind(b.id), centre: b.centre, shape, density: b.density, seed: b.seed, traits: b.traits }
+            })
+            .collect();
+        loop {
+            let warped: Vec<u16> = bodies.iter().filter(|b| b.traits.form == Form::Warped).map(|b| b.id).collect();
+            if super::storage::plan(&bodies, &warped).is_ok() {
+                break;
+            }
+            let smallest = bodies
+                .iter()
+                .filter(|b| b.traits.rank != Rank::Start && matches!(b.traits.form, Form::Round | Form::Warped))
+                .min_by(|a, b| a.traits.mass.total_cmp(&b.traits.mass).then(a.id.cmp(&b.id)))
+                .map(|b| b.id)
+                .expect("the start world alone fits storage");
+            demote(&mut bodies, smallest);
+        }
+        Self::assemble(seed32, bodies, universe.suites, space, deep)
+    }
+
+    /// The catalog with its index and clusters.
+    fn assemble(seed: u32, bodies: Vec<Body>, suites: Vec<Suite>, space: f32, deep: f32) -> Self {
+        let mut cosmos = Self {
+            seed,
+            bodies,
+            suites,
+            clusters: Vec::new(),
+            by_cell: HashMap::new(),
+            groups: Vec::new(),
+            group_at: vec![u32::MAX; (GRID_SIDE * GRID_SIDE * GRID_SIDE) as usize],
+            deep: deep.clamp(0.0, 2.0),
+            reliefs: Vec::new(),
+            shapes: Vec::new(),
+            warps: Vec::new(),
+            index: BodyIndex::default(),
+        };
+        cosmos.index = BodyIndex::new(&cosmos.bodies);
+        cosmos.place_clusters(space);
+        cosmos
+    }
+
+    /// Today's authored catalog (home, the twins, Verdance, the Hollow and its Ember, moons), every
+    /// body of `rock`: the shells no seed grows yet, for tests of the machinery that draws them.
+    #[cfg(test)]
+    fn authored(seed: u32, space: f32, deep: f32) -> Self {
         let mut bodies = vec![Body::authored(0, Kind::Home, HOME_CENTRE, Shape::Ball { r: HOME_RADIUS }, hash3(seed, 0, 0, 0))];
         let home = bodies[0].centre_f();
         // Big worlds: (kind, shape) on the far shell.
@@ -554,22 +664,18 @@ impl Cosmos {
             }
         }
         link(&mut bodies);
-        let mut cosmos = Self {
-            seed,
-            bodies,
-            clusters: Vec::new(),
-            by_cell: HashMap::new(),
-            groups: Vec::new(),
-            group_at: vec![u32::MAX; (GRID_SIDE * GRID_SIDE * GRID_SIDE) as usize],
-            deep: deep.clamp(0.0, 2.0),
-            reliefs: Vec::new(),
-            shapes: Vec::new(),
-            warps: Vec::new(),
-            index: BodyIndex::default(),
-        };
-        cosmos.index = BodyIndex::new(&cosmos.bodies);
-        cosmos.place_clusters(space);
-        cosmos
+        let rock = super::emergent::minerals::role_suite(&material::Law::current(), "rock");
+        Self::assemble(seed, bodies, vec![rock], space, deep)
+    }
+
+    /// The mineral suites, indexed by [`Traits::suite`].
+    pub fn suites(&self) -> &[Suite] {
+        &self.suites
+    }
+
+    /// The suite body `b` is made of.
+    pub fn suite(&self, b: &Body) -> &Suite {
+        &self.suites[usize::from(b.traits.suite)]
     }
 
     /// Every big body.
@@ -942,6 +1048,82 @@ impl BodyIndex {
     }
 }
 
+/// Test fixtures over the catalog.
+#[cfg(test)]
+pub(crate) mod fixture {
+    use std::cell::Cell;
+
+    use super::{Body, Cosmos, Form, Rank};
+
+    thread_local! {
+        pub(super) static AUTHORED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Run `f` with every universe it grows on this thread replaced by the authored catalog: the
+    /// Hollow and its Ember, which no seed grows before shells are emergent.
+    pub(crate) fn authored<T>(f: impl FnOnce() -> T) -> T {
+        AUTHORED.with(|a| a.set(true));
+        let out = f();
+        AUTHORED.with(|a| a.set(false));
+        out
+    }
+
+    /// A body a test needs, by what it is rather than by a catalog entry.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Want {
+        /// One half of a contact binary of cubes: the canyon between them.
+        Pair,
+        /// A cube that sags into a storage box.
+        Warped,
+        /// A cube that keeps its physical grid.
+        Cube,
+        /// A round body the living (Verdant) painter grows.
+        Living,
+        /// A round body the glowing (Ember) painter burns.
+        Glowing,
+        /// A round body painted as a cratered moon.
+        Moonlike,
+        /// A body held by a heavier one.
+        Satellite,
+    }
+
+    impl Want {
+        pub(crate) const ALL: [Want; 7] =
+            [Want::Pair, Want::Warped, Want::Cube, Want::Living, Want::Glowing, Want::Moonlike, Want::Satellite];
+
+        pub(crate) fn matches(self, b: &Body) -> bool {
+            let t = &b.traits;
+            let round = t.form == Form::Round && t.rank != Rank::Start;
+            match self {
+                Want::Pair => t.partner.is_some(),
+                Want::Warped => t.form == Form::Warped,
+                Want::Cube => t.form == Form::Cube,
+                Want::Living => round && !t.glow && t.life > 0,
+                Want::Glowing => round && t.glow,
+                Want::Moonlike => round && !t.glow && t.life == 0,
+                Want::Satellite => t.rank == Rank::Satellite,
+            }
+        }
+    }
+
+    /// Seeds whose universes hold what tests want, found by `census` (default knobs) and checked
+    /// by `fixture_seeds_hold_what_they_promise`.
+    pub(crate) const SEEDS: [(i64, &[Want]); 2] = [
+        (139, &[Want::Pair, Want::Warped, Want::Living, Want::Glowing, Want::Moonlike, Want::Satellite]),
+        (157, &[Want::Pair, Want::Warped, Want::Living, Want::Glowing, Want::Moonlike, Want::Satellite]),
+    ];
+
+    /// The first pinned seed whose universe holds a body of every kind in `wants`.
+    pub(crate) fn seed(wants: &[Want]) -> i64 {
+        SEEDS.iter().find(|(_, has)| wants.iter().all(|w| has.contains(w))).map(|(s, _)| *s).expect("a pinned seed holds it")
+    }
+
+    /// The first body of `cosmos` that is `want`.
+    pub(crate) fn first(cosmos: &Cosmos, want: Want) -> Option<Body> {
+        cosmos.bodies().iter().copied().find(|b| want.matches(b))
+    }
+}
+
 /// A body's relaxed shape as the catalog knows it.
 #[derive(Clone, Debug)]
 struct Relaxed {
@@ -955,7 +1137,8 @@ impl Cosmos {
     /// the bench and the travel targets expect the ground.
     pub fn settle_home(&mut self, top_offset: i64) {
         let home = &mut self.bodies[0];
-        home.centre = [HOME_CENTRE[0], HOME_CENTRE[1] - top_offset, HOME_CENTRE[2]];
+        let Shape::Ball { r } = home.shape else { return };
+        home.centre = [0, -r - top_offset, 0];
         self.index = BodyIndex::new(&self.bodies);
     }
 
@@ -1270,6 +1453,30 @@ mod tests {
         assert_eq!(none, 0);
     }
 
+    /// `cargo test --release --lib census -- --ignored --nocapture`: which seeds hold which bodies
+    /// (`CENSUS_SEEDS`, default 400), for [`fixture::SEEDS`].
+    #[test]
+    #[ignore]
+    fn census() {
+        use fixture::Want;
+        let n: i64 = std::env::var("CENSUS_SEEDS").ok().and_then(|v| v.parse().ok()).unwrap_or(400);
+        for seed in 0..n {
+            let cosmos = Cosmos::grow(seed as u64, &super::super::TerrainCfg::default());
+            let has: Vec<Want> = Want::ALL.into_iter().filter(|w| cosmos.bodies().iter().any(|b| w.matches(b))).collect();
+            println!("{seed}: {} bodies {has:?}", cosmos.bodies().len());
+        }
+    }
+
+    #[test]
+    fn fixture_seeds_hold_what_they_promise() {
+        for (seed, wants) in fixture::SEEDS {
+            let cosmos = Cosmos::grow(seed as u64, &super::super::TerrainCfg::default());
+            for &w in wants {
+                assert!(fixture::first(&cosmos, w).is_some(), "seed {seed} lacks {w:?}");
+            }
+        }
+    }
+
     /// `cargo test --lib cosmos_report -- --ignored --nocapture`: the catalog of a seed.
     #[test]
     #[ignore]
@@ -1278,7 +1485,11 @@ mod tests {
         let cosmos = Cosmos::new(seed, 1.0);
         for b in cosmos.bodies() {
             let d = (b.centre_f() - cosmos.home().centre_f()).length();
-            println!("{:>2} {:?} at {:?} {:?} — {:.3e} blocks from home", b.id, b.kind, b.centre, b.shape, d);
+            let t = &b.traits;
+            println!(
+                "{:>2} {:<12} {:?}/{:?} {:?} ρ {} g {:.1} T {} air {:?} life {} glow {} ({}) — {:.3e} blocks from home",
+                b.id, b.name(), t.rank, t.form, b.shape, b.density, t.gravity, t.temp, t.air_top, t.life, t.glow, t.class(), d
+            );
         }
         let n = cosmos.clusters().len();
         let near = cosmos.clusters().iter().filter(|c| (c.centre - cosmos.home().centre_f()).length() < 2.0e8).count();

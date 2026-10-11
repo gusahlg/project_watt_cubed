@@ -43,6 +43,9 @@ pub struct Round {
     style: Style,
     /// Unit direction of a moon's ice cap: from the parent toward the moon. Zero for every other style.
     pole: DVec3,
+    /// Fill below every cave, and of the transition shell and the core.
+    deep: BlockId,
+    heart: (BlockId, BlockId),
     m: Arc<Materials>,
 }
 
@@ -111,7 +114,22 @@ fn smoothstep(a: f32, b: f32, t: f32) -> f32 {
 
 impl Round {
     pub fn new(atlas: Atlas, seed: u32, style: Style, m: Arc<Materials>, pole: DVec3) -> Self {
-        Self { atlas, seed, style, pole, m }
+        let deep = match style {
+            Style::HollowInner | Style::HollowOuter => m.basalt,
+            Style::Ember => m.magma,
+            _ => m.deeprock,
+        };
+        let heart = match style {
+            Style::Moon { .. } => (m.deeprock, m.basalt),
+            _ => (m.deeprock, m.magma),
+        };
+        Self { atlas, seed, style, pole, deep, heart, m }
+    }
+
+    /// The same painter over a body of its own matter: `deep` below the caves and through the
+    /// transition shell, `core` at the centre.
+    pub fn filled(self, (deep, core): (BlockId, BlockId)) -> Self {
+        Self { deep, heart: (deep, core), ..self }
     }
 
     fn salt(&self, k: u32) -> u32 {
@@ -269,19 +287,12 @@ impl Round {
 
     /// The fill below every cave (the uniform deep body of a shell chart).
     pub fn deep(&self) -> BlockId {
-        match self.style {
-            Style::HollowInner | Style::HollowOuter => self.m.basalt,
-            Style::Ember => self.m.magma,
-            _ => self.m.deeprock,
-        }
+        self.deep
     }
 
     /// The fill of the transition shell and the core.
     pub fn heart(&self) -> (BlockId, BlockId) {
-        match self.style {
-            Style::Moon { .. } => (self.m.deeprock, self.m.basalt),
-            _ => (self.m.deeprock, self.m.magma),
-        }
+        self.heart
     }
 
     /// Relief at lattice node `(i, j)` (a cell corner) of a shell patch.

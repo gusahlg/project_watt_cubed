@@ -252,7 +252,7 @@ impl Stats {
         self.others.push(u.bodies.len() as f64 - 1.0);
         self.systems.push(u.systems as f64);
         self.basins.push(u.basins as f64);
-        let mut forms = [false; 3];
+        let mut forms = [false; 4];
         for b in &u.bodies {
             let t = &b.traits;
             self.half.push(b.half as f64);
@@ -272,7 +272,7 @@ impl Stats {
             self.life.push(t.life as f64);
             self.glow += t.glow as usize;
             self.pi.push(t.pi_g);
-            self.pi_clamped += t.pi_clamped as usize;
+            self.pi_clamped += b.pi_clamped as usize;
         }
         self.both_layouts += ((forms[0] || forms[1]) && forms[2]) as usize;
         for &ms in u.suite_ms.iter().filter(|&&ms| ms > 0.0) {

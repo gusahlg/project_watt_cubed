@@ -2,14 +2,15 @@
 //! nebula conserves mass for any thread count, universes are sane, and every stage's bytes are
 //! pinned per seed (the same pins on every machine are the cross-machine check).
 
-use super::globe::{self, Input};
 use super::nebula::Nebula;
 use super::*;
 
 /// Seeds the digests are pinned for: GOLDEN_SEED, 42 and the owner's seed.
+#[cfg(feature = "dev-tools")]
 const SEEDS: [u64; 3] = [0xC0FFEE, 42, 1_791_184_794_939_118_871];
 
 /// `(nebula, catalog, suites, start globe at G=32)` per seed.
+#[cfg(feature = "dev-tools")]
 const PINS: [[u64; 4]; 3] = [
     [0xc9eb33927aa562fa, 0x6b1c643a854df8f1, 0x6935160005a0a303, 0xb35ca704b2e41828],
     [0x14276b40ffcd9ae0, 0xdcd25efe3aa85d89, 0x5b4086c57a5864d2, 0xc0777c8deca31ed6],
@@ -90,6 +91,7 @@ fn the_nebula_conserves_mass_for_any_thread_count() {
     assert!(one.systems[0].origin && one.systems.iter().skip(1).all(|s| !s.origin));
 }
 
+#[cfg(feature = "dev-tools")]
 fn fnv(h: &mut u64, bytes: &[u8]) {
     for &b in bytes {
         *h ^= b as u64;
@@ -97,7 +99,9 @@ fn fnv(h: &mut u64, bytes: &[u8]) {
     }
 }
 
+#[cfg(feature = "dev-tools")]
 fn digests(seed: u64) -> [u64; 4] {
+    use super::globe::{self, Input};
     let cfg = TerrainCfg::default();
     let p = Params::default();
     let u = Universe::new(seed, &cfg, &p, 2);
@@ -137,6 +141,7 @@ fn digests(seed: u64) -> [u64; 4] {
     d
 }
 
+#[cfg(feature = "dev-tools")]
 #[test]
 fn stage_digests_are_pinned() {
     let got: Vec<[u64; 4]> = SEEDS.iter().map(|&s| digests(s)).collect();

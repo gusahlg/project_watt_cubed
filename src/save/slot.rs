@@ -94,8 +94,8 @@ pub enum SaveError {
     /// Written before the selective-transfer law (save versions 4-8): its materials have no
     /// meaning under the current law.
     Outdated(u16),
-    /// A v9 Diffusion world from before the cube-planet universe.
-    BeforeCubePlanet,
+    /// A Diffusion world grown by another generator version: its universe is not this game's.
+    OtherUniverse(u16),
 }
 
 impl fmt::Display for SaveError {
@@ -113,9 +113,11 @@ impl fmt::Display for SaveError {
                 f,
                 "save v{v} was made under the old material law; worlds from before selective transfer cannot be loaded"
             ),
-            SaveError::BeforeCubePlanet => {
-                write!(f, "this world was made before the cube-planet universe")
-            }
+            SaveError::OtherUniverse(v) => write!(
+                f,
+                "this world was grown by world generator v{v}; this game grows v{} universes and cannot load it",
+                crate::world::terrain::WORLDGEN_VERSION
+            ),
         }
     }
 }

@@ -539,24 +539,30 @@ fn cube_edges_share_one_rim_and_the_ridge_is_solid() {
 #[test]
 fn deep_mix_mean_amount_is_the_bulk_density() {
     let (reg, t) = make(1);
-    let home = *t.cosmos.home();
-    let mut sum = 0.0f64;
-    let mut n = 0u32;
-    for i in 0..40 {
-        for j in 0..40 {
-            for k in 0..12 {
-                let rel = [i as i64 * 64, j as i64 * 64, k as i64 * 64];
-                debug_assert!(cube::in_deep(rel, cube::half_of(&home)));
-                sum += f64::from(reg.amount(cube::bulk_id(&t.bulk, &home, rel)));
-                n += 1;
+    for body in t.cosmos.bodies().iter().filter(|b| b.traits.rank == cosmos::Rank::Start || matches!(b.shape, cosmos::Shape::Cube { .. })) {
+        // Exactly, by the mix's shares, and by sampling cells.
+        let bulk = &t.bulks[usize::from(body.id)];
+        let exact: f64 = bulk.fractions().iter().map(|&(id, f)| f * f64::from(reg.amount(id))).sum();
+        assert!((exact - body.density).abs() <= 1e-6 * body.density, "body {}: mix {exact} vs density {}", body.id, body.density);
+        let mut sum = 0.0f64;
+        let mut n = 0u32;
+        for i in 0..40 {
+            for j in 0..40 {
+                for k in 0..12 {
+                    let rel = [i as i64 * 64, j as i64 * 64, k as i64 * 64];
+                    sum += f64::from(reg.amount(bulk_at(&t, body, rel)));
+                    n += 1;
+                }
             }
         }
+        let mean = sum / f64::from(n);
+        assert!((mean - body.density).abs() <= 0.03 * body.density.max(5.0), "body {}: deep mean {mean} over {n} cells, density {}", body.id, body.density);
     }
-    let mean = sum / f64::from(n);
-    assert!(
-        (mean - cosmos::BULK_DENSITY).abs() <= 0.05,
-        "deep mean {mean} over {n} cells"
-    );
+}
+
+/// The deep bulk of `body` at `rel`.
+fn bulk_at(t: &Terrain, body: &cosmos::Body, rel: [i64; 3]) -> BlockId {
+    cube::bulk_id(&t.bulks[usize::from(body.id)], body, rel)
 }
 
 #[test]
@@ -1205,7 +1211,7 @@ fn the_interior_is_batch_exact_and_the_heart_is_below_band_0() {
             let mut rel = bubble;
             rel[axis] += sign * (r + 3);
             let (ox, oy, oz) = world_of(&t, &home, rel);
-            if t.voxel_at(ox, oy, oz) == cube::bulk_id(&t.bulk, &home, rel) {
+            if t.voxel_at(ox, oy, oz) == bulk_at(&t, &home, rel) {
                 bulk_outside = true;
             }
         }
@@ -1223,7 +1229,7 @@ fn the_interior_is_batch_exact_and_the_heart_is_below_band_0() {
     let mut reg = BlockRegistry::with_builtins();
     let off = Terrain::with_cfg(&mut reg, 42, TerrainCfg { deep: 0, ..TerrainCfg::default() });
     assert_ne!(off.voxel_at(x, y, z), AIR, "deep=0 left the cavern hollow");
-    assert_eq!(off.voxel_at(x, y, z), cube::bulk_id(&off.bulk, &home, air));
+    assert_eq!(off.voxel_at(x, y, z), bulk_at(&off, &home, air));
     assert_eq!(off.voxel_at(core[0] as i32, core[1] as i32, core[2] as i32), off.storage.home_fill());
 }
 
@@ -1391,7 +1397,7 @@ fn interior_lights_cover_the_floor_and_match_per_voxel() {
     let mut reg = BlockRegistry::with_builtins();
     let off = Terrain::with_cfg(&mut reg, 42, TerrainCfg { deep: 0, ..TerrainCfg::default() });
     let (x, y, z) = world_of(&t, &home, rel);
-    assert_eq!(off.voxel_at(x, y, z), cube::bulk_id(&off.bulk, &home, rel), "deep=0 left a floor light");
+    assert_eq!(off.voxel_at(x, y, z), bulk_at(&off, &home, rel), "deep=0 left a floor light");
 }
 
 #[test]

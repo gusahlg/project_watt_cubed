@@ -379,7 +379,7 @@ impl Atlas {
             }
             let f = rz / (n + GAP);
             let lz = rz - f * (n + GAP);
-            (f < 6 && lz < n).then_some((FACES[f as usize], lx, lz))
+            (f < 6 && lz < n).then(|| (FACES[f as usize], lx, lz))
         };
         for (band, b) in self.bands.iter().enumerate() {
             if let Some((face, lx, lz)) = faces(b.origin[0], b.n) {

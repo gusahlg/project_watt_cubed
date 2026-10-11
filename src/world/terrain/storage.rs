@@ -51,6 +51,8 @@ fn style_of(b: &Body) -> Style {
 
 /// Rows of storage stay below this z (section, heightmip and save keys are audited to here).
 const Z_END: i64 = 1_000_000_000;
+/// Storage x (and a cube box's y) stays below the cells block coordinates resolve.
+const END: i64 = crate::math::CELL_LIMIT as i64;
 /// Empty storage cells between shelf rows.
 const ROW_GAP: i64 = 64;
 
@@ -131,7 +133,7 @@ pub(crate) fn plan(bodies: &[Body], warped: &[u16]) -> Result<Vec<(u16, Need, [i
     for (id, need) in needs {
         let b = &bodies[usize::from(id)];
         let (dx, dz) = need.spans(b);
-        let fits = |x: i64| x + dx < i32::MAX as i64;
+        let fits = |x: i64| x + dx < END;
         // A lower row takes only what fits its height; the last row may grow.
         let last = rows.len().checked_sub(1);
         let row = match (0..rows.len()).find(|&k| fits(rows[k].2) && (dz <= rows[k].1 || (Some(k) == last && rows[k].0 + dz <= Z_END))) {
@@ -146,7 +148,7 @@ pub(crate) fn plan(bodies: &[Body], warped: &[u16]) -> Result<Vec<(u16, Need, [i
             }
         };
         let y = if need == Need::Cube {
-            if cube_y + dx > i32::MAX as i64 {
+            if cube_y + dx > END {
                 return Err(id);
             }
             cube_y += dx;
@@ -201,10 +203,10 @@ fn boxes_of(atlas: &Atlas) -> Vec<(Patch, [i64; 3], [i64; 3])> {
 
 impl StorageWorlds {
     /// Chart every round body of `cosmos` and give each sagging cube in `warps` one box (its cells are
-    /// an integer translation of the physical cube), placed by [`plan`]. `home_fill` is the start
-    /// world's uniform block below band 0 (the bulk mix's majority material). `Err` names a body
-    /// that does not fit.
-    pub fn new(cosmos: &Cosmos, m: &Arc<Materials>, home_fill: BlockId, warps: &[(u16, Arc<Warp>)]) -> Result<Self, u16> {
+    /// an integer translation of the physical cube), placed by [`plan`]. `fills` holds each body's
+    /// deep fill and heart by id: the start world's uniform block below band 0, a round painter's
+    /// fill below its caves and in its core. `Err` names a body that does not fit.
+    pub fn new(cosmos: &Cosmos, m: &Arc<Materials>, fills: &[(BlockId, BlockId)], warps: &[(u16, Arc<Warp>)]) -> Result<Self, u16> {
         let bodies = cosmos.bodies();
         let warped: Vec<u16> = warps.iter().map(|(id, _)| *id).collect();
         let mut worlds = Vec::new();
@@ -218,10 +220,10 @@ impl StorageWorlds {
                 Need::Ball => {
                     let style = style_of(b);
                     let pole = if matches!(style, Style::Moon { .. }) { parent_pole(bodies, b) } else { DVec3::ZERO };
-                    Some(Round::new(atlas.clone(), b.seed, style, m.clone(), pole))
+                    Some(Round::new(atlas.clone(), b.seed, style, m.clone(), pole).filled(fills[usize::from(id)]))
                 }
             };
-            let (home, fill) = if need == Need::Home { (true, home_fill) } else { (false, AIR) };
+            let (home, fill) = if need == Need::Home { (true, fills[usize::from(id)].0) } else { (false, AIR) };
             worlds.push(Charted { boxes: boxes_of(&atlas), round, atlas, home, fill });
         }
         let atlases = worlds.iter().map(|w| Arc::new(w.atlas.clone())).collect();
@@ -617,7 +619,8 @@ mod tests {
         let mut reg = BlockRegistry::with_builtins();
         let m = Arc::new(Materials::intern(&mut reg));
         let cosmos = Cosmos::new(42, 1.0);
-        (StorageWorlds::new(&cosmos, &m, AIR, &[]).expect("fits"), cosmos)
+        let fills = vec![(m.deeprock, m.magma); cosmos.bodies().len()];
+        (StorageWorlds::new(&cosmos, &m, &fills, &[]).expect("fits"), cosmos)
     }
 
     #[test]
