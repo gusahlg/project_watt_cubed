@@ -137,6 +137,8 @@ pub(in crate::world) struct Laps {
     pub(in crate::world) full: [Duration; PHASES],
     /// The last finished pass: its wall time and whether it was a full pass.
     pub(in crate::world) last: (Duration, bool),
+    /// The slowest pass: its wall time and its phases.
+    pub(in crate::world) worst: (Duration, [Duration; PHASES]),
 }
 
 impl Default for Laps {
@@ -150,6 +152,7 @@ impl Default for Laps {
             sum: [Duration::ZERO; PHASES],
             full: [Duration::ZERO; PHASES],
             last: (Duration::ZERO, false),
+            worst: (Duration::ZERO, [Duration::ZERO; PHASES]),
         }
     }
 }
@@ -175,6 +178,9 @@ impl Laps {
                 }
             }
             self.last = (now - self.start, self.full_pass);
+            if self.last.0 > self.worst.0 {
+                self.worst = (self.last.0, self.pass);
+            }
         }
     }
 
@@ -182,6 +188,7 @@ impl Laps {
     pub(in crate::world) fn reset(&mut self) {
         self.sum = [Duration::ZERO; PHASES];
         self.full = [Duration::ZERO; PHASES];
+        self.worst = (Duration::ZERO, [Duration::ZERO; PHASES]);
     }
 }
 

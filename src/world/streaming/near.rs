@@ -11,10 +11,12 @@
 use super::*;
 use super::super::rule::PhysBox;
 use super::super::section::{CHART_BODY_BASE, ColumnClip};
+use super::super::sampler::Sampler;
+use super::super::generation::TerrainGenerator;
 use super::super::{DATA_MARGIN, UNLOAD_MARGIN, UNLOAD_MARGIN_V};
 
 /// Where the near field reads its columns.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(in crate::world) enum Frame {
     /// A round world's chart storage, folded into one net around the centre; storage +Y is up.
     Chart { index: usize, body: u16, floor: i32 },
@@ -70,10 +72,74 @@ pub(in crate::world) struct NearField {
     /// The farthest a point of a near column's box lies from the eye's cell: where the finest far
     /// level meets the full-res chunks.
     pub(in crate::world) reach: f64,
+    /// The thread reading the ground of the columns just outside the square, before the centre
+    /// moves onto them.
+    sampler: Option<Sampler<(Frame, ColumnKey), Option<(i32, i32)>>>,
 }
 
 /// A memo past this many columns is dropped and refilled.
 const MEMO_CAP: usize = 1 << 15;
+
+/// Rings of columns outside the square whose ground is read ahead.
+const LEAD_RINGS: i32 = 2;
+
+/// First-open-cell bounds of real column `real` in its frame's altitude: the generator's bounds
+/// over a chart's storage rect, or the ground sampled at nine points of a cube face's or a flat
+/// world's column, eight blocks wider each way. `None` where it holds no ground. Pure, so the near
+/// field's sampler reads it ahead.
+fn column_ground(generator: &dyn TerrainGenerator, frame: Frame, real: ColumnKey) -> Option<(i32, i32)> {
+    let cs = CHUNK_SIZE as i32;
+    match frame {
+        Frame::Chart { body, .. } => {
+            let (x0, z0) = (real.a * cs, real.b * cs);
+            let (ox, oz) = generator.chart_origin(body, Face::PosY).unwrap_or((0, 0));
+            generator.surface_rect(body, Face::PosY, x0 - ox, z0 - oz, x0 + cs - ox, z0 + cs - oz)
+        }
+        Frame::Cube { face, shift, .. } => {
+            let (u0, u1, v0, v1) = cube_cells(real, shift)?;
+            let mut out: Option<(i32, i32)> = None;
+            for u in [u0, (u0 + u1) / 2, u1] {
+                for v in [v0, (v0 + v1) / 2, v1] {
+                    let s = generator.surface(face, u, v);
+                    if s != i32::MIN {
+                        out = Some(out.map_or((s, s), |(a, b)| (a.min(s), b.max(s))));
+                    }
+                }
+            }
+            out.map(|(lo, hi)| (lo - 8, hi + 8))
+        }
+        Frame::Flat => {
+            let (x0, z0) = (real.a * cs, real.b * cs);
+            let mut out: Option<(i32, i32)> = None;
+            for x in [x0, x0 + cs / 2, x0 + cs - 1] {
+                for z in [z0, z0 + cs / 2, z0 + cs - 1] {
+                    let s = generator.height(x, z);
+                    out = Some(out.map_or((s, s), |(a, b)| (a.min(s), b.max(s))));
+                }
+            }
+            out
+        }
+    }
+}
+
+/// The reference-face cell range `(u0, u1, v0, v1)` of storage column `real` shifted by `shift`
+/// chunks.
+fn cube_cells(real: ColumnKey, shift: [i32; 3]) -> Option<(i32, i32, i32, i32)> {
+    let frame = FaceFrame::new(real.face);
+    let c = real.chunk(0);
+    let r = Coord::new(c.x + shift[0], c.y + shift[1], c.z + shift[2]);
+    let cs = CHUNK_SIZE as i32;
+    let (mut u0, mut u1, mut v0, mut v1) = (i32::MAX, i32::MIN, i32::MAX, i32::MIN);
+    for dx in [0, cs - 1] {
+        for dz in [0, cs - 1] {
+            for dy in [0, cs - 1] {
+                let (u, _, v) = frame.cell_to_local((r.x.checked_mul(cs)? + dx, r.y.checked_mul(cs)? + dy, r.z.checked_mul(cs)? + dz));
+                (u0, u1, v0, v1) = (u0.min(u), u1.max(u), v0.min(v), v1.max(v));
+            }
+        }
+    }
+    Some((u0, u1, v0, v1))
+}
 
 /// `a ∪ b`.
 fn hull(a: Option<[i32; 2]>, b: [i32; 2]) -> Option<[i32; 2]> {
@@ -266,6 +332,17 @@ impl World {
         if near.boxes.len() > MEMO_CAP {
             near.boxes.clear();
         }
+        if near.sampler.is_none() {
+            let generator = self.generator.clone();
+            near.sampler = Sampler::start("near-ground", move |(frame, real)| column_ground(&*generator, frame, real));
+        }
+        if let Some(sampler) = &mut near.sampler {
+            sampler.land(|(f, real), ground| {
+                if f == frame {
+                    near.ground.entry(real).or_insert(ground);
+                }
+            });
+        }
         let n = 2 * near.half + 1;
         let keep_r = r + f64::from(UNLOAD_MARGIN * CHUNK_SIZE as i32);
         let mut cols = vec![Col::default(); (n * n) as usize];
@@ -280,7 +357,7 @@ impl World {
                 let (real, _) = ColumnKey::of(up, real_chunk);
                 let col = &mut cols[((db + near.half) * n + da + near.half) as usize];
                 col.real = Some(real);
-                let ground = *near.ground.entry(real).or_insert_with(|| self.column_ground(frame, real));
+                let ground = *near.ground.entry(real).or_insert_with(|| column_ground(&*self.generator, frame, real));
                 let Some((lo, hi)) = ground.map(|b| self.column_edits(frame, real, b)) else { continue };
                 let (a, b) = (self.frame_layer(frame, real, lo.saturating_sub(1)), self.frame_layer(frame, real, hi.saturating_sub(1)));
                 col.shell = Some([a.min(b) - 1, a.max(b) + 1]);
@@ -343,46 +420,34 @@ impl World {
         }
         near.cols = cols;
         near.hull = hull_span;
+        self.read_ahead(near, frame, up, key, alt);
     }
 
-    /// First-open-cell bounds of real column `real` in its frame's altitude: the generator's
-    /// bounds over a chart's storage rect, or the ground sampled at nine points of a cube face's or
-    /// a flat world's column, eight blocks wider each way. `None` where it holds no ground.
-    fn column_ground(&self, frame: Frame, real: ColumnKey) -> Option<(i32, i32)> {
-        let cs = CHUNK_SIZE as i32;
-        match frame {
-            Frame::Chart { body, .. } => {
-                let (x0, z0) = (real.a * cs, real.b * cs);
-                self.storage_rect(body, x0, z0, x0 + cs, z0 + cs)
-            }
-            Frame::Cube { face, shift, .. } => {
-                let (u0, u1, v0, v1) = self.cube_cells(real, shift)?;
-                let mut out: Option<(i32, i32)> = None;
-                for u in [u0, (u0 + u1) / 2, u1] {
-                    for v in [v0, (v0 + v1) / 2, v1] {
-                        let s = self.generator.surface(face, u, v);
-                        if s != i32::MIN {
-                            out = Some(out.map_or((s, s), |(a, b)| (a.min(s), b.max(s))));
-                        }
+    /// Ask the near field's sampler for the ground of the [`LEAD_RINGS`] rings of columns just
+    /// outside the square around folded centre column `key` (altitude `alt`), nearest first.
+    fn read_ahead(&self, near: &mut NearField, frame: Frame, up: Face, key: ColumnKey, alt: i32) {
+        let Some(sampler) = &mut near.sampler else { return };
+        let mut want = Vec::new();
+        for ring in near.half + 1..=near.half + LEAD_RINGS {
+            for db in -ring..=ring {
+                let step = if db.abs() == ring { 1 } else { 2 * ring as usize };
+                for da in (-ring..=ring).step_by(step) {
+                    let folded = match frame {
+                        Frame::Chart { floor, .. } => Coord::new(key.a + da, floor, key.b + db),
+                        _ => ColumnKey { face: up, a: key.a + da, b: key.b + db }.chunk(alt),
+                    };
+                    let Some(real_chunk) = self.fold.unfold(folded) else { continue };
+                    let (real, _) = ColumnKey::of(up, real_chunk);
+                    if !near.ground.contains_key(&real) && sampler.mark((frame, real)) {
+                        want.push((frame, real));
                     }
                 }
-                out.map(|(lo, hi)| (lo - 8, hi + 8))
-            }
-            Frame::Flat => {
-                let (x0, z0) = (real.a * cs, real.b * cs);
-                let mut out: Option<(i32, i32)> = None;
-                for x in [x0, x0 + cs / 2, x0 + cs - 1] {
-                    for z in [z0, z0 + cs / 2, z0 + cs - 1] {
-                        let s = self.generator.height(x, z);
-                        out = Some(out.map_or((s, s), |(a, b)| (a.min(s), b.max(s))));
-                    }
-                }
-                out
             }
         }
+        sampler.send(want);
     }
 
-    /// [`column_ground`](Self::column_ground) widened to every chunk an edit touched in a chart's
+    /// [`column_ground`] widened to every chunk an edit touched in a chart's
     /// or a flat world's column (storage +Y).
     fn column_edits(&self, frame: Frame, real: ColumnKey, (lo, hi): (i32, i32)) -> (i32, i32) {
         match frame {
@@ -423,24 +488,6 @@ impl World {
         (lo, hi)
     }
 
-    /// Face-local reference cells `(u0, u1, v0, v1)` (inclusive) of a cube's storage column.
-    fn cube_cells(&self, real: ColumnKey, shift: [i32; 3]) -> Option<(i32, i32, i32, i32)> {
-        let frame = FaceFrame::new(real.face);
-        let c = real.chunk(0);
-        let r = Coord::new(c.x + shift[0], c.y + shift[1], c.z + shift[2]);
-        let cs = CHUNK_SIZE as i32;
-        let (mut u0, mut u1, mut v0, mut v1) = (i32::MAX, i32::MIN, i32::MAX, i32::MIN);
-        for dx in [0, cs - 1] {
-            for dz in [0, cs - 1] {
-                for dy in [0, cs - 1] {
-                    let (u, _, v) = frame.cell_to_local((r.x.checked_mul(cs)? + dx, r.y.checked_mul(cs)? + dy, r.z.checked_mul(cs)? + dz));
-                    (u0, u1, v0, v1) = (u0.min(u), u1.max(u), v0.min(v), v1.max(v));
-                }
-            }
-        }
-        Some((u0, u1, v0, v1))
-    }
-
     /// The up-local chunk layer of frame altitude `a` in real column `real`.
     fn frame_layer(&self, frame: Frame, real: ColumnKey, a: i32) -> i32 {
         match frame {
@@ -476,7 +523,7 @@ impl World {
                 PhysBox::around(corners.map(|p| atlas.embed_storage(patch, p)), 1.0, f64::from(cs))
             }
             Frame::Cube { body, face, shift } => {
-                let (u0, u1, v0, v1) = self.cube_cells(real, shift)?;
+                let (u0, u1, v0, v1) = cube_cells(real, shift)?;
                 let f = FaceFrame::new(face);
                 let warp = self.seams.atlases().iter().find(|a| a.grid.as_ref().is_some_and(|g| g.body == body)).and_then(|a| a.warp.clone());
                 let corners = (0..8).map(|c| {

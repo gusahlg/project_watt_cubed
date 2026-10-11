@@ -177,6 +177,7 @@ impl World {
 
     /// The generator's surface over storage rect `[x0, x1) × [z0, z1)` of chart `body`: callers on
     /// the storage grid read through its +Y patch's frame, which spans all of storage.
+    #[cfg(test)]
     pub(in crate::world) fn storage_rect(&self, body: u16, x0: i32, z0: i32, x1: i32, z1: i32) -> Option<(i32, i32)> {
         let (ox, oz) = self.generator.chart_origin(body, Face::PosY).unwrap_or((0, 0));
         self.generator.surface_rect(body, Face::PosY, x0 - ox, z0 - oz, x1 - ox, z1 - oz)

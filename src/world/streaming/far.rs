@@ -339,6 +339,9 @@ impl World {
         if self.section_frontier_key != Some(key) || !self.dirty_sections.is_empty() {
             let mut leaves = Vec::new();
             self.section_desired = self.desired_sections_with(center, &mut leaves);
+            if let Some(g) = ground {
+                self.prefetch_bounds(&self.rule_on(g), &leaves);
+            }
             let wanted = self.wanted_clips(&leaves);
             self.section_dist = leaves.iter().map(|l| (l.pos, l.dist)).collect();
             self.lod_morph = ground.map_or([voxel_engine::LodMorph::default(); 16], |g| self.morph_bands(&self.rule_on(g), &leaves, &cell));

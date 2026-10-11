@@ -67,6 +67,7 @@ mod quadtree;
 mod query;
 mod resident;
 mod rule;
+mod sampler;
 pub(crate) mod seam;
 mod settings;
 mod streaming;
@@ -674,9 +675,10 @@ pub struct World {
     /// from. While they are unchanged the frontier is retained across streaming
     /// passes — a still camera repeats no grid walk or relief coarsening.
     section_frontier_key: Option<SectionFrontierKey>,
-    /// Generator bounds of the nodes the rule measured.
     /// The physical boxes the rule measured, kept until a node's bounds change.
     node_boxes: std::sync::Mutex<rule::RuleMemo>,
+    /// The thread sampling the generator's bounds of tiles the cut is about to split into.
+    bounds_prefetch: Option<rule::Prefetch>,
     /// The rule's cut: each desired section's distance from the eye cell, for load priority.
     section_dist: FastMap<SectionPos, f64>,
     /// Morph band per engine detail: where a level's vertices blend to their parent's surface.
@@ -892,6 +894,7 @@ impl World {
             section_fade: coverage::Coverage::default(),
             section_frontier_key: None,
             node_boxes: std::sync::Mutex::default(),
+            bounds_prefetch: None,
             section_dist: FastMap::default(),
             section_ancestors: FastSet::default(),
             lod_morph: [voxel_engine::LodMorph::default(); 16],

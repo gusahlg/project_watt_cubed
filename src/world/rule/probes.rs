@@ -396,7 +396,7 @@ fn lod_rule_cut_at_the_owner_site() {
         let seat = world.seams.chart_seat(World::chunk_of(storage.x.floor() as i32, storage.y.floor() as i32, storage.z.floor() as i32)).expect("a seat");
         let ground = Ground::Chart { index: seat.index };
         let mut leaves = Vec::new();
-        world.forget_node_boxes();
+        world.forget_rule_memo();
         let t = std::time::Instant::now();
         let rule = world.rule_cut(ground, OWNER_EYE, &mut leaves);
         let us = t.elapsed().as_micros();

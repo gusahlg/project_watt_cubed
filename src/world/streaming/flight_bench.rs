@@ -202,6 +202,11 @@ fn fly(speed: f64, secs: f64, settle: f64, view: (i32, i32), lod2: bool, hz: f64
         line.push_str(&format!(" {name}={:.3}", d.as_secs_f64() * 1e3 / cross_ms.len().max(1) as f64));
     }
     println!("{line}");
+    let mut line = format!("  slowest pass {:.2} ms by phase:", laps.worst.0.as_secs_f64() * 1e3);
+    for (name, d) in PHASE_NAMES.iter().zip(laps.worst.1) {
+        line.push_str(&format!(" {name}={:.3}", d.as_secs_f64() * 1e3));
+    }
+    println!("{line}");
     println!(
         "  end: chunks={end_chunks} mesh_worklist={end_mesh} (not NeedsMesh {end_not_mesh}, unloaded {end_unloaded}) \
          light_worklist={end_light} upload_queue={end_upload} sections={end_sections} desired={end_desired} generating={end_generating}",
