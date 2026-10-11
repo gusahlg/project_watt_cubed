@@ -4,14 +4,14 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
-    # The renderer lives in a sibling checkout. Use the local Git repository,
-    # not a raw `path:` snapshot: the latter copied ignored build products such
-    # as voxel-engine/target into the Nix store (about 5 GiB on this machine).
-    # This packages the committed main revision and records that exact
-    # revision in flake.lock. It remains machine-specific until the engine audit
-    # commits are published, at which point this should become a remote Git URL.
+    # The renderer, from its public repository. flake.lock records the exact
+    # revision, so `nix develop` and the package work on any machine. Cargo
+    # builds still use the sibling checkout at ../voxel-engine; run
+    # `nix flake update voxel-engine` when the game starts needing a newer
+    # renderer revision. (A raw `path:` input once copied the engine's ignored
+    # target/ directory into the store, about 5 GiB.)
     voxel-engine = {
-      url = "git+file:///home/gusahlg/repos/voxel-engine?ref=main";
+      url = "github:gusahlg/voxel-engine";
       flake = false;
     };
   };

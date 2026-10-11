@@ -219,6 +219,21 @@ pub struct Failure {
     pub detail: String,
 }
 
+/// Keep the capture window at exactly 1280x720, floating, unfocused and never resized or moved by
+/// the window manager for the whole run (gharial 0.4 rules, applied before the first configure).
+/// `fullscreen off` overrides a fullscreen request from the player's settings. Best effort: without
+/// gharial (other WMs, CI) `gharialctl` is missing or exits 3, and the capture-dimension guard still
+/// catches a wrong size. The rule ends with this process.
+fn pin_capture_window() {
+    let pid = std::process::id().to_string();
+    let _ = std::process::Command::new("gharialctl")
+        .args(["rule", "add", "--until-exit", &pid, &format!("pid={pid}")])
+        .args(["fullscreen", "off", "float", "size", "1280x720", "center", "nofocus", "lock", "oneshot"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
 /// Fixed offscreen-capture window config: a real winit window still backs the
 /// surface (the engine has no fully headless path). Size and pacing are pinned
 /// for reproducibility across machines; the dimension check in `evaluate`
@@ -690,25 +705,12 @@ fn execute(stages: Vec<Stage>, build: &GameBuild) -> Outcomes {
     let mut sample_total_ms = 0f32;
     let mut sample_n = 0u32;
     let mut stress: Option<StressRun> = None;
-    let mut floated = false;
 
+    pin_capture_window();
     voxel_engine::run(scripted_config(), move |eng| {
         // Work-half timestamp for the stress stages' frame samples (their
         // pacing sleep must not count as frame cost).
         let frame_started = Instant::now();
-        // First frame of the whole run: pull our just-opened (and therefore
-        // focused) window out of the tiling layout. gharial ignores the
-        // fixed-size hint and re-splits the column the moment another window
-        // on the tag is touched mid-run — which resizes the swapchain and
-        // breaks every later capture. Floating keeps the requested size for
-        // the whole run. Best-effort: no gharialctl (other WMs, CI) → no-op;
-        // a mis-timed focus is caught by the capture-dimension guard anyway.
-        if !floated {
-            floated = true;
-            let _ = std::process::Command::new("gharialctl")
-                .arg("toggle-float")
-                .status();
-        }
         let stage = &stages[idx];
         // First frame of a stage: (re)build its scripted game and reset the
         // per-stage watchdog / sample accumulators.
