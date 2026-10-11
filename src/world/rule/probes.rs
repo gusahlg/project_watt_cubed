@@ -339,7 +339,8 @@ fn lod_rule_symptom_b_detail_is_concentric() {
 }
 
 /// (c) Far things in more detail than nearer ones. Settled on a chart seam, flying at 300 m/s,
-/// and a few passes after stopping from that flight, a drawn tile is finer than its distance gives.
+/// and a few passes after stopping from that flight, a drawn tile is finer than its distance gives;
+/// once the workers have caught up after the flight, the drawn cut is exactly the rule's.
 #[test]
 #[ignore]
 fn lod_rule_symptom_c_far_tiles_are_never_finer() {
@@ -376,6 +377,13 @@ fn lod_rule_symptom_c_far_tiles_are_never_finer() {
         step(&mut world, eye);
     }
     check("half a second after stopping", &world, eye);
+    // The two above race the workers; once they have caught up the cut is the rule's exactly.
+    let passes = settle(&mut world, eye);
+    let a = audit_cut(&world, eye);
+    println!("settled {passes} passes later: {a:?}");
+    if a.finer + a.coarser + a.inverted > 0 {
+        failures.push(format!("settled after the flight: {a:?}"));
+    }
     assert!(failures.is_empty(), "far tiles finer than their distance: {failures:?}");
 }
 
