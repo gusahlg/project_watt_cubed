@@ -2801,3 +2801,12 @@ fn a_joiner_with_another_table_grows_the_same_universe() {
         }
     }
 }
+
+/// The painters did not change under worldgen 11: over the authored catalog (today's bodies, all of
+/// `rock`) the three seeds paint the bytes worldgen 10 pinned.
+#[test]
+fn the_authored_catalog_still_paints_worldgen_10() {
+    const WORLDGEN_10: [u64; 3] = [0x1f71eba60b4ff3a8, 0x460ca935f8e6e11f, 0xae29e197774929c9];
+    let got: Vec<u64> = DIGEST_SEEDS.iter().map(|&s| cosmos::fixture::authored(|| worldgen_digest(s))).collect();
+    assert_eq!(got, WORLDGEN_10);
+}
