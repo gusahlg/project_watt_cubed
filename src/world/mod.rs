@@ -59,6 +59,7 @@ mod coverage;
 mod edits;
 #[cfg(test)]
 mod fixtures;
+mod ground_tops;
 mod heightmip;
 mod lanes;
 mod ledger;
@@ -680,6 +681,8 @@ pub struct World {
     node_boxes: std::sync::Mutex<rule::RuleMemo>,
     /// The thread sampling the generator's bounds of tiles the cut is about to split into.
     bounds_prefetch: Option<rule::Prefetch>,
+    /// The generator's tops of columns no loaded chunk shows the ground of (the minimap's).
+    ground_tops: std::sync::Mutex<ground_tops::GroundTops>,
     /// The rule's cut: each desired section's distance from the eye cell, for load priority.
     section_dist: FastMap<SectionPos, f64>,
     /// Morph band per engine detail: where a level's vertices blend to their parent's surface.
@@ -896,6 +899,7 @@ impl World {
             section_frontier_key: None,
             node_boxes: std::sync::Mutex::default(),
             bounds_prefetch: None,
+            ground_tops: std::sync::Mutex::default(),
             section_dist: FastMap::default(),
             section_ancestors: FastSet::default(),
             lod_morph: [voxel_engine::LodMorph::default(); 16],

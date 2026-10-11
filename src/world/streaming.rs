@@ -52,7 +52,7 @@ pub(in crate::world) use gauges::StreamCounters;
 pub(in crate::world) use generate::{FailKey, GenCursor};
 pub(in crate::world) use light::{LightGate, RemeshStats};
 pub(in crate::world) use pacer::{StreamPacer, chunk_behind};
-pub(in crate::world) use near::NearField;
+pub(in crate::world) use near::{Frame, NearField};
 #[cfg(test)]
 pub(in crate::world) use generate::GenRun;
 use far::{eye_chunk, section_key};

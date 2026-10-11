@@ -292,8 +292,10 @@ impl World {
 
     /// Highest solid of each face-local column `(lu, lv)` in `us × vs` of the `(cu, cv)` chunk
     /// column of `face`, as `out[lv][lu]`: the face-local altitude (`chunk_alt0 + la`; on PosY
-    /// the world Y) and colour, `None` where no loaded chunk holds a solid. The altitude chunks
-    /// are resolved once, highest first, and each settles every column it tops.
+    /// the world Y) and colour. The altitude chunks are resolved once, highest first, and each
+    /// settles every column it tops. Where no loaded chunk holds a solid, the generator's top of
+    /// the column in the near field's frame once it has been read off the main thread
+    /// ([`fill_ground_tops`](Self::fill_ground_tops)), else `None`.
     pub(crate) fn top_solids_on_face(
         &self,
         face: Face,
@@ -342,13 +344,18 @@ impl World {
                 }
             }
         }
+        // Where no loaded chunk holds a solid block, the ground is the generator's.
+        if open > 0 {
+            self.fill_ground_tops(face, (cu, cv), us, vs, out);
+        }
     }
 
-    /// A fingerprint of every block edit and of the loaded altitude chunks in the chunk columns
-    /// `cus × cvs` of `face`: an unchanged stamp means an unchanged surface over that area.
+    /// A fingerprint of every block edit, of the generator columns read for the ground no loaded
+    /// chunk holds, and of the loaded altitude chunks in the chunk columns `cus × cvs` of `face`:
+    /// an unchanged stamp means an unchanged surface over that area.
     pub(crate) fn surface_stamp(&self, face: Face, cus: RangeInclusive<i32>, cvs: RangeInclusive<i32>) -> u64 {
         let mix = |h: u64, x: u64| crate::hash::splitmix_finish(h ^ x);
-        let mut h = mix(0, self.edit_generation);
+        let mut h = mix(mix(0, self.edit_generation), self.ground_tops_rev());
         for cu in cus {
             for cv in cvs.clone() {
                 let alts = self.column_alts(face, cu, cv);

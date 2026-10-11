@@ -11,28 +11,43 @@ use super::{FastMap, FastSet};
 /// Entries a [`Recent`] map holds before it lets go of those unused since it last did.
 pub(in crate::world) const MEMO_CAP: usize = 1 << 16;
 
-/// A memo that keeps what was used lately. Past [`MEMO_CAP`] entries it starts afresh, keeping the
-/// previous entries aside until it is full again: one read brings an entry back, and only what
-/// went unread for that long is dropped, so a long flight never measures its whole view again.
+/// A memo that keeps what was used lately. Past its cap ([`MEMO_CAP`] unless made
+/// [`with_cap`](Self::with_cap)) it starts afresh, keeping the previous entries aside until it is
+/// full again: one read brings an entry back, and only what went unread for that long is dropped,
+/// so a long flight never measures its whole view again.
 pub(in crate::world) struct Recent<K, V> {
     now: FastMap<K, V>,
     old: FastMap<K, V>,
+    cap: usize,
 }
 
 impl<K, V> Default for Recent<K, V> {
     fn default() -> Self {
-        Recent { now: FastMap::default(), old: FastMap::default() }
+        Self::with_cap(MEMO_CAP)
+    }
+}
+
+impl<K, V> Recent<K, V> {
+    /// A memo that lets go past `cap` entries.
+    pub(in crate::world) fn with_cap(cap: usize) -> Self {
+        Recent { now: FastMap::default(), old: FastMap::default(), cap: cap.max(1) }
     }
 }
 
 impl<K: Copy + Eq + Hash, V: Copy> Recent<K, V> {
     pub(in crate::world) fn get(&mut self, k: &K) -> Option<V> {
-        if let Some(&v) = self.now.get(k) {
-            return Some(v);
+        self.touch(k).copied()
+    }
+}
+
+impl<K: Copy + Eq + Hash, V> Recent<K, V> {
+    /// The entry for `k`, kept as used.
+    pub(in crate::world) fn touch(&mut self, k: &K) -> Option<&V> {
+        if !self.now.contains_key(k) {
+            let v = self.old.remove(k)?;
+            self.insert(*k, v);
         }
-        let v = self.old.remove(k)?;
-        self.insert(*k, v);
-        Some(v)
+        self.now.get(k)
     }
 
     pub(in crate::world) fn contains(&self, k: &K) -> bool {
@@ -40,7 +55,7 @@ impl<K: Copy + Eq + Hash, V: Copy> Recent<K, V> {
     }
 
     pub(in crate::world) fn insert(&mut self, k: K, v: V) {
-        if self.now.len() >= MEMO_CAP {
+        if self.now.len() >= self.cap {
             self.old = std::mem::take(&mut self.now);
         }
         self.now.insert(k, v);
