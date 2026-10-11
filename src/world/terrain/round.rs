@@ -387,8 +387,10 @@ impl Round {
             col.top
         } else if d <= col.sub_depth + 1 {
             col.sub
-        } else if self.style == Style::Ember {
-            if d < 60 { self.m.basalt } else { self.m.magma }
+        } else if self.style == Style::Ember && d < 60 {
+            self.m.basalt
+        } else if self.style == Style::Ember && d < 220 {
+            self.m.magma
         } else if d < 220 {
             self.m.rock[((d / 9) % 4) as usize]
         } else {

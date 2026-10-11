@@ -606,7 +606,7 @@ mod tests {
     use crate::space::datum::DatumField;
     use crate::world::generation::TerrainGenerator;
     use crate::world::generation::WorldgenKind;
-    use crate::world::terrain::cosmos::{Kind, AIR_TOP, HOME_RADIUS};
+    use crate::world::terrain::cosmos::{AIR_TOP, HOME_RADIUS};
     use crate::world::terrain::TerrainCfg;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
@@ -957,7 +957,7 @@ mod tests {
         let mut registry = BlockRegistry::with_builtins();
         let terrain = Terrain::new(&mut registry, 42);
         let key = map_key(&terrain, &registry, WorldgenKind::Diffusion, knobs).unwrap();
-        assert_eq!((key.seed, key.body, key.hash), (42, 0, 0xc0d8_998d_8559_c507));
+        assert_eq!((key.seed, key.body, key.hash), (42, 0, 0xf9dc_6b8e_7cbb_f973));
     }
 
     #[test]
@@ -993,7 +993,8 @@ mod tests {
         assert_eq!(datum[idx], field.offsets[idx] - lo as f32);
         let radius = super::super::bodies::home_impostor(cosmos, body).1;
         let sample_r = radius + datum[idx] as f64;
-        let physical = HOME_RADIUS as f64 + field.offsets[idx] as f64 - 150.0;
+        let crate::world::terrain::cosmos::Shape::Ball { r } = body.shape else { panic!("the start world is round") };
+        let physical = r as f64 + field.offsets[idx] as f64 - 150.0;
         assert!((sample_r - physical).abs() < 1.0, "{sample_r} vs {physical}");
 
         let (surface, trees, leaf) = terrain.home_far_column(2, 0, 0).unwrap();
@@ -1046,27 +1047,28 @@ mod tests {
         far.update(&terrain, centre);
         assert_eq!(far.horizon(), 1.0);
         let hi = radius + datum.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
-        let eye_near = centre + DVec3::Y * (hi + AIR_TOP + 1_000.0);
-        let eye_far = centre + DVec3::Y * (hi + AIR_TOP + 50_000.0);
+        let air = f64::from(terrain.cosmos().expect("a cosmos").home().traits.air_top.expect("air"));
+        let eye_near = centre + DVec3::Y * (hi + air + 1_000.0);
+        let eye_far = centre + DVec3::Y * (hi + air + 50_000.0);
         far.update(&terrain, eye_near);
         let h_near = far.horizon();
-        assert_eq!(h_near.to_bits(), horizon_sine((centre - eye_near).length(), hi, AIR_TOP).to_bits());
+        assert_eq!(h_near.to_bits(), horizon_sine((centre - eye_near).length(), hi, air).to_bits());
         assert!(h_near < 0.0);
         alloc_count::reset();
         far.update(&terrain, eye_near);
         let shifted = eye_near + DVec3::X * 1_000.0;
         far.update(&terrain, shifted);
         assert_eq!(alloc_count::alloc_count(), 0, "horizon refresh allocated");
-        assert_eq!(far.horizon().to_bits(), horizon_sine((centre - shifted).length(), hi, AIR_TOP).to_bits());
+        assert_eq!(far.horizon().to_bits(), horizon_sine((centre - shifted).length(), hi, air).to_bits());
         far.update(&terrain, eye_far);
         let h_far = far.horizon();
-        assert_eq!(h_far.to_bits(), horizon_sine((centre - eye_far).length(), hi, AIR_TOP).to_bits());
+        assert_eq!(h_far.to_bits(), horizon_sine((centre - eye_far).length(), hi, air).to_bits());
         assert!(h_far < h_near, "near {h_near} far {h_far}");
         alloc_count::reset();
         let further = eye_far + DVec3::X * 1001.0;
         far.update(&terrain, further);
         assert_eq!(alloc_count::alloc_count(), 0);
-        assert_eq!(far.horizon().to_bits(), horizon_sine((centre - further).length(), hi, AIR_TOP).to_bits());
+        assert_eq!(far.horizon().to_bits(), horizon_sine((centre - further).length(), hi, air).to_bits());
     }
 
     struct Tint(u16);
@@ -1232,7 +1234,8 @@ mod tests {
                 assert_eq!(map, HOME_MAP);
                 assert!(horizon.is_finite() && horizon < 0.0, "horizon {horizon}");
                 // Engine FarShape::Mapped: air is the air-shell thickness in the same unit as radius.
-                assert_eq!(air.to_bits(), (AIR_TOP as f32).to_bits(), "air is AIR_TOP blocks, like radius");
+                let top = home.traits.air_top.expect("the start world has air") as f32;
+                assert_eq!(air.to_bits(), top.to_bits(), "air is the start world's air top in blocks, like radius");
                 assert!((radius as f32) > air, "the reference radius is the same unit, and much larger");
             }
             other => panic!("home draws mapped once the previews are sent, got {other:?}"),
@@ -1242,7 +1245,7 @@ mod tests {
         assert_eq!(mapped.atmosphere.0, want.0, "daylight air; moons stay black");
         assert!(listed.iter().filter(|b| b.seed != home.seed).all(|b| !matches!(b.shape, FarShape::Mapped { .. })));
         let mut moons = 0;
-        for body in cosmos.bodies().iter().filter(|b| b.kind == Kind::Moon) {
+        for body in cosmos.bodies().iter().filter(|b| crate::world::terrain::cosmos::fixture::Want::Moonlike.matches(b)) {
             let Some(moon) = listed.iter().find(|b| b.seed == body.seed) else { continue };
             assert_eq!(moon.shape, FarShape::Sphere);
             assert_eq!(moon.atmosphere.0, [0.0, 0.0, 0.0]);

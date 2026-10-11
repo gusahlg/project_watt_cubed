@@ -658,6 +658,50 @@ mod tests {
         );
     }
 
+    /// Today's catalog fits row 0 end to end, as storage was laid out before rows: the start
+    /// world at the storage border, every chart after the last, the cube boxes after the charts
+    /// with their own y ranges.
+    #[test]
+    fn the_authored_catalog_lies_end_to_end_in_row_0() {
+        let cosmos = crate::world::terrain::cosmos::fixture::authored(|| Cosmos::new(42, 1.0));
+        let warped: Vec<u16> = cosmos.bodies().iter().filter(|b| b.traits.partner.is_some()).map(|b| b.id).collect();
+        assert_eq!(warped.len(), 2);
+        let placed = plan(cosmos.bodies(), &warped).expect("fits");
+        let (mut x, mut y) = (STORAGE_X0, STORAGE_X0);
+        for &(id, need, at) in &placed {
+            assert_eq!(at[2], 0, "row 0");
+            assert_eq!(at[0], x, "end to end");
+            let (dx, _) = need.spans(&cosmos.bodies()[usize::from(id)]);
+            x = (x + dx + ROW_GAP + CS - 1).div_euclid(CS) * CS;
+            if need == Need::Cube {
+                assert_eq!(at[1], y, "cube boxes stack in y from the border");
+                y += dx;
+            }
+        }
+        assert_eq!(placed.iter().filter(|p| p.1 == Need::Home).count(), 1);
+        assert_eq!(placed[0].1, Need::Home, "the start world comes first");
+    }
+
+    /// More charts than one row holds stack in rows along z below the cap, and a catalog past every
+    /// row names the body that does not fit.
+    #[test]
+    fn rows_stack_in_z_and_overflow_names_the_body() {
+        let cosmos = Cosmos::new(42, 1.0);
+        let home = *cosmos.home();
+        let big = |id: u16| Body { id, shape: Shape::Ball { r: 40_000_000 }, ..home };
+        let bodies: Vec<Body> = (0..10).map(big).collect();
+        let placed = plan(&bodies, &[]).expect("ten big worlds fit");
+        let rows: std::collections::BTreeSet<i64> = placed.iter().map(|p| p.2[2]).collect();
+        assert!(rows.len() > 1, "they need more than one row: {placed:?}");
+        for &(id, need, at) in &placed {
+            let (dx, dz) = need.spans(&bodies[usize::from(id)]);
+            assert!(at[0] + dx < crate::math::CELL_LIMIT as i64 && at[2] + dz <= Z_END, "{id} inside storage");
+        }
+        let many: Vec<Body> = (0..40).map(big).collect();
+        let err = plan(&many, &[]).expect_err("forty big worlds do not fit");
+        assert!(usize::from(err) < many.len());
+    }
+
     #[test]
     fn storage_chunks_are_the_painter_and_deep_ones_are_uniform() {
         let (w, _) = worlds();

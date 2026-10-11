@@ -952,7 +952,8 @@ impl World {
         self.set_far_center(eye_chunk(far));
         let _ = self.adopt_fold(center);
         self.place_window(center, true);
-        for coord in self.mesh_box(center).coords() {
+        // The data box: the mesh box and the ring its meshes read, which the next pass would load.
+        for coord in self.data_box(center).coords() {
             self.ensure_data(coord);
             if let Some(loaded) = self.chunks.get_mut(&coord)
                 && !matches!(loaded.state, MeshState::Air | MeshState::Ready(_))

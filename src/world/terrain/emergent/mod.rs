@@ -602,6 +602,10 @@ fn expand(ws: &mut Vec<Work>, suites: &mut Suites, law: &Law, p: &Params) {
             parts[k].suite = suites.of(law, key(pair.comps[k]), Ground::Face, p);
             parts[k].shape(&suites.list[parts[k].suite]);
         }
+        // Both parts must keep their cube grid with their own matter, or the pair stays one body.
+        if parts.iter().any(|part| part.layout.form == Form::Round) {
+            continue;
+        }
         let rho = [0, 1].map(|k| suites.list[parts[k].suite].density);
         let half = [0, 1].map(|k| parts[k].half);
         // Each part's relief stays on its own side of the canyon.
@@ -624,9 +628,11 @@ fn expand(ws: &mut Vec<Work>, suites: &mut Suites, law: &Law, p: &Params) {
 
 /// Satellites must dominate their own surface: each body (lightest first) is a satellite of the
 /// heavier body pulling hardest at its centre if its own surface pull is at least `k_dom` times
-/// that body's pull there; otherwise it falls onto it. Repeats until stable. Returns the falls.
-fn hierarchy(ws: &mut [Work], suites: &mut Suites, law: &Law, p: &Params, start: usize, grounds: &[Ground]) -> u32 {
+/// that body's pull there; otherwise it falls onto it. Repeats until stable. Returns the falls and
+/// the mass lost: with `keep_start`, what falls onto the start world is ejecta, not its matter.
+fn hierarchy(ws: &mut [Work], suites: &mut Suites, law: &Law, p: &Params, start: usize, grounds: &[Ground], keep_start: bool) -> (u32, f64) {
     let mut falls = 0;
+    let mut lost = 0.0;
     loop {
         let mut order: Vec<usize> = (0..ws.len()).filter(|&i| ws[i].alive).collect();
         order.sort_by(|&a, &b| ws[a].b.mass.total_cmp(&ws[b].b.mass).then(a.cmp(&b)));
@@ -658,7 +664,11 @@ fn hierarchy(ws: &mut [Work], suites: &mut Suites, law: &Law, p: &Params, start:
             let d = (dist(ws[i].b.pos, ws[c].b.pos) - ws[i].radius()).max(1.0);
             if own < p.k_dom * pull_at(ws[c].b.mass, d) && i != start && ws[i].partner.is_none() {
                 let from = ws[i].b.clone();
-                fuse(&mut ws[c].b, &from, true);
+                if keep_start && c == start {
+                    lost += from.mass;
+                } else {
+                    fuse(&mut ws[c].b, &from, true);
+                }
                 ws[i].alive = false;
                 falls += 1;
                 if c != start {
@@ -669,7 +679,7 @@ fn hierarchy(ws: &mut [Work], suites: &mut Suites, law: &Law, p: &Params, start:
             }
         }
         if falls == before {
-            return falls;
+            return (falls, lost);
         }
     }
 }
@@ -859,7 +869,7 @@ fn settle(
         }
         assign(&mut ws, suites, law, p, start, s_suite, &grounds);
         let before = ws[start].b.mass;
-        fell += hierarchy(&mut ws, suites, law, p, start, &grounds);
+        fell += hierarchy(&mut ws, suites, law, p, start, &grounds, false).0;
         let next = grounds_of(&ws, start, &lite(&ws, start, r_s, suites, p));
         let changed = next != grounds;
         if changed {
@@ -887,40 +897,50 @@ fn settle(
             lost += w.b.mass;
         }
     }
-    // Systems never pull on each other: a body too near another system's falls onto its primary.
-    loop {
-        let alive: Vec<usize> = (0..ws.len()).filter(|&i| ws[i].alive).collect();
-        let bad = alive.iter().flat_map(|&a| alive.iter().map(move |&b| (a, b))).find(|&(a, b)| {
-            a < b && ws[a].system != ws[b].system && dist(ws[a].b.pos, ws[b].b.pos) <= R_G + ws[a].reach() + ws[b].reach()
-        });
-        let Some((a, b)) = bad else { break };
-        let light = if ws[a].b.mass <= ws[b].b.mass && a != start { a } else { b };
-        let mut root = light;
-        while let Some(up) = ws[root].parent.filter(|&u| ws[u].alive) {
-            root = up;
+    // Settle what the last falls move, until nothing does: a body too near another system's falls
+    // onto its primary (systems never pull on each other), a fall onto the start world rescales the
+    // universe (the spawn contract holds its mass), and a satellite the rescale left under its
+    // parent's pull falls. In the last round what falls onto the start world is ejecta.
+    for round in 0..=CALIBRATIONS {
+        loop {
+            let alive: Vec<usize> = (0..ws.len()).filter(|&i| ws[i].alive).collect();
+            let bad = alive.iter().flat_map(|&a| alive.iter().map(move |&b| (a, b))).find(|&(a, b)| {
+                a < b && ws[a].system != ws[b].system && dist(ws[a].b.pos, ws[b].b.pos) <= R_G + ws[a].reach() + ws[b].reach()
+            });
+            let Some((a, b)) = bad else { break };
+            let light = if ws[a].b.mass <= ws[b].b.mass && a != start { a } else { b };
+            let mut root = light;
+            while let Some(up) = ws[root].parent.filter(|&u| ws[u].alive) {
+                root = up;
+            }
+            if root == light {
+                root = if light == a { b } else { a };
+            }
+            let from = ws[light].b.clone();
+            fuse(&mut ws[root].b, &from, true);
+            ws[light].alive = false;
+            fell += 1;
+            if root != start {
+                let k = suites.of(law, key(ws[root].b.comp), grounds[root], p);
+                ws[root].suite = k;
+                ws[root].shape(&suites.list[k]);
+            }
         }
-        if root == light {
-            root = if light == a { b } else { a };
+        if ws[start].b.mass != m_s {
+            let f = m_s / ws[start].b.mass;
+            calibration *= f;
+            for w in ws.iter_mut() {
+                w.b.mass *= f;
+            }
+            ws[start].b.mass = m_s;
+            assign(&mut ws, suites, law, p, start, s_suite, &grounds);
         }
-        let from = ws[light].b.clone();
-        fuse(&mut ws[root].b, &from, true);
-        ws[light].alive = false;
-        fell += 1;
-        if root != start {
-            let k = suites.of(law, key(ws[root].b.comp), grounds[root], p);
-            ws[root].suite = k;
-            ws[root].shape(&suites.list[k]);
+        let (falls, ejecta) = hierarchy(&mut ws, suites, law, p, start, &grounds, round == CALIBRATIONS);
+        fell += falls;
+        lost += ejecta;
+        if falls == 0 {
+            break;
         }
-    }
-    // The spawn contract holds the start world's mass: a last fall onto it rescales the universe.
-    if ws[start].b.mass != m_s {
-        let f = m_s / ws[start].b.mass;
-        calibration *= f;
-        for w in ws.iter_mut() {
-            w.b.mass *= f;
-        }
-        ws[start].b.mass = m_s;
-        assign(&mut ws, suites, law, p, start, s_suite, &grounds);
     }
     let traits = lite(&ws, start, r_s, suites, p);
     let settled_grounds = grounds_of(&ws, start, &traits);

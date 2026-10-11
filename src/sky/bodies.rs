@@ -595,7 +595,7 @@ mod tests {
     }
 
     fn radius_f(cosmos: &Cosmos, atlases: &[std::sync::Arc<crate::space::atlas::Atlas>], body: &Body) -> f32 {
-        let radius = if body.kind == Kind::Home {
+        let radius = if body.traits.rank == Rank::Start {
             home_impostor(cosmos, body).1
         } else if let Some((_, r)) = warped_impostor(atlases, body) {
             r
@@ -639,15 +639,11 @@ mod tests {
 
     #[test]
     fn spawn_lists_the_far_worlds_and_a_distant_eye_lists_home() {
+        use crate::world::terrain::cosmos::fixture::{self, Want};
         let mut registry = BlockRegistry::with_builtins();
-        let terrain = Terrain::new(&mut registry, 1);
+        let terrain = Terrain::new(&mut registry, fixture::seed(&[Want::Warped, Want::Living, Want::Glowing, Want::Moonlike]));
         let cosmos = terrain.cosmos().expect("the diffusion generator has a cosmos");
-        for kind in [Kind::Twin, Kind::Verdant, Kind::Hollow, Kind::Ember, Kind::Moon] {
-            assert!(
-                cosmos.bodies().iter().any(|b| b.kind == kind),
-                "catalog missing {kind:?}"
-            );
-        }
+        assert!(cosmos.bodies().len() <= MAX_FAR_BODIES, "every body fits the engine's list");
 
         let spawn = DVec3::new(0.5, 8.0, 0.5);
         let mut far = FarBodies::default();
@@ -657,58 +653,44 @@ mod tests {
         for body in cosmos.bodies() {
             let visible = expect_visible(cosmos, body, spawn);
             let got = find(cosmos, listed, terrain.atlases(), body);
-            assert!(visible, "{:?} should be a sky body from spawn", body.kind);
+            assert!(visible, "{} should be a sky body from spawn", body.name());
             let got = got.expect("missing far body");
             finite_unit(got);
-            let shape = match body.kind {
-                Kind::Twin => {
-                    let (rounded, _) = warped_impostor(terrain.atlases(), body).expect("the twins sag");
-                    let FarShape::Rounded { exponent } = rounded else { panic!("a twin draws rounded") };
-                    assert!((6.0..=16.0).contains(&exponent), "twin exponent {exponent}");
+            let shape = match body.traits.form {
+                Form::Warped => {
+                    let (rounded, _) = warped_impostor(terrain.atlases(), body).expect("a warped cube sags");
+                    let FarShape::Rounded { exponent } = rounded else { panic!("a warped cube draws rounded") };
+                    assert!(exponent >= 2.0, "exponent {exponent}");
                     rounded
                 }
+                Form::Cube => FarShape::Cube,
                 // Sphere: this list has not uploaded the datum. Mapped is the installed map.
-                Kind::Home => home_impostor(cosmos, body).0,
+                _ if body.traits.rank == Rank::Start => home_impostor(cosmos, body).0,
                 _ => FarShape::Sphere,
             };
-            assert_eq!(got.shape, shape, "{:?}", body.kind);
+            assert_eq!(got.shape, shape, "{}", body.name());
             expect += 1;
+            if body.traits.rank == Rank::Start {
+                continue;
+            }
+            // Tones come from the body's own minerals, crust first; living worlds are greened and
+            // wear a sky, glowing ones burn, the rest are bare.
+            let crust = cosmos.suite(body).minerals.last().expect("a mineral").rgb;
+            let t = &body.traits;
+            if t.life == 0 {
+                assert_eq!(got.albedo[0].0, srgb(crust[0], crust[1], crust[2]).0, "{} wears its crust", body.name());
+            }
+            if t.glow {
+                assert!(got.atmosphere.0[0] > 1.0 && got.atmosphere.0[0] > got.atmosphere.0[1], "{} burns", body.name());
+            } else if t.life > 0 {
+                assert!(got.atmosphere.0[2] > got.atmosphere.0[0] && got.atmosphere.0[0] > 0.0, "{} has a sky", body.name());
+            } else {
+                assert_eq!(got.atmosphere.0, [0.0, 0.0, 0.0], "{} is bare", body.name());
+            }
+            let a = got.albedo[0].0;
+            assert!(a.iter().all(|&c| (0.0..=1.0).contains(&c)), "a plain surface tone: {a:?}");
         }
         assert_eq!(listed.len(), expect);
-
-        let twins: Vec<_> = cosmos.bodies().iter().filter(|b| b.kind == Kind::Twin).collect();
-        assert!(twins.len() >= 2);
-        let lush = find(cosmos, listed, terrain.atlases(), twins[0]).unwrap();
-        let crystal = find(cosmos, listed, terrain.atlases(), twins[1]).unwrap();
-        assert!(lush.albedo[2].0[1] > lush.albedo[2].0[0] && lush.albedo[2].0[1] > lush.albedo[2].0[2]);
-        assert!(crystal.albedo[2].0[2] > crystal.albedo[2].0[0]);
-
-        let verdant = cosmos.bodies().iter().find(|b| b.kind == Kind::Verdant).unwrap();
-        let verdant = find(cosmos, listed, terrain.atlases(), verdant).unwrap();
-        assert!(verdant.albedo[0].0[1] > verdant.albedo[0].0[0]);
-        assert!(verdant.albedo[1].0[1] > verdant.albedo[1].0[2], "forest green, no seas");
-        assert!(verdant.atmosphere.0[2] > verdant.atmosphere.0[0]);
-        assert!(verdant.atmosphere.0[0] > 0.0);
-
-        let hollow = cosmos.bodies().iter().find(|b| b.kind == Kind::Hollow).unwrap();
-        let hollow = find(cosmos, listed, terrain.atlases(), hollow).unwrap();
-        assert_eq!(hollow.atmosphere.0, [0.0, 0.0, 0.0]);
-        assert!(hollow.albedo[0].0[2] > 0.5);
-
-        let ember = cosmos.bodies().iter().find(|b| b.kind == Kind::Ember).unwrap();
-        let ember = find(cosmos, listed, terrain.atlases(), ember).unwrap();
-        assert!(ember.atmosphere.0[0] > 1.0);
-        assert!(ember.atmosphere.0[0] > ember.atmosphere.0[1]);
-        assert!(ember.atmosphere.0[1] > ember.atmosphere.0[2]);
-        assert!(ember.albedo[0].0[0] > ember.albedo[0].0[1]);
-
-        for moon in cosmos.bodies().iter().filter(|b| b.kind == Kind::Moon) {
-            let moon = find(cosmos, listed, terrain.atlases(), moon).unwrap();
-            assert_eq!(moon.shape, FarShape::Sphere);
-            assert_eq!(moon.atmosphere.0, [0.0, 0.0, 0.0]);
-            let a = moon.albedo[0].0;
-            assert!(a.iter().all(|&c| c > 0.0 && c <= 1.0), "a lit, plain surface tone: {a:?}");
-        }
         assert!(far.sun_override().is_none());
 
         // Warm the buffer, then two more updates must not allocate.
@@ -782,7 +764,7 @@ mod tests {
                         let eye = c + dir * (body.reach() * k + extra);
                         let dist = (c - eye).length();
                         let exact = cosmos.altitude(body, eye) < STREAM_ALTITUDE;
-                        assert_eq!(dist < reach && exact, exact, "{:?} at {eye}", body.kind);
+                        assert_eq!(dist < reach && exact, exact, "{} at {eye}", body.name());
                     }
                 }
             }
@@ -790,11 +772,23 @@ mod tests {
     }
 
     /// Along a flight from spawn past every body, into the streaming band over each and through the
-    /// Hollow's cavity, with home's map off and on, the list is the old per-frame derivation's.
+    /// Hollow's cavity, with home's map off and on, the list is the old per-frame derivation's: in a
+    /// universe of more bodies than the engine draws (nearest first), and in the authored catalog
+    /// with its Hollow.
     #[test]
     fn the_list_matches_the_per_frame_derivation_along_a_flight() {
+        use crate::world::terrain::cosmos::fixture;
         let mut registry = BlockRegistry::with_builtins();
-        let terrain = Terrain::new(&mut registry, 42);
+        let crowded = Terrain::new(&mut registry, 157);
+        assert!(crowded.cosmos().expect("cosmos").bodies().len() > MAX_FAR_BODIES, "more bodies than the engine draws");
+        assert_eq!(flight(&crowded), 0);
+        let mut registry = BlockRegistry::with_builtins();
+        let authored = fixture::authored(|| Terrain::new(&mut registry, 42));
+        assert!(flight(&authored) > 10, "the flight crosses the cavity");
+    }
+
+    /// Fly past every body of `terrain` comparing the list with [`oracle`]; the eyes in a cavity.
+    fn flight(terrain: &Terrain) -> usize {
         let cosmos = terrain.cosmos().expect("cosmos");
         let mut eyes = vec![DVec3::new(0.5, 8.0, 0.5)];
         for body in cosmos.bodies() {
@@ -812,23 +806,23 @@ mod tests {
         let mut cavity = 0;
         for (i, &eye) in eyes.iter().enumerate() {
             far.set_live(i % 2 == 1);
-            let list = far.update(&terrain, eye).to_vec();
+            let list = far.update(terrain, eye).to_vec();
             let got = if cosmos.hollow_cavity(eye).is_some() {
                 cavity += 1;
                 &list[1..]
             } else {
                 &list[..]
             };
-            let want = oracle(&terrain, eye, i % 2 == 1, far.horizon);
+            let want = oracle(terrain, eye, i % 2 == 1, far.horizon);
             assert_eq!(format!("{got:?}"), format!("{want:?}"), "eye {eye}");
         }
-        assert!(cavity > 10, "the flight crosses the cavity");
+        cavity
     }
 
     #[test]
     fn inside_the_hollow_the_wall_and_the_ember_are_the_sky() {
         let mut registry = BlockRegistry::with_builtins();
-        let terrain = Terrain::new(&mut registry, 1);
+        let terrain = crate::world::terrain::cosmos::fixture::authored(|| Terrain::new(&mut registry, 1));
         let cosmos = terrain.cosmos().expect("cosmos");
         let hollow = cosmos.bodies().iter().find(|b| b.kind == Kind::Hollow).unwrap();
         let ember = cosmos.bodies().iter().find(|b| b.kind == Kind::Ember).unwrap();
@@ -945,8 +939,8 @@ mod tests {
         let mut registry = BlockRegistry::with_builtins();
         let terrain = Terrain::new(&mut registry, 42);
         let cosmos = terrain.cosmos().expect("cosmos");
-        let twin = cosmos.bodies().iter().find(|b| b.kind == Kind::Twin).unwrap();
-        let Shape::Cube { half } = twin.shape else { panic!("a twin is a cube") };
+        let twin = cosmos.bodies().iter().find(|b| b.traits.form == Form::Warped).unwrap();
+        let Shape::Cube { half } = twin.shape else { panic!("a warped body is a cube") };
         let eyes = [
             ("spawn", DVec3::new(0.5, 8.0, 0.5)),
             ("twin surface", twin.centre_f() + DVec3::new(half as f64 + 5_000.0, 300.0, -200.0)),

@@ -1759,21 +1759,25 @@ mod tests {
         let home = cosmos.home();
         let cosmos = game.world.terrain().cosmos().expect("a cosmos");
         assert!((game.sky_altitude(eye) - cosmos.altitude(&home, eye)).abs() < 1e-6);
-        let verdance = cosmos
-            .bodies()
-            .iter()
-            .find(|b| b.kind == crate::world::terrain::cosmos::Kind::Verdant)
-            .expect("Verdance");
-        let crate::world::terrain::cosmos::Shape::Ball { r } = verdance.shape else { panic!("round") };
+        use crate::world::terrain::cosmos::{fixture, Form, Rank, Shape};
+        let round = |air: bool| {
+            cosmos.bodies().iter().find(move |b| b.traits.form == Form::Round && b.traits.rank != Rank::Start && b.traits.air_top.is_some() == air)
+        };
+        let verdance = round(true).expect("a round world with air");
+        let Shape::Ball { r } = verdance.shape else { panic!("round") };
         let above = verdance.centre_f() + DVec3::new(0.0, 0.0, r as f64 + 300.0);
-        assert!((game.sky_altitude(above) - 300.0).abs() < 1e-6, "over Verdance");
+        assert!((game.sky_altitude(above) - 300.0).abs() < 1e-6, "over a world with air");
+        if let Some(bare) = round(false) {
+            let Shape::Ball { r } = bare.shape else { panic!("round") };
+            assert_eq!(game.sky_altitude(bare.centre_f() + DVec3::new(0.0, 0.0, r as f64 + 300.0)), 1.0e9, "over an airless world");
+        }
         assert!(game.sky_altitude(DVec3::new(9.0e8, 9.0e8, 9.0e8)) > 1.0e8, "deep space");
 
-        let hollow = cosmos
-            .bodies()
-            .iter()
-            .find(|b| b.kind == crate::world::terrain::cosmos::Kind::Hollow)
-            .expect("the Hollow");
+        // A shell's cavity is its own sky (the authored catalog still holds the Hollow).
+        let world = fixture::authored(|| World::with_kind(1, RenderConfig::default(), crate::world::generation::WorldgenKind::Diffusion, false));
+        let game = Game::new(world, Player::new(DVec3::new(0.5, 80.0, 0.5)), "alt".into());
+        let cosmos = game.world.terrain().cosmos().expect("a cosmos");
+        let hollow = cosmos.bodies().iter().find(|b| b.traits.form == Form::Shell).expect("the Hollow");
         let crate::world::terrain::cosmos::Shape::Shell { outer, inner } = hollow.shape else {
             panic!("the Hollow is a shell");
         };

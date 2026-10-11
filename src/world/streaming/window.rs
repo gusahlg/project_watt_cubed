@@ -1525,7 +1525,7 @@ mod tests {
     fn cube_coverage_reads_storage_chunks() {
         use crate::ident::Detail;
         use crate::world::heightmip::BakeExtent;
-        use crate::world::terrain::cosmos::{Kind, Shape};
+        use crate::world::terrain::cosmos::{Form, Shape};
 
         for face in [Face::PosY, Face::PosX] {
             let mut world = gentle_world();
@@ -1540,10 +1540,9 @@ mod tests {
                 .bodies()
                 .iter()
                 .copied()
-                .filter(|b| b.kind == Kind::Twin)
-                .nth(1)
-                .expect("twin 2");
-            let Shape::Cube { .. } = twin.shape else { panic!("twin is a cube") };
+                .find(|b| b.traits.form == Form::Warped)
+                .expect("a warped cube");
+            let Shape::Cube { .. } = twin.shape else { panic!("a warped body is a cube") };
             let centre = (
                 i32::try_from(twin.centre[0]).unwrap(),
                 i32::try_from(twin.centre[1]).unwrap(),
@@ -1797,13 +1796,13 @@ mod tests {
     }
 
     fn twin_under(world: &World, p: DVec3) -> crate::world::terrain::cosmos::Body {
-        use crate::world::terrain::cosmos::Kind;
+        use crate::world::terrain::cosmos::Form;
         let cosmos = world.generator.cosmos().expect("cosmos");
         cosmos
             .bodies()
             .iter()
             .copied()
-            .filter(|b| b.kind == Kind::Twin)
+            .filter(|b| b.traits.form == Form::Warped)
             .min_by(|a, b| cosmos.altitude(a, p).abs().total_cmp(&cosmos.altitude(b, p).abs()))
             .expect("a twin")
     }
@@ -2153,8 +2152,9 @@ mod tests {
         passes
     }
 
+    /// Over the authored catalog, which still holds a body of every old kind (shells included).
     fn audit_round(kind: crate::world::terrain::cosmos::Kind, inward: bool, name: &str) {
-        let mut world = seeded(42, 16, 5);
+        let mut world = crate::world::terrain::cosmos::fixture::authored(|| seeded(42, 16, 5));
         let body = body_of(&world, kind);
         let atlas = round_atlas(&world, &body, inward);
         let radius = atlas.radius;

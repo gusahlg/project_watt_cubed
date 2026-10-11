@@ -223,22 +223,31 @@ impl Bulk {
     }
 }
 
+/// The bulk at virtual-cube cell `rel`, painted on `face`. Mix cells follow the grid chunks lie
+/// on, so a chunk sits in one cell: a cube's physical axes, or the start world's chart axes (its
+/// virtual cube's negative faces flip physical axes against the chart).
 #[inline]
-pub(super) fn bulk_id(bulk: &Bulk, body: &Body, rel: [i64; 3]) -> BlockId {
+pub(super) fn bulk_id(bulk: &Bulk, body: &Body, face: Face, rel: [i64; 3]) -> BlockId {
     if bulk.layers.len() == 1 {
         return bulk.layers[0].1;
     }
+    let (salt, cell) = if body.traits.rank == super::cosmos::Rank::Start {
+        let (u, a, v) = FaceFrame::new(face).cell_to_local((rel[0] as i32, rel[1] as i32, rel[2] as i32));
+        (face.index() as u32, [i64::from(u), i64::from(a), i64::from(v)])
+    } else {
+        (0, rel)
+    };
     let h = hash3(
-        bulk.seed ^ body.seed,
-        rel[0].div_euclid(MIX) as i32,
-        rel[1].div_euclid(MIX) as i32,
-        rel[2].div_euclid(MIX) as i32,
+        bulk.seed ^ body.seed ^ salt,
+        cell[0].div_euclid(MIX) as i32,
+        cell[1].div_euclid(MIX) as i32,
+        cell[2].div_euclid(MIX) as i32,
     ) >> 8;
     bulk.layers.iter().find(|&&(cut, _)| h < cut).map_or(bulk.layers[bulk.layers.len() - 1].1, |&(_, id)| id)
 }
 
 /// The one material of a deep chunk, when every coarse cell it touches agrees.
-pub(super) fn bulk_uniform(bulk: &Bulk, body: &Body, cells: &[[i64; 3]]) -> Option<BlockId> {
-    let id = bulk_id(bulk, body, cells[0]);
-    cells[1..].iter().all(|&r| bulk_id(bulk, body, r) == id).then_some(id)
+pub(super) fn bulk_uniform(bulk: &Bulk, body: &Body, face: Face, cells: &[[i64; 3]]) -> Option<BlockId> {
+    let id = bulk_id(bulk, body, face, cells[0]);
+    cells[1..].iter().all(|&r| bulk_id(bulk, body, face, r) == id).then_some(id)
 }

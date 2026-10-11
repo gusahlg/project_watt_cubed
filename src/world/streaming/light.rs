@@ -768,7 +768,8 @@ mod tests {
     /// ceiling built through the index equals the one built by scanning the whole overlay.
     #[test]
     fn indexed_roofs_match_the_overlay_scan() {
-        let mut world = World::with_kind(7, RenderConfig::default(), WorldgenKind::Diffusion, false);
+        use crate::world::terrain::cosmos::fixture::{seed, Want};
+        let mut world = World::with_kind(seed(&[Want::Warped]), RenderConfig::default(), WorldgenKind::Diffusion, false);
         let rock = world.registry.id_by_label("rock").expect("rock");
         let cosmos = world.generator.cosmos().expect("cosmos");
         let mut state = 0x2545_f491_4f6c_dd1du64;

@@ -1611,8 +1611,8 @@ mod tests {
             .bodies()
             .iter()
             .copied()
-            .find(|b| b.kind == crate::world::terrain::cosmos::Kind::Twin)
-            .expect("a twin");
+            .find(|b| b.traits.form == crate::world::terrain::cosmos::Form::Warped)
+            .expect("a warped cube");
         let (au, av) = (
             i32::try_from(twin.centre[0]).expect("twin x") + 8,
             i32::try_from(twin.centre[2]).expect("twin z") + 8,
@@ -2045,9 +2045,10 @@ mod tests {
     /// Start-world chart far field from altitude: the square under the eye is drawn, its columns
     /// have tops, and the seams around it are closed. Spawn ground level keeps the punch on the
     /// interior of the near box. The border, within one span-32 section, is drawn: that tile is
-    /// what covers the sliver outside the box. Bytes re-pinned to `0x46ae3b3a`: every level
-    /// samples the cell's first block and packs on one shared lattice (seed 42, diffusion,
-    /// default view). The window streaming places there is the eye band.
+    /// what covers the sliver outside the box. Bytes re-pinned to `0x11e4_f2aa` for worldgen 11
+    /// (seed 42 grows another start world); every level samples the cell's first block and packs on
+    /// one shared lattice (seed 42, diffusion, default view). The window streaming places there is
+    /// the eye band.
     #[test]
     fn far_chart_altitude_frontier_is_closed() {
         use crate::render_config::RenderConfig;
@@ -2059,7 +2060,7 @@ mod tests {
         let (center, storage) = home_altitude_eye(&world, DVec3::new(0.0, 1.0, 0.0), 0.0);
         world.section_eye_y = storage.y;
         let spawn = frontier_counts(&mut world, center);
-        assert_eq!(spawn.hash, 0x46ae3b3a, "spawn ground-level far-field bytes changed");
+        assert_eq!(spawn.hash, 0x11e4_f2aa, "spawn ground-level far-field bytes changed");
         assert_eq!(spawn.bare, 0, "spawn ground-level bare columns");
         assert_eq!(spawn.gaps, 0, "spawn ground-level seam gaps");
         assert_eq!(spawn.missing, 0, "spawn ground-level missing tops");

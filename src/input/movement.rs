@@ -1048,17 +1048,19 @@ mod tests {
     }
 
 
-    /// The whole chain on the real universe: teleport above Verdance's surface, stream its chart,
-    /// fall under its matter's own pull, land on its storage cells and walk along the curve.
+    /// The whole chain on the real universe: teleport above a round world's surface, stream its
+    /// chart, fall under its matter's own pull, land on its storage cells and walk along the curve.
     #[test]
     fn a_player_lands_on_verdance_and_walks_along_the_curve() {
         use crate::render_config::RenderConfig;
         use crate::world::generation::WorldgenKind;
-        use crate::world::terrain::cosmos::Kind;
+        use crate::world::terrain::cosmos::{Form, Rank};
         let mut world = World::with_kind(42, RenderConfig::default(), WorldgenKind::Diffusion, false);
         let atlas = {
             let generator = world.terrain();
-            let verdance = generator.cosmos().expect("cosmos").bodies().iter().copied().find(|b| b.kind == Kind::Verdant).expect("Verdance");
+            let cosmos = generator.cosmos().expect("cosmos");
+            let round = |b: &&crate::world::terrain::cosmos::Body| b.traits.form == Form::Round && b.traits.rank != Rank::Start;
+            let verdance = cosmos.bodies().iter().filter(round).max_by_key(|b| b.traits.gravity.to_bits()).copied().expect("a round world");
             world.atlases().iter().find(|a| (a.centre - verdance.centre_f()).length() < 1.0).expect("charted").clone()
         };
         // A point 12 blocks above the ground at the middle of the +Y chart, found through the chart.
@@ -1103,11 +1105,13 @@ mod tests {
     #[test]
     fn a_player_stands_on_a_sagging_twin_along_the_pull() {
         use crate::space::FaceFrame;
-        use crate::world::terrain::cosmos::{Kind, Shape};
-        let mut world = diffusion();
+        use crate::render_config::RenderConfig;
+        use crate::world::generation::WorldgenKind;
+        use crate::world::terrain::cosmos::{fixture, Shape};
+        let mut world = World::with_kind(fixture::seed(&[fixture::Want::Warped]), RenderConfig::default(), WorldgenKind::Diffusion, false);
         let (atlas, half, centre_i) = {
             let generator = world.terrain();
-            let twin = generator.cosmos().expect("cosmos").bodies().iter().copied().find(|b| b.kind == Kind::Twin).expect("a twin");
+            let twin = fixture::first(generator.cosmos().expect("cosmos"), fixture::Want::Warped).expect("a warped cube");
             let Shape::Cube { half } = twin.shape else { panic!("a twin is a cube") };
             let atlas = world
                 .atlases()
@@ -1194,11 +1198,14 @@ mod tests {
 
     #[test]
     fn vacuum_above_the_home_face_falls_with_the_gravity() {
-        use crate::world::terrain::cosmos::HOME_RADIUS;
+        use crate::world::terrain::cosmos::Shape;
         let world = diffusion();
-        let centre = world.terrain().cosmos().expect("a cosmos").home().centre_f();
-        let start = centre + DVec3::new(HOME_RADIUS as f64 + 50_000.0, 0.0, 0.0);
-        assert!(!world.in_air(start), "50 000 above the +X side is vacuum");
+        let home = *world.terrain().cosmos().expect("a cosmos").home();
+        let Shape::Ball { r } = home.shape else { panic!("the start world is round") };
+        let air = f64::from(home.traits.air_top.expect("the start world has air"));
+        let centre = home.centre_f();
+        let start = centre + DVec3::new(r as f64 + air + 30_000.0, 0.0, 0.0);
+        assert!(!world.in_air(start), "past the air on the +X side is vacuum");
         let mut player = Player::new(start);
         player.motion = Motion::Walking { velocity: DVec3::ZERO, on_ground: false };
         // Keys and jump do nothing while falling in vacuum.

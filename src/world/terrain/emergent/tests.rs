@@ -14,7 +14,7 @@ const SEEDS: [u64; 3] = [0xC0FFEE, 42, 1_791_184_794_939_118_871];
 const PINS: [[u64; 4]; 3] = [
     [0xc9eb33927aa562fa, 0x6b1c643a854df8f1, 0x6935160005a0a303, 0xb35ca704b2e41828],
     [0x14276b40ffcd9ae0, 0xdcd25efe3aa85d89, 0x5b4086c57a5864d2, 0xc0777c8deca31ed6],
-    [0xdcdcba074d536dbe, 0x8d4c630a32d91943, 0x570c969d06a6fc4e, 0xbd95e746bde93ca5],
+    [0xdcdcba074d536dbe, 0xe01207b66de43499, 0xdb9ecabd77c12c21, 0xbd95e746bde93ca5],
 ];
 
 /// Calls whose results may differ between math libraries.
@@ -177,4 +177,111 @@ fn a_universe_is_the_same_twice_and_sane() {
             }
         }
     }
+}
+
+/// Grow `seeds` on `threads` threads (each universe on one), in seed order.
+fn grow_all(seeds: std::ops::Range<u64>, threads: u64) -> Vec<Universe> {
+    let cfg = TerrainCfg::default();
+    let p = Params::default();
+    let chunk = (seeds.end - seeds.start).div_ceil(threads);
+    std::thread::scope(|s| {
+        let handles: Vec<_> = (0..threads)
+            .map(|k| {
+                let lo = seeds.start + k * chunk;
+                let hi = (lo + chunk).min(seeds.end);
+                let (cfg, p) = (&cfg, &p);
+                s.spawn(move || (lo..hi).map(|seed| Universe::new(seed, cfg, p, 1)).collect::<Vec<_>>())
+            })
+            .collect();
+        handles.into_iter().flat_map(|h| h.join().expect("a universe thread")).collect()
+    })
+}
+
+/// The properties every universe keeps, whatever its seed: a valid start world that pulls as
+/// designed, company, no overlap, systems that never pull on each other, and satellites that
+/// dominate their own ground.
+fn check_universe(u: &Universe, p: &Params) {
+    let start = &u.bodies[0];
+    let t = &start.traits;
+    let seed = u.seed;
+    assert_eq!((t.rank, t.form), (Rank::Start, Form::Round), "seed {seed}: the start world is round");
+    assert!(t.air_top.is_some(), "seed {seed}: the start world has air");
+    assert!(start_fallback_or(u, |temp| (TEMPERATE.0..=TEMPERATE.1).contains(&temp)), "seed {seed}: temperate start ({})", t.temp);
+    assert!((start.density * start.radius as f64 - RHO_R).abs() <= 8.0 * start.density, "seed {seed}: the spawn contract");
+    assert!((t.gravity as f64 / start_pull() - 1.0).abs() < 1e-3, "seed {seed}: the spawn pull {}", t.gravity);
+    assert!(u.bodies.len() > OTHERS_MIN || u.resalts == INTEREST_TRIES, "seed {seed}: company");
+    assert!(u.bodies.len() <= p.bodies_max, "seed {seed}: the cap");
+    let surface = |b: &Body| match b.traits.form {
+        Form::Round => G * b.traits.mass / (b.radius as f64 * b.radius as f64),
+        _ => KAPPA_FACE * G * b.density * b.half as f64,
+    };
+    let radius = |b: &Body| if b.traits.form == Form::Round { b.radius as f64 } else { b.half as f64 };
+    for (i, a) in u.bodies.iter().enumerate() {
+        assert_eq!(a.id as usize, i, "seed {seed}: ids are indices");
+        for b in &u.bodies[i + 1..] {
+            let d = dist(a.centre.map(|v| v as f64), b.centre.map(|v| v as f64));
+            let touch = if a.traits.partner == Some(b.id) { (a.half + b.half) as f64 } else { a.reach() + b.reach() };
+            assert!(d > touch, "seed {seed}: {} and {} overlap", a.id, b.id);
+            if a.system != b.system {
+                assert!(d > R_G + a.reach() + b.reach(), "seed {seed}: systems {} and {} pull on each other", a.system, b.system);
+            }
+        }
+        if let Some(parent) = a.traits.parent.filter(|_| a.traits.rank == Rank::Satellite) {
+            let up = &u.bodies[parent as usize];
+            let d = (dist(a.centre.map(|v| v as f64), up.centre.map(|v| v as f64)) - radius(a)).max(1.0);
+            let theirs = pull_at(up.traits.mass, d);
+            assert!(surface(a) >= p.k_dom * theirs * (1.0 - 1e-6), "seed {seed}: satellite {} pulls {} under {} × its parent's {theirs}", a.id, surface(a), p.k_dom);
+        }
+        if let Some(partner) = a.traits.partner {
+            let b = &u.bodies[partner as usize];
+            assert_eq!(b.traits.partner, Some(a.id), "seed {seed}: partners point at each other");
+            assert!(a.traits.form != Form::Round && b.traits.form != Form::Round, "seed {seed}: a binary is two cubes");
+        }
+    }
+}
+
+/// `pred` of the start world's temperature, or the last-resort `rock` start world.
+fn start_fallback_or(u: &Universe, pred: impl Fn(f64) -> bool) -> bool {
+    u.start_fallback || pred(u.bodies[0].traits.temp as f64)
+}
+
+/// The P2 property suite over 1000 seeds (`EMERGENT_SEEDS` overrides).
+#[test]
+fn a_thousand_universes_keep_their_properties() {
+    let n: u64 = std::env::var("EMERGENT_SEEDS").ok().and_then(|v| v.parse().ok()).unwrap_or(1000);
+    let p = Params::default();
+    for u in grow_all(1..n + 1, 4) {
+        check_universe(&u, &p);
+    }
+}
+
+/// `cargo test --release --lib ten_thousand_universes -- --ignored`: no seed panics.
+#[test]
+#[ignore]
+fn ten_thousand_universes_grow_without_panic() {
+    let p = Params::default();
+    let all = grow_all(0..10_000, 4);
+    assert_eq!(all.len(), 10_000);
+    for u in &all {
+        check_universe(u, &p);
+    }
+}
+
+/// The same seed grows the same universe on one thread and on four, and twice in a row: what a
+/// server and every joiner build is one universe.
+#[test]
+fn two_growths_of_a_seed_are_equal() {
+    let cfg = TerrainCfg::default();
+    let p = Params::default();
+    for seed in [0u64, 157, 240, 1_791_184_794_939_118_871, u64::MAX] {
+        let a = Universe::new(seed, &cfg, &p, 1);
+        let b = Universe::new(seed, &cfg, &p, 4);
+        assert_eq!(a.bodies, b.bodies, "seed {seed}");
+        assert_eq!(a.suites, b.suites, "seed {seed}");
+        assert_eq!(a.resalts, b.resalts, "seed {seed}");
+    }
+    // All 64 bits count.
+    let low = Universe::new(5, &cfg, &p, 2);
+    let high = Universe::new(5 | (1 << 40), &cfg, &p, 2);
+    assert_ne!(low.bodies, high.bodies, "the high half of the seed grows another universe");
 }

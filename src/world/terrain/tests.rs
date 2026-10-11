@@ -11,6 +11,11 @@ use crate::world::chunk::Chunk;
 use crate::world::generation::Classify;
 use crate::world::layout::{ColumnKey, Sky};
 
+/// A pinned seed whose universe holds a contact binary of cubes and a moon-painted body.
+fn pair_seed() -> i64 {
+    cosmos::fixture::seed(&[cosmos::fixture::Want::Pair, cosmos::fixture::Want::Moonlike])
+}
+
 fn make(seed: i64) -> (BlockRegistry, Terrain) {
     let mut reg = BlockRegistry::with_builtins();
     let t = Terrain::new(&mut reg, seed);
@@ -161,7 +166,7 @@ fn the_three_realms_have_their_features() {
     // The old space realm is air. A moon is charted: nothing of it in physical space, its ground in
     // its chart's storage cells.
     assert_eq!(t.voxel_at(0, SPACE_FLOOR + 10, 0), AIR);
-    let moon = t.cosmos.bodies().iter().copied().find(|b| b.kind == cosmos::Kind::Moon).expect("a moon");
+    let moon = cosmos::fixture::first(&t.cosmos, cosmos::fixture::Want::Moonlike).expect("a moon");
     let cosmos::Shape::Ball { r } = moon.shape else { panic!("moon is a ball") };
     for d in [r / 2, r - 8, r - 1] {
         assert_eq!(t.voxel_at((moon.centre[0] + d) as i32, moon.centre[1] as i32, moon.centre[2] as i32), AIR);
@@ -348,7 +353,7 @@ fn storage_to_rel(t: &Terrain, x: i32, y: i32, z: i32) -> Option<[i64; 3]> {
 
 /// Chunk containing the top solid cell at the centre of `body`'s `face`.
 fn face_centre_chunk(t: &Terrain, body: &cosmos::Body, face: Face) -> (i32, i32, i32) {
-    if body.kind == cosmos::Kind::Home {
+    if body.traits.rank == cosmos::Rank::Start {
         let (sx, sz, _) = home_column(t, face, 0, 0);
         let h = t.height(sx, sz);
         assert_ne!(h, i32::MIN, "home {face:?} has no chart surface");
@@ -409,7 +414,7 @@ fn home_plus_y_keeps_the_v3_field_near_spawn() {
 
 #[test]
 fn faces_edges_bulk_twin_and_moon_match_the_voxel() {
-    let (_reg, t) = make(42);
+    let (_reg, t) = make(pair_seed());
     let home = *t.cosmos.home();
     for face in Face::ALL {
         let (cx, cy, cz) = face_centre_chunk(&t, &home, face);
@@ -463,7 +468,7 @@ fn faces_edges_bulk_twin_and_moon_match_the_voxel() {
     assert_worker_matches(&t, cx, above, cz);
 
     // The outward face of the lower twin (the inner faces see each other).
-    let mut twins: Vec<_> = t.cosmos.bodies().iter().copied().filter(|b| b.kind == cosmos::Kind::Twin).collect();
+    let mut twins: Vec<_> = t.cosmos.bodies().iter().copied().filter(|b| b.traits.partner.is_some()).collect();
     assert_eq!(twins.len(), 2);
     let axis = (0..3).max_by_key(|&a| (twins[0].centre[a] - twins[1].centre[a]).abs()).unwrap();
     twins.sort_by_key(|b| b.centre[axis]);
@@ -473,7 +478,7 @@ fn faces_edges_bulk_twin_and_moon_match_the_voxel() {
     assert_chunk_matches(&t, cx, cy, cz);
 
     // A moon: physical space holds none of it; its surface chunk in storage matches cell for cell.
-    let moon = t.cosmos.bodies().iter().copied().find(|b| b.kind == cosmos::Kind::Moon).unwrap();
+    let moon = cosmos::fixture::first(&t.cosmos, cosmos::fixture::Want::Moonlike).unwrap();
     let (cx, cy, cz) = chunk_of(moon.centre);
     assert_eq!(t.classify(ChunkCoord::new(cx, cy, cz)), Classify::Air);
     let (x, y, z) = moon_surface_cell(&t, &moon);
@@ -496,8 +501,8 @@ fn moon_surface_cell(t: &Terrain, moon: &cosmos::Body) -> (i32, i32, i32) {
 
 #[test]
 fn cube_edges_share_one_rim_and_the_ridge_is_solid() {
-    let (_reg, t) = make(42);
-    let twin = t.cosmos.bodies().iter().copied().find(|b| b.kind == cosmos::Kind::Twin).expect("a twin");
+    let (_reg, t) = make(pair_seed());
+    let twin = t.cosmos.bodies().iter().copied().find(|b| b.traits.partner.is_some()).expect("a twin");
     let half = cube::half_of(&twin);
     let hi = half as i32;
     let centre = cube::centre_i32(twin.centre).expect("twin centre");
@@ -560,21 +565,21 @@ fn deep_mix_mean_amount_is_the_bulk_density() {
     }
 }
 
-/// The deep bulk of `body` at `rel`.
+/// The deep bulk of `body` at `rel` (on the face that owns it).
 fn bulk_at(t: &Terrain, body: &cosmos::Body, rel: [i64; 3]) -> BlockId {
-    cube::bulk_id(&t.bulks[usize::from(body.id)], body, rel)
+    cube::bulk_id(&t.bulks[usize::from(body.id)], body, cube::face_of(rel), rel)
 }
 
 #[test]
 fn classify_matches_what_generation_stores() {
-    let (_reg, t) = make(42);
+    let (_reg, t) = make(pair_seed());
     let samples = [
         ChunkCoord::new(0, 1_000, 0),
         ChunkCoord::new(0, (cube::TREE_CLEAR + 15) / 16, 0),
         ChunkCoord::new(0, (-1_000i32).div_euclid(16), 0),
         ChunkCoord::new(0, t.cosmos.home().centre[1].div_euclid(16) as i32, 0),
     ];
-    let moon = t.cosmos.bodies().iter().copied().find(|b| b.kind == cosmos::Kind::Moon).unwrap();
+    let moon = cosmos::fixture::first(&t.cosmos, cosmos::fixture::Want::Moonlike).unwrap();
     let (mx, my, mz) = chunk_of(moon.centre);
     let mut samples = samples.to_vec();
     samples.push(ChunkCoord::new(mx, my, mz));
@@ -594,7 +599,7 @@ fn classify_matches_what_generation_stores() {
     // Chart surface, a twin's edge band, empty space, a moon.
     let y = h.div_euclid(16);
     assert_eq!(t.sky(ChunkCoord::new(sx.div_euclid(16), y, sz.div_euclid(16))), Sky::Axis(Face::PosY));
-    let twin = t.cosmos.bodies().iter().copied().find(|b| b.kind == cosmos::Kind::Twin).unwrap();
+    let twin = t.cosmos.bodies().iter().copied().find(|b| b.traits.partner.is_some()).unwrap();
     let cosmos::Shape::Cube { half } = twin.shape else { panic!("a twin is a cube") };
     let edge = occupy(&t, &twin, face_world(&twin, Face::PosY, half as i32 - 100, 0, 0));
     assert_eq!(
@@ -660,7 +665,7 @@ fn landmarks() {
 
 #[test]
 fn home_spawn_is_a_temperate_meadow_and_the_twins_differ() {
-    let (_reg, t) = make(42);
+    let (_reg, t) = make(pair_seed());
     let home = t.cosmos.home();
     let expect = [
         (Face::PosY, province::Realm::Green),
@@ -691,18 +696,13 @@ fn home_spawn_is_a_temperate_meadow_and_the_twins_differ() {
     }
     assert!(themes.len() >= 3, "themes within 3 km: {themes:?}");
 
-    let twins: Vec<_> = t.cosmos.bodies().iter().copied().filter(|b| b.kind == cosmos::Kind::Twin).collect();
-    assert_eq!(twins.len(), 2);
-    let mut realms = Vec::new();
-    for b in &twins {
-        let realm = t.paint(b, Face::PosY).shape.realm();
+    // Every cube has one realm on all its faces: lush where it lives, crystalline where it does not.
+    for b in t.cosmos.bodies().iter().filter(|b| matches!(b.shape, cosmos::Shape::Cube { .. })) {
+        let want = if b.traits.life > 0 { province::Realm::Lush } else { province::Realm::Crystal };
         for face in Face::ALL {
-            assert_eq!(t.paint(b, face).shape.realm(), realm, "twin {} {face:?}", b.id);
+            assert_eq!(t.paint(b, face).shape.realm(), want, "cube {} {face:?}", b.id);
         }
-        realms.push(realm);
     }
-    realms.sort_by_key(|r| *r as u8);
-    assert_eq!(realms, vec![province::Realm::Lush, province::Realm::Crystal]);
 }
 
 #[test]
@@ -908,7 +908,7 @@ fn occupy(t: &Terrain, body: &cosmos::Body, world: [i32; 3]) -> [i32; 3] {
 
 #[test]
 fn asteroids_round_worlds_and_the_twin_canyon() {
-    let (_reg, t) = make(42);
+    let (_reg, t) = make(pair_seed());
     let m = t.materials();
     let rocks = one_of_each_kind(&t);
     for rock in &rocks {
@@ -1036,13 +1036,12 @@ fn asteroids_round_worlds_and_the_twin_canyon() {
         }
     }
 
-    let twins: Vec<_> = t.cosmos.bodies().iter().copied().filter(|b| b.kind == cosmos::Kind::Twin).collect();
+    let twins: Vec<_> = t.cosmos.bodies().iter().copied().filter(|b| b.traits.partner.is_some()).collect();
     assert_eq!(twins.len(), 2);
-    let lush_id = twins.iter().map(|b| b.id).min().unwrap();
     for body in &twins {
         let face = span::facing_face(&t.cosmos, body).unwrap();
         let half = cube::half_of(body);
-        let lush = body.id == lush_id;
+        let lush = span::lush(body);
         let (u, h, v) = span::example(span::face_seed(body), half).expect("a spire");
         assert!(h > MAX_GROUND && (h as i64) < cosmos::RELIEF, "spire altitude {h}");
         let w = occupy(&t, body, face_world(body, face, u, h, v));
@@ -1147,7 +1146,7 @@ fn cluster_classify_cost() {
 }
 
 fn world_of(t: &Terrain, body: &cosmos::Body, rel: [i64; 3]) -> (i32, i32, i32) {
-    if body.kind == cosmos::Kind::Home {
+    if body.traits.rank == cosmos::Rank::Start {
         return home_rel_storage(t, rel).unwrap_or_else(|| panic!("home cell {rel:?} is outside band 0"));
     }
     (
@@ -1325,7 +1324,7 @@ fn light_in_chunk(t: &Terrain, body: &cosmos::Body, rel: [i64; 3]) -> Option<[i6
                 let wx = cx * n + lx as i32;
                 let wy = cy * n + ly as i32;
                 let wz = cz * n + lz as i32;
-                if body.kind == cosmos::Kind::Home {
+                if body.traits.rank == cosmos::Rank::Start {
                     return storage_to_rel(t, wx, wy, wz);
                 }
                 let c = body.centre;
@@ -1465,7 +1464,7 @@ fn quiet_deep_chunks_stay_uniform() {
 /// Storage cell of a chart column, or the world cell of a cube face column.
 /// `h` is altitude above the face plane.
 fn face_cell(t: &Terrain, body: &cosmos::Body, face: Face, u: i32, h: i32, v: i32) -> (i32, i32, i32) {
-    if body.kind == cosmos::Kind::Home {
+    if body.traits.rank == cosmos::Rank::Start {
         let (sx, sz, rise) = home_column(t, face, u, v);
         let atlas = t.storage.home_atlas().expect("the start world is charted");
         let _ = atlas;
@@ -1492,7 +1491,7 @@ fn agree_cell(t: &Terrain, body: &cosmos::Body, face: Face, u: i32, h: i32, v: i
     let (x, y, z) = face_cell(t, body, face, u, h, v);
     let coord = ChunkCoord::new(x.div_euclid(16), y.div_euclid(16), z.div_euclid(16));
     // A chart's up is storage +Y on every face. A cube keeps the face's own sky.
-    let sky = if body.kind == cosmos::Kind::Home { Face::PosY } else { face };
+    let sky = if body.traits.rank == cosmos::Rank::Start { Face::PosY } else { face };
     assert_eq!(t.sky(coord), Sky::Axis(sky), "landmark chunk {coord:?} on {face:?} uses the batch path");
     assert_chunk_matches(t, coord.x, coord.y, coord.z);
 }
@@ -1504,34 +1503,35 @@ struct ThemeHit {
     v: i32,
 }
 
-/// Deepest sample of each theme on one face, inside the inland band.
+/// Every sample of one face on a lattice inside the inland band, with its theme.
 fn survey(t: &Terrain, body: &cosmos::Body, face: Face) -> Vec<ThemeHit> {
     let paint = t.paint(body, face);
     let mut hits: Vec<ThemeHit> = Vec::new();
-    for i in 0..36 {
-        for j in 0..36 {
+    for i in 0..96 {
+        for j in 0..96 {
             let u = 4_000 + i * 1_200;
             let v = 4_000 + j * 1_200;
             if paint.shape.inset(u, v) < 20_000 {
                 continue;
             }
             let p = paint.shape.place(u, v);
-            if let Some(hit) = hits.iter_mut().find(|h| h.theme == p.theme) {
-                if p.weight > hit.weight {
-                    *hit = ThemeHit { theme: p.theme, weight: p.weight, u, v };
-                }
-            } else {
-                hits.push(ThemeHit { theme: p.theme, weight: p.weight, u, v });
-            }
+            hits.push(ThemeHit { theme: p.theme, weight: p.weight, u, v });
         }
     }
     hits
 }
 
+/// The deepest sample of `theme`.
 fn origin(hits: &[ThemeHit], theme: province::ThemeId) -> (i32, i32) {
-    let hit = hits.iter().find(|h| h.theme == theme).unwrap_or_else(|| panic!("no {theme:?}"));
-    assert!(hit.weight >= 0.5, "{theme:?} weight {}", hit.weight);
-    (hit.u, hit.v)
+    origins(hits, theme)[0]
+}
+
+/// The deepest samples of `theme` (at most eight), deepest first.
+fn origins(hits: &[ThemeHit], theme: province::ThemeId) -> Vec<(i32, i32)> {
+    let mut of: Vec<&ThemeHit> = hits.iter().filter(|h| h.theme == theme && h.weight >= 0.5).collect();
+    assert!(!of.is_empty(), "no {theme:?}");
+    of.sort_by(|a, b| b.weight.total_cmp(&a.weight).then((a.u, a.v).cmp(&(b.u, b.v))));
+    of.iter().take(8).map(|h| (h.u, h.v)).collect()
 }
 
 fn probe(
@@ -1562,16 +1562,20 @@ fn probe(
     None
 }
 
+/// The first hit of `pred` near any of `origins`, in order.
 fn must(
     paint: &FacePaint,
-    origin: (i32, i32),
+    origins: Vec<(i32, i32)>,
     span: i32,
     step: i32,
     dys: &[i32],
     what: &str,
-    pred: impl FnMut(&Column, i32, Option<features::Stamp>) -> bool,
+    mut pred: impl FnMut(&Column, i32, Option<features::Stamp>) -> bool,
 ) -> (i32, i32, i32) {
-    probe(paint, origin, span, step, dys, pred).unwrap_or_else(|| panic!("no {what} near {origin:?}"))
+    origins
+        .iter()
+        .find_map(|&o| probe(paint, o, span, step, dys, &mut pred))
+        .unwrap_or_else(|| panic!("no {what} near {origins:?}"))
 }
 
 #[test]
@@ -1677,7 +1681,7 @@ fn every_landmark_family_matches_on_its_face() {
         (Face::PosY, &py, province::ThemeId::Broadleaf, 96),
     ] {
         let paint = t.paint(&home, face);
-        let (u, v, y) = must(paint, origin(hits, theme), span, 1, &[12, 24, 40], "giant trunk", |col, y, st| {
+        let (u, v, y) = must(paint, origins(hits, theme), span, 1, &[12, 24, 40], "giant trunk", |col, y, st| {
             y >= col.height + 8 && st.is_some_and(|s| s.id == m.darkwood)
         });
         let col = paint.shape.column(u, v);
@@ -1712,7 +1716,7 @@ fn every_landmark_family_matches_on_its_face() {
     // Mushrooms on the fungal face.
     {
         let paint = t.paint(&home, Face::NegZ);
-        let (u, v, y) = must(paint, origin(&nz, province::ThemeId::Fungal), 64, 1, &[4, 10, 20], "mushroom", |col, y, st| {
+        let (u, v, y) = must(paint, origins(&nz, province::ThemeId::Fungal), 64, 1, &[4, 10, 20], "mushroom", |col, y, st| {
             y > col.height && st.is_some_and(|s| s.id == m.stem)
         });
         let col = paint.shape.column(u, v);
@@ -1731,7 +1735,7 @@ fn every_landmark_family_matches_on_its_face() {
     // Spires on karst.
     {
         let paint = t.paint(&home, Face::NegX);
-        let (u, v, y) = must(paint, origin(&nx, province::ThemeId::Karst), 64, 1, &[8, 16, 28], "spire", |col, y, st| {
+        let (u, v, y) = must(paint, origins(&nx, province::ThemeId::Karst), 64, 1, &[8, 16, 28], "spire", |col, y, st| {
             y > col.height + 6 && st.is_some_and(|s| stone(s.id))
         });
         agree_cell(&t, &home, Face::NegX, u, y, v);
@@ -1740,7 +1744,7 @@ fn every_landmark_family_matches_on_its_face() {
     // Volcanic cones and ash fissures.
     {
         let paint = t.paint(&home, Face::NegY);
-        let (u, v, y) = must(paint, origin(&ny, province::ThemeId::Volcanic), 80, 2, &[6, 16, 40], "volcano", |col, y, st| {
+        let (u, v, y) = must(paint, origins(&ny, province::ThemeId::Volcanic), 80, 2, &[6, 16, 40], "volcano", |col, y, st| {
             y >= col.height && st.is_some_and(|s| fire(s.id))
         });
         agree_cell(&t, &home, Face::NegY, u, y, v);
@@ -1749,7 +1753,7 @@ fn every_landmark_family_matches_on_its_face() {
     // Crystals on the glass face.
     {
         let paint = t.paint(&home, Face::PosZ);
-        let (u, v, y) = must(paint, origin(&pz, province::ThemeId::Crystal), 48, 1, &[4, 12, 22], "crystal", |col, y, st| {
+        let (u, v, y) = must(paint, origins(&pz, province::ThemeId::Crystal), 48, 1, &[4, 12, 22], "crystal", |col, y, st| {
             y > col.height && st.is_some_and(|s| crystal(s.id))
         });
         let col = paint.shape.column(u, v);
@@ -1773,7 +1777,7 @@ fn every_landmark_family_matches_on_its_face() {
     // Ice on a glacier.
     {
         let paint = t.paint(&home, Face::PosZ);
-        let (u, v, y) = must(paint, origin(&pz, province::ThemeId::Glacier), 56, 1, &[6, 14, -4, -10], "ice", |col, y, st| {
+        let (u, v, y) = must(paint, origins(&pz, province::ThemeId::Glacier), 56, 1, &[6, 14, -4, -10], "ice", |col, y, st| {
             let Some(st) = st else { return false };
             (y > col.height && ice(st.id)) || (y < col.height && st.dig && st.id == AIR)
         });
@@ -1783,11 +1787,11 @@ fn every_landmark_family_matches_on_its_face() {
     // Sand ripples and mesa buttes.
     {
         let paint = t.paint(&home, Face::PosX);
-        let (u, v, y) = must(paint, origin(&px, province::ThemeId::Dune), 40, 1, &[0], "ripple", |col, y, st| {
+        let (u, v, y) = must(paint, origins(&px, province::ThemeId::Dune), 40, 1, &[0], "ripple", |col, y, st| {
             y == col.height && st.is_some_and(|s| s.id == m.sand)
         });
         agree_cell(&t, &home, Face::PosX, u, y, v);
-        let (u, v, y) = must(paint, origin(&px, province::ThemeId::Mesa), 48, 1, &[4, 10], "butte", |col, y, st| {
+        let (u, v, y) = must(paint, origins(&px, province::ThemeId::Mesa), 48, 1, &[4, 10], "butte", |col, y, st| {
             y > col.height && st.is_some_and(|s| s.id == m.redsand)
         });
         agree_cell(&t, &home, Face::PosX, u, y, v);
@@ -1802,7 +1806,7 @@ fn every_landmark_family_matches_on_its_face() {
             high.push(d);
             d += 4;
         }
-        let (u, v, y) = must(paint, origin(&nx, province::ThemeId::Islands), 180, 6, &high, "sky island", |col, y, st| {
+        let (u, v, y) = must(paint, origins(&nx, province::ThemeId::Islands), 180, 6, &high, "sky island", |col, y, st| {
             y >= col.height + 100 && st.is_some_and(|s| s.id == m.grass || s.id == m.rock[0] || s.id == m.rock[1] || s.id == m.soil)
         });
         let col = paint.shape.column(u, v);
@@ -1815,7 +1819,7 @@ fn every_landmark_family_matches_on_its_face() {
         let paint = t.paint(&home, Face::NegY);
         let (u, v, y) = must(
             paint,
-            origin(&ny, province::ThemeId::Crater),
+            origins(&ny, province::ThemeId::Crater),
             200,
             4,
             &[0, 2, 4, -6, -12],
@@ -1832,26 +1836,28 @@ fn every_landmark_family_matches_on_its_face() {
     // Bone, petrified trunks, karst sinkholes.
     {
         let paint = t.paint(&home, Face::NegZ);
-        let (u, v, y) = must(paint, origin(&nz, province::ThemeId::Bone), 56, 1, &[2, 6, 10], "bone", |col, y, st| {
+        let (u, v, y) = must(paint, origins(&nz, province::ThemeId::Bone), 56, 1, &[2, 6, 10], "bone", |col, y, st| {
             y >= col.height && st.is_some_and(|s| s.id == m.bone)
         });
         agree_cell(&t, &home, Face::NegZ, u, y, v);
     }
     {
         let paint = t.paint(&home, Face::NegX);
-        let (u, v, y) = must(paint, origin(&nx, province::ThemeId::Petrified), 48, 1, &[1, 4, 8], "petrified", |col, y, st| {
+        let (u, v, y) = must(paint, origins(&nx, province::ThemeId::Petrified), 48, 1, &[1, 4, 8], "petrified", |col, y, st| {
             y >= col.height && st.is_some_and(|s| s.id == m.petrified)
         });
         agree_cell(&t, &home, Face::NegX, u, y, v);
-        let (u, v, y) = must(paint, origin(&nx, province::ThemeId::Karst), 80, 1, &[-8, -16], "sinkhole", |col, y, st| {
+        let (u, v, y) = must(paint, origins(&nx, province::ThemeId::Karst), 80, 1, &[-8, -16], "sinkhole", |col, y, st| {
             col.strata == province::Strata::Limestone && y < col.height - 4 && st.is_some_and(|s| s.dig && s.id == AIR)
         });
         agree_cell(&t, &home, Face::NegX, u, y, v);
     }
 
-    // A lush twin grows the same giants, on a face the other twin does not cover.
-    let twins: Vec<_> = t.cosmos.bodies().iter().copied().filter(|b| b.kind == cosmos::Kind::Twin).collect();
-    let lush = *twins.iter().min_by_key(|b| (b.seed, b.id)).unwrap();
+    // A lush cube grows the same giants, on a face its partner does not cover. A living binary is
+    // rare, so the authored catalog's twins stand in.
+    let (_reg, t) = cosmos::fixture::authored(|| make(42));
+    let twins: Vec<_> = t.cosmos.bodies().iter().copied().filter(|b| b.traits.partner.is_some()).collect();
+    let lush = *twins.iter().find(|b| b.traits.life > 0).expect("a living twin");
     let other = *twins.iter().find(|b| b.id != lush.id).unwrap();
     let axis = (0..3).max_by_key(|&a| (lush.centre[a] - other.centre[a]).abs()).unwrap();
     let away = if lush.centre[axis] < other.centre[axis] {
@@ -1861,7 +1867,7 @@ fn every_landmark_family_matches_on_its_face() {
     };
     let hits = survey(&t, &lush, away);
     let paint = t.paint(&lush, away);
-    let (u, v, y) = must(paint, origin(&hits, province::ThemeId::Giant), 64, 1, &[12, 28], "twin giant", |col, y, st| {
+    let (u, v, y) = must(paint, origins(&hits, province::ThemeId::Giant), 64, 1, &[12, 28], "twin giant", |col, y, st| {
         y >= col.height + 8 && st.is_some_and(|s| s.id == m.darkwood)
     });
     agree_cell(&t, &lush, away, u, y, v);
@@ -1894,7 +1900,7 @@ fn structures_knob_at_zero_builds_nothing() {
 fn structures_own_their_footprint_and_match_the_batch() {
     assert!(structures::DIG_LIMIT < cube::CRUST);
     assert!(structures::DIG_LIMIT > features::MAX_BELOW);
-    let (_reg, t) = make(42);
+    let (_reg, t) = make(pair_seed());
     let home = *t.cosmos.home();
     let m = t.materials();
     let paint = t.paint(&home, Face::PosY);
@@ -2007,7 +2013,7 @@ fn structures_own_their_footprint_and_match_the_batch() {
     assert!(cap == m.obsidian || cap == m.marble);
     assert_ne!(base, cap);
 
-    let twin = t.cosmos.bodies().iter().find(|b| b.kind == cosmos::Kind::Twin).copied().unwrap();
+    let twin = t.cosmos.bodies().iter().find(|b| b.traits.partner.is_some()).copied().unwrap();
     let face = span::facing_face(&t.cosmos, &twin).unwrap();
     let facing = t.paint(&twin, face);
     assert!(structures::survey(&facing.structures, &facing.shape, &facing.under, 0, 0, 2).is_empty());
@@ -2258,18 +2264,26 @@ fn home_chart_terrain_is_continuous_across_a_seam() {
 /// and gravity there points at the planet's centre.
 #[test]
 fn home_spawn_stands_on_the_plus_y_chart() {
+    let (reg, t) = make(42);
+    spawn_stands_and_pulls(&reg, &t);
+}
+
+/// The spawn contract on `t`: the +Y chart's centre, standing on solid ground at y near 0,
+/// pulled straight at the centre with the designed strength.
+fn spawn_stands_and_pulls(reg: &BlockRegistry, t: &Terrain) {
     use crate::gravity::Field;
-    let (_reg, t) = make(42);
     let home = *t.cosmos.home();
     let cosmos::Shape::Ball { .. } = home.shape else { panic!("home is a ball") };
     let spawn = t.home_spawn().expect("chart spawn");
-    assert!(spawn.x.abs() < 2.0 && spawn.z.abs() < 2.0, "spawn xz {spawn:?}");
+    assert!(spawn.x.abs() < 2.0 + f64::from(SPAWN_REACH) && spawn.z.abs() < 2.0 + f64::from(SPAWN_REACH), "spawn xz {spawn:?}");
     assert!(spawn.y > 2.0 && spawn.y < 600.0, "spawn y {}", spawn.y);
     let field = Field::new(t.mass());
     let pull = field.sample(spawn);
     let to_centre = home.centre_f() - spawn;
     let dot = pull.accel.dot(to_centre) / (pull.accel.length() * to_centre.length());
     assert!(dot > 0.999, "gravity at spawn points at the centre: {dot}");
+    let want = emergent::start_pull();
+    assert!((pull.accel.length() / want - 1.0).abs() < 0.05, "spawn pull {} vs the designed {want}", pull.accel.length());
     let atlas = t.storage.home_atlas().expect("charted");
     let cell = atlas.storage_of(spawn).expect("spawn embeds onto the chart");
     let (patch, local) = atlas.locate(cell).expect("located");
@@ -2277,7 +2291,56 @@ fn home_spawn_stands_on_the_plus_y_chart() {
     let open = i64::from(t.height(cell[0] as i32, cell[2] as i32));
     assert!((1..=2).contains(&(local[1] - open)), "feet at local {} open {open}", local[1]);
     assert_ne!(t.voxel_at(cell[0] as i32, (open - 1) as i32, cell[2] as i32), AIR, "standing on air");
-    assert_eq!(t.voxel_at(cell[0] as i32, open as i32, cell[2] as i32), AIR, "the first open cell is solid");
+    // A flower may grow on the ground cell; the feet and head stand in the open.
+    for y in [local[1], local[1] + 1].map(|l| cell[1] - local[1] + l) {
+        let id = t.voxel_at(cell[0] as i32, y as i32, cell[2] as i32);
+        assert!(!reg.is_solid(id), "seed {}: the spawn body meets {id:?} ({:?})", t.seed, reg.label(id));
+    }
+}
+
+/// The spawn contract and storage over many seeds (`SPAWN_SEEDS`, default 1000): every start
+/// world stands and pulls as designed, and every universe's boxes fit storage.
+#[test]
+fn every_seed_spawns_on_its_start_world_and_fits_storage() {
+    let n: i64 = std::env::var("SPAWN_SEEDS").ok().and_then(|v| v.parse().ok()).unwrap_or(1000);
+    let threads = 4;
+    std::thread::scope(|s| {
+        for k in 0..threads {
+            s.spawn(move || {
+                for seed in (1..=n).filter(|seed| seed % threads == k) {
+                    let (reg, t) = make(seed);
+                    spawn_stands_and_pulls(&reg, &t);
+                    for a in t.atlases() {
+                        for patch in a.patches() {
+                            let (o, size) = a.storage_box(patch);
+                            assert!(o[0] >= crate::space::atlas::STORAGE_X0 && o[0] + size[0] < crate::math::CELL_LIMIT as i64, "seed {seed}: storage x");
+                            assert!(o[2] >= 0 && o[2] + size[2] <= 1_000_000_000, "seed {seed}: storage z");
+                        }
+                    }
+                }
+            });
+        }
+    });
+}
+
+/// `cargo test --release --lib world_creation_cost -- --ignored --nocapture`: building the
+/// generator (the universe, its suites, warps, relief and storage) per seed, with a fresh table.
+#[test]
+#[ignore]
+fn world_creation_cost() {
+    let n: i64 = std::env::var("CREATION_SEEDS").ok().and_then(|v| v.parse().ok()).unwrap_or(200);
+    let _ = make(0);
+    let mut ms: Vec<f64> = (1..=n)
+        .map(|seed| {
+            let mut reg = BlockRegistry::with_builtins();
+            let start = std::time::Instant::now();
+            std::hint::black_box(Terrain::new(&mut reg, seed));
+            start.elapsed().as_secs_f64() * 1e3
+        })
+        .collect();
+    ms.sort_by(f64::total_cmp);
+    let q = |f: f64| ms[((ms.len() - 1) as f64 * f) as usize];
+    println!("world creation over {n} seeds: p50 {:.1} ms, p90 {:.1} ms, p99 {:.1} ms, max {:.1} ms", q(0.5), q(0.9), q(0.99), q(1.0));
 }
 
 /// A datum lifts the start world's band-0 cells, not its painting: storage heights stay where the
@@ -2323,15 +2386,20 @@ fn a_datum_lifts_the_home_grid_and_leaves_its_painting() {
 /// lower, the face centre bows out, and gravity is that shape rather than a sag error bound.
 #[test]
 fn warped_twins_keep_the_cube_painter_and_sag() {
-    let (_reg, t) = make(42);
-    let twins: Vec<_> = t.cosmos.bodies().iter().copied().filter(|b| b.kind == cosmos::Kind::Twin).collect();
+    let (_reg, t) = make(pair_seed());
+    let twins: Vec<_> = t.cosmos.bodies().iter().copied().filter(|b| b.traits.partner.is_some()).collect();
     assert_eq!(twins.len(), 2);
     let cubes: Vec<_> = t.atlases().iter().filter(|a| a.grid.is_some()).cloned().collect();
-    assert_eq!(cubes.len(), 2, "both twins sag into storage");
-    let g0 = cubes[0].grid.unwrap();
-    let g1 = cubes[1].grid.unwrap();
-    let y_apart = g0.origin[1] + g0.size[1] <= g1.origin[1] || g1.origin[1] + g1.size[1] <= g0.origin[1];
-    assert!(y_apart, "cube boxes share a PosX column");
+    let warped = t.cosmos.bodies().iter().filter(|b| b.traits.form == cosmos::Form::Warped).count();
+    assert_eq!(cubes.len(), warped, "every warped cube sags into storage");
+    assert!(twins.iter().all(|b| cubes.iter().any(|a| a.grid.unwrap().body == b.id)), "both twins sag into storage");
+    for (i, a) in cubes.iter().enumerate() {
+        for b in &cubes[i + 1..] {
+            let (g0, g1) = (a.grid.unwrap(), b.grid.unwrap());
+            let y_apart = g0.origin[1] + g0.size[1] <= g1.origin[1] || g1.origin[1] + g1.size[1] <= g0.origin[1];
+            assert!(y_apart, "cube boxes share a PosX column");
+        }
+    }
     for atlas in &cubes {
         let g = atlas.grid.unwrap();
         assert!(g.origin[0] + g.size[0] < crate::math::CELL_LIMIT as i64, "cube box leaves i32");
@@ -2393,10 +2461,8 @@ fn warped_twins_keep_the_cube_painter_and_sag() {
     let face_len = (warp.apply(c + glam::DVec3::new(h, 0.0, 0.0)) - c).length();
     // Corner/face is the roundness: a cube is √3 ≈ 1.73, the twins' sag is about 1.56.
     let roundness = radial / face_len;
-    assert!(
-        (roundness - 1.56).abs() < 0.03 && ratio < 0.98,
-        "corner/face {roundness} radial ratio {ratio}"
-    );
+    assert!(roundness <= 3.0f64.sqrt() + 1e-9 && roundness > 1.0 && ratio <= 1.0, "corner/face {roundness} radial ratio {ratio}");
+    assert!(warp.max_displacement() > crate::space::warp::STORAGE_MOVE, "a stored cube sags past half a block");
     assert!(face_len > h && face_len - h < 0.10 * h, "face centre {face_len} vs half {h}");
 
     let sag = warp.max_displacement();
@@ -2422,8 +2488,8 @@ fn warped_twins_keep_the_cube_painter_and_sag() {
     assert!(near_s.error + 1e-6 >= relief, "near error {} < relief {relief}", near_s.error);
     let sag_term = crate::gravity::G * 2.0 * std::f64::consts::PI * body.density * sag * 0.5;
     assert!(
-        near_s.error - far_s.error < sag_term,
-        "sag still declared as error: near {} far {} sag term {sag_term}",
+        near_s.error - relief - far_s.error < sag_term + 1e-6 * relief,
+        "sag still declared as error: near {} far {} relief {relief} sag term {sag_term}",
         near_s.error,
         far_s.error
     );
@@ -2479,8 +2545,8 @@ fn the_start_world_is_relaxed_and_its_grid_fits_the_shape() {
 #[test]
 #[ignore]
 fn twin_gravity_sample_cost() {
-    let (_reg, t) = make(42);
-    let body = t.cosmos.bodies().iter().copied().find(|b| b.kind == cosmos::Kind::Twin).expect("twin");
+    let (_reg, t) = make(pair_seed());
+    let body = t.cosmos.bodies().iter().copied().find(|b| b.traits.partner.is_some()).expect("twin");
     let warp = t
         .atlases()
         .iter()
@@ -2518,17 +2584,17 @@ fn home_gravity_sample_cost() {
     println!("{:.2} µs per sample at spawn [{acc:.3}]", start.elapsed().as_secs_f64() * 1e6 / n as f64);
 }
 
-/// On a warped twin the air follows the bent grid: the bowed face centre sits ~7 % above the
-/// reference cube, and standing there is still in air with a small altitude.
+/// On a warped cube the air follows the bent grid: the bowed face centre sits above the reference
+/// cube, and standing there is still in air with a small altitude.
 #[test]
 fn a_warped_twin_has_air_on_its_bowed_face() {
-    let (_reg, t) = make(42);
-    let twin = *t.cosmos.bodies().iter().find(|b| b.kind == cosmos::Kind::Twin).unwrap();
-    let cosmos::Shape::Cube { half } = twin.shape else { panic!("a twin is a cube") };
+    let (_reg, t) = make(pair_seed());
+    let twin = cosmos::fixture::first(&t.cosmos, cosmos::fixture::Want::Warped).expect("a warped cube");
+    let cosmos::Shape::Cube { half } = twin.shape else { panic!("a warped body is a cube") };
     let atlas = t.storage.atlases().iter().find(|a| a.grid.as_ref().is_some_and(|g| g.body == twin.id)).expect("warped");
     let warp = atlas.warp.as_ref().expect("a warp");
     let top = warp.apply(twin.centre_f() + glam::DVec3::new(0.0, half as f64 + 100.0, 0.0));
-    assert!(top.y - twin.centre_f().y > half as f64 * 1.03, "the face bows out");
+    assert!(top.y - twin.centre_f().y > half as f64 + 100.5, "the face bows out");
     let alt = t.cosmos.altitude(&twin, top);
     assert!((alt - 100.0).abs() < 1.0, "altitude on the bent grid {alt}");
     assert!(t.cosmos.in_air(top));
@@ -2539,11 +2605,11 @@ fn a_warped_twin_has_air_on_its_bowed_face() {
 #[test]
 #[ignore]
 fn column_generation_costs() {
-    let (_reg, t) = make(42);
+    let (_reg, t) = make(pair_seed());
     let mut columns = Vec::new();
     let (sx, sz, _) = home_column(&t, Face::PosY, 1_000, 2_000);
     columns.push(("home chart", sx, sz));
-    let twin = *t.cosmos.bodies().iter().find(|b| b.kind == cosmos::Kind::Twin).unwrap();
+    let twin = *t.cosmos.bodies().iter().find(|b| b.traits.partner.is_some()).unwrap();
     let cosmos::Shape::Cube { half } = twin.shape else { panic!() };
     let atlas = t.storage.atlases().iter().find(|a| a.grid.as_ref().is_some_and(|g| g.body == twin.id)).unwrap();
     let warp = atlas.warp.as_ref().unwrap();
@@ -2567,8 +2633,9 @@ fn column_generation_costs() {
 
 /// Seeds the worldgen digest is pinned for: the golden seed, 42 and the owner's seed.
 const DIGEST_SEEDS: [i64; 3] = [0xC0FFEE, 42, 1_791_184_794_939_118_871];
-/// [`worldgen_digest`] of [`DIGEST_SEEDS`] at the current `WORLDGEN_VERSION`.
-const DIGEST_PINS: [u64; 3] = [0x1f71eba60b4ff3a8, 0x460ca935f8e6e11f, 0xae29e197774929c9];
+/// [`worldgen_digest`] of [`DIGEST_SEEDS`] at the current `WORLDGEN_VERSION`. Re-pinned at 11:
+/// the emergent cosmos grows other bodies from every seed.
+const DIGEST_PINS: [u64; 3] = [0xa0113cf14223ec38, 0xbb4ad5d7ece10673, 0xafd58afc06160545];
 
 /// What a seed generates, as bytes: the catalog, then chunks at every body's surface (each face of
 /// a cube, each band-0 chart of a round body), a deep chunk per cube, rocks of the first clusters,

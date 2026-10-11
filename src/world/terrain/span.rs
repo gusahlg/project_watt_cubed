@@ -27,6 +27,9 @@ struct Site {
 
 /// The face of a binary's cube `body` whose normal points at its partner.
 pub(super) fn facing_face(cosmos: &Cosmos, body: &Body) -> Option<Face> {
+    if !matches!(body.shape, super::cosmos::Shape::Cube { .. }) {
+        return None;
+    }
     let other = cosmos.bodies().get(usize::from(body.traits.partner?))?;
     let axis = (0..3).max_by_key(|&a| (other.centre[a] - body.centre[a]).abs()).unwrap();
     let pos = other.centre[axis] > body.centre[axis];

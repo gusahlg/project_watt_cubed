@@ -66,6 +66,9 @@ pub const MAX_GROUND: i32 = 470;
 /// Ground never sinks below this (the far-LOD floor is 0).
 pub const MIN_GROUND: i32 = 6;
 
+/// How far from the +Y chart's centre the spawn looks for a column clear of trees.
+const SPAWN_REACH: i32 = 24;
+
 /// Atlas index of a chart body id, if `body` is one.
 fn chart_body(body: u16) -> Option<usize> {
     let base = super::section::CHART_BODY_BASE;
@@ -431,6 +434,8 @@ pub struct Terrain {
     /// The round bodies, painted on curved charts in storage.
     storage: storage::StorageWorlds,
     m: Arc<Materials>,
+    /// The start world's spawn, found on first use.
+    spawn: std::sync::OnceLock<Option<glam::DVec3>>,
 }
 
 /// Whether world cell x `x` lies in the storage region (curved charts), not physical space.
@@ -607,6 +612,7 @@ impl Terrain {
             bulks,
             deep: deep::Deep::new(scale, m.clone()),
             m,
+            spawn: std::sync::OnceLock::new(),
         }
     }
 
@@ -712,8 +718,8 @@ impl Terrain {
 
     /// Bulk, or the interior feature at `rel`. `depth` is the true depth when the caller already
     /// has the column; otherwise it is derived, and inside one band the block does not depend on it.
-    fn deep_at(&self, body: &cosmos::Body, rel: [i64; 3], depth: Option<i32>) -> BlockId {
-        let bulk = cube::bulk_id(&self.bulks[usize::from(body.id)], body, rel);
+    fn deep_at(&self, body: &cosmos::Body, face: Face, rel: [i64; 3], depth: Option<i32>) -> BlockId {
+        let bulk = cube::bulk_id(&self.bulks[usize::from(body.id)], body, face, rel);
         // A known depth means the chunk already intersects a feature; `might` would only repeat that test.
         if depth.is_none() && !self.deep.might(body, rel) {
             return bulk;
@@ -759,7 +765,7 @@ impl Terrain {
         let rel = [p[0] - body.centre[0], p[1] - body.centre[1], p[2] - body.centre[2]];
         let half = cube::half_of(body);
         if cube::in_deep(rel, half) {
-            return self.deep_at(body, rel, None);
+            return self.deep_at(body, cube::face_of(rel), rel, None);
         }
         let (Ok(x), Ok(y), Ok(z)) = (i32::try_from(rel[0]), i32::try_from(rel[1]), i32::try_from(rel[2])) else {
             return AIR;
@@ -831,7 +837,7 @@ impl Terrain {
             return AIR;
         }
         if col.height - h > cube::CRUST {
-            return self.deep_at(body, rel, Some(col.height - h));
+            return self.deep_at(body, face, rel, Some(col.height - h));
         }
         // A dig replaces the crust cell, so a crater core is not opened back into a cave.
         // Structure shafts reach a mine level; landmark digs stay in their shallower band.
@@ -912,7 +918,7 @@ impl Terrain {
         if self.deep.hits(&body, rlo, rhi) {
             return None;
         }
-        let id = cube::bulk_uniform(&self.bulks[usize::from(body.id)], &body, &rels)?;
+        let id = cube::bulk_uniform(&self.bulks[usize::from(body.id)], &body, cube::face_of(rels[0]), &rels)?;
         Some(ChunkData::Uniform(id))
     }
 
@@ -1026,7 +1032,7 @@ impl Terrain {
             at(0, 15, 15),
             at(15, 15, 15),
         ];
-        if let Some(id) = cube::bulk_uniform(&self.bulks[usize::from(body.id)], body, &rels) {
+        if let Some(id) = cube::bulk_uniform(&self.bulks[usize::from(body.id)], body, face, &rels) {
             return ChunkData::Uniform(id);
         }
         let frame = FaceFrame::new(face);
@@ -1035,7 +1041,7 @@ impl Terrain {
             for lv in 0..CHUNK_SIZE {
                 for lu in 0..CHUNK_SIZE {
                     let rel = at(lu as i32, la as i32, lv as i32);
-                    let id = cube::bulk_id(&self.bulks[usize::from(body.id)], body, rel);
+                    let id = cube::bulk_id(&self.bulks[usize::from(body.id)], body, face, rel);
                     let (lx, ly, lz) = if IDENTITY { (lu, la, lv) } else { frame.index_to_world(lu, la, lv) };
                     cells[Chunk::index(lx, ly, lz)] = id;
                 }
@@ -1080,7 +1086,7 @@ impl Terrain {
                     let rel = at(lu as i32, la as i32, lv as i32);
                     let depth = cols[lu + lv * CHUNK_SIZE].height - h;
                     let (lx, ly, lz) = if IDENTITY { (lu, la, lv) } else { frame.index_to_world(lu, la, lv) };
-                    cells[Chunk::index(lx, ly, lz)] = self.deep_at(body, rel, Some(depth));
+                    cells[Chunk::index(lx, ly, lz)] = self.deep_at(body, face, rel, Some(depth));
                 }
             }
         }
@@ -1144,7 +1150,7 @@ impl Terrain {
                             AIR
                         } else if !crust_only && col.height - h > cube::CRUST {
                             let rel = cube::local_to_rel(face, u, half + h, v);
-                            self.deep_at(body, rel, Some(col.height - h))
+                            self.deep_at(body, face, rel, Some(col.height - h))
                         } else {
                             let la_i = la as i32;
                             let ground = paint.shape.ground(col, u, h, v);
@@ -1332,7 +1338,7 @@ impl Terrain {
         let body = self.cosmos.home();
         let half = cube::half_of(body);
         if cube::in_deep(rel, half) {
-            return self.deep_at(body, rel, None);
+            return self.deep_at(body, face, rel, None);
         }
         let paint = self.paint(body, face);
         let mut col = paint.shape.column(u, v);
@@ -1405,7 +1411,7 @@ impl Terrain {
             return Some(AIR);
         }
         if !self.deep.hits(body, lo, hi)
-            && let Some(id) = cube::bulk_uniform(&self.bulks[usize::from(body.id)], body, &rels)
+            && let Some(id) = cube::bulk_uniform(&self.bulks[usize::from(body.id)], body, face, &rels)
         {
             return Some(id);
         }
@@ -1447,7 +1453,7 @@ impl Terrain {
         if self.deep.all_air(body, lo, hi) {
             return Some(AIR);
         }
-        if !self.deep.hits(body, lo, hi) { cube::bulk_uniform(&self.bulks[usize::from(body.id)], body, &rels) } else { None }
+        if !self.deep.hits(body, lo, hi) { cube::bulk_uniform(&self.bulks[usize::from(body.id)], body, c.face, &rels) } else { None }
     }
 
     fn fill_chart(&self, c: &ChartCols) -> ChunkData {
@@ -1700,25 +1706,41 @@ impl Terrain {
         })
     }
 
-    /// Physical spawn: the +Y chart's centre column, two blocks above its first open cell.
+    /// Physical spawn: two blocks above the first open cell of the +Y chart column nearest its
+    /// centre whose three cells above the ground cell are open (a tree's canopy is not a spawn).
+    /// Found once.
     fn home_spawn(&self) -> Option<glam::DVec3> {
+        *self.spawn.get_or_init(|| self.find_spawn())
+    }
+
+    fn find_spawn(&self) -> Option<glam::DVec3> {
         let atlas = self.storage.home_atlas()?;
         let b = atlas.bands[0];
         let face = Face::PosY;
         let patch = crate::space::atlas::Patch::Shell { band: 0, face };
-        let (i, j) = (b.n / 2, b.n / 2);
         let half = b.n / 2;
         let body = self.cosmos.home();
         let paint = self.paint(body, face);
-        let h = cube::blend_height(paint.shape.height(0, 0), cube::rim_seed(body), face, half, 0, 0);
-        let y = i64::from(h) + atlas.radius - b.r_lo;
-        Some(atlas.embed(patch, glam::DVec3::new(i as f64 + 0.5, y as f64 + 2.0, j as f64 + 0.5)))
+        let rise = atlas.radius - b.r_lo;
+        let column = |u: i32, v: i32| {
+            let h = cube::blend_height(paint.shape.height(u, v), cube::rim_seed(body), face, half, i64::from(u), i64::from(v));
+            let (i, j) = (half + i64::from(u), half + i64::from(v));
+            let y = i64::from(h) + rise;
+            let open = (1..=3).all(|k| self.chart_voxel(face, [i, y + k, j]) == AIR);
+            (open, glam::DVec3::new(i as f64 + 0.5, y as f64 + 2.0, j as f64 + 0.5))
+        };
+        let rings = (0..=SPAWN_REACH).step_by(2).flat_map(|r| {
+            (-r..=r).step_by(2).flat_map(move |d| [(d, -r), (d, r), (-r, d), (r, d)])
+        });
+        let (_, at) = rings.map(|(u, v)| column(u, v)).find(|c| c.0).unwrap_or_else(|| column(0, 0));
+        Some(atlas.embed(patch, at))
     }
 
     /// Replace the start world's spherical datum. Tests use this; a relaxed field is data.
     #[cfg(test)]
     pub fn set_home_datum(&mut self, field: std::sync::Arc<crate::space::datum::DatumField>) {
         self.storage.set_home_datum(field);
+        self.spawn = std::sync::OnceLock::new();
     }
 
     fn face_columns(
@@ -1851,7 +1873,7 @@ impl Terrain {
                         return Classify::Uniform(AIR);
                     }
                     if !self.deep.hits(&body, rlo, rhi)
-                        && let Some(id) = cube::bulk_uniform(&self.bulks[usize::from(body.id)], &body, &rels)
+                        && let Some(id) = cube::bulk_uniform(&self.bulks[usize::from(body.id)], &body, cube::face_of(rels[0]), &rels)
                     {
                         return Classify::Uniform(id);
                     }

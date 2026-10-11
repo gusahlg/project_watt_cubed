@@ -576,6 +576,7 @@ fn sweep(a: &Args, cfg: &TerrainCfg, name: &str, values: &[String]) {
         println!("## {name}={v}");
         println!("bodies {}", st.bodies.summary());
         println!("{}", st.form.line("forms").trim_end());
+        println!("seeds with both a cube layout and a round one: {:.1}%", 100.0 * st.both_layouts as f64 / st.seeds as f64);
         println!("law amount {}", st.own_amount.summary());
         println!("law cohesion {}", st.own_cohesion.summary());
         println!("law colour spread {}", st.own_colour_spread.summary());

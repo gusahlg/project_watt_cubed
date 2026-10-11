@@ -1108,8 +1108,9 @@ pub(crate) mod fixture {
 
     /// Seeds whose universes hold what tests want, found by `census` (default knobs) and checked
     /// by `fixture_seeds_hold_what_they_promise`.
-    pub(crate) const SEEDS: [(i64, &[Want]); 2] = [
-        (139, &[Want::Pair, Want::Warped, Want::Living, Want::Glowing, Want::Moonlike, Want::Satellite]),
+    pub(crate) const SEEDS: [(i64, &[Want]); 3] = [
+        (240, &[Want::Pair, Want::Warped, Want::Glowing, Want::Moonlike, Want::Satellite]),
+        (139, &[Want::Warped, Want::Living, Want::Glowing, Want::Moonlike, Want::Satellite]),
         (157, &[Want::Pair, Want::Warped, Want::Living, Want::Glowing, Want::Moonlike, Want::Satellite]),
     ];
 
@@ -1310,16 +1311,16 @@ mod tests {
         let b = Cosmos::new(42, 1.0);
         assert_eq!(a.bodies, b.bodies);
         assert_eq!(a.clusters.len(), b.clusters.len());
-        let worlds: Vec<&Body> = a.bodies.iter().filter(|b| matches!(b.kind, Kind::Twin | Kind::Verdant | Kind::Hollow)).collect();
-        assert!(worlds.len() >= 3, "home has company: {:?}", a.bodies.iter().map(|b| b.kind).collect::<Vec<_>>());
-        for b in &a.bodies {
+        assert!(a.bodies.len() > 3, "the start world has company: {}", a.bodies.len());
+        assert_eq!((a.home().traits.rank, a.home().traits.form, a.home().kind), (Rank::Start, Form::Round, Kind::Home));
+        for (i, b) in a.bodies.iter().enumerate() {
+            assert_eq!(usize::from(b.id), i, "ids are catalog indices");
+            assert_eq!(b.kind, b.traits.legacy_kind(b.id));
             assert!(b.centre.iter().all(|&c| c.abs() < 980_000_000), "{b:?} inside the border");
             assert!(b.centre.iter().all(|&c| c % 16 == 0), "{b:?} on the chunk grid");
-        }
-        // Moons clear every body.
-        for m in a.bodies.iter().filter(|b| b.kind == Kind::Moon) {
-            for o in a.bodies.iter().filter(|o| o.id != m.id) {
-                assert!((m.centre_f() - o.centre_f()).length() > o.reach(), "moon {m:?} inside {o:?}");
+            for o in &a.bodies[i + 1..] {
+                let gap = (b.centre_f() - o.centre_f()).length();
+                assert!(gap > b.reach().min(o.reach()), "{} and {} overlap", b.id, o.id);
             }
         }
         assert!(!a.clusters.is_empty());
@@ -1329,9 +1330,11 @@ mod tests {
     fn air_stops_at_air_top_and_open_space_is_vacuum() {
         let cosmos = Cosmos::new(1, 1.0);
         let home = cosmos.home().centre_f();
-        let top = HOME_RADIUS as f64;
+        let Shape::Ball { r } = cosmos.home().shape else { panic!("the start world is round") };
+        let top = r as f64;
+        let air = f64::from(cosmos.home().traits.air_top.expect("the start world has air"));
         assert!(cosmos.in_air(home + DVec3::new(0.0, top + 80.0, 0.0)));
-        assert!(!cosmos.in_air(home + DVec3::new(0.0, top + AIR_TOP + 1.0, 0.0)));
+        assert!(!cosmos.in_air(home + DVec3::new(0.0, top + air + 1.0, 0.0)));
         let empty = DVec3::new(0.0, 0.0, 9.95e8);
         assert!(cosmos.body_at(empty).is_none());
         assert!(!cosmos.in_air(empty));
@@ -1341,15 +1344,16 @@ mod tests {
     fn a_cube_polyhedron_replaces_the_box_and_adds_no_sag_error() {
         use crate::gravity::{Field, Polyhedron, Primitive, Shape as MassShape};
         use std::sync::Arc;
-        let base = Cosmos::new(1, 0.0);
-        let twin = base.bodies().iter().copied().find(|b| b.kind == Kind::Twin).expect("twin");
-        let Shape::Cube { half } = twin.shape else { panic!("twin") };
+        let seed = fixture::seed(&[fixture::Want::Warped]) as u64;
+        let base = Cosmos::new(seed, 1.0);
+        let twin = fixture::first(&base, fixture::Want::Warped).expect("a cube");
+        let Shape::Cube { half } = twin.shape else { panic!("a cube") };
         let c = twin.centre_f();
         let h = DVec3::splat(half as f64);
         let p = c + DVec3::new(0.0, half as f64 + 1_000.0, 0.0);
-        let mut same = Cosmos::new(1, 0.0);
+        let mut same = Cosmos::new(seed, 1.0);
         same.set_shape(twin.id, Arc::new(Polyhedron::from_box(c - h, c + h, twin.density)));
-        let mut none = Cosmos::new(1, 0.0);
+        let mut none = Cosmos::new(seed, 1.0);
         none.set_shape(twin.id, Arc::new(Polyhedron::from_box(c - h, c + h, 0.0)));
         let a = Field::new(Arc::new(base)).sample(p);
         let b = Field::new(Arc::new(same)).sample(p);
@@ -1368,10 +1372,7 @@ mod tests {
         let Shape::Ball { r } = home.shape else { panic!("home is a ball") };
         let at = DVec3::new(0.0, 2.0, 0.0);
         let s = field.sample(at);
-        let solid = crate::gravity::Primitive::new(
-            crate::gravity::Shape::Ball { c: home.centre_f(), r: r as f64 },
-            BULK_DENSITY,
-        );
+        let solid = crate::gravity::Primitive::new(crate::gravity::Shape::Ball { c: home.centre_f(), r: r as f64 }, home.density);
         let want = solid.field(at).0 * crate::gravity::G;
         let to_centre = home.centre_f() - at;
         let dot = s.accel.dot(to_centre) / (s.accel.length() * to_centre.length());
@@ -1522,26 +1523,21 @@ mod tests {
             ("the cube's centre".into(), home),
             ("10,000,000 above spawn".into(), home + DVec3::new(0.0, h + 1.0e7, 0.0)),
         ];
-        let twins: Vec<&Body> = cosmos.bodies().iter().filter(|b| b.kind == Kind::Twin).collect();
-        if let [a, b] = twins[..] {
-            let mid = (a.centre_f() + b.centre_f()) * 0.5;
-            stops.push(("the Twins' canyon midpoint".into(), mid));
+        for a in cosmos.bodies() {
+            let Some(b) = a.traits.partner.map(|p| cosmos.bodies()[usize::from(p)]).filter(|b| b.id > a.id) else { continue };
+            let (Shape::Cube { half: ha }, Shape::Cube { half: hb }) = (a.shape, b.shape) else { continue };
             let d = (b.centre_f() - a.centre_f()).normalize();
-            stops.push(("a Twin's facing surface".into(), mid - d * (750_000.0 - 70.0)));
+            let gap = (b.centre_f() - a.centre_f()).length() - (ha + hb) as f64;
+            stops.push((format!("{}'s canyon midpoint", a.name()), a.centre_f() + d * (ha as f64 + gap * 0.5)));
+            stops.push((format!("{}'s facing surface", a.name()), a.centre_f() + d * (ha as f64 + 70.0)));
         }
-        for b in cosmos.bodies() {
-            match (b.kind, b.shape) {
-                (Kind::Verdant, Shape::Ball { r }) => stops.push(("Verdance's surface".into(), b.centre_f() + DVec3::new(0.0, r as f64 + 70.0, 0.0))),
-                (Kind::Hollow, Shape::Shell { outer, inner }) => {
-                    stops.push(("the Hollow's outer surface".into(), b.centre_f() + DVec3::new(0.0, outer as f64 + 70.0, 0.0)));
-                    stops.push(("the Hollow's inner surface".into(), b.centre_f() + DVec3::new(0.0, inner as f64 - 70.0, 0.0)));
-                    stops.push(("halfway to the Hollow's core".into(), b.centre_f() + DVec3::new(0.0, inner as f64 * 0.5, 0.0)));
-                }
-                (Kind::Moon, Shape::Ball { r }) if (b.centre_f() - home).length() < 4.0e8 => {
-                    stops.push((format!("moon {} (r {r})", b.id), b.centre_f() + DVec3::new(0.0, r as f64 + 70.0, 0.0)))
-                }
-                _ => {}
-            }
+        for b in cosmos.bodies().iter().filter(|b| b.id != 0 && (b.centre_f() - home).length() < 4.0e8) {
+            let top = match b.shape {
+                Shape::Ball { r } => r,
+                Shape::Cube { half } => half,
+                Shape::Shell { outer, .. } => outer,
+            };
+            stops.push((format!("{} ({}, {top})", b.name(), b.traits.class()), b.centre_f() + DVec3::new(0.0, top as f64 + 70.0, 0.0)));
         }
         println!("| where | pull (% of spawn) | tilt from local vertical |\n|---|---|---|");
         for (name, p) in stops {
@@ -1587,7 +1583,7 @@ mod tests {
         }
         let per = t.elapsed().as_secs_f64() / n as f64;
         println!("{:.2} µs per sample at spawn ({} cluster groups) [{acc:.3}]", per * 1e6, cosmos.groups.len());
-        let moon = cosmos.bodies().iter().find(|b| b.kind == Kind::Moon).unwrap();
+        let moon = cosmos.bodies().iter().find(|b| b.id != 0 && b.traits.form == Form::Round).unwrap();
         let q = moon.centre_f() + DVec3::new(0.0, 2.0e6, 0.0);
         let t = std::time::Instant::now();
         for _ in 0..2_000 {
