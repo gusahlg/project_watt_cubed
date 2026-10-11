@@ -202,7 +202,14 @@ fn fly(speed: f64, secs: f64, settle: f64, view: (i32, i32), lod2: bool, hz: f64
         line.push_str(&format!(" {name}={:.3}", d.as_secs_f64() * 1e3 / cross_ms.len().max(1) as f64));
     }
     println!("{line}");
-    let mut line = format!("  slowest pass {:.2} ms by phase:", laps.worst.0.as_secs_f64() * 1e3);
+    let mut line = format!(
+        "  costliest pass (#{} of {}): {:.2} ms on the CPU, {:.2} ms wall (longest wall {:.2} ms), by phase:",
+        laps.passes.1,
+        laps.passes.0,
+        laps.cpu.0.as_secs_f64() * 1e3,
+        laps.worst.0.as_secs_f64() * 1e3,
+        laps.cpu.1.as_secs_f64() * 1e3,
+    );
     for (name, d) in PHASE_NAMES.iter().zip(laps.worst.1) {
         line.push_str(&format!(" {name}={:.3}", d.as_secs_f64() * 1e3));
     }

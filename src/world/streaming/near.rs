@@ -11,7 +11,7 @@
 use super::*;
 use super::super::rule::PhysBox;
 use super::super::section::{CHART_BODY_BASE, ColumnClip};
-use super::super::sampler::Sampler;
+use super::super::sampler::{Recent, Sampler};
 use super::super::generation::TerrainGenerator;
 use super::super::{DATA_MARGIN, UNLOAD_MARGIN, UNLOAD_MARGIN_V};
 
@@ -33,6 +33,8 @@ struct Col {
     real: Option<ColumnKey>,
     /// Chunk layers from one under the lowest solid top to one over the highest, edits included.
     shell: Option<[i32; 2]>,
+    /// Its terrain box in physical space.
+    bx: Option<PhysBox>,
     /// The terrain box lies within `R` of the eye cell: the shell draws at full resolution.
     near: bool,
     /// Within `R` plus the unload margin: the shell stays loaded.
@@ -64,9 +66,9 @@ pub(in crate::world) struct NearField {
     /// Bumped whenever a span or flag changes.
     pub(in crate::world) rev: u32,
     /// First-open-cell bounds `(lo, hi)` in frame altitude, by real column.
-    ground: FastMap<ColumnKey, Option<(i32, i32)>>,
+    ground: Recent<ColumnKey, Option<(i32, i32)>>,
     /// Physical terrain boxes by real column, with the ground (edits included) they were placed for.
-    boxes: FastMap<ColumnKey, ((i32, i32), Option<PhysBox>)>,
+    boxes: Recent<ColumnKey, ((i32, i32), Option<PhysBox>)>,
     /// The ground is to be read again (an edit landed).
     pub(in crate::world) stale: bool,
     /// The farthest a point of a near column's box lies from the eye's cell: where the finest far
@@ -77,8 +79,8 @@ pub(in crate::world) struct NearField {
     sampler: Option<Sampler<(Frame, ColumnKey), Option<(i32, i32)>>>,
 }
 
-/// A memo past this many columns is dropped and refilled.
-const MEMO_CAP: usize = 1 << 15;
+/// Most read-ahead columns one layout keeps.
+const LAND_MAX: usize = 1 << 10;
 
 /// Rings of columns outside the square whose ground is read ahead.
 const LEAD_RINGS: i32 = 2;
@@ -294,6 +296,8 @@ impl World {
             return false;
         }
         let mut near = std::mem::take(&mut self.near);
+        // Only the eye's cell moved: every column's shell and box stand.
+        let held = !moved && !near.stale && near.frame == frame && near.up == up;
         near.stale = false;
         let prev = (near.frame, near.hull, std::mem::take(&mut near.cols), near.band);
         near.frame = frame;
@@ -301,7 +305,7 @@ impl World {
         near.eye_cell = Some(cell_key);
         let changed = match (frame, up) {
             (Some(frame), Some(up)) => {
-                self.lay_out(&mut near, frame, up, center, &cell);
+                self.lay_out(&mut near, frame, up, center, &cell, held.then_some(&prev.2[..]));
                 prev.0 != near.frame || prev.1 != near.hull || prev.2 != near.cols || prev.3 != near.band
             }
             _ => {
@@ -317,29 +321,27 @@ impl World {
     }
 
     /// [`place_near`](Self::place_near) on a frame: every column's shell, box and flags, then the
-    /// data spans beside them.
-    fn lay_out(&self, near: &mut NearField, frame: Frame, up: Face, center: Coord, eye: &PhysBox) {
+    /// data spans beside them. `held` is the last layout's columns when only the eye's cell moved
+    /// since: their shells and boxes are kept if the square is the same.
+    fn lay_out(&self, near: &mut NearField, frame: Frame, up: Face, center: Coord, eye: &PhysBox, held: Option<&[Col]>) {
         let (h, v) = (self.view.horizontal, self.view.vertical);
         let (key, alt) = ColumnKey::of(up, center);
+        let half = h + UNLOAD_MARGIN + DATA_MARGIN;
+        let band = [alt - v, alt + v];
+        let held = held.filter(|p| near.centre == (key.a, key.b) && near.half == half && near.band == band && p.len() == ((2 * half + 1) * (2 * half + 1)) as usize);
         near.centre = (key.a, key.b);
-        near.half = h + UNLOAD_MARGIN + DATA_MARGIN;
-        near.band = [alt - v, alt + v];
+        near.half = half;
+        near.band = band;
         let r = f64::from(h * CHUNK_SIZE as i32);
         near.reach2 = f64::from(h).powi(2);
-        if near.ground.len() > MEMO_CAP {
-            near.ground.clear();
-        }
-        if near.boxes.len() > MEMO_CAP {
-            near.boxes.clear();
-        }
         if near.sampler.is_none() {
             let generator = self.generator.clone();
             near.sampler = Sampler::start("near-ground", move |(frame, real)| column_ground(&*generator, frame, real));
         }
         if let Some(sampler) = &mut near.sampler {
-            sampler.land(|(f, real), ground| {
-                if f == frame {
-                    near.ground.entry(real).or_insert(ground);
+            sampler.land(LAND_MAX, |(f, real), ground| {
+                if f == frame && !near.ground.contains(&real) {
+                    near.ground.insert(real, ground);
                 }
             });
         }
@@ -349,26 +351,42 @@ impl World {
         near.reach = 0.0;
         for db in -near.half..=near.half {
             for da in -near.half..=near.half {
-                let folded = match frame {
-                    Frame::Chart { floor, .. } => Coord::new(key.a + da, floor, key.b + db),
-                    _ => ColumnKey { face: up, a: key.a + da, b: key.b + db }.chunk(alt),
-                };
-                let Some(real_chunk) = self.fold.unfold(folded) else { continue };
-                let (real, _) = ColumnKey::of(up, real_chunk);
-                let col = &mut cols[((db + near.half) * n + da + near.half) as usize];
-                col.real = Some(real);
-                let ground = *near.ground.entry(real).or_insert_with(|| column_ground(&*self.generator, frame, real));
-                let Some((lo, hi)) = ground.map(|b| self.column_edits(frame, real, b)) else { continue };
-                let (a, b) = (self.frame_layer(frame, real, lo.saturating_sub(1)), self.frame_layer(frame, real, hi.saturating_sub(1)));
-                col.shell = Some([a.min(b) - 1, a.max(b) + 1]);
-                let b = match near.boxes.get(&real) {
-                    Some(&(g, b)) if g == (lo, hi) => b,
-                    _ => {
-                        let b = self.column_box(frame, real, Some((lo, hi)));
-                        near.boxes.insert(real, ((lo, hi), b));
-                        b
+                let i = ((db + near.half) * n + da + near.half) as usize;
+                let col = &mut cols[i];
+                if let Some(p) = held {
+                    *col = Col { real: p[i].real, shell: p[i].shell, bx: p[i].bx, ..Col::default() };
+                    if col.shell.is_none() {
+                        continue;
                     }
-                };
+                } else {
+                    let folded = match frame {
+                        Frame::Chart { floor, .. } => Coord::new(key.a + da, floor, key.b + db),
+                        _ => ColumnKey { face: up, a: key.a + da, b: key.b + db }.chunk(alt),
+                    };
+                    let Some(real_chunk) = self.fold.unfold(folded) else { continue };
+                    let (real, _) = ColumnKey::of(up, real_chunk);
+                    col.real = Some(real);
+                    let ground = match near.ground.get(&real) {
+                        Some(g) => g,
+                        None => {
+                            let g = column_ground(&*self.generator, frame, real);
+                            near.ground.insert(real, g);
+                            g
+                        }
+                    };
+                    let Some((lo, hi)) = ground.map(|b| self.column_edits(frame, real, b)) else { continue };
+                    let (a, b) = (self.frame_layer(frame, real, lo.saturating_sub(1)), self.frame_layer(frame, real, hi.saturating_sub(1)));
+                    col.shell = Some([a.min(b) - 1, a.max(b) + 1]);
+                    col.bx = match near.boxes.get(&real) {
+                        Some((g, b)) if g == (lo, hi) => b,
+                        _ => {
+                            let b = self.column_box(frame, real, Some((lo, hi)));
+                            near.boxes.insert(real, ((lo, hi), b));
+                            b
+                        }
+                    };
+                }
+                let b = col.bx;
                 // Without a far field the chunks are all the ground there is: every column of the
                 // near square draws.
                 // The view square holds the near columns: the mesh box is built from it.
@@ -420,7 +438,9 @@ impl World {
         }
         near.cols = cols;
         near.hull = hull_span;
-        self.read_ahead(near, frame, up, key, alt);
+        if held.is_none() {
+            self.read_ahead(near, frame, up, key, alt);
+        }
     }
 
     /// Ask the near field's sampler for the ground of the [`LEAD_RINGS`] rings of columns just
@@ -438,7 +458,7 @@ impl World {
                     };
                     let Some(real_chunk) = self.fold.unfold(folded) else { continue };
                     let (real, _) = ColumnKey::of(up, real_chunk);
-                    if !near.ground.contains_key(&real) && sampler.mark((frame, real)) {
+                    if !near.ground.contains(&real) && sampler.mark((frame, real)) {
                         want.push((frame, real));
                     }
                 }

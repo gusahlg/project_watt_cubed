@@ -617,7 +617,8 @@ impl StreamLane for SectionLane {
         }
     }
     fn prepare_admit(world: &mut World) {
-        world.section_standin_slack = world.count_section_standins();
+        // Admitting adds sections that hold no slots yet, so the budget stands for the round.
+        world.section_admit_cap = world.sections_allowed() + world.count_section_standins();
     }
     fn ready(world: &World, key: SectionPos) -> bool {
         // Sections only. Near-field chunks never consume this budget; a large
@@ -625,7 +626,7 @@ impl StreamLane for SectionLane {
         // finer tile under a hole keeps its slot, and the hole is admitted
         // past the floor by however many such tiles there are. A re-extract in place adds
         // no section.
-        world.sections.contains_key(&key) || world.section_budget_used() < world.sections_allowed() + world.section_standin_slack
+        world.sections.contains_key(&key) || world.section_budget_used() < world.section_admit_cap
     }
     fn submit(world: &mut World, key: SectionPos) -> Option<(pipeline::Job, pipeline::ClaimToken)> {
         world.refresh_tables();

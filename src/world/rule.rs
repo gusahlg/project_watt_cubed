@@ -174,6 +174,7 @@ impl World {
 
     /// Section `s`'s physical box: its footprint between its lowest and highest terrain, placed
     /// through its chart, the warp of its cube, or its face frame.
+    #[cfg(test)]
     pub(in crate::world) fn node_box(&self, s: SectionPos) -> Option<PhysBox> {
         let mut memo = self.node_boxes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         self.node_box_in(&mut memo, s)

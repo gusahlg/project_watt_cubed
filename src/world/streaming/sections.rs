@@ -376,8 +376,9 @@ impl World {
         // Fading sections still draw this frame. Keep meshes until fade completes
         // or outgoing section vanishes mid-fade.
         let fading: FastSet<SectionPos> = self.section_fade.tracked().collect();
-        let ground = self.far_ground(center);
+        let ground = self.far_ground(center).map(|g| (g, self.rule_on(g)));
         let eye = super::super::rule::PhysBox::eye_cell(self.phys_eye(center, true));
+        let mut memo = self.node_boxes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let stale: Vec<SectionPos> = self
             .sections
             .keys()
@@ -390,9 +391,10 @@ impl World {
                 if self.stands_under_hole(*s, &holes) {
                     return false;
                 }
-                !ground.is_some_and(|g| self.rule_keeps(g, *s, &eye))
+                !ground.is_some_and(|(g, rule)| self.rule_keeps(&mut memo, g, &rule, *s, &eye))
             })
             .collect();
+        drop(memo);
         // Removals move the covering (a freed cell may re-expose an ancestor).
         for &s in &stale {
             if let Some(state) = self.drop_section(s) {
@@ -403,7 +405,7 @@ impl World {
 
     /// Section `s` of `ground` is within the hold of what the rule draws from `eye`: inside its
     /// horizon, its parent would split, and it would not split well inside its own range.
-    fn rule_keeps(&self, ground: super::super::rule::Ground, s: SectionPos, eye: &super::super::rule::PhysBox) -> bool {
+    fn rule_keeps(&self, memo: &mut super::super::rule::RuleMemo, ground: super::super::rule::Ground, rule: &super::super::rule::Rule, s: SectionPos, eye: &super::super::rule::PhysBox) -> bool {
         use super::super::rule::Ground;
         const HOLD: f64 = 1.25;
         let on = match ground {
@@ -414,13 +416,12 @@ impl World {
         if !on {
             return false;
         }
-        let rule = self.rule_on(ground);
-        let Some(b) = self.node_box(s) else { return false };
+        let Some(b) = self.node_box_in(memo, s) else { return false };
         let d = b.dist_box(eye);
         if d >= rule.horizon() * HOLD || s.detail.0 > rule.coarsest {
             return false;
         }
-        if s.detail.0 < rule.coarsest && self.node_box(s.parent()).is_some_and(|p| p.dist_box(eye) >= rule.range_of(p.span) * HOLD) {
+        if s.detail.0 < rule.coarsest && self.node_box_in(memo, s.parent()).is_some_and(|p| p.dist_box(eye) >= rule.range_of(p.span) * HOLD) {
             return false;
         }
         !(s.detail.0 > rule.finest && d < rule.range_of(b.span) / HOLD)

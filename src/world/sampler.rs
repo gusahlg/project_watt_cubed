@@ -6,13 +6,69 @@
 use std::hash::Hash;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 
-use super::FastSet;
+use super::{FastMap, FastSet};
 
-/// The thread's two ends and the keys asked for whose answers have not landed.
+/// Entries a [`Recent`] map holds before it lets go of those unused since it last did.
+pub(in crate::world) const MEMO_CAP: usize = 1 << 16;
+
+/// A memo that keeps what was used lately. Past [`MEMO_CAP`] entries it starts afresh, keeping the
+/// previous entries aside until it is full again: one read brings an entry back, and only what
+/// went unread for that long is dropped, so a long flight never measures its whole view again.
+pub(in crate::world) struct Recent<K, V> {
+    now: FastMap<K, V>,
+    old: FastMap<K, V>,
+}
+
+impl<K, V> Default for Recent<K, V> {
+    fn default() -> Self {
+        Recent { now: FastMap::default(), old: FastMap::default() }
+    }
+}
+
+impl<K: Copy + Eq + Hash, V: Copy> Recent<K, V> {
+    pub(in crate::world) fn get(&mut self, k: &K) -> Option<V> {
+        if let Some(&v) = self.now.get(k) {
+            return Some(v);
+        }
+        let v = self.old.remove(k)?;
+        self.insert(*k, v);
+        Some(v)
+    }
+
+    pub(in crate::world) fn contains(&self, k: &K) -> bool {
+        self.now.contains_key(k) || self.old.contains_key(k)
+    }
+
+    pub(in crate::world) fn insert(&mut self, k: K, v: V) {
+        if self.now.len() >= MEMO_CAP {
+            self.old = std::mem::take(&mut self.now);
+        }
+        self.now.insert(k, v);
+    }
+
+    pub(in crate::world) fn remove(&mut self, k: &K) {
+        self.now.remove(k);
+        self.old.remove(k);
+    }
+
+    pub(in crate::world) fn clear(&mut self) {
+        self.now.clear();
+        self.old.clear();
+    }
+
+    #[cfg(test)]
+    pub(in crate::world) fn len(&self) -> usize {
+        self.now.len() + self.old.len()
+    }
+}
+
+/// The thread's two ends, the keys asked for whose answers have not landed, and answers received
+/// but not yet handed over.
 pub(in crate::world) struct Sampler<K, V> {
     ask: Sender<Vec<K>>,
     got: Receiver<Vec<(K, V)>>,
     asked: FastSet<K>,
+    held: Vec<(K, V)>,
 }
 
 impl<K: Copy + Eq + Hash + Send + 'static, V: Send + 'static> Sampler<K, V> {
@@ -31,7 +87,7 @@ impl<K: Copy + Eq + Hash + Send + 'static, V: Send + 'static> Sampler<K, V> {
                 }
             })
             .ok()?;
-        Some(Sampler { ask, got, asked: FastSet::default() })
+        Some(Sampler { ask, got, asked: FastSet::default(), held: Vec::new() })
     }
 
     /// Keys asked for that have not landed.
@@ -57,20 +113,30 @@ impl<K: Copy + Eq + Hash + Send + 'static, V: Send + 'static> Sampler<K, V> {
         }
     }
 
-    /// Hand every answer that has landed to `keep`.
-    pub(in crate::world) fn land(&mut self, mut keep: impl FnMut(K, V)) {
+    /// Hand up to `most` of the answers that have landed to `keep`, oldest first; the rest wait for
+    /// the next call.
+    pub(in crate::world) fn land(&mut self, most: usize, mut keep: impl FnMut(K, V)) {
+        let mut left = most;
         loop {
+            while left > 0
+                && let Some((k, v)) = self.held.pop()
+            {
+                self.asked.remove(&k);
+                keep(k, v);
+                left -= 1;
+            }
+            if left == 0 {
+                return;
+            }
             match self.got.try_recv() {
-                Ok(batch) => {
-                    for (k, v) in batch {
-                        self.asked.remove(&k);
-                        keep(k, v);
-                    }
+                Ok(mut batch) => {
+                    batch.reverse();
+                    self.held = batch;
                 }
-                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Empty) => return,
                 Err(TryRecvError::Disconnected) => {
                     self.asked.clear();
-                    break;
+                    return;
                 }
             }
         }
@@ -93,10 +159,33 @@ mod tests {
         while s.waiting() > 0 {
             assert!(start.elapsed().as_secs() < 30, "the sampler never answered");
             std::thread::yield_now();
-            s.land(|k, v| seen.push((k, v)));
+            s.land(7, |k, v| seen.push((k, v)));
         }
         seen.sort_unstable();
         assert_eq!(seen, (0..100).map(|k| (k, k * 3)).collect::<Vec<_>>());
         assert!(!s.asked(&5));
+    }
+
+    /// Past its cap the memo keeps what was read since it last let go, and drops what was not.
+    #[test]
+    fn recent_keeps_what_was_read_lately() {
+        let cap = MEMO_CAP as i32;
+        let mut m = Recent::<i32, i32>::default();
+        for x in 0..=cap {
+            m.insert(x, x);
+        }
+        assert_eq!(m.get(&5), Some(5));
+        for x in cap + 1..2 * cap {
+            m.insert(x, x);
+        }
+        assert!(m.contains(&5), "an entry read since the memo last let go was dropped");
+        assert!(!m.contains(&6), "an entry nobody read survived two fills");
+        for x in 2 * cap..3 * cap {
+            m.insert(x, x);
+        }
+        assert!(!m.contains(&5));
+        assert!(m.len() <= 2 * MEMO_CAP);
+        m.remove(&(3 * cap - 1));
+        assert!(!m.contains(&(3 * cap - 1)));
     }
 }

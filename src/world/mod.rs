@@ -608,10 +608,11 @@ pub struct World {
     section_mip_rx: Option<Receiver<HeightMip>>,
     /// Loaded sections.
     sections: FastMap<SectionPos, SectionState>,
-    /// Ready finer tiles under a desired cell nothing Ready draws yet. Counted at the
-    /// start of a section admission that has already filled [`sections_allowed`](Self::sections_allowed).
-    /// Those tiles hold slots the holes still need, so the lane may pass the floor by this many.
-    section_standin_slack: usize,
+    /// Sections an admission round may hold: [`sections_allowed`](Self::sections_allowed), plus
+    /// the Ready finer tiles under a desired cell nothing Ready draws yet (counted once the floor
+    /// is full). Those tiles hold slots the holes still need, so the lane may pass the floor by
+    /// that many.
+    section_admit_cap: usize,
     /// Finished section meshes awaiting budgeted upload, tagged with the claim
     /// token that produced them (re-validated at the moment of upload) and the
     /// vertex-byte charge computed at queue time.
@@ -877,7 +878,7 @@ impl World {
             section_mip: None,
             section_mip_rx: None,
             sections: FastMap::default(),
-            section_standin_slack: 0,
+            section_admit_cap: 0,
             section_upload_queue: VecDeque::new(),
             gpu_live_slots: 0,
             slot_ceiling: CPU_CULL_MAX,

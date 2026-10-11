@@ -87,6 +87,8 @@ fn far_lane_admits_when_near_slots_exceed_the_cpu_cull_ceiling() {
         x: 0,
         z: 0,
     };
+    // An admission round sizes its budget once, before it asks.
+    <SectionLane as StreamLane>::prepare_admit(&mut world);
     assert!(
         <SectionLane as StreamLane>::ready(&world, pos),
         "6000 near slots against cpu_cull_max=1024 must not starve the far lane"
@@ -101,8 +103,10 @@ fn far_lane_admits_when_near_slots_exceed_the_cpu_cull_ceiling() {
         };
         world.sections.insert(held(i), state);
     }
+    <SectionLane as StreamLane>::prepare_admit(&mut world);
     assert!(<SectionLane as StreamLane>::ready(&world, pos));
     world.sections.insert(held(SECTION_SLOT_FLOOR), SectionState::Meshing { token: pipeline::ClaimToken(0) });
+    <SectionLane as StreamLane>::prepare_admit(&mut world);
     assert!(
         !<SectionLane as StreamLane>::ready(&world, pos),
         "the section floor is the far lane's own cap, not the near field's"
@@ -134,6 +138,7 @@ fn far_field_at_max_view_fits_the_section_slot_floor() {
         "over the section floor: {} desired cells",
         desired.len()
     );
+    <SectionLane as StreamLane>::prepare_admit(&mut world);
     assert!(
         <SectionLane as StreamLane>::ready(&world, desired[0]),
         "the far lane must still admit under 6000 near slots"

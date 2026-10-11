@@ -15,7 +15,8 @@ use crate::space::chart::{Map, basis};
 use crate::world::World;
 use crate::world::chunk::CHUNK_SIZE;
 use crate::world::section::{CHART_BODY_BASE, SectionPos, section_fits, section_span};
-use crate::world::{FastMap, terrain};
+use crate::world::sampler::Recent;
+use crate::world::terrain;
 
 /// The ground the far field stands on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -33,69 +34,15 @@ pub(in crate::world) enum Ground {
 /// bounds under them are pure and stay. Both keep what the cuts used lately.
 #[derive(Default)]
 pub(in crate::world) struct RuleMemo {
-    pub(in crate::world) boxes: Recent<Option<PhysBox>>,
+    pub(in crate::world) boxes: Recent<SectionPos, Option<PhysBox>>,
     /// [`World::generator_bounds_in`] per node.
-    pub(in crate::world) ground: Recent<Option<(f64, f64)>>,
+    pub(in crate::world) ground: Recent<SectionPos, Option<(f64, f64)>>,
 }
 
 impl RuleMemo {
     /// Forget the boxes; the generator's bounds stand.
     pub(in crate::world) fn clear(&mut self) {
         self.boxes.clear();
-    }
-}
-
-/// Entries a [`Recent`] map holds before it lets go of those unused since it last did.
-pub(in crate::world) const MEMO_CAP: usize = 1 << 16;
-
-/// A memo that keeps what was used lately. Past [`MEMO_CAP`] entries it starts afresh, keeping the
-/// previous entries aside until it is full again: one read brings an entry back, and only what
-/// went unread for that long is dropped, so a long flight never measures its whole view again.
-pub(in crate::world) struct Recent<V> {
-    now: FastMap<SectionPos, V>,
-    old: FastMap<SectionPos, V>,
-}
-
-impl<V> Default for Recent<V> {
-    fn default() -> Self {
-        Recent { now: FastMap::default(), old: FastMap::default() }
-    }
-}
-
-impl<V: Copy> Recent<V> {
-    pub(in crate::world) fn get(&mut self, s: &SectionPos) -> Option<V> {
-        if let Some(&v) = self.now.get(s) {
-            return Some(v);
-        }
-        let v = self.old.remove(s)?;
-        self.insert(*s, v);
-        Some(v)
-    }
-
-    pub(in crate::world) fn contains(&self, s: &SectionPos) -> bool {
-        self.now.contains_key(s) || self.old.contains_key(s)
-    }
-
-    pub(in crate::world) fn insert(&mut self, s: SectionPos, v: V) {
-        if self.now.len() >= MEMO_CAP {
-            self.old = std::mem::take(&mut self.now);
-        }
-        self.now.insert(s, v);
-    }
-
-    pub(in crate::world) fn remove(&mut self, s: &SectionPos) {
-        self.now.remove(s);
-        self.old.remove(s);
-    }
-
-    pub(in crate::world) fn clear(&mut self) {
-        self.now.clear();
-        self.old.clear();
-    }
-
-    #[cfg(test)]
-    pub(in crate::world) fn len(&self) -> usize {
-        self.now.len() + self.old.len()
     }
 }
 
@@ -329,34 +276,5 @@ impl World {
             }
         }
         bands
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Past its cap the memo keeps what was read since it last let go, and drops what was not.
-    #[test]
-    fn recent_keeps_what_was_read_lately() {
-        let key = |x: i32| SectionPos { detail: Detail(0), body: 0, face: Face::PosY, x, z: 0 };
-        let cap = MEMO_CAP as i32;
-        let mut m = Recent::<i32>::default();
-        for x in 0..=cap {
-            m.insert(key(x), x);
-        }
-        assert_eq!(m.get(&key(5)), Some(5));
-        for x in cap + 1..2 * cap {
-            m.insert(key(x), x);
-        }
-        assert!(m.contains(&key(5)), "an entry read since the memo last let go was dropped");
-        assert!(!m.contains(&key(6)), "an entry nobody read survived two fills");
-        for x in 2 * cap..3 * cap {
-            m.insert(key(x), x);
-        }
-        assert!(!m.contains(&key(5)));
-        assert!(m.len() <= 2 * MEMO_CAP);
-        m.remove(&key(3 * cap - 1));
-        assert!(!m.contains(&key(3 * cap - 1)));
     }
 }

@@ -4,9 +4,9 @@
 //! where a coarse node splits into a few hundred freshly sampled tiles.
 
 use super::{Leaf, Rule, SAMPLED_SPAN, SPLIT_SPANS, TIGHT_SPAN, sampled_bounds};
-use crate::world::sampler::Sampler;
+use crate::world::World;
+use crate::world::sampler::{Recent, Sampler};
 use crate::world::section::{Quadrant, SectionPos};
-use crate::world::{FastSet, World};
 
 /// A leaf has its children's bounds fetched once the eye is within this many of its spans: twice
 /// the reach at which it splits.
@@ -15,14 +15,14 @@ const LEAD_SPANS: f64 = 2.0 * SPLIT_SPANS;
 /// Most tiles waiting on the sampler; past it a cut asks for nothing more until some land.
 const ASKED_MAX: usize = 1 << 14;
 
-/// Leaves remembered as fetched for before the list starts afresh.
-const FETCHED_MAX: usize = 1 << 14;
+/// Most tiles one cut asks for, and most answers it keeps: a pass after a jump spreads the work.
+const PER_CUT: usize = 1 << 12;
 
 /// The sampler of tile bounds, and the leaves whose children it was asked for (a cut mostly holds
 /// the leaves the last one did).
 pub(in crate::world) struct Prefetch {
     sampler: Sampler<SectionPos, Option<(f64, f64)>>,
-    fetched: FastSet<SectionPos>,
+    fetched: Recent<SectionPos, ()>,
 }
 
 /// Push the tiles whose samples give the bounds of `s`'s children: each child up to
@@ -45,20 +45,17 @@ impl World {
         if self.bounds_prefetch.is_none() {
             let generator = self.generator.clone();
             let sampler = Sampler::start("rule-bounds", move |s| sampled_bounds(&*generator, s));
-            self.bounds_prefetch = sampler.map(|sampler| Prefetch { sampler, fetched: FastSet::default() });
+            self.bounds_prefetch = sampler.map(|sampler| Prefetch { sampler, fetched: Recent::default() });
         }
         let Some(p) = &mut self.bounds_prefetch else { return };
         let mut memo = self.node_boxes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        p.sampler.land(|s, b| {
+        p.sampler.land(PER_CUT, |s, b| {
             if !memo.ground.contains(&s) {
                 memo.ground.insert(s, b);
             }
         });
         if p.sampler.waiting() >= ASKED_MAX {
             return;
-        }
-        if p.fetched.len() > FETCHED_MAX {
-            p.fetched.clear();
         }
         let mut near: Vec<&Leaf> = leaves
             .iter()
@@ -70,7 +67,10 @@ impl World {
         near.sort_unstable_by(|a, b| a.dist.total_cmp(&b.dist));
         let mut want = Vec::new();
         for l in near {
-            p.fetched.insert(l.pos);
+            if want.len() >= PER_CUT {
+                break;
+            }
+            p.fetched.insert(l.pos, ());
             sampled_under(l.pos, &mut |s| {
                 if !memo.ground.contains(&s) && p.sampler.mark(s) {
                     want.push(s);
