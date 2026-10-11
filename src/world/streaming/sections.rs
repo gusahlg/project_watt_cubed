@@ -444,10 +444,10 @@ impl World {
         if d >= rule.horizon() * HOLD || s.detail.0 > rule.coarsest {
             return false;
         }
-        if s.detail.0 < rule.coarsest && self.node_box(s.parent()).is_some_and(|p| p.dist_box(eye) >= rule.range(s.detail.0 + 1) * HOLD) {
+        if s.detail.0 < rule.coarsest && self.node_box(s.parent()).is_some_and(|p| p.dist_box(eye) >= rule.range_of(p.span) * HOLD) {
             return false;
         }
-        !(s.detail.0 > rule.finest && d < rule.range(s.detail.0) / HOLD)
+        !(s.detail.0 > rule.finest && d < rule.range_of(b.span) / HOLD)
     }
 
     /// Free GPU meshes so edited sections re-extract from the updated overlay.

@@ -28,6 +28,10 @@ pub(in crate::world) const DRESS: f64 = 8.0;
 /// Doublings of the render distance the far field reaches: its horizon is `R·2^8`.
 const HORIZON_DOUBLINGS: i32 = 8;
 
+/// Widest tile whose terrain bounds are read from the sampled surface rather than the generator's
+/// band: nearer tiles need tight boxes, farther ones are cheap to over-split.
+const TIGHT_SPAN: i32 = 256;
+
 /// Side of the physical cell the eye is measured from.
 pub(in crate::world) const EYE_CELL: f64 = 16.0;
 
@@ -49,15 +53,21 @@ impl Rule {
         Rule { r, finest, coarsest }
     }
 
-    /// Distance out to which detail `d` splits into detail `d − 1`. Tied to the tile's size; it
-    /// equals `R·2^(d − finest)` when `R = 64·2^k`.
+    /// Distance out to which a tile of detail `d` and nominal span `32·2^d` splits into detail
+    /// `d − 1`. Tied to the tile's size; it equals `R·2^(d − finest)` when `R = 64·2^k`.
     pub fn range(&self, d: i8) -> f64 {
-        SPLIT_SPANS * 32.0 * 2f64.powi(i32::from(d))
+        self.range_of(32.0 * 2f64.powi(i32::from(d)))
     }
 
-    /// Whether a node of detail `d` at distance `dist` splits.
-    pub fn splits(&self, d: i8, dist: f64) -> bool {
-        d > self.finest && dist < self.range(d)
+    /// Distance out to which a tile `span` blocks across (physically) splits.
+    pub fn range_of(&self, span: f64) -> f64 {
+        SPLIT_SPANS * span
+    }
+
+    /// Whether a node of detail `d`, `span` blocks across where it really is, at distance `dist`
+    /// splits. A chart's cells are not all one block: a tile is as large as its footprint.
+    pub fn splits(&self, d: i8, dist: f64, span: f64) -> bool {
+        d > self.finest && dist < self.range_of(span)
     }
 
     /// Distance past which nothing of the far field draws.
@@ -73,32 +83,35 @@ impl Rule {
     }
 }
 
-/// An axis-aligned box in physical space.
+/// An axis-aligned box in physical space around a node, with how far across the node's
+/// footprint really is.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(in crate::world) struct PhysBox {
     pub lo: DVec3,
     pub hi: DVec3,
+    /// The footprint's physical side in blocks.
+    pub span: f64,
 }
 
 impl PhysBox {
-    /// The smallest box holding `points`, widened by `pad`.
-    pub fn around(points: impl IntoIterator<Item = DVec3>, pad: f64) -> Option<PhysBox> {
+    /// The smallest box holding `points`, widened by `pad`, around a footprint `span` across.
+    pub fn around(points: impl IntoIterator<Item = DVec3>, pad: f64, span: f64) -> Option<PhysBox> {
         let mut it = points.into_iter();
         let first = it.next()?;
         let (lo, hi) = it.fold((first, first), |(lo, hi), p| (lo.min(p), hi.max(p)));
         let pad = DVec3::splat(pad);
-        (lo.is_finite() && hi.is_finite()).then_some(PhysBox { lo: lo - pad, hi: hi + pad })
+        (lo.is_finite() && hi.is_finite()).then_some(PhysBox { lo: lo - pad, hi: hi + pad, span })
     }
 
     /// The box holding only `p`.
     pub fn point(p: DVec3) -> PhysBox {
-        PhysBox { lo: p, hi: p }
+        PhysBox { lo: p, hi: p, span: 0.0 }
     }
 
     /// The [`EYE_CELL`] cell holding physical eye `eye`.
     pub fn eye_cell(eye: DVec3) -> PhysBox {
         let lo = (eye / EYE_CELL).floor() * EYE_CELL;
-        PhysBox { lo, hi: lo + DVec3::splat(EYE_CELL) }
+        PhysBox { lo, hi: lo + DVec3::splat(EYE_CELL), span: EYE_CELL }
     }
 
     /// Euclidean distance from `p` to the nearest point of the box (`0` inside).
@@ -127,9 +140,15 @@ impl World {
     }
 
     /// [`baked_bounds`](Self::baked_bounds) from the generator's surface bounds: what the square
-    /// can hold before anything is baked or edited. Pure, so it may be kept.
+    /// can hold before anything is baked or edited. Pure, so it may be kept. A tile up to
+    /// [`TIGHT_SPAN`] across reads the sampled surface; a larger one the generator's band.
     pub(in crate::world) fn generator_bounds(&self, s: SectionPos) -> Option<(f64, f64)> {
-        let (lo, hi) = self.generator.surface_bounds(s.body, s.face, s.min_x(), s.min_z(), s.span())?;
+        let (x0, z0, w) = (s.min_x(), s.min_z(), s.span());
+        let (lo, hi) = if w <= TIGHT_SPAN {
+            self.generator.surface_rect(s.body, s.face, x0, z0, x0 + w, z0 + w)?
+        } else {
+            self.generator.surface_bounds(s.body, s.face, x0, z0, w)?
+        };
         let (lo, hi) = (f64::from(lo), f64::from(hi));
         Some((lo.min(hi) - DRESS, lo.max(hi) + DRESS))
     }
@@ -153,19 +172,22 @@ impl World {
             // block by the chord rule, but a far tile may not.
             let bend = bend?;
             let pad = span * span / (8.0 * bend.atlas.radius.max(1) as f64) + 1.0;
-            return PhysBox::around(corners.map(|p| bend.atlas.embed_storage(bend.patch, p)), pad);
+            let embedded: Vec<DVec3> = corners.map(|p| bend.atlas.embed_storage(bend.patch, p)).collect();
+            // Its cells are not one block everywhere: the footprint's longer edge, at its floor.
+            let side = (embedded[1] - embedded[0]).length().max((embedded[4] - embedded[0]).length());
+            return PhysBox::around(embedded, pad, side);
         }
         let frame = FaceFrame::new(s.face);
         let world = |p: DVec3| {
             let (x, y, z) = frame.cell_to_world((p.x as i32, p.y as i32, p.z as i32));
             DVec3::new(f64::from(x), f64::from(y), f64::from(z))
         };
-        let b = PhysBox::around(corners.map(world), 1.0)?;
+        let b = PhysBox::around(corners.map(world), 1.0, span)?;
         // A warped cube: the box its warp can move the tile to.
         Some(match bend.as_ref().and_then(|b| b.atlas.warp.as_ref()) {
             Some(w) => {
                 let (lo, hi) = w.bound_box(b.lo, b.hi);
-                PhysBox { lo, hi }
+                PhysBox { lo, hi, span }
             }
             None => b,
         })
@@ -197,13 +219,13 @@ mod tests {
         }
         let rule = Rule::new(256.0, 8);
         assert_eq!((rule.range(2), rule.range(3), rule.range(8)), (256.0, 512.0, 16_384.0));
-        assert!(rule.splits(3, 511.0) && !rule.splits(3, 512.0) && !rule.splits(2, 0.0));
+        assert!(rule.splits(3, 511.0, 256.0) && !rule.splits(3, 512.0, 256.0) && !rule.splits(2, 0.0, 128.0));
     }
 
     /// Distance to a box is zero inside and Euclidean outside.
     #[test]
     fn box_distance_is_euclidean() {
-        let b = PhysBox { lo: DVec3::new(0.0, 0.0, 0.0), hi: DVec3::new(10.0, 2.0, 10.0) };
+        let b = PhysBox { lo: DVec3::new(0.0, 0.0, 0.0), hi: DVec3::new(10.0, 2.0, 10.0), span: 10.0 };
         assert_eq!(b.dist(DVec3::new(5.0, 1.0, 5.0)), 0.0);
         assert_eq!(b.dist(DVec3::new(13.0, 6.0, 5.0)), 5.0);
         assert_eq!(b.dist(DVec3::new(-3.0, 1.0, -4.0)), 5.0);

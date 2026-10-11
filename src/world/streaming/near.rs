@@ -465,7 +465,7 @@ impl World {
                 let (x0, z0) = (real.a * cs, real.b * cs);
                 let (patch, _, _) = atlas.column(i64::from(x0 + cs / 2), i64::from(z0 + cs / 2))?;
                 let corners = (0..8).map(|c| DVec3::new(f64::from(x0 + cs * (c & 1)), if c & 2 == 0 { y0 } else { y1 }, f64::from(z0 + cs * ((c >> 2) & 1))));
-                PhysBox::around(corners.map(|p| atlas.embed_storage(patch, p)), 1.0)
+                PhysBox::around(corners.map(|p| atlas.embed_storage(patch, p)), 1.0, f64::from(cs))
             }
             Frame::Cube { body, face, shift } => {
                 let (u0, u1, v0, v1) = self.cube_cells(real, shift)?;
@@ -476,31 +476,32 @@ impl World {
                     let v = if c & 4 == 0 { v0 } else { v1 + 1 };
                     f.point_to_world(DVec3::new(f64::from(u), if c & 2 == 0 { y0 } else { y1 }, f64::from(v)))
                 });
-                let b = PhysBox::around(corners, 1.0)?;
+                let b = PhysBox::around(corners, 1.0, f64::from(cs))?;
                 Some(match warp {
                     Some(w) => {
                         let (lo, hi) = w.bound_box(b.lo, b.hi);
-                        PhysBox { lo, hi }
+                        PhysBox { lo, hi, span: b.span }
                     }
                     None => b,
                 })
             }
             Frame::Flat => {
                 let (x0, z0) = (f64::from(real.a * cs), f64::from(real.b * cs));
-                Some(PhysBox { lo: DVec3::new(x0, y0, z0), hi: DVec3::new(x0 + f64::from(cs), y1, z0 + f64::from(cs)) })
+                Some(PhysBox { lo: DVec3::new(x0, y0, z0), hi: DVec3::new(x0 + f64::from(cs), y1, z0 + f64::from(cs)), span: f64::from(cs) })
             }
         }
     }
 
-    /// The clip each finest far tile within `R` wants: each of its 16-block columns that only near
-    /// columns hold, with the real columns and shells whose chunks must be final first.
-    pub(in crate::world) fn wanted_clips(&self, leaves: &[super::super::rule::Leaf], finest: i8) -> Vec<(SectionPos, Vec<super::clip::ClipBit>)> {
+    /// The clip each far tile within `R` wants: each of its 16-block columns that only near columns
+    /// hold, with the real columns and shells whose chunks must be final first. Only the finest far
+    /// level reaches inside `R` (its parent splits there), and it is never wider than a clip.
+    pub(in crate::world) fn wanted_clips(&self, leaves: &[super::super::rule::Leaf]) -> Vec<(SectionPos, Vec<super::clip::ClipBit>)> {
         let mut out = Vec::new();
         if !self.near.active() {
             return out;
         }
         let r = f64::from(self.view.horizontal * CHUNK_SIZE as i32);
-        for leaf in leaves.iter().filter(|l| l.pos.detail.0 == finest && l.dist < r) {
+        for leaf in leaves.iter().filter(|l| l.dist < r) {
             let s = leaf.pos;
             let Some(side) = ColumnClip::side(s) else { continue };
             let mut bits = Vec::new();

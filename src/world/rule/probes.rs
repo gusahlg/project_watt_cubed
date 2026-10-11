@@ -93,7 +93,7 @@ fn audit_cut(world: &World, eye: DVec3) -> CutAudit {
         let finer = if s.detail.0 < rule.finest {
             d >= rule.r
         } else if s.detail.0 < rule.coarsest {
-            world.node_box(s.parent()).is_some_and(|p| !rule.splits(s.detail.0 + 1, p.dist_box(&cell)))
+            world.node_box(s.parent()).is_some_and(|p| !rule.splits(s.detail.0 + 1, p.dist_box(&cell), p.span))
         } else {
             false
         };
@@ -103,7 +103,7 @@ fn audit_cut(world: &World, eye: DVec3) -> CutAudit {
                 audit.worst = Some((s, d));
             }
         }
-        audit.coarser += usize::from(rule.splits(s.detail.0, d));
+        audit.coarser += usize::from(world.node_box(s).is_some_and(|b| rule.splits(s.detail.0, d, b.span)));
     }
     tiles.sort_by(|a, b| a.1.total_cmp(&b.1));
     let mut farther_min = i8::MAX;

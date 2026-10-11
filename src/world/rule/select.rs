@@ -44,7 +44,7 @@ impl Rule {
             if dist >= horizon {
                 continue;
             }
-            if self.splits(s.detail.0, dist) {
+            if self.splits(s.detail.0, dist, b.span) {
                 stack.extend(Quadrant::ALL.map(|q| s.child(q)));
             } else {
                 out.push(Leaf { pos: s, dist });
@@ -103,7 +103,7 @@ mod tests {
         fn node_box(&mut self, s: SectionPos) -> Option<PhysBox> {
             let (x0, z0, span) = (f64::from(s.min_x()), f64::from(s.min_z()), f64::from(s.span()));
             let (lo, hi) = bounds(&self.h, x0, z0, span);
-            Some(PhysBox { lo: DVec3::new(x0, lo, z0), hi: DVec3::new(x0 + span, hi, z0 + span) })
+            Some(PhysBox { lo: DVec3::new(x0, lo, z0), hi: DVec3::new(x0 + span, hi, z0 + span), span })
         }
     }
 
@@ -167,7 +167,8 @@ mod tests {
             // The face stretches its cells by up to √2 at the corners, and the sphere bulges
             // between sampled points by the sagitta of half the stretched diagonal.
             let half_diag = span * std::f64::consts::SQRT_2;
-            PhysBox::around(pts, half_diag * half_diag / (8.0 * self.radius) + 1.0)
+            let side = (pts[2] - pts[0]).length().max((pts[4] - pts[0]).length());
+            PhysBox::around(pts, half_diag * half_diag / (8.0 * self.radius) + 1.0, side)
         }
     }
 
@@ -190,10 +191,11 @@ mod tests {
         assert!(!leaves.is_empty(), "{name}: empty cut");
         for l in leaves {
             let d = l.pos.detail.0;
-            assert!(!rule.splits(d, l.dist), "{name}: {:?} at {} should split", l.pos, l.dist);
+            let span = surface.node_box(l.pos).expect("a box").span;
+            assert!(!rule.splits(d, l.dist, span), "{name}: {:?} at {} should split", l.pos, l.dist);
             if d < rule.coarsest {
-                let p = surface.node_box(l.pos.parent()).expect("parent box").dist(eye);
-                assert!(rule.splits(d + 1, p), "{name}: {:?}'s parent at {p} would not split", l.pos);
+                let p = surface.node_box(l.pos.parent()).expect("parent box");
+                assert!(rule.splits(d + 1, p.dist(eye), p.span), "{name}: {:?}'s parent at {} would not split", l.pos, p.dist(eye));
             }
         }
         let mut by_dist: Vec<&Leaf> = leaves.iter().collect();
@@ -360,7 +362,7 @@ mod tests {
                             hi = hi.max(y);
                         }
                     }
-                    Some(PhysBox { lo: DVec3::new(x0, lo, z0), hi: DVec3::new(x0 + span, hi, z0 + span) })
+                    Some(PhysBox { lo: DVec3::new(x0, lo, z0), hi: DVec3::new(x0 + span, hi, z0 + span), span })
                 }
             }
             let rule = Rule::new(256.0, 9);

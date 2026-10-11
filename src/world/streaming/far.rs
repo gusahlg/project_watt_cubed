@@ -360,8 +360,7 @@ impl World {
             let mut memo = std::mem::take(&mut self.rule_memo);
             self.section_desired = self.desired_sections_with(center, &mut memo, &mut leaves);
             self.rule_memo = memo;
-            let finest = ground.map(|g| self.rule_on(g).finest);
-            let wanted = finest.map(|f| self.wanted_clips(&leaves, f)).unwrap_or_default();
+            let wanted = self.wanted_clips(&leaves);
             self.section_dist = leaves.iter().map(|l| (l.pos, l.dist)).collect();
             self.wait_clips(wanted);
             self.clip_recheck.take();
@@ -384,10 +383,8 @@ impl World {
     pub(in crate::world) fn desired_and_clips(&self, center: Coord) -> (Vec<SectionPos>, FastMap<SectionPos, ColumnClip>) {
         let mut leaves = Vec::new();
         let desired = self.desired_sections_with(center, &mut Default::default(), &mut leaves);
-        let finest = self.far_ground(center).map(|g| self.rule_on(g).finest);
-        let clips = finest
-            .map(|f| self.wanted_clips(&leaves, f))
-            .unwrap_or_default()
+        let clips = self
+            .wanted_clips(&leaves)
             .into_iter()
             .map(|(s, bits)| (s, bits.iter().fold(ColumnClip::NONE, |m, (b, _)| m.union(*b))))
             .collect();
