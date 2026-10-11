@@ -35,7 +35,7 @@ pub(in crate::world) fn air_loaded(cx: i32, cy: i32, cz: i32) -> Loaded {
 
 /// A resident section with no slabs: what a headless upload lands as.
 pub(in crate::world) fn ready_section() -> SectionState {
-    SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None }
+    SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None, clip: Default::default() }
 }
 
 /// The environment variable `name` parsed, else `default`.

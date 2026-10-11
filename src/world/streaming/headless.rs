@@ -38,8 +38,9 @@ impl Landing for Headless {
         world.note_settled();
     }
 
-    fn section(&mut self, _world: &mut World, _pos: SectionPos, _data: pipeline::SectionPayload) -> SectionState {
-        crate::world::fixtures::ready_section()
+    fn section(&mut self, _world: &mut World, _pos: SectionPos, asked: ColumnClip, data: pipeline::SectionPayload) -> SectionState {
+        let clip = crate::world::resident::SectionClip { asked, drawn: data.clip_drawn() };
+        SectionState::Ready { meshes: Vec::new(), cages: Vec::new(), last_style: None, clip }
     }
 }
 
@@ -136,6 +137,30 @@ pub(in crate::world) struct Laps {
     pub(in crate::world) full: [Duration; PHASES],
     /// The last finished pass: its wall time and whether it was a full pass.
     pub(in crate::world) last: (Duration, bool),
+    /// The pass that took the most CPU time: its wall time and its phases. Wall time alone is
+    /// mostly the scheduler's (a pass preempted by the workers).
+    pub(in crate::world) worst: (Duration, [Duration; PHASES]),
+    /// Passes finished, and the index of the costliest.
+    pub(in crate::world) passes: (usize, usize),
+    /// This thread's CPU time when the pass started; the costliest pass's CPU time, and the
+    /// longest wall time of any pass.
+    cpu_start: Duration,
+    pub(in crate::world) cpu: (Duration, Duration),
+    /// CPU time over every pass.
+    pub(in crate::world) cpu_sum: Duration,
+}
+
+/// This thread's CPU time.
+fn thread_cpu() -> Duration {
+    #[cfg(target_os = "linux")]
+    {
+        let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        // SAFETY: `t` is a valid timespec for the call to fill.
+        if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut t) } == 0 {
+            return Duration::new(t.tv_sec as u64, t.tv_nsec as u32);
+        }
+    }
+    Duration::ZERO
 }
 
 impl Default for Laps {
@@ -149,6 +174,11 @@ impl Default for Laps {
             sum: [Duration::ZERO; PHASES],
             full: [Duration::ZERO; PHASES],
             last: (Duration::ZERO, false),
+            worst: (Duration::ZERO, [Duration::ZERO; PHASES]),
+            passes: (0, 0),
+            cpu_start: Duration::ZERO,
+            cpu: (Duration::ZERO, Duration::ZERO),
+            cpu_sum: Duration::ZERO,
         }
     }
 }
@@ -159,6 +189,7 @@ impl Laps {
         self.at = self.start;
         self.pass = [Duration::ZERO; PHASES];
         self.full_pass = false;
+        self.cpu_start = thread_cpu();
     }
 
     fn lap(&mut self, phase: Phase) {
@@ -174,6 +205,15 @@ impl Laps {
                 }
             }
             self.last = (now - self.start, self.full_pass);
+            let cpu = thread_cpu().saturating_sub(self.cpu_start);
+            self.cpu_sum += cpu;
+            if cpu > self.cpu.0 {
+                self.worst = (self.last.0, self.pass);
+                self.passes.1 = self.passes.0;
+                self.cpu.0 = cpu;
+            }
+            self.cpu.1 = self.cpu.1.max(self.last.0);
+            self.passes.0 += 1;
         }
     }
 
@@ -181,6 +221,10 @@ impl Laps {
     pub(in crate::world) fn reset(&mut self) {
         self.sum = [Duration::ZERO; PHASES];
         self.full = [Duration::ZERO; PHASES];
+        self.worst = (Duration::ZERO, [Duration::ZERO; PHASES]);
+        self.passes = (0, 0);
+        self.cpu = (Duration::ZERO, Duration::ZERO);
+        self.cpu_sum = Duration::ZERO;
     }
 }
 

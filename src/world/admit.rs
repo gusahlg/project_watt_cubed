@@ -537,27 +537,25 @@ impl StreamLane for SectionLane {
             !world.sections.contains_key(s)
                 && !world.quarantined.contains(&streaming::FailKey::Section { pos: *s })
         };
+        // Drawn tiles whose clip moved re-extract in place first.
+        world.for_each_reclip(&mut visit);
         // At rest every hole is a candidate. While moving, the deadline submits
         // only a few, so keep the nearest handful of holes. Residency is the
         // cheap filter and runs first: the nearest sections are almost always
-        // resident. The coverage proof runs only on a hole that would enter
-        // the shortlist.
+        // resident.
+        // The cut's resident ancestors are candidates beside it; coarse first by the order.
+        let wanted = || world.section_desired.iter().chain(world.section_ancestors.iter()).copied().filter(hole);
         if world.stream_pacer.effort() >= 1.0 || world.stream_pacer.boosting() {
-            for s in world.section_desired.iter().copied().filter(hole) {
-                if !world.coverage_skips(center, s) {
-                    visit(s);
-                }
+            for s in wanted() {
+                visit(s);
             }
             return;
         }
         const CAP: usize = 32;
         rank.clear();
-        for s in world.section_desired.iter().copied().filter(hole) {
+        for s in wanted() {
             let d = Self::order(world, center, s);
             if rank.len() == CAP && d >= rank[CAP - 1].0 {
-                continue;
-            }
-            if world.coverage_skips(center, s) {
                 continue;
             }
             if rank.len() == CAP {
@@ -576,22 +574,31 @@ impl StreamLane for SectionLane {
         }
     }
     fn order(world: &World, center: Coord, key: SectionPos) -> u64 {
-        let span = key.span() as i64;
-        let (x, z) = world.net_column(center, key.min_x() as i64 + span / 2, key.min_z() as i64 + span / 2);
-        let cs = CHUNK_SIZE as i64;
-        let (psx, psz) = ((center.x as i64 * cs).div_euclid(span), (center.z as i64 * cs).div_euclid(span));
-        let (sx, sz) = (x.div_euclid(span), z.div_euclid(span));
-        (sx - psx).unsigned_abs().max((sz - psz).unsigned_abs())
+        // The rule's distance in the tile's own spans: rings of tiles outward from the eye.
+        match world.section_dist.get(&key) {
+            Some(&d) => (d / f64::from(key.span())) as u64,
+            None => {
+                let span = key.span() as i64;
+                let (x, z) = world.tile_centre(key);
+                let (x, z) = world.net_column(center, x, z);
+                let cs = CHUNK_SIZE as i64;
+                let (psx, psz) = ((center.x as i64 * cs).div_euclid(span), (center.z as i64 * cs).div_euclid(span));
+                let (sx, sz) = (x.div_euclid(span), z.div_euclid(span));
+                (sx - psx).unsigned_abs().max((sz - psz).unsigned_abs())
+            }
+        }
     }
     fn dist2(world: &World, center: Coord, key: SectionPos) -> Option<u64> {
-        // Sections are an XZ heightfield: pass the eye altitude as `wy` so
-        // `dy` is 0 and a vertical move does not reshuffle them. A neighbour
-        // chart's column is measured where the net puts it, or its storage
-        // distance admits the far side of the box ahead of the seam.
-        let span = key.span() as i64;
+        // The rule's distance from the eye cell, biased by motion so the leading edge fills
+        // first: prediction reorders what loads, never what is selected. A neighbour chart's
+        // column is measured where the net puts it.
         let py = center.y as i64 * CHUNK_SIZE as i64 + CHUNK_SIZE as i64 / 2;
-        let (cx, cz) = world.net_column(center, key.min_x() as i64 + span / 2, key.min_z() as i64 + span / 2);
-        let base = player_dist2(center, cx, py, cz);
+        let (cx, cz) = world.tile_centre(key);
+        let (cx, cz) = world.net_column(center, cx, cz);
+        let base = match world.section_dist.get(&key) {
+            Some(&d) => (d * d) as u64,
+            None => player_dist2(center, cx, py, cz),
+        };
         // Bias by motion direction so leading edge fills first.
         let cs = CHUNK_SIZE as i64;
         let (px, pz) = (center.x as i64 * cs + cs / 2, center.z as i64 * cs + cs / 2);
@@ -603,17 +610,23 @@ impl StreamLane for SectionLane {
         ))
     }
     fn in_flight(world: &World, key: SectionPos) -> bool {
-        world.sections.contains_key(&key)
+        match world.sections.get(&key) {
+            None => false,
+            Some(SectionState::Meshing { .. }) => true,
+            Some(SectionState::Ready { .. }) => !world.needs_reclip(key),
+        }
     }
     fn prepare_admit(world: &mut World) {
-        world.section_standin_slack = world.count_section_standins();
+        // Admitting adds sections that hold no slots yet, so the budget stands for the round.
+        world.section_admit_cap = world.sections_allowed() + world.count_section_standins();
     }
-    fn ready(world: &World, _key: SectionPos) -> bool {
+    fn ready(world: &World, key: SectionPos) -> bool {
         // Sections only. Near-field chunks never consume this budget; a large
         // view must not starve covering. In-flight claims count now. A Ready
         // finer tile under a hole keeps its slot, and the hole is admitted
-        // past the floor by however many such tiles there are.
-        world.section_budget_used() < world.sections_allowed() + world.section_standin_slack
+        // past the floor by however many such tiles there are. A re-extract in place adds
+        // no section.
+        world.sections.contains_key(&key) || world.section_budget_used() < world.section_admit_cap
     }
     fn submit(world: &mut World, key: SectionPos) -> Option<(pipeline::Job, pipeline::ClaimToken)> {
         world.refresh_tables();
@@ -623,16 +636,25 @@ impl StreamLane for SectionLane {
         let token = pipeline::ClaimToken(world.section_claim_seq);
         let job = pipeline::Job::Section {
             pos: key,
+            at: world.tile_centre(key),
             epoch: world.section_epoch,
             token,
             generator: world.generator.clone(),
             edits: world.edits_for_section(key),
             tables: world.tables.get(),
+            clip: world.clip_target(key),
+            morph: world.section_morphs(key),
         };
         Some((job, token))
     }
     fn claim(world: &mut World, key: SectionPos, token: pipeline::ClaimToken) {
         world.dirty_sections.remove(&key);
+        // A Ready tile re-extracts in place: its mesh keeps drawing until the new one lands.
+        if world.sections.get(&key).is_some_and(SectionState::is_ready) {
+            world.claim_reclip(key, Some(token));
+            return;
+        }
+        world.claim_reclip(key, None);
         let prev = world.sections.insert(key, SectionState::Meshing { token });
         adjust_count(
             &mut world.meshing_sections,
@@ -645,20 +667,17 @@ impl StreamLane for SectionLane {
             pos,
             epoch,
             token,
+            clip,
             meshes,
         } = done
         {
             // A result from a retired ladder epoch, or for a claim replaced
             // after unload/re-admission, is dropped here — it must not queue an
             // upload that would capture a same-position replacement.
-            let live = epoch == world.section_epoch
-                && matches!(world.sections.get(&pos),
-                    Some(SectionState::Meshing { token: t }) if *t == token);
+            let live = epoch == world.section_epoch && world.section_claim_live(pos, token);
             if live {
                 let bytes = meshes.vertex_bytes();
-                world
-                    .section_upload_queue
-                    .push_back((pos, token, bytes, meshes));
+                world.section_upload_queue.push_back(pipeline::SectionUpload { pos, token, bytes, clip, meshes });
             }
         }
     }

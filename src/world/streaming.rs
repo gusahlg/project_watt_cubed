@@ -19,13 +19,11 @@ use super::generation::{Classify, ColumnHeights};
 use crate::block::registry::{HotTables, AIR};
 use super::brick::ChunkPayload;
 use super::heightmip::{BakeExtent, HeightMip};
-use super::metric::{DyCap, EyeDist, EyeMetric, HeightEnvelope};
-use super::section::SectionPos;
-use super::summary::{CellError, CellSummary, SseBudget};
+use super::section::{ColumnClip, SectionPos};
 use super::{
     ColumnKey, Coord, DIRTY_BUDGET, FastMap, FastSet, LightLane, Loaded, MeshLane, MeshState,
     SECTION_UPLOAD_BUDGET, SectionFrontierKey, SectionLane, SectionState, Sky, StreamLane,
-    UPLOAD_BUDGET_BYTES, UPLOAD_QUEUE_MAX, UPLOAD_SCAN_MAX, World, pipeline, pyramid, quadtree,
+    UPLOAD_BUDGET_BYTES, UPLOAD_QUEUE_MAX, UPLOAD_SCAN_MAX, World, pipeline, quadtree,
 };
 // What the stage modules name through `super::`.
 use super::{
@@ -36,32 +34,29 @@ use super::{
 use super::vis_log;
 
 mod claims;
+mod clip;
 mod drain;
 mod far;
 mod gauges;
 mod generate;
 mod light;
 mod mesh;
+mod near;
 mod pacer;
 mod sections;
 mod unload;
-mod window;
 
 pub use gauges::{RemeshDistribution, StreamGauges};
-pub(in crate::world) use far::{NearBounds, span_reach};
+pub(in crate::world) use clip::Clips;
 pub(in crate::world) use gauges::StreamCounters;
 pub(in crate::world) use generate::{FailKey, GenCursor};
 pub(in crate::world) use light::{LightGate, RemeshStats};
 pub(in crate::world) use pacer::{StreamPacer, chunk_behind};
-pub(in crate::world) use window::Window;
+pub(in crate::world) use near::{Frame, NearField};
 #[cfg(test)]
 pub(in crate::world) use generate::GenRun;
 use far::{eye_chunk, section_key};
 use pacer::{LoadWindow, travel_heading};
-#[cfg(test)]
-use far::inside_near;
-#[cfg(test)]
-use pacer::FULL_EFFORT_SPEED_MPS;
 
 /// Exact upload placement for a chunk mesh: integer chunk origin, full detail.
 /// Pinned at upload so the GPU record is written once; draws only mark
@@ -102,14 +97,6 @@ pub(in crate::world) fn edits_in_footprint(
 /// (safer for fast motion, low cost) but never shrinks the view.
 const TAU_STREAM: f64 = 1.0;
 
-/// Chart prediction lands on whole chunks. A flight's velocity jitters frame to frame; an exact
-/// lookahead would move the predicted eye, and so recompute the frontier, every frame. Adding
-/// zero folds a rounded `-0` into `+0`, so equal deltas key equal bits.
-fn chart_delta(vel: DVec3) -> DVec3 {
-    let step = CHUNK_SIZE as f64;
-    (vel * TAU_STREAM / step).round() * step + DVec3::ZERO
-}
-
 /// Above this sample gap, treat eye motion as pause/teleport; discard velocity
 /// to zero prediction. Generous (streaming may legitimately run at 15 Hz under
 /// `stream_hz`); the speed cap below catches genuine discontinuities.
@@ -136,19 +123,8 @@ fn eye_sample(prev: Option<(DVec3, Instant)>, eye: DVec3, now: Instant) -> (DVec
     }
 }
 
-/// Above this speed the far-field key is bucketed so the sweep is not redone
-/// every chunk step. The sweep costs the same at any speed; running it on
-/// every step is what made a fast frame grow with speed. Slower flight keeps
-/// the exact key, so rest and the spawn frontier stay bit-identical.
-const FRONTIER_COARSE_SPEED: f64 = 1000.0;
 
-/// Fixed chunk grid for that key. A speed-scaled grid moves its edges when the
-/// sampled speed jitters, which rebuilds the sweep every frame.
-const FRONTIER_CHUNK_QUANTUM: i32 = 32;
 
-/// Fixed altitude grid, metres. Same reason: the eye's storage height is large,
-/// and a quantum that tracks speed does not land on one value.
-const FRONTIER_EYE_QUANTUM: f64 = 512.0;
 
 /// The phases of a stream pass, in order, as [`StreamSteps::lap`] marks them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -316,9 +292,10 @@ impl World {
         false
     }
 
-    /// The mesh box: chunks meshed and drawn around `center`, over the held window.
+    /// The mesh box: chunks meshed and drawn around `center`, over the near field's columns. Inside
+    /// it the near field picks what draws ([`NearField::draws`]).
     fn mesh_box(&self, center: Coord) -> ChunkBox {
-        self.view.mesh(center, self.live_up()).stretched(self.window_grow(center))
+        self.view.mesh(center, self.live_up()).stretched(self.near.grow())
     }
 
     /// Radii new work may cover. Before the first stream this is the full view.
@@ -331,7 +308,7 @@ impl World {
     }
 
     /// The loading window is the whole view (rest, walking, or not yet streamed).
-    fn loading_full(&self) -> bool {
+    pub(in crate::world) fn loading_full(&self) -> bool {
         self.load_h < 0
             || (self.load_h >= self.view.horizontal && self.load_v >= self.view.vertical)
     }
@@ -401,8 +378,8 @@ impl World {
     /// full window (the mesh lane checks the draw box itself), else inside the
     /// reduced mesh box and not behind the player.
     pub(in crate::world) fn admits_mesh(&self, coord: Coord) -> bool {
-        self.load_window()
-            .is_none_or(|w| w.covers(self.fold.fold(coord), false))
+        let folded = self.fold.fold(coord);
+        self.near.draws(folded) && self.load_window().is_none_or(|w| w.covers(folded, false))
     }
 
     /// [`in_mesh_box`](Self::in_mesh_box) and [`admits_mesh`](Self::admits_mesh) at once,
@@ -412,14 +389,14 @@ impl World {
             return false;
         };
         let folded = self.fold.fold(coord);
-        self.mesh_box(center).contains(folded) && self.load_window().is_none_or(|w| w.covers(folded, false))
+        self.mesh_box(center).contains(folded) && self.near.draws(folded) && self.load_window().is_none_or(|w| w.covers(folded, false))
     }
 
     /// Whether a light settle for `coord` is worth running. Light covers the
     /// data box, so a mesh-box edge chunk sees lit neighbours.
     pub(in crate::world) fn admits_light(&self, coord: Coord) -> bool {
-        self.load_window()
-            .is_none_or(|w| w.covers(self.fold.fold(coord), true))
+        let folded = self.fold.fold(coord);
+        self.near.loads(folded) && self.load_window().is_none_or(|w| w.covers(folded, true))
     }
 
     /// `will_accept_chunk`'s region: the spawn slab always, otherwise the load
@@ -432,15 +409,17 @@ impl World {
             return false;
         };
         let folded = self.fold.fold(coord);
-        match self.load_window() {
-            Some(window) => window.covers(folded, true),
-            None => self.data_box(center).contains(folded),
-        }
+        self.near.loads(folded)
+            && match self.load_window() {
+                Some(window) => window.covers(folded, true),
+                None => self.data_box(center).contains(folded),
+            }
     }
 
     /// Record that `coord` is owed a light settle the reduced window dropped.
     pub(in crate::world) fn owe_light(&mut self, coord: Coord) {
-        if self.chunks.contains_key(&coord) {
+        // A chunk the near field does not load lights nothing drawn: it is owed nothing.
+        if self.chunks.contains_key(&coord) && self.near.loads(self.fold.fold(coord)) {
             self.light_owed.insert(coord);
         }
     }
@@ -455,7 +434,9 @@ impl World {
         let mut seeded = false;
         owed.retain(|&coord| {
             if !self.admits_light(coord) {
-                return true;
+                // A chunk the near field no longer loads is drawn by nothing and lights nothing
+                // drawn: it is owed nothing.
+                return self.near.loads(self.fold.fold(coord));
             }
             self.seed_light(coord, super::LightSeed::Store);
             seeded = true;
@@ -470,18 +451,19 @@ impl World {
     /// The data box: the mesh box plus one [`DATA_MARGIN`] shell of voxel data,
     /// so edge chunks can cull against neighbours that are loaded but unmeshed.
     fn data_box(&self, center: Coord) -> ChunkBox {
-        self.view.data(center, self.live_up()).stretched(self.window_grow(center))
+        self.view.data(center, self.live_up()).stretched(self.near.grow())
     }
 
     /// The unload box: the mesh box plus the unload hysteresis, past which
     /// chunks are freed.
     pub(in crate::world) fn unload_box(&self, center: Coord) -> ChunkBox {
-        self.view.unload(center, self.live_up()).stretched(self.window_grow(center))
+        self.view.unload(center, self.live_up()).stretched(self.near.grow())
     }
 
     /// Ring buckets for the worklists around `center` (see `ViewVolume::worklist_rings`).
     pub(in crate::world) fn worklist_rings(&self, center: Coord) -> usize {
-        let [below, above] = self.window_grow(center);
+        let _ = center;
+        let [below, above] = self.near.grow();
         self.view.worklist_rings(self.live_up(), below.max(above))
     }
 
@@ -491,8 +473,10 @@ impl World {
     /// this, so a chunk is enqueued only if its result would be accepted.
     /// `false` before the first stream (no centre yet).
     pub(in crate::world) fn in_mesh_box(&self, coord: Coord) -> bool {
-        self.center
-            .is_some_and(|c| self.view_contains(self.mesh_box(c), coord))
+        self.center.is_some_and(|c| {
+            let folded = self.fold.fold(coord);
+            self.mesh_box(c).contains(folded) && self.near.draws(folded)
+        })
     }
 
     /// Whether `coord` lies in view box `b` once the charts around a storage centre are unfolded
@@ -582,8 +566,6 @@ impl World {
         // The synchronous edit remesh: self-gates on `pending_dirty`, so an
         // editless frame pays one flag check and does not need the engine.
         steps.remesh_dirty(self);
-        // Fold any settle events into the LOD clip the moment they land.
-        self.refresh_lod_clip();
     }
 
     /// [`stream`](Self::stream) with the renderer behind `steps`: the one pass the game, the
@@ -614,17 +596,23 @@ impl World {
         // Placed after unload so freed slots can regenerate.
         lanes::GenerateLane::run(self, None);
         steps.lap(Phase::Generate);
-        if self.radius_shrunk.take() {
-            // Meshes are about to be freed: the settled scan must restart.
-            self.lod_clip_shrunk.set();
-            // Free meshes between new radius and unload ring (data stays).
+        let shrunk = self.radius_shrunk.take();
+        if shrunk | self.retire_check.take() {
+            // Free the meshes of chunks that no longer draw (data stays): past a shrunk radius, or
+            // where the near field gave a column back to the far field. A column a landed far
+            // tile still leaves out keeps drawing until the tile that draws it lands.
             // Air/NeedsMesh own no handle.
             // Ready chunks drop to NeedsMesh; Dirty chunks stay dirty
             // (prev: None) so same-frame dirty pass still remeshes them.
             let keep = self.mesh_box(center_chunk);
-            let fold = self.fold;
+            let landed = self.landed_columns();
+            let (fold, up, near) = (self.fold, self.near.up(), &self.near);
             for (&coord, loaded) in self.chunks.iter_mut() {
-                if keep.contains(fold.fold(coord)) {
+                let folded = fold.fold(coord);
+                if keep.contains(folded) && near.draws(folded) {
+                    continue;
+                }
+                if up.is_some_and(|u| landed.contains(&ColumnKey::of(u, coord).0)) {
                     continue;
                 }
                 // Ready becomes NeedsMesh; Dirty stays Dirty (prev: None); a
@@ -714,9 +702,6 @@ impl World {
             let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::StreamOcclusion);
             steps.occlusion(self);
         }
-        // Unloads/boundary crossings above may have shrunk the settled rings;
-        // fold them in before this frame renders.
-        self.refresh_lod_clip();
         steps.lap(Phase::Occlusion);
         #[cfg(debug_assertions)]
         self.debug_assert_liveness();
@@ -802,8 +787,6 @@ impl World {
         // Update centre before draining: old centre may be a sentinel, so draining
         // against it would discard all results and regenerate them immediately.
         // An up-face change is the same kind of pass: the box changed shape.
-        let prev_center = self.center;
-        let leaving = (self.prev_unload_box, self.fold);
         let center_moved = Some(center_chunk) != self.center;
         let fold_changed = center_moved && self.adopt_fold(center_chunk);
         let up_changed = if center_moved || !self.stream_up_set {
@@ -820,11 +803,9 @@ impl World {
         } else {
             false
         };
-        if up_changed || fold_changed {
-            self.follow_frame(center_chunk, leaving);
-        }
-        let window_moved = self.place_window(center_chunk, center_moved || up_changed || fold_changed);
-        let full_pass = center_moved || up_changed || fold_changed || window_moved;
+        let eye = self.phys_eye(center_chunk, false);
+        let near_moved = self.place_near(center_chunk, eye, center_moved || up_changed || fold_changed);
+        let full_pass = center_moved || up_changed || fold_changed || near_moved;
         self.center = Some(center_chunk);
         // A new chart net means the near eye changed frames: that sample's
         // velocity mixes two storage origins.
@@ -847,16 +828,8 @@ impl World {
         self.publish_view(center_chunk, far_chunk, stager);
         // Crossing a chunk boundary moves the BFS root, so the visible set is stale.
         self.occlusion_dirty.raise(full_pass);
-        // The ring geometry is centred on the eye: a boundary cross SHIFTS the
-        // settled rings by the move's chess distance across the up axis (a
-        // move along that axis, an up-face change, or the first pass restarts
-        // the scan) — see `shift_lod_clip`.
-        if full_pass {
-            if up_changed || fold_changed {
-                self.lod_clip_shrunk.set();
-            } else {
-                self.shift_lod_clip(prev_center, center_chunk);
-            }
+        if near_moved {
+            self.retire_check.set();
         }
         (center_chunk, far_chunk, full_pass, far_moved)
     }
@@ -895,8 +868,10 @@ impl World {
             self.prune_admission_worklists();
         }
         let window = self.load_mesh_box(center);
+        // The near field moved inside the box: what it draws there changed too.
+        let near_moved = std::mem::replace(&mut self.near_seen.0, self.near.rev) != self.near.rev;
         match self.prev_mesh_box {
-            Some(prev) if !self.heading_changed => self.seed_fresh(self.view_shell(window, prev)),
+            Some(prev) if !self.heading_changed && !near_moved => self.seed_fresh(self.view_shell(window, prev)),
             _ => self.seed_fresh(self.view_coords(window)),
         }
         self.pending_fresh.set();
@@ -951,8 +926,12 @@ impl World {
         self.center = Some(center);
         self.set_far_center(eye_chunk(far));
         let _ = self.adopt_fold(center);
-        self.place_window(center, true);
-        for coord in self.mesh_box(center).coords() {
+        let eye = self.phys_eye(center, false);
+        self.place_near(center, eye, true);
+        let near = &self.near;
+        let fold = self.fold;
+        let coords: Vec<Coord> = self.mesh_box(center).coords().filter(|&c| near.draws(fold.fold(c))).collect();
+        for coord in coords {
             self.ensure_data(coord);
             if let Some(loaded) = self.chunks.get_mut(&coord)
                 && !matches!(loaded.state, MeshState::Air | MeshState::Ready(_))

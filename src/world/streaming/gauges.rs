@@ -87,8 +87,10 @@ enum EntryBlocker {
     Unmeshed,
     /// Section meshes waiting to upload.
     SectionUploads,
-    /// A desired far cell neither covered by a section nor by settled chunks.
+    /// A desired far cell no Ready section covers.
     Uncovered,
+    /// A far tile's clip still waits on chunks, or a drawn tile does not draw its clip yet.
+    Clips,
 }
 
 /// Cumulative counters the flight bench and the stress gauges read.
@@ -142,7 +144,8 @@ impl World {
         }
         // Every in-view chunk has a final mesh (data loaded, not building/dirty).
         let is_final = |c: Coord| {
-            matches!(self.chunks.get(&c).map(|l| &l.state), Some(MeshState::Air | MeshState::Ready(_)))
+            !self.near.draws(self.fold.fold(c))
+                || matches!(self.chunks.get(&c).map(|l| &l.state), Some(MeshState::Air | MeshState::Ready(_)))
         };
         if !self.view_coords(self.mesh_box(center)).all(is_final) {
             return Some(EntryBlocker::Unmeshed);
@@ -154,16 +157,14 @@ impl World {
             if !self.section_upload_queue.is_empty() {
                 return Some(EntryBlocker::SectionUploads);
             }
-            if self.section_desired.iter().any(|&c| self.uncovered(center, c)) {
+            if self.section_desired.iter().any(|&c| !self.section_covered(c)) {
                 return Some(EntryBlocker::Uncovered);
+            }
+            if !self.clips_at_target() {
+                return Some(EntryBlocker::Clips);
             }
         }
         None
-    }
-
-    /// A desired far cell neither its section nor the settled chunks draw.
-    fn uncovered(&self, center: Coord, cell: SectionPos) -> bool {
-        !self.section_covered(cell) && !self.full_res_covers(center, cell)
     }
 
     /// Near generate/mesh/light queues empty — the five-queue rest predicate.
@@ -323,9 +324,14 @@ impl World {
             }
             Some(EntryBlocker::Uncovered) => {
                 let desired = &self.section_desired;
-                let uncovered = desired.iter().filter(|&&c| self.uncovered(center, c)).count();
+                let uncovered = desired.iter().filter(|&&c| !self.section_covered(c)).count();
                 format!("column sections uncovered: {uncovered} of {} desired", desired.len())
             }
+            Some(EntryBlocker::Clips) => format!(
+                "far clips: {} waiting on chunks, {} re-extracting",
+                self.clips_waiting_count(),
+                usize::from(self.reclips_in_flight())
+            ),
         }
     }
 

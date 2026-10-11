@@ -101,6 +101,9 @@ impl World {
                     // A meshing claim holds nothing on the GPU.
                     self.drop_section(pos);
                 }
+                if epoch == self.section_epoch {
+                    self.release_reclip(pos, token);
+                }
                 if rearm {
                     self.pending_sections.set();
                 }

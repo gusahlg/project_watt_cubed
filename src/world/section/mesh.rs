@@ -32,7 +32,8 @@ use crate::space::FaceFrame;
 
 use super::super::generation::TerrainGenerator;
 use super::super::mesh::{ChunkMeshData, new_chunk_mesh_data};
-use super::{ChunkCoord, FINEST_DETAIL, SECTION_N, SectionPos};
+use super::{ChunkCoord, ColumnClip, FINEST_DETAIL, SECTION_N, SectionPos};
+use crate::world::chunk::CHUNK_SIZE;
 #[cfg(test)]
 use super::{DOMAIN_H, Section};
 use crate::block::registry::{AIR, BlockId, HotTables};
@@ -47,6 +48,9 @@ pub(in crate::world) struct SectionMeshData {
     pub slabs: Vec<SlabMesh>,
     /// World altitude of native cell 0. `0` on the legacy `[0, 512)` window.
     pub altitude_floor: i32,
+    /// The chunk columns left out of the mesh: the asked clip, or none where a packed column is
+    /// wider than a chunk.
+    pub clip_drawn: ColumnClip,
     /// Shift the old per-section relief loop would have used. Nesting ignores it.
     #[cfg(test)]
     pub relief_shift: u8,
@@ -90,7 +94,8 @@ thread_local! {
 /// Packed section cells as a dense column-major grid: `nx × nz` columns of
 /// `ny` cells. Column-major keeps a column's vertical neighbours adjacent.
 /// Meshing emits only the slab `y_lo..y_hi`; the cells around it are context
-/// (covering faces and AO across the seam).
+/// (covering faces and AO across the seam). `clip` masks chunk columns
+/// ([`ColumnClip`] bits); packed column `x` lies in chunk column `x >> col_shift`.
 struct DenseGrid<'a> {
     cells: &'a [BlockId],
     nx: i32,
@@ -98,12 +103,25 @@ struct DenseGrid<'a> {
     nz: i32,
     y_lo: i32,
     y_hi: i32,
+    clip: u64,
+    col_shift: u32,
 }
 
 impl DenseGrid<'_> {
+    /// Whether in-range packed column `(x, z)` is left to the full-res chunks.
+    #[inline]
+    fn masked(&self, x: i32, z: i32) -> bool {
+        self.clip >> (((z >> self.col_shift) << 3) + (x >> self.col_shift)) & 1 != 0
+    }
+
     #[inline]
     fn at_flat(&self, i: usize) -> BlockId {
         self.cells[i]
+    }
+
+    #[inline]
+    fn at(&self, x: i32, y: i32, z: i32) -> BlockId {
+        self.cells[(x + z * self.nx) as usize * self.ny as usize + y as usize]
     }
 
     /// Index delta of one step along world axis `axis` (0=X, 1=Y, 2=Z) in the
@@ -122,14 +140,83 @@ impl DenseGrid<'_> {
     }
 }
 
-/// Merge key: block, micro, and AO must all match — an AO gradient must never
-/// merge into a flat quad (mirrors the chunk mesher's `FaceSample`).
+/// Merge key: block, micro, AO, and the morph of each edge must all match — an AO
+/// gradient must never merge into a flat quad, and a merged quad's vertices share
+/// one `dy` per edge (mirrors the chunk mesher's `FaceSample`).
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct FaceSample {
     block: BlockId,
     micro: [i8; 3],
     ao: [u8; 4],
+    /// `[lower, upper]` in packed cells. Horizontal faces store the same value twice.
+    edge_dy: [i8; 2],
 }
+
+/// Parent offset along local +Y, in this mesh's packed cells. The engine field is
+/// 6-bit signed; every stored `dy` is clamped here so the width can change once.
+const MORPH_LIMIT: i32 = 31;
+
+#[inline]
+fn morph_bits(dy: i64) -> i8 {
+    dy.clamp(-i64::from(MORPH_LIMIT), i64::from(MORPH_LIMIT)) as i8
+}
+
+#[inline]
+fn morph_vertex(v: MeshVertex, dy: i32) -> MeshVertex {
+    v.with_morph(morph_bits(i64::from(dy)))
+}
+
+/// Per packed column: the drawn top, its `dy` toward the parent top, and the
+/// underside of that topmost solid run. `i16::MIN` is an air column. Index is
+/// `x + z * nx` with `nx ≤ 16`.
+struct MorphCols {
+    on: bool,
+    nx: i32,
+    nz: i32,
+    top: [i16; 256],
+    dy: [i8; 256],
+    lip: [i16; 256],
+}
+
+impl MorphCols {
+    fn off() -> Self {
+        Self { on: false, nx: 0, nz: 0, top: [i16::MIN; 256], dy: [0; 256], lip: [0; 256] }
+    }
+
+    #[inline]
+    fn idx(&self, x: i32, z: i32) -> Option<usize> {
+        if self.on && x >= 0 && z >= 0 && x < self.nx && z < self.nz {
+            Some((x + z * self.nx) as usize)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn top_at(&self, x: i32, z: i32) -> i16 {
+        self.idx(x, z).map(|i| self.top[i]).unwrap_or(i16::MIN)
+    }
+
+    #[inline]
+    fn dy_at(&self, x: i32, z: i32) -> i8 {
+        self.idx(x, z).map(|i| self.dy[i]).unwrap_or(0)
+    }
+}
+
+/// `dy` at absolute packed height `h` on a wall from `(h0, dy0)` to `(h1, dy1)`.
+/// Endpoints are exact, so the wall meets both horizontal surfaces. Intermediate
+/// heights truncate the same way on every cell that shares them.
+#[inline]
+fn dy_on_span(h: i32, h0: i32, h1: i32, dy0: i32, dy1: i32) -> i32 {
+    if h1 == h0 {
+        return dy0;
+    }
+    let target0 = h0 + dy0;
+    let target1 = h1 + dy1;
+    let pos = target0 + (h - h0) * (target1 - target0) / (h1 - h0);
+    pos - h
+}
+
 
 /// Face direction with corner winding; micro-offset zero for verticals (never borders).
 struct Dir {
@@ -147,29 +234,30 @@ const DIRS: [Dir; 6] = [
 ];
 
 /// Opaque-occupancy probe for AO sampling: below-floor reads solid (matches the
-/// cull rule's "solid ground"), above-ceiling and outside the section read air
-/// (matches the border-overdraw convention).
+/// cull rule's "solid ground"), above-ceiling, outside the section and in a clipped
+/// column read air (matches the border-overdraw convention).
 #[inline]
-fn occluder(grid: &DenseGrid<'_>, tables: &HotTables, idx: i32, x: i32, y: i32, z: i32) -> bool {
+fn occluder<const CLIP: bool>(grid: &DenseGrid<'_>, tables: &HotTables, idx: i32, x: i32, y: i32, z: i32) -> bool {
     if y < 0 {
         return true;
     }
-    if y >= grid.ny || x < 0 || x >= grid.nx || z < 0 || z >= grid.nz {
+    if y >= grid.ny || x < 0 || x >= grid.nx || z < 0 || z >= grid.nz || (CLIP && grid.masked(x, z)) {
         return false;
     }
     tables.opaque(grid.at_flat(idx as usize))
 }
 
-/// Sample a face: cull if covered by neighbor; overdraw section edges as air.
-/// Per-corner AO reads the two in-plane occluders plus the diagonal, in the
-/// layer the face opens into — same stencil `face_sample` in `world/mesh.rs`
+/// Sample a face: cull if covered by neighbor; overdraw section edges and clipped
+/// columns as air. Per-corner AO reads the two in-plane occluders plus the diagonal,
+/// in the layer the face opens into — same stencil `face_sample` in `world/mesh.rs`
 /// uses. `idx` is the cell's flat index; every probe is a stride add off it.
 #[inline]
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::needless_range_loop)] // 3×3 stencil: du/dv are both indices and signed offsets
-fn face_sample(
+fn face_sample<const CLIP: bool>(
     grid: &DenseGrid<'_>,
     tables: &HotTables,
+    morph: &MorphCols,
     dir: &Dir,
     s_n: i32,
     s_u: i32,
@@ -184,7 +272,7 @@ fn face_sample(
         return None;
     }
     let me = grid.at_flat(idx as usize);
-    if me == AIR {
+    if me == AIR || (CLIP && grid.masked(x, z)) {
         return None;
     }
     let open = idx + dir.face.step * s_n;
@@ -201,8 +289,9 @@ fn face_sample(
     } else {
         let n = if dir.face.n_axis == 0 { x } else { z };
         let lim = if dir.face.n_axis == 0 { grid.nx } else { grid.nz };
-        if n + dir.face.step < 0 || n + dir.face.step >= lim {
-            // Section border: overdraw as air, nudge inward.
+        let (nx, nz) = if dir.face.n_axis == 0 { (x + dir.face.step, z) } else { (x, z + dir.face.step) };
+        if n + dir.face.step < 0 || n + dir.face.step >= lim || (CLIP && grid.masked(nx, nz)) {
+            // Section border or a clipped column: overdraw as air, nudge inward.
             micro = dir.micro;
             AIR
         } else {
@@ -224,9 +313,9 @@ fn face_sample(
             let eu = du as i32 - 1;
             let pidx = open + eu * s_u + ev * s_v;
             opaque[du][dv] = match dir.face.n_axis {
-                0 => occluder(grid, tables, pidx, ox, oy + ev, oz + eu),
-                1 => occluder(grid, tables, pidx, ox + eu, oy, oz + ev),
-                _ => occluder(grid, tables, pidx, ox + eu, oy + ev, oz),
+                0 => occluder::<CLIP>(grid, tables, pidx, ox, oy + ev, oz + eu),
+                1 => occluder::<CLIP>(grid, tables, pidx, ox + eu, oy, oz + ev),
+                _ => occluder::<CLIP>(grid, tables, pidx, ox + eu, oy + ev, oz),
             };
         }
     }
@@ -235,12 +324,66 @@ fn face_sample(
         let ov = (corner_uv[i][1] + 1) as usize;
         vertex_ao(opaque[ou][1], opaque[1][ov], opaque[ou][ov])
     });
-    Some(FaceSample { block: me, micro, ao })
+    Some(FaceSample { block: me, micro, ao, edge_dy: face_dy(morph, dir, x, y, z) })
 }
+
+/// `dy` of this face's lower and upper edges. An up face at the column top rises
+/// to the parent top (`P − t`, which can be negative when this column sits above
+/// the columns the parent sampled). Down faces stay put: the parent underside is
+/// not derived. A side vertex takes the `dy` of the horizontal surface it belongs
+/// to — the column top on the upper edge, the neighbour top it stands on (or 0 at
+/// the floor or under an underside) on the lower edge. Section-border overdraw is
+/// this same side face, so its upper edge carries the top it hangs from.
+fn face_dy(morph: &MorphCols, dir: &Dir, x: i32, y: i32, z: i32) -> [i8; 2] {
+    if !morph.on {
+        return [0, 0];
+    }
+    if dir.face.n_axis == 1 {
+        // Undersides (step < 0) do not morph.
+        if dir.face.step > 0 && morph.top_at(x, z) == (y + 1) as i16 {
+            let d = morph.dy_at(x, z);
+            [d, d]
+        } else {
+            [0, 0]
+        }
+    } else {
+        let (nx, nz) = if dir.face.n_axis == 0 { (x + dir.face.step, z) } else { (x, z + dir.face.step) };
+        side_dy(morph, x, z, nx, nz, y)
+    }
+}
+
+/// Per-cell `dy` along the exposed wall of the column's topmost run, so cells that
+/// cannot merge still meet. Endpoints are the neighbour top (or the underside / floor
+/// at `dy` 0) and this column's top.
+fn side_dy(morph: &MorphCols, x: i32, z: i32, nx: i32, nz: i32, y: i32) -> [i8; 2] {
+    let Some(i) = morph.idx(x, z) else { return [0, 0] };
+    let t = i32::from(morph.top[i]);
+    if morph.top[i] == i16::MIN || y + 1 <= i32::from(morph.lip[i]) || y >= t {
+        return [0, 0];
+    }
+    let lip = i32::from(morph.lip[i]);
+    let dy_t = i32::from(morph.dy[i]);
+    let (h0, dy0) = match morph.idx(nx, nz) {
+        Some(ni) if morph.top[ni] != i16::MIN => {
+            let nt = i32::from(morph.top[ni]);
+            if nt > lip && nt < t { (nt, i32::from(morph.dy[ni])) } else { (lip, 0) }
+        }
+        _ => (lip, 0),
+    };
+    if y < h0 || h0 >= t {
+        return [0, 0];
+    }
+    [
+        morph_bits(i64::from(dy_on_span(y, h0, t, dy0, dy_t))),
+        morph_bits(i64::from(dy_on_span(y + 1, h0, t, dy0, dy_t))),
+    ]
+}
+
 
 /// Greedy-mesh one slab of the packed volume: merge adjacent quads with identical
 /// properties across it (one mesh, vertex coords `0..=16` relative to the slab).
-fn build_volume(grid: &DenseGrid<'_>, tables: &HotTables, out: &mut ChunkMeshData) -> bool {
+/// `CLIP` instances test the grid's column mask; the other compiles without it.
+fn build_volume<const CLIP: bool>(grid: &DenseGrid<'_>, tables: &HotTables, morph: &MorphCols, out: &mut ChunkMeshData) -> bool {
     let mut mask: [Option<FaceSample>; SLICE] = [None; SLICE];
     let mut emitted = false;
 
@@ -269,8 +412,8 @@ fn build_volume(grid: &DenseGrid<'_>, tables: &HotTables, out: &mut ChunkMeshDat
                         1 => (u, n + y_lo, v),
                         _ => (u, v + y_lo, n),
                     };
-                    let cell = face_sample(
-                        grid, tables, dir, s_n, s_u, s_v, idx, x, y, z, &corner_uv,
+                    let cell = face_sample::<CLIP>(
+                        grid, tables, morph, dir, s_n, s_u, s_v, idx, x, y, z, &corner_uv,
                     );
                     mask[(u + v * n_u) as usize] = cell;
                     any |= cell.is_some();
@@ -308,8 +451,68 @@ fn build_volume(grid: &DenseGrid<'_>, tables: &HotTables, out: &mut ChunkMeshDat
             }
         }
     }
+    if emit_seams(grid, tables, morph, out) {
+        emitted = true;
+    }
     emitted
 }
+
+/// Where two adjacent columns share a top but their parent tops differ, emit a
+/// pair of opposite side quads on that boundary. Both edges start at the shared
+/// top; the lower takes the lower parent `dy` and the upper the higher one, so
+/// the pair is degenerate at `a = 0` and is the parent's side face at `a = 1`.
+fn emit_seams(grid: &DenseGrid<'_>, tables: &HotTables, morph: &MorphCols, out: &mut ChunkMeshData) -> bool {
+    if !morph.on {
+        return false;
+    }
+    let mut emitted = false;
+    {
+        let mut pair = |x0: i32, z0: i32, x1: i32, z1: i32, along_x: bool| {
+            let ta = morph.top_at(x0, z0);
+            let tb = morph.top_at(x1, z1);
+            if ta == i16::MIN || ta != tb {
+                return;
+            }
+            let (da, db) = (morph.dy_at(x0, z0), morph.dy_at(x1, z1));
+            if da == db {
+                return;
+            }
+            let t = i32::from(ta);
+            let cell_y = t - 1;
+            if cell_y < grid.y_lo || cell_y >= grid.y_hi {
+                return;
+            }
+            let (hx, hz) = if da >= db { (x0, z0) } else { (x1, z1) };
+            let sample = FaceSample {
+                block: grid.at(hx, cell_y, hz),
+                micro: [0, 0, 0],
+                ao: [3, 3, 3, 3],
+                edge_dy: [da.min(db), da.max(db)],
+            };
+            let local_y = t - grid.y_lo;
+            if along_x {
+                emit(out, &DIRS[0], x0, z0, local_y, 1, 0, sample, tables);
+                emit(out, &DIRS[1], x1, z0, local_y, 1, 0, sample, tables);
+            } else {
+                emit(out, &DIRS[4], z0, x0, local_y, 1, 0, sample, tables);
+                emit(out, &DIRS[5], z1, x0, local_y, 1, 0, sample, tables);
+            }
+            emitted = true;
+        };
+        for z in 0..morph.nz {
+            for x in 0..morph.nx - 1 {
+                pair(x, z, x + 1, z, true);
+            }
+        }
+        for z in 0..morph.nz - 1 {
+            for x in 0..morph.nx {
+                pair(x, z, x, z + 1, false);
+            }
+        }
+    }
+    emitted
+}
+
 
 /// Append one merged rectangle as a single quad, routed to its block's pass with
 /// the border micro-offset applied. Corners are block-local (`0..=16`).
@@ -337,7 +540,9 @@ fn emit(
         pos[dir.face.n_axis] = origin[dir.face.n_axis] + cr[0] as u32;
         pos[dir.face.u_axis] = origin[dir.face.u_axis] + cr[1] as u32 * w as u32;
         pos[dir.face.v_axis] = origin[dir.face.v_axis] + cr[2] as u32 * h as u32;
-        MeshVertex::new(
+        // Horizontal faces store one dy twice. A side's lower edge is cr[2] == 0.
+        let dy = if dir.face.n_axis == 1 || cr[2] == 0 { sample.edge_dy[0] } else { sample.edge_dy[1] };
+        morph_vertex(MeshVertex::new(
             [pos[0] as u8, pos[1] as u8, pos[2] as u8],
             dir.face.normal,
             // Vertex layer only (tables above index by the true id); wraps
@@ -349,7 +554,7 @@ fn emit(
             Light::DAY,
             false,
         )
-        .with_micro(sample.micro)
+        .with_micro(sample.micro), i32::from(dy))
     });
     // Same anisotropy fix as the chunk mesher: rotate the quad so the fixed
     // diagonal falls on the darker corner pair, not the brighter one.
@@ -369,7 +574,7 @@ fn emit(
 #[cfg(test)]
 pub(in crate::world) fn build_section_mesh(section: &Section, tables: &HotTables, floor: Option<i32>) -> SectionMeshData {
     let n_cells = (DOMAIN_H / section.pos().cell_size()) as usize;
-    mesh_section_with(n_cells, tables, floor, 0, section.pos().cell_size(), |dense| fill_from_section(dense, n_cells, section))
+    mesh_section_with(n_cells, tables, floor, 0, section.pos().cell_size(), true, ColumnClip::NONE, |dense| fill_from_section(dense, n_cells, section))
 }
 
 /// Lowest native cell a section's border walls must reach so they meet the neighbour.
@@ -392,31 +597,54 @@ pub(in crate::world) fn ring_floor<G: TerrainGenerator + ?Sized>(pos: SectionPos
     floor.max(0)
 }
 
-/// Extract AND mesh a section in one pass: sample the generator (folding the
-/// edit overlay) directly into the dense section grid, then mesh it — the
-/// production worker path. Skips the whole RLE brick round trip
-/// ([`Section::extract`]'s per-column run slicing plus this module's decode),
-/// which existed only because the temporary [`Section`] was built and dropped.
+/// [`extract_section_mesh_with`] leaving no column out, with `dy` on +Y.
+#[cfg(test)]
 pub(in crate::world) fn extract_section_mesh<G: TerrainGenerator + ?Sized>(
     pos: SectionPos,
     r#gen: &G,
     edits: &[(ChunkCoord, Vec<(usize, BlockId)>)],
     tables: &HotTables,
 ) -> SectionMeshData {
+    extract_section_mesh_with(pos, r#gen, edits, tables, ColumnClip::NONE, true)
+}
+
+/// Extract AND mesh a section in one pass: sample the generator (folding the
+/// edit overlay) directly into the dense section grid, then mesh it — the
+/// production worker path. Skips the whole RLE brick round trip
+/// ([`Section::extract`]'s per-column run slicing plus this module's decode),
+/// which existed only because the temporary [`Section`] was built and dropped.
+/// `clip`'s chunk columns are left to the full-res chunks. With `morph` every vertex carries its
+/// `dy` toward the parent level's surface (a chart patch and a +Y face, whose local up is the
+/// mesh's +Y); without it (a level with no coarser level beside it) the faces merge as plain
+/// greedy quads.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::world) fn extract_section_mesh_with<G: TerrainGenerator + ?Sized>(
+    pos: SectionPos,
+    r#gen: &G,
+    edits: &[(ChunkCoord, Vec<(usize, BlockId)>)],
+    tables: &HotTables,
+    clip: ColumnClip,
+    morph: bool,
+) -> SectionMeshData {
     let Some((alo, ahi)) = section_window(pos, r#gen) else {
         return SectionMeshData::default();
     };
+    let clip = if pos.span() <= super::CLIP_MAX_SPAN { clip } else { ColumnClip::NONE };
     let cell = pos.cell_size();
     let n_cells = ((ahi - alo) / cell) as usize;
     // Home +Y keeps the legacy column and the `[0, 512]` floor. A chart is +Y in storage
     // but its surface sits far outside that window, so it takes the face sampler.
     let chart = pos.body >= super::CHART_BODY_BASE;
     let floor = if pos.face == Face::PosY && !chart { ring_floor(pos, r#gen) } else { ring_floor_face(pos, r#gen, alo) };
-    let mut mesh = mesh_section_with(n_cells, tables, Some(floor), alo, cell, |dense| {
+    // Morph only meshes whose local +Y is up: the shader adds `dy` to local Y. A cube's other
+    // faces are rotated into world after meshing; a chart patch stays storage +Y up.
+    let morph_up = morph && (pos.face == Face::PosY || chart);
+    let mut mesh = mesh_section_with(n_cells, tables, Some(floor), alo, cell, morph_up, clip, |dense| {
         sample_columns(pos, r#gen, edits, alo, n_cells, dense);
     });
     mesh.altitude_floor = alo;
-    if pos.face != Face::PosY {
+    // A chart patch is storage +Y up whatever its face; a cube face meshes face-local.
+    if pos.face != Face::PosY && !chart {
         orient_section(&mut mesh, pos.face);
     }
     mesh
@@ -451,7 +679,7 @@ fn ring_floor_face<G: TerrainGenerator + ?Sized>(pos: SectionPos, r#gen: &G, alo
     let n = SECTION_N as i32;
     let top = |ix: i32, iz: i32| {
         let (u, v) = (pos.min_x() + ix * cell + cell / 2, pos.min_z() + iz * cell + cell / 2);
-        let h = r#gen.surface(pos.face, u, v);
+        let h = r#gen.surface_on(pos.body, pos.face, u, v);
         if h == i32::MIN {
             i32::MAX
         } else {
@@ -595,14 +823,7 @@ fn sample_columns<G: TerrainGenerator + ?Sized>(
 ) {
     let cell = pos.cell_size();
     let ys = super::column_ys(pos.detail, alo, n_cells as i32, cell);
-    let flat = super::flatten_edits(edits);
-    let remapped;
-    let used: &[_] = if pos.face == Face::PosY {
-        &flat
-    } else {
-        remapped = face_edits(&flat, pos.face);
-        &remapped
-    };
+    let used = super::frame_edits(pos, r#gen, edits);
     let chart = pos.body >= super::CHART_BODY_BASE;
     for iz in 0..SECTION_N {
         for ix in 0..SECTION_N {
@@ -613,7 +834,7 @@ fn sample_columns<G: TerrainGenerator + ?Sized>(
             } else {
                 r#gen.lod_column_face(pos.body, pos.face, fx, fz, &ys, column);
             }
-            super::apply_edits(column, used, fx, fz, cell, alo);
+            super::apply_edits(column, &used, fx, fz, cell, alo);
         }
     }
 }
@@ -621,18 +842,25 @@ fn sample_columns<G: TerrainGenerator + ?Sized>(
 /// The one section-mesh driver both producers share: `fill` overwrites this
 /// worker's pooled native grid (every cell must be written), then the packer
 /// and mesher run over it. Producers differ ONLY in how the grid is filled.
+#[allow(clippy::too_many_arguments)]
 fn mesh_section_with(
     n_cells: usize,
     tables: &HotTables,
     floor: Option<i32>,
     alo: i32,
     cell: i32,
+    morph_up: bool,
+    clip: ColumnClip,
     fill: impl FnOnce(&mut [BlockId]),
 ) -> SectionMeshData {
     DENSE_NATIVE.with_borrow_mut(|native| {
         native.resize(SECTION_N * SECTION_N * n_cells, AIR);
         fill(native);
-        mesh_packed(native, n_cells, tables, floor, alo, cell)
+        if clip.is_empty() {
+            mesh_packed::<false>(native, n_cells, tables, floor, alo, cell, morph_up, clip)
+        } else {
+            mesh_packed::<true>(native, n_cells, tables, floor, alo, cell, morph_up, clip)
+        }
     })
 }
 
@@ -710,7 +938,6 @@ fn relief_shift(ylo: i32, yhi: i32) -> u32 {
 /// grid covers, from that grid alone. Index is `[z][x]` inside the quadrant.
 /// The value is the world altitude of the packed cell's top face, or `None` when
 /// the parent column has no solid parent-sample. The parent mesher draws these.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(in crate::world) fn coarser_tops(native: &[BlockId], n_cells: usize, alo: i32, cell: i32) -> [[Option<i32>; 8]; 8] {
     let mut tops = [[None; 8]; 8];
     // Parent cell is 2·cell and the mesh step is 2, so one parent packed column is 4 child cells.
@@ -782,6 +1009,69 @@ fn pick_coarse(
     best
 }
 
+/// Per packed column of the slab volume: its drawn top, the underside of that run, and its `dy`
+/// toward the parent top ([`coarser_tops`]). Off unless the mesh nests on its parent's lattice.
+#[allow(clippy::too_many_arguments)]
+fn morph_columns(
+    native: &[BlockId],
+    n_cells: usize,
+    alo: i32,
+    cell: i32,
+    coarse: &[BlockId],
+    nx: i32,
+    ny: i32,
+    nz: i32,
+    y0: i32,
+    step: i32,
+    on: bool,
+) -> MorphCols {
+    if !on || step != 2 || nx * nz > 256 || nx <= 0 {
+        return MorphCols::off();
+    }
+    let mut morph = MorphCols { on: true, nx, nz, top: [i16::MIN; 256], dy: [0; 256], lip: [0; 256] };
+    let parents = coarser_tops(native, n_cells, alo, cell);
+    let parent_w = 2i32;
+    let scale = i64::from(cell) * i64::from(step);
+    if scale <= 0 {
+        return MorphCols::off();
+    }
+    for z in 0..nz {
+        for x in 0..nx {
+            let base = (x + z * nx) as usize * ny as usize;
+            let mut hy = -1i32;
+            for y in (0..ny).rev() {
+                if coarse[base + y as usize] != AIR {
+                    hy = y;
+                    break;
+                }
+            }
+            if hy < 0 {
+                continue;
+            }
+            let mut lip = hy;
+            while lip > 0 && coarse[base + (lip - 1) as usize] != AIR {
+                lip -= 1;
+            }
+            let t = hy + 1;
+            let i = (x + z * nx) as usize;
+            morph.top[i] = t as i16;
+            morph.lip[i] = lip as i16;
+            let (px, pz) = (x / parent_w, z / parent_w);
+            let Some(p_world) = parents.get(pz as usize).and_then(|row| row.get(px as usize)).copied().flatten() else {
+                continue;
+            };
+            // Drawn top of coarse cell `t - 1`: world Y `alo + (y0 + t·step)·cell`.
+            let face_world = i64::from(alo) + (i64::from(y0) + i64::from(t) * i64::from(step)) * i64::from(cell);
+            let diff = i64::from(p_world) - face_world;
+            if diff.rem_euclid(scale) != 0 {
+                continue;
+            }
+            morph.dy[i] = morph_bits(diff.div_euclid(scale));
+        }
+    }
+    morph
+}
+
 /// Pack the native 32×n×32 occupancy into ≤16-cell columns and greedy-mesh it, one
 /// mesh per stacked 16-cell slab.
 ///
@@ -791,13 +1081,21 @@ fn pick_coarse(
 /// the relief inside the section costs slabs. The shift stays the one that packs the 32
 /// columns: raising it would move this level's edges off its parent's lattice. Tall relief
 /// stacks more slabs instead.
-fn mesh_packed(
+///
+/// `clip`'s chunk columns are left out after everything that shapes the mesh (floor, lattice)
+/// is taken from the full grid, so the kept columns match the unclipped mesh and the walls along
+/// the clip reach the lowest ground. A packed column wider than a chunk cannot follow the clip:
+/// the mesh is then whole and reports no clip.
+#[allow(clippy::too_many_arguments)]
+fn mesh_packed<const CLIP: bool>(
     native: &[BlockId],
     n_cells: usize,
     tables: &HotTables,
     floor: Option<i32>,
     alo: i32,
     cell: i32,
+    morph_up: bool,
+    clip: ColumnClip,
 ) -> SectionMeshData {
     let ny_n = n_cells as i32;
     let (mut min_top, mut yhi) = (ny_n, 0);
@@ -845,14 +1143,32 @@ fn mesh_packed(
                 }
             }
         }
+        let chunk = CHUNK_SIZE as i32;
+        let w = step * cell;
+        let clip = if CLIP && w <= chunk && chunk % w == 0 { clip } else { ColumnClip::NONE };
+        let col_shift = (chunk / w.clamp(1, chunk)).trailing_zeros();
+        // The relief shift leaves the shared lattice, so that section does not morph.
+        let mut morph = morph_columns(native, n_cells, alo, cell, coarse, nx, ny, nz, y0, step, morph_up && shift == pack_shift(SECTION_N as i32));
+        // A clipped column has no top: its neighbours' walls and seams treat it as the border.
+        if morph.on && !clip.is_empty() {
+            for z in 0..nz {
+                for x in 0..nx {
+                    if clip.masks(x >> col_shift, z >> col_shift) {
+                        let i = (x + z * nx) as usize;
+                        morph.top[i] = i16::MIN;
+                        morph.dy[i] = 0;
+                    }
+                }
+            }
+        }
         MESH_SCRATCH.with_borrow_mut(|scratch| {
             let mut slabs = Vec::new();
             for y_lo in (0..ny).step_by(BLOCK as usize) {
                 for (_, m) in scratch.iter_mut() {
                     m.clear();
                 }
-                let grid = DenseGrid { cells: coarse, nx, ny, nz, y_lo, y_hi: (y_lo + BLOCK).min(ny) };
-                if build_volume(&grid, tables, scratch) {
+                let grid = DenseGrid { cells: coarse, nx, ny, nz, y_lo, y_hi: (y_lo + BLOCK).min(ny), clip: clip.0, col_shift };
+                if build_volume::<CLIP>(&grid, tables, &morph, scratch) {
                     slabs.push(SlabMesh {
                         origin_y: (y0 + y_lo * step) as u32,
                         data: std::mem::replace(scratch, new_chunk_mesh_data()),
@@ -863,6 +1179,7 @@ fn mesh_packed(
                 shift: if slabs.is_empty() { 0 } else { shift as u8 },
                 slabs,
                 altitude_floor: alo,
+                clip_drawn: clip,
                 #[cfg(test)]
                 relief_shift: natural as u8,
             }
@@ -1117,9 +1434,9 @@ mod tests {
         let grid = |tall: bool| -> Vec<BlockId> {
             (0..SECTION_N * SECTION_N).flat_map(|i| column(if tall && i % SECTION_N < 12 { 1_100 } else { 50 })).collect()
         };
-        let flat = mesh_packed(&grid(false), n_cells, &tables, None, 0, 4);
+        let flat = mesh_packed::<false>(&grid(false), n_cells, &tables, None, 0, 4, true, ColumnClip::NONE);
         assert_eq!((flat.shift, flat.slabs.len()), (1, 1), "flat ground");
-        let cliff = mesh_packed(&grid(true), n_cells, &tables, None, 0, 4);
+        let cliff = mesh_packed::<false>(&grid(true), n_cells, &tables, None, 0, 4, true, ColumnClip::NONE);
         assert!(cliff.shift > flat.shift, "a 4 km cliff coarsens instead of stacking");
         assert!(!cliff.slabs.is_empty() && cliff.slabs.len() <= MAX_SLABS as usize, "{} slabs", cliff.slabs.len());
     }
@@ -1332,8 +1649,8 @@ mod tests {
         }
         let mesh_of = |grid: &[BlockId]| {
             let mut out = new_chunk_mesh_data();
-            let g = DenseGrid { cells: grid, nx: n, ny: n, nz: n, y_lo: 0, y_hi: n };
-            assert!(build_volume(&g, &tables, &mut out), "the feature emits no faces");
+            let g = DenseGrid { cells: grid, nx: n, ny: n, nz: n, y_lo: 0, y_hi: n, clip: 0, col_shift: 0 };
+            assert!(build_volume::<false>(&g, &tables, &MorphCols::off(), &mut out), "the feature emits no faces");
             out
         };
         let key = |v: MeshVertex| {
@@ -1399,6 +1716,8 @@ mod tests {
         z1: i32,
         tops: Vec<[i32; 5]>,
         walls: Vec<[i32; 6]>,
+        /// Columns the tile leaves to the full-res chunks.
+        clip: ColumnClip,
     }
 
     fn place_tile(pos: SectionPos, mesh: &SectionMeshData) -> Tile {
@@ -1438,7 +1757,7 @@ mod tests {
                 }
             }
         }
-        Tile { pos, x0, x1, z0, z1, tops, walls }
+        Tile { pos, x0, x1, z0, z1, tops, walls, clip: ColumnClip::NONE }
     }
 
     fn top_at(tile: &Tile, x: i32, z: i32) -> Option<i32> {
@@ -1503,7 +1822,9 @@ mod tests {
                     ((s, edge + inset_a), (s, edge + inset_b))
                 };
                 let (ta, tb) = (top_at(a, pa.0, pa.1), top_at(b, pb.0, pb.1));
-                if let (Some(ta), Some(tb)) = (ta, tb) {
+                if clipped(a, pa.0, pa.1) || clipped(b, pb.0, pb.1) {
+                    // A column left to the full-res chunks: its walls are the clip's.
+                } else if let (Some(ta), Some(tb)) = (ta, tb) {
                     let (lo_y, hi_y) = (ta.min(tb), ta.max(tb));
                     let gap = open_span(a, b, axis, edge, s, lo_y, hi_y);
                     if gap > 0 {
@@ -1599,7 +1920,6 @@ mod tests {
         use crate::render_config::RenderConfig;
         use crate::world::generation::WorldgenKind;
         use crate::world::heightmip::BakeExtent;
-        use crate::world::quadtree;
         use crate::world::{World, DEFAULT_SEED};
         use std::collections::BTreeMap;
 
@@ -1632,19 +1952,23 @@ mod tests {
         ));
         world.section_mip_anchor = Some((body, Face::PosY, au, av));
         let bake_ms = bake_at.elapsed().as_secs_f64() * 1000.0;
-        let outer = world.section_pyramid.outer_m();
-        let clip = world.lod_clip();
-        let full = world.view.coverage();
         let ground = world.terrain().height(au, av);
+        let horizon = world.rule_on(crate::world::rule::Ground::Cube { body }).horizon() as f32;
 
         let mut reports = Vec::new();
         for lift in [1500.0_f64, 3000.0] {
             let eye_y = ground as f64 + lift;
             world.section_eye_y = eye_y;
-            let center = ChunkCoord::new(au.div_euclid(16), (eye_y as i32).div_euclid(16), av.div_euclid(16));
-            let desired = world.desired_sections(center);
-            let cut = quadtree::resolve_covering(&desired, Detail(9), &|_| true);
-            let drawn: Vec<SectionPos> = cut.iter().map(|(p, _)| *p).collect();
+            // Where that eye really is: the twin's warp moves its reference cells.
+            let warp = world.terrain().atlases().iter().find(|a| a.grid.as_ref().is_some_and(|g| g.body == body)).and_then(|a| a.warp.clone());
+            let reference = voxel_engine::DVec3::new(f64::from(au) + 0.5, eye_y, f64::from(av) + 0.5);
+            let (near, _) = world.place_eyes(warp.map_or(reference, |w| w.apply(reference)));
+            let center = ChunkCoord::new((near.x / 16.0).floor() as i32, (near.y / 16.0).floor() as i32, (near.z / 16.0).floor() as i32);
+            // The +Y face around the eye's column: the cut's other faces are another plane.
+            let desired: Vec<SectionPos> = world.desired_sections(center).into_iter().filter(|s| s.face == Face::PosY).collect();
+            // The ground the horizon reaches from this height.
+            let outer = (horizon * horizon - (lift as f32) * (lift as f32)).sqrt();
+            let drawn = desired.clone();
             let tables = world.registry.hot_tables();
             let mut tiles = Vec::with_capacity(drawn.len());
             let mesh_at = std::time::Instant::now();
@@ -1692,22 +2016,6 @@ mod tests {
             }
 
             let cam_ground = eye_y - ground as f64;
-            let cam_y = eye_y as f32;
-            let eye_x = (center.x * 16 + 8) as f32;
-            let eye_z = (center.z * 16 + 8) as f32;
-            let culled = drawn.iter().filter(|p| {
-                let (x0, x1) = (p.min_x() as f32 - eye_x, (p.min_x() + p.span()) as f32 - eye_x);
-                let (lo, hi) = world
-                    .terrain()
-                    .surface_bounds(p.body, p.face, p.min_x(), p.min_z(), p.span())
-                    .unwrap_or((0, 512));
-                let (wlo, whi) = super::super::sample_window(lo, hi, p.cell_size());
-                let (y0, y1) = (wlo as f32 - cam_y, whi as f32 - cam_y);
-                let (z0, z1) = (p.min_z() as f32 - eye_z, (p.min_z() + p.span()) as f32 - eye_z);
-                x0 > -clip.half.x && x1 < clip.half.x
-                    && y0 > -clip.half.y && y1 < clip.half.y
-                    && z0 > -clip.half.z && z1 < clip.half.z
-            }).count();
 
             let mut gaps: Vec<SeamGap> = Vec::new();
             let mut seams = 0usize;
@@ -1784,14 +2092,7 @@ mod tests {
                  vertical gaps {vert_n} (same-detail {same}) missing-top {missing} {worst_s}; \
                  bare columns {bare}/{bare_n} origin-top {origin_top:?}; coverage gaps {cover_gaps}/{cover_n} \
                  step {step} limit {limit:.0} examples {cover_at:?}; mesh {mesh_ms:.1} ms ({per:.2} ms/section); \
-                 dy {dy:.0} outer {outer:.0} ground {ground} cam-ground {cam_ground:.0}; lod clip half ({cx:.0},{cy:.0},{cz:.0}) \
-                 full half ({fx:.0},{fy:.0},{fz:.0}) culled {culled}",
-                cx = clip.half.x,
-                cy = clip.half.y,
-                cz = clip.half.z,
-                fx = full.half.x,
-                fy = full.half.y,
-                fz = full.half.z,
+                 dy {dy:.0} outer {outer:.0} ground {ground} cam-ground {cam_ground:.0}"
             ));
         }
         let report = format!("mip bake {bake_ms:.1} ms; {}", reports.join(" || "));
@@ -1801,7 +2102,6 @@ mod tests {
                 && r.contains("missing-top 0 ")
                 && r.contains("bare columns 0/")
                 && r.contains("coverage gaps 0/")
-                && r.contains("culled 0")
         });
         assert!(closed, "{report}");
     }
@@ -1834,37 +2134,60 @@ mod tests {
         bare: i32,
         gaps: usize,
         missing: usize,
+        /// Near-square samples whose column is drawn the wrong way: a near column a far tile tops,
+        /// or a column no far tile tops that is not near.
         under: i32,
         under_n: i32,
-        deep: i32,
-        deep_n: i32,
+        /// Near-square samples whose column is near (the far field leaves it to the chunks).
+        near_n: i32,
         sections: usize,
+        /// The first missing tops: station, the two tiles and which side had a top.
+        missing_at: Vec<String>,
+        /// The eye's column is topped by a far tile or left to the chunks as a near column.
         covered: bool,
         hash: u32,
         tiles: Vec<Tile>,
     }
 
+    /// Tile `pos` of `mesh` placed in storage (a chart tile counts from its patch origin; the patch
+    /// is storage +Y up), leaving out `clip`'s columns.
+    fn place_storage_tile(world: &crate::world::World, pos: SectionPos, mesh: &SectionMeshData) -> Tile {
+        let Some((ox, oz)) = world.terrain().chart_origin(pos.body, pos.face) else { return place_tile(pos, mesh) };
+        let mut t = place_tile(SectionPos { face: Face::PosY, ..pos }, mesh);
+        t.pos = pos;
+        (t.x0, t.x1, t.z0, t.z1) = (t.x0 + ox, t.x1 + ox, t.z0 + oz, t.z1 + oz);
+        for top in &mut t.tops {
+            (top[0], top[1], top[2], top[3]) = (top[0] + ox, top[1] + ox, top[2] + oz, top[3] + oz);
+        }
+        for w in &mut t.walls {
+            let (e, a) = if w[0] == 0 { (ox, oz) } else { (oz, ox) };
+            (w[1], w[2], w[3]) = (w[1] + e, w[2] + a, w[3] + a);
+        }
+        t
+    }
+
     fn frontier_counts(world: &mut crate::world::World, center: crate::coord::ChunkCoord) -> ChartFrontier {
-        use crate::world::quadtree;
         world.adopt_fold(center);
-        // The window streaming places around this centre, from scratch.
-        world.window = crate::world::streaming::Window::default();
-        world.place_window(center, true);
-        let desired = world.desired_sections(center);
-        let cut = quadtree::resolve_covering(&desired, Detail(9), &|_| true);
-        let drawn: Vec<SectionPos> = cut.iter().map(|(p, _)| *p).collect();
+        // The near field streaming lays out around this centre, from scratch.
+        let eye = world.phys_eye(center, false);
+        world.place_near(center, eye, true);
+        // Every tile meshes from its patch with the clip it takes once the near chunks settle, and
+        // is placed in storage, where the tiles of neighbouring charts meet.
+        let (desired, clips) = world.desired_and_clips(center);
         let tables = world.registry.hot_tables();
-        let mut tiles = Vec::with_capacity(drawn.len());
+        let mut tiles = Vec::with_capacity(desired.len());
         let mut hash = 0x811c9dc5u32;
         let mix = |h: &mut u32, b: u8| {
             *h ^= b as u32;
             *h = h.wrapping_mul(0x01000193);
         };
-        let mut order: Vec<SectionPos> = drawn.clone();
-        order.sort_by_key(|p| (p.detail, p.x, p.z));
+        let mut order: Vec<SectionPos> = desired.clone();
+        order.sort_by_key(|p| (p.face as u8, p.detail, p.x, p.z));
         for pos in &order {
-            let mesh = extract_section_mesh(*pos, world.terrain(), &[], &tables);
+            let clip = clips.get(pos).copied().unwrap_or_default();
+            let mesh = extract_section_mesh_with(*pos, world.terrain(), &[], &tables, clip, world.section_morphs(*pos));
             mix(&mut hash, mesh.shift);
+            mix(&mut hash, pos.face as u8);
             for b in mesh.altitude_floor.to_le_bytes() {
                 mix(&mut hash, b);
             }
@@ -1875,6 +2198,9 @@ mod tests {
                 mix(&mut hash, b);
             }
             for b in pos.z.to_le_bytes() {
+                mix(&mut hash, b);
+            }
+            for b in mesh.clip_drawn.0.to_le_bytes() {
                 mix(&mut hash, b);
             }
             for slab in &mesh.slabs {
@@ -1895,7 +2221,9 @@ mod tests {
                     }
                 }
             }
-            tiles.push(place_tile(*pos, &mesh));
+            let mut t = place_storage_tile(world, *pos, &mesh);
+            t.clip = mesh.clip_drawn;
+            tiles.push(t);
         }
         let mut bare = 0i32;
         for t in &tiles {
@@ -1904,7 +2232,7 @@ mod tests {
             while x < t.x1 {
                 let mut z = t.z0 + cell / 2;
                 while z < t.z1 {
-                    if top_at(t, x, z).is_none() {
+                    if top_at(t, x, z).is_none() && !clipped(t, x, z) {
                         bare += 1;
                     }
                     z += cell;
@@ -1919,54 +2247,52 @@ mod tests {
             }
         }
         let missing = gaps.iter().filter(|g| g.gap > 1_000_000).count();
+        let missing_at = gaps
+            .iter()
+            .filter(|g| g.gap > 1_000_000)
+            .take(2)
+            .map(|g| {
+                let t = tiles.iter().find(|t| (t.pos.x, t.pos.z) == g.a && t.pos.detail.0 == g.da);
+                let info = t.map(|t| {
+                    let near: Vec<_> = t.tops.iter().filter(|top| (top[0] - 2..=top[1] + 2).contains(&g.station)).map(|top| [top[0] - t.x0, top[1] - t.x0, top[2] - t.z0, top[3] - t.z0, top[4]]).collect();
+                    format!("clip {:#x} x0 {} z0 {} tops near {near:?} walls {}", t.clip.0, t.x0, t.z0, t.walls.len())
+                });
+                format!("station {} tops {}/{} d{} {:?} {:?} vs d{} {:?}", g.station, g.top_lo, g.top_hi, g.da, g.a, info, g.db, g.b)
+            })
+            .collect();
         let vertical = gaps.iter().filter(|g| g.gap <= 1_000_000).count();
         let cs = 16i32;
         let h = world.view.horizontal;
         let (x0, x1) = ((center.x - h) * cs, (center.x + h + 1) * cs);
         let (z0, z1) = ((center.z - h) * cs, (center.z + h + 1) * cs);
-        let mut under = 0i32;
-        let mut under_n = 0i32;
-        let mut deep = 0i32;
-        let mut deep_n = 0i32;
-        // A detail-0 tile still crossing the box edge overlaps it by less than its span.
-        let border = 32i32;
+        let (mut under, mut under_n, mut near_n) = (0i32, 0i32, 0i32);
+        let floor = world.seams.chart_seat(center).map_or(center.y, |s| (s.lo[1] / 16) as i32);
+        let near_at = |x: i32, z: i32| world.near.near_column(crate::coord::ChunkCoord::new(x.div_euclid(cs), floor, z.div_euclid(cs))).is_some();
         let mut x = x0 + cs / 2;
         while x < x1 {
             let mut z = z0 + cs / 2;
             while z < z1 {
                 under_n += 1;
                 let hit = tiles.iter().any(|t| top_at(t, x, z).is_some());
-                if !hit {
+                let near = near_at(x, z);
+                near_n += i32::from(near);
+                if hit == near {
                     under += 1;
-                }
-                if x - x0 >= border && x1 - x > border && z - z0 >= border && z1 - z > border {
-                    deep_n += 1;
-                    if !hit {
-                        deep += 1;
-                    }
                 }
                 z += cs;
             }
             x += cs;
         }
         let eye = ((center.x * cs + cs / 2), (center.z * cs + cs / 2));
-        let covered = desired.iter().any(|p| {
-            let (a, b) = (p.min_x(), p.min_z());
-            eye.0 >= a && eye.0 < a + p.span() && eye.1 >= b && eye.1 < b + p.span()
-        });
-        ChartFrontier {
-            bare,
-            gaps: vertical,
-            missing,
-            under,
-            under_n,
-            deep,
-            deep_n,
-            sections: desired.len(),
-            covered,
-            hash,
-            tiles,
-        }
+        let covered = near_at(eye.0, eye.1) || tiles.iter().any(|t| top_at(t, eye.0, eye.1).is_some());
+        ChartFrontier { bare, gaps: vertical, missing, under, under_n, near_n, sections: desired.len(), missing_at, covered, hash, tiles }
+    }
+
+    /// Whether tile `t` leaves storage column `(x, z)` to the full-res chunks. A point on the tile's
+    /// edge reads the column inside it.
+    fn clipped(t: &Tile, x: i32, z: i32) -> bool {
+        let (x, z) = (x.clamp(t.x0, t.x1 - 1), z.clamp(t.z0, t.z1 - 1));
+        !t.clip.is_empty() && t.clip.masks((x - t.x0).div_euclid(16), (z - t.z0).div_euclid(16))
     }
 
     /// Distance from far-field centre `center`'s column to the nearest ground sample (every `step`
@@ -2013,41 +2339,21 @@ mod tests {
         (radius, void)
     }
 
-    /// How far a frontier cut to the slot budget still tops all ground: the chart frontier keeps the
-    /// sections nearest the eye in the chart net, so every dropped one lies at least as far as the
-    /// farthest kept, and a sample it would have topped at most half its diagonal nearer. A seam
-    /// spends the budget early: a storage box's x edges are aligned to 256 blocks only, so each
-    /// coarse section straddling one splits into dozens down the seam.
-    fn capped_reach(world: &crate::world::World, desired: &[SectionPos], center: crate::coord::ChunkCoord) -> f64 {
-        let unfold = world.seams.unfold_at(center);
-        let eye = (i64::from(center.x) * 16 + 8, i64::from(center.z) * 16 + 8);
-        let kept = desired
-            .iter()
-            .map(|s| {
-                let half = i64::from(s.span()) / 2;
-                let (x, z) = unfold.fold_column(i64::from(s.min_x()) + half, i64::from(s.min_z()) + half).expect("a section in the net");
-                ((x - eye.0) as f64).hypot((z - eye.1) as f64)
-            })
-            .fold(0.0, f64::max);
-        let span = desired.iter().map(|s| s.span()).max().unwrap_or(0);
-        kept - f64::from(span) * std::f64::consts::FRAC_1_SQRT_2
-    }
-
     fn assert_chart_closed(name: &str, f: &ChartFrontier) {
         assert!(f.under_n > 0, "{name}: the near box was not sampled");
         assert_eq!(f.bare, 0, "{name}: bare columns");
         assert_eq!(f.gaps, 0, "{name}: vertical seam gaps");
-        assert_eq!(f.missing, 0, "{name}: missing tops");
-        assert_eq!(f.under, 0, "{name}: under-eye holes {}/{}", f.under, f.under_n);
-        assert!(f.covered, "{name}: no section covers the eye column");
+        assert_eq!(f.missing, 0, "{name}: missing tops {:?}", f.missing_at);
+        assert_eq!(f.under, 0, "{name}: near-square columns drawn twice or not at all {}/{}", f.under, f.under_n);
+        assert!(f.covered, "{name}: nothing draws the eye column");
     }
 
-    /// Start-world chart far field from altitude: the square under the eye is drawn, its columns
-    /// have tops, and the seams around it are closed. Spawn ground level keeps the punch on the
-    /// interior of the near box. The border, within one span-32 section, is drawn: that tile is
-    /// what covers the sliver outside the box. Bytes re-pinned to `0x46ae3b3a`: every level
-    /// samples the cell's first block and packs on one shared lattice (seed 42, diffusion,
-    /// default view). The window streaming places there is the eye band.
+    /// Start-world chart far field at spawn and from altitude: every tile's columns have tops or
+    /// are left to the near columns, the seams between tiles are closed, and each column of the
+    /// near square is drawn one way: by the far field, or (near, at spawn ground level) by the
+    /// chunks. Bytes re-pinned to `0x25d65e7b` when the cut became the distance rule's: chart tiles count
+    /// from their own patch, the finest tiles over near columns leave them out, and every level but
+    /// the coarsest carries its morph `dy` (seed 42, diffusion, default view).
     #[test]
     fn far_chart_altitude_frontier_is_closed() {
         use crate::render_config::RenderConfig;
@@ -2059,17 +2365,10 @@ mod tests {
         let (center, storage) = home_altitude_eye(&world, DVec3::new(0.0, 1.0, 0.0), 0.0);
         world.section_eye_y = storage.y;
         let spawn = frontier_counts(&mut world, center);
-        assert_eq!(spawn.hash, 0x46ae3b3a, "spawn ground-level far-field bytes changed");
-        assert_eq!(spawn.bare, 0, "spawn ground-level bare columns");
-        assert_eq!(spawn.gaps, 0, "spawn ground-level seam gaps");
-        assert_eq!(spawn.missing, 0, "spawn ground-level missing tops");
-        assert!(spawn.deep_n > 0, "spawn interior was not sampled");
-        assert_eq!(
-            spawn.deep, spawn.deep_n,
-            "spawn interior must keep the near-box punch ({}/{}, border under {}/{}, sections {})",
-            spawn.deep, spawn.deep_n, spawn.under, spawn.under_n, spawn.sections
-        );
-        assert!(!spawn.covered, "spawn ground level must keep the near-box punch at the eye");
+        println!("spawn: hash {:#x}, {} sections, {} of {} near-square columns near", spawn.hash, spawn.sections, spawn.near_n, spawn.under_n);
+        assert_eq!(spawn.hash, 0x25d65e7b, "spawn ground-level far-field bytes changed");
+        assert!(spawn.near_n > 0, "no column near spawn is near");
+        assert_chart_closed("spawn", &spawn);
 
         let sites = [("plus-y", DVec3::new(0.0, 1.0, 0.0)), ("highland", DVec3::new(1.0, 0.9, 0.8))];
         for (name, dir) in sites {
@@ -2083,10 +2382,10 @@ mod tests {
     }
 
     /// Start-world far field from high above the ground, where the near window is back in physical
-    /// space: the far field stands on the chart column under the eye, tops every column of the
-    /// ground under it out to three times the height (100 km at most), across seams into the
-    /// neighbour charts too, keeps the seams closed and the slot budget, and is the frontier it
-    /// would be with the near window on the chart (nothing changes at the near window's reach).
+    /// space: the far field stands on the chart column under the eye and tops every column of the
+    /// ground its horizon reaches, across seams into the neighbour charts too, with the seams
+    /// closed, within the slot budget, and the same cut whether or not the near window stands on
+    /// the chart. Past the horizon nothing draws (the body's impostor does).
     #[test]
     fn far_chart_high_altitude_is_closed() {
         use crate::render_config::RenderConfig;
@@ -2103,29 +2402,22 @@ mod tests {
                 let (near_c, far_c) = (storage_chunk(near), storage_chunk(far));
                 world.adopt_fold(near_c);
                 assert!(world.fold.is_identity(), "{name}: the near window is not in physical space");
+                let horizon = world.far_ground(far_c).map(|g| world.rule_on(g).horizon()).expect("a chart under the eye");
+                let ground = world.terrain().surface(Face::PosY, far.x.floor() as i32, far.z.floor() as i32);
+                let height = far.y - f64::from(ground);
                 let desired = world.desired_sections(far_c);
+                if height >= horizon {
+                    assert!(desired.is_empty(), "{name}: {} tiles past the horizon", desired.len());
+                    continue;
+                }
                 assert!(!desired.is_empty(), "{name}: no chart sections from altitude");
-                assert!(
-                    desired.len() <= world.sections_allowed(),
-                    "{name}: {} sections over the slot budget {}",
-                    desired.len(),
-                    world.sections_allowed()
-                );
+                assert!(desired.len() <= world.sections_allowed(), "{name}: {} sections over the slot budget {}", desired.len(), world.sections_allowed());
                 let got = frontier_counts(&mut world, far_c);
                 assert_eq!(world.desired_sections(far_c), desired, "{name}: the near window's chart changes the far field");
                 assert_chart_closed(&name, &got);
-                let ground = world.terrain().surface(Face::PosY, far.x.floor() as i32, far.z.floor() as i32);
-                let height = far.y - f64::from(ground);
                 let (topped, void) = topped_radius(&world, &got.tiles, far_c, 1024, 200_000);
-                let capped = desired.len() == world.sections_allowed();
-                let want = if capped { capped_reach(&world, &desired, far_c) } else { (3.0 * height).min(100_000.0) };
-                println!(
-                    "{name}: height {height:.0}, scale {}, sections {}{}, topped disc {topped} blocks (want {want:.0}), \
-                     {void} samples past a corner",
-                    world.far_scale,
-                    got.sections,
-                    if capped { " (at the slot budget)" } else { "" }
-                );
+                let want = (horizon * horizon - height * height).sqrt() - 2.0 * 8192.0;
+                println!("{name}: height {height:.0}, sections {}, topped disc {topped} blocks (want {want:.0}), {void} samples past a corner", got.sections);
                 assert!(f64::from(topped) >= want, "{name}: topped disc {topped} short of {want:.0}");
             }
         }
@@ -2481,4 +2773,636 @@ mod tests {
             }
         }
     }
+
+    /// Faces by the packed cell they cover: `(normal, x, native y, z)` to every layer drawn there.
+    /// AO and the border nudge are left out.
+    type UnitFaces = std::collections::HashMap<([i8; 3], i32, i32, i32), Vec<u16>>;
+
+    fn unit_faces(mesh: &SectionMeshData) -> UnitFaces {
+        let step = 1i32 << mesh.shift;
+        let mut out = UnitFaces::new();
+        for slab in &mesh.slabs {
+            for p in Pass::ALL {
+                for q in slab.data[p].vertices().chunks_exact(4) {
+                    let pos: Vec<[i32; 3]> = q.iter().map(|v| v.local_pos().map(|c| c as i32)).collect();
+                    let lo = |a: usize| pos.iter().map(|p| p[a]).min().unwrap();
+                    let hi = |a: usize| pos.iter().map(|p| p[a]).max().unwrap();
+                    let span = |a: usize| lo(a)..hi(a).max(lo(a) + 1);
+                    let dir = q[0].normal().direction();
+                    let axis = (0..3).find(|&a| dir[a] != 0).unwrap();
+                    let plane = pos[0][axis] - i32::from(dir[axis] > 0);
+                    let range = |a: usize| if a == axis { plane..plane + 1 } else { span(a) };
+                    for x in range(0) {
+                        for y in range(1) {
+                            for z in range(2) {
+                                out.entry((dir, x, slab.origin_y as i32 + y * step, z)).or_default().push(q[0].layer());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for v in out.values_mut() {
+            v.sort_unstable();
+        }
+        out
+    }
+
+    /// Clipped packed column test for a mesh of shift `shift` (32 columns packed).
+    fn clipped_at(clip: ColumnClip, shift: u8, col_shift: u32) -> impl Fn(i32, i32) -> bool {
+        let n = (SECTION_N as i32) >> shift;
+        move |x, z| (0..n).contains(&x) && (0..n).contains(&z) && clip.masks(x >> col_shift, z >> col_shift)
+    }
+
+    /// Outside the clip `cut` draws exactly what `whole` does; a clipped column draws nothing.
+    /// Faces of a kept column toward a clipped one (the clip's walls) are left out.
+    fn assert_same_outside(tag: &str, cut: &SectionMeshData, whole: &SectionMeshData, clip: ColumnClip, col_shift: u32) {
+        let masked = clipped_at(clip, whole.shift, col_shift);
+        let wall = |k: &([i8; 3], i32, i32, i32)| masked(k.1 + i32::from(k.0[0]), k.3 + i32::from(k.0[2]));
+        let (a, b) = (unit_faces(cut), unit_faces(whole));
+        for (k, v) in &a {
+            assert!(!masked(k.1, k.3), "{tag}: a face on clipped column {k:?}");
+            if !wall(k) {
+                assert_eq!(b.get(k), Some(v), "{tag}: face {k:?} differs from the whole mesh");
+            }
+        }
+        for (k, v) in &b {
+            if !masked(k.1, k.3) && !wall(k) {
+                assert_eq!(a.get(k), Some(v), "{tag}: the clip lost face {k:?}");
+            }
+        }
+    }
+
+    /// The generic clip instance with nothing clipped meshes byte for byte what the plain one does.
+    fn assert_clip_instance_parity(tag: &str, native: &[BlockId], n_cells: usize, tables: &HotTables, floor: Option<i32>, alo: i32, cell: i32) {
+        let plain = mesh_packed::<false>(native, n_cells, tables, floor, alo, cell, true, ColumnClip::NONE);
+        let generic = mesh_packed::<true>(native, n_cells, tables, floor, alo, cell, true, ColumnClip::NONE);
+        assert_eq!(flatten(&generic), flatten(&plain), "{tag}: the clip instance moved bytes");
+        assert_eq!(generic.clip_drawn, ColumnClip::NONE);
+    }
+
+    /// On ground without overhangs, a clipped finest section draws nothing on its clipped columns,
+    /// draws what the whole section does on the rest, and every kept column beside a clipped one
+    /// walls it off from its top down to the slab floor, so no ray past the clip's edge sees under
+    /// the far field.
+    #[test]
+    fn clipped_columns_are_walled_off_and_the_rest_is_unchanged() {
+        let (_r, tables, b) = setup();
+        let (stone, grass) = (b.stone, b.grass);
+        let height = |x: i32, z: i32| 150 + (x + 2 * z) / 6;
+        let r#gen = FnGen {
+            h: height,
+            b: move |x, y, z| if y < height(x, z) { stone } else { AIR },
+            surf: move |_, _| grass,
+            deep: stone,
+        };
+        let sec = extract(FINEST, &r#gen);
+        let n_cells = (super::super::DOMAIN_H / CELL) as usize;
+        let mut native = vec![AIR; SECTION_N * SECTION_N * n_cells];
+        fill_from_section(&mut native, n_cells, &sec);
+        assert_clip_instance_parity("slope", &native, n_cells, &tables, None, 0, CELL);
+        let whole = mesh_section_with(n_cells, &tables, None, 0, CELL, true, ColumnClip::NONE, |dense| fill_from_section(dense, n_cells, &sec));
+        let rect = (2..6).flat_map(|z| (1..4).map(move |x| ColumnClip::of_column(x, z))).fold(ColumnClip::NONE, ColumnClip::union);
+        for clip in [ColumnClip(0x0F0F_0F0F), ColumnClip(0xAA55_AA55_AA55_AA55), rect, ColumnClip(u64::MAX)] {
+            let mesh = mesh_section_with(n_cells, &tables, None, 0, CELL, true, clip, |dense| fill_from_section(dense, n_cells, &sec));
+            assert_eq!(mesh.clip_drawn, clip);
+            assert_same_outside(&format!("clip {:#x}", clip.0), &mesh, &whole, clip, 1);
+            let faces = unit_faces(&mesh);
+            let step = 1i32 << mesh.shift;
+            let Some(floor) = mesh.slabs.iter().map(|s| s.origin_y as i32).min() else {
+                assert_eq!(clip, ColumnClip(u64::MAX), "only a full clip draws nothing");
+                continue;
+            };
+            let n = (SECTION_N as i32) >> mesh.shift;
+            let masked = clipped_at(clip, mesh.shift, 1);
+            for z in 0..n {
+                for x in 0..n {
+                    let top = faces.keys().filter(|k| k.0 == [0, 1, 0] && k.1 == x && k.3 == z).map(|k| k.2 + step).max();
+                    if masked(x, z) {
+                        assert_eq!(top, None, "clipped column ({x}, {z}) has a top");
+                        continue;
+                    }
+                    let top = top.unwrap_or_else(|| panic!("column ({x}, {z}) has no top"));
+                    for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                        if !masked(x + dx, z + dz) {
+                            continue;
+                        }
+                        for y in (floor..top).step_by(step as usize) {
+                            assert!(faces.contains_key(&([dx as i8, 0, dz as i8], x, y, z)), "clip {:#x}: no wall at ({x}, {y}, {z}) toward ({dx}, {dz})", clip.0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A section whose packed columns are wider than a chunk (the relief shift) cannot follow a
+    /// clip: it meshes whole and reports none. Start-world chart sections around spawn take the
+    /// clip, and draw what the whole section does outside it.
+    #[test]
+    fn real_sections_take_a_clip_or_report_none() {
+        use crate::render_config::RenderConfig;
+        use crate::world::World;
+        use crate::world::generation::WorldgenKind;
+        let world = World::with_kind(42, RenderConfig::default(), WorldgenKind::Diffusion, false);
+        let (centre, storage) = home_altitude_eye(&world, voxel_engine::DVec3::new(0.3, 1.0, 0.2), 0.0);
+        let seat = world.seams.chart_seat(centre).expect("spawn is charted");
+        let body = super::super::CHART_BODY_BASE + seat.index as u16;
+        let terra = world.terrain();
+        let tables = world.registry.hot_tables();
+        let span = f64::from(super::super::section_span(FINEST_DETAIL));
+        let mut checked = 0;
+        for (dx, dz) in [(0, 0), (3, -2), (-5, 1), (8, 8)] {
+            let (x, z) = ((storage.x + span * f64::from(dx)) as i64, (storage.z + span * f64::from(dz)) as i64);
+            let pos = world.tile_at(body, FINEST_DETAIL, x, z).expect("a chart tile");
+            let Some((alo, ahi)) = super::section_window(pos, terra) else { continue };
+            let n_cells = ((ahi - alo) / pos.cell_size()) as usize;
+            let mut native = vec![AIR; SECTION_N * SECTION_N * n_cells];
+            super::sample_columns(pos, terra, &[], alo, n_cells, &mut native);
+            let floor = super::ring_floor_face(pos, terra, alo);
+            assert_clip_instance_parity(&format!("{pos:?}"), &native, n_cells, &tables, Some(floor), alo, pos.cell_size());
+            let whole = extract_section_mesh(pos, terra, &[], &tables);
+            for clip in [ColumnClip(0x00FF_00FF_00FF_00FF), ColumnClip::of_column(3, 4)] {
+                let cut = extract_section_mesh_with(pos, terra, &[], &tables, clip, true);
+                if u32::from(whole.shift) != super::pack_shift(SECTION_N as i32) {
+                    assert_eq!(cut.clip_drawn, ColumnClip::NONE, "{pos:?}: a relief-shift section clipped");
+                    assert_eq!(flatten(&cut), flatten(&whole));
+                    continue;
+                }
+                assert_eq!(cut.clip_drawn, clip);
+                assert_same_outside(&format!("{pos:?} {:#x}", clip.0), &cut, &whole, clip, 1);
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "no section took a clip");
+        let wide = world.tile_at(body, crate::ident::Detail(FINEST_DETAIL.0 + 1), storage.x as i64, storage.z as i64).expect("a chart tile");
+        assert_eq!(extract_section_mesh_with(wide, terra, &[], &tables, ColumnClip(1), true).clip_drawn, ColumnClip::NONE, "a tile wider than eight columns cannot clip");
+    }
+
+    fn xs32(state: &mut u64) -> u32 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *state = x;
+        x as u32
+    }
+
+    /// Home-chart body and the middle of its +Y patch, counted from the patch.
+    fn home_chart(terra: &Terrain) -> (u16, i32, i32) {
+        use crate::space::atlas::Patch;
+        let home = terra.cosmos().expect("cosmos").home();
+        let index = terra
+            .atlases()
+            .iter()
+            .position(|a| (a.centre - home.centre_f()).length() < 1.0)
+            .expect("home chart");
+        let (_, size) = terra.atlases()[index].storage_box(Patch::Shell { band: 0, face: Face::PosY });
+        (super::super::CHART_BODY_BASE + index as u16, (size[0] / 2) as i32, (size[2] / 2) as i32)
+    }
+
+    /// Highest +Y at `(x, z)` after moving each vertex by `a_num/100` of its `dy`.
+    fn column_top_a(pos: SectionPos, mesh: &SectionMeshData, x: i32, z: i32, a_num: i32) -> Option<i64> {
+        let detail = Detail(pos.detail.0.saturating_add(mesh.shift as i8));
+        let scale = 1i64 << detail.0;
+        let mut best: Option<i64> = None;
+        for slab in &mesh.slabs {
+            let place = crate::world::SectionState::slab_placement(pos, slab.origin_y, detail, mesh.altitude_floor);
+            for pass in Pass::ALL {
+                for q in slab.data[pass].vertices().chunks_exact(4) {
+                    if q[0].normal() != Normal::PosY {
+                        continue;
+                    }
+                    let mut minx = i32::MAX;
+                    let mut maxx = i32::MIN;
+                    let mut minz = i32::MAX;
+                    let mut maxz = i32::MIN;
+                    let mut y0 = 0i64;
+                    let mut flat = true;
+                    for (i, v) in q.iter().enumerate() {
+                        let p = v.local_pos();
+                        let gx = place.block.x.wrapping_add((p[0] as i32).wrapping_mul(scale as i32));
+                        let gz = place.block.z.wrapping_add((p[2] as i32).wrapping_mul(scale as i32));
+                        let gy = i64::from(place.block.y)
+                            + i64::from(p[1] as i32) * scale
+                            + i64::from(v.morph()) * scale * i64::from(a_num) / 100;
+                        if i == 0 {
+                            y0 = gy;
+                        } else if gy != y0 {
+                            flat = false;
+                        }
+                        minx = minx.min(gx);
+                        maxx = maxx.max(gx);
+                        minz = minz.min(gz);
+                        maxz = maxz.max(gz);
+                    }
+                    if flat && x >= minx && x <= maxx && z >= minz && z <= maxz {
+                        best = Some(best.map_or(y0, |b| b.max(y0)));
+                    }
+                }
+            }
+        }
+        best
+    }
+
+    fn count_pm31(mesh: &SectionMeshData) -> u32 {
+        let mut n = 0u32;
+        for slab in &mesh.slabs {
+            for p in Pass::ALL {
+                for v in slab.data[p].vertices() {
+                    let m = v.morph();
+                    if m == 31 || m == -31 {
+                        n += 1;
+                    }
+                }
+            }
+        }
+        n
+    }
+
+    fn morph_clears_without_touching_other_bits(v: MeshVertex) -> bool {
+        let c = v.with_morph(0);
+        c.morph() == 0
+            && v.local_pos() == c.local_pos()
+            && v.normal() == c.normal()
+            && v.layer() == c.layer()
+            && v.ao() == c.ao()
+            && v.light() == c.light()
+            && v.micro() == c.micro()
+            && v.is_water() == c.is_water()
+    }
+
+    type Vk = (i32, i64, i32);
+
+    fn morph_key(origin_y: i32, step: i32, v: MeshVertex, a_num: i32) -> Vk {
+        let p = v.local_pos();
+        let yk = (i64::from(origin_y) + i64::from(p[1] as i32) * i64::from(step)) * 100
+            + i64::from(v.morph()) * i64::from(a_num) * i64::from(step);
+        (p[0] as i32, yk, p[2] as i32)
+    }
+
+    fn quad_has_area(q: [Vk; 4]) -> bool {
+        let (ax, ay, az) = q[0];
+        let ux = i64::from(q[1].0 - ax);
+        let uy = q[1].1 - ay;
+        let uz = i64::from(q[1].2 - az);
+        let vx = i64::from(q[3].0 - ax);
+        let vy = q[3].1 - ay;
+        let vz = i64::from(q[3].2 - az);
+        uy * vz - uz * vy != 0 || uz * vx - ux * vz != 0 || ux * vy - uy * vx != 0
+    }
+
+    fn on_section_border(a: Vk, b: Vk, n: i32) -> bool {
+        (a.0 == 0 && b.0 == 0) || (a.0 == n && b.0 == n) || (a.2 == 0 && b.2 == 0) || (a.2 == n && b.2 == n)
+    }
+
+    /// Closed after the move: every edge is shared by exactly one other quad, except
+    /// section-border edges and the double-sided seam pair (degenerate at a = 0, the
+    /// parent side at a = 1). T-junctions are split before the count. Zero-area quads
+    /// (a collapsed side, a seam that has not opened) contribute no edges.
+    fn assert_watertight(tag: &str, mesh: &SectionMeshData, a_num: i32) {
+        assert_closed(tag, mesh, a_num, ColumnClip::NONE, 0);
+    }
+
+    /// Whether edge `a`-`b` lies against a clipped packed column (the clip's own border).
+    fn on_clip_border(a: Vk, b: Vk, clip: ColumnClip, col_shift: u32, n: i32) -> bool {
+        let span = |p: i32, q: i32| if p == q { (p - 1, p) } else { (p.min(q), p.max(q) - 1) };
+        let ((x0, x1), (z0, z1)) = (span(a.0, b.0), span(a.2, b.2));
+        (x0.max(0)..=x1.min(n - 1)).any(|x| (z0.max(0)..=z1.min(n - 1)).any(|z| clip.masks(x >> col_shift, z >> col_shift)))
+    }
+
+    /// [`assert_watertight`] where the clip's border edges may be used once, like the section's.
+    /// Packed column `x` lies in chunk column `x >> col_shift`.
+    fn assert_closed(tag: &str, mesh: &SectionMeshData, a_num: i32, clip: ColumnClip, col_shift: u32) {
+        if mesh.slabs.is_empty() || mesh.shift == 0 {
+            return;
+        }
+        let step = 1i32 << mesh.shift;
+        let n = (SECTION_N as i32) >> mesh.shift;
+        let mut kept: Vec<(bool, u8, [Vk; 4])> = Vec::new();
+        for slab in &mesh.slabs {
+            for p in Pass::ALL {
+                for q in slab.data[p].vertices().chunks_exact(4) {
+                    let seam = matches!(q[0].normal(), Normal::PosX | Normal::NegX | Normal::PosZ | Normal::NegZ)
+                        && q.iter().all(|v| v.local_pos()[1] == q[0].local_pos()[1]);
+                    let keys = std::array::from_fn(|i| morph_key(slab.origin_y as i32, step, q[i], a_num));
+                    if quad_has_area(keys) {
+                        kept.push((seam, q[0].normal() as u8, keys));
+                    }
+                }
+            }
+        }
+        let mut by_xz: std::collections::HashMap<(i32, i32), Vec<i64>> = std::collections::HashMap::new();
+        let mut by_xy: std::collections::HashMap<(i32, i64), Vec<i32>> = std::collections::HashMap::new();
+        let mut by_yz: std::collections::HashMap<(i64, i32), Vec<i32>> = std::collections::HashMap::new();
+        for (_, _, q) in &kept {
+            for &v in q {
+                by_xz.entry((v.0, v.2)).or_default().push(v.1);
+                by_xy.entry((v.0, v.1)).or_default().push(v.2);
+                by_yz.entry((v.1, v.2)).or_default().push(v.0);
+            }
+        }
+        for bin in by_xz.values_mut() {
+            bin.sort_unstable();
+            bin.dedup();
+        }
+        for bin in by_xy.values_mut() {
+            bin.sort_unstable();
+            bin.dedup();
+        }
+        for bin in by_yz.values_mut() {
+            bin.sort_unstable();
+            bin.dedup();
+        }
+        let mut counts: std::collections::HashMap<(Vk, Vk), (u16, u16)> = std::collections::HashMap::new();
+        for (seam, _, q) in &kept {
+            for e in 0..4 {
+                let (a, b) = (q[e], q[(e + 1) % 4]);
+                if a == b {
+                    continue;
+                }
+                let mut pts = vec![a, b];
+                if a.1 == b.1 && a.2 == b.2 {
+                    if let Some(xs) = by_yz.get(&(a.1, a.2)) {
+                        let (lo, hi) = if a.0 < b.0 { (a.0, b.0) } else { (b.0, a.0) };
+                        for &x in xs {
+                            if x > lo && x < hi {
+                                pts.push((x, a.1, a.2));
+                            }
+                        }
+                    }
+                } else if a.0 == b.0 && a.1 == b.1 {
+                    if let Some(zs) = by_xy.get(&(a.0, a.1)) {
+                        let (lo, hi) = if a.2 < b.2 { (a.2, b.2) } else { (b.2, a.2) };
+                        for &z in zs {
+                            if z > lo && z < hi {
+                                pts.push((a.0, a.1, z));
+                            }
+                        }
+                    }
+                } else if a.0 == b.0 && a.2 == b.2 {
+                    if let Some(ys) = by_xz.get(&(a.0, a.2)) {
+                        let (lo, hi) = if a.1 < b.1 { (a.1, b.1) } else { (b.1, a.1) };
+                        for &y in ys {
+                            if y > lo && y < hi {
+                                pts.push((a.0, y, a.2));
+                            }
+                        }
+                    }
+                }
+                pts.sort_unstable();
+                pts.dedup();
+                for w in pts.windows(2) {
+                    let key = if w[0] <= w[1] { (w[0], w[1]) } else { (w[1], w[0]) };
+                    let slot = counts.entry(key).or_insert((0, 0));
+                    if *seam { slot.1 += 1; } else { slot.0 += 1; }
+                }
+            }
+        }
+        let mut bad_n = 0usize;
+        let mut bad = Vec::new();
+        for (edge, count) in &counts {
+            let border = on_section_border(edge.0, edge.1, n) || on_clip_border(edge.0, edge.1, clip, col_shift, n);
+            let (solid, seam) = *count;
+            // A seam pair is the double-sided parent side where two child tops matched.
+            // Diagonal columns put four logical faces on one edge; each culled side is
+            // a pair, so the solid/seam counts step by (1, 2): (4, 0) (3, 2) (2, 4)
+            // (1, 6) (0, 8). A flat wall plus one fin is (2, 2); a top or a single wall
+            // meeting a pair is (1, 2); the pair alone or two pairs on one vertical
+            // are (0, 2) and (0, 4).
+            let ok = match (solid, seam, border) {
+                (2, 0, _) | (1, 2, _) | (2, 2, _) | (0, 2, _) | (0, 4, _) => true,
+                (4, 0, _) | (3, 2, _) | (2, 4, _) | (1, 6, _) | (0, 8, _) => true,
+                (1, 0, true) => true,
+                _ => false,
+            };
+            if !ok {
+                bad_n += 1;
+                if bad.len() < 6 {
+                    bad.push((solid, seam, border, *edge));
+                }
+            }
+        }
+        if bad_n > 0 {
+            let (_, _, _, (a, b)) = bad[0];
+            let covers = |p: Vk, r: Vk, a: Vk, b: Vk| {
+                p.0 == r.0 && p.0 == a.0 && p.2 == r.2 && p.2 == a.2 && {
+                    let (lo, hi) = if p.1 < r.1 { (p.1, r.1) } else { (r.1, p.1) };
+                    let (ya, yb) = if a.1 < b.1 { (a.1, b.1) } else { (b.1, a.1) };
+                    lo <= ya && hi >= yb
+                }
+            };
+            let hits: Vec<_> = kept
+                .iter()
+                .filter(|(_, _, q)| (0..4).any(|i| covers(q[i], q[(i + 1) % 4], a, b)))
+                .map(|(seam, nrm, q)| (*seam, *nrm, *q))
+                .take(8)
+                .collect();
+            panic!("watertight {tag} a={a_num}/100: {bad_n} bad edges, first {bad:?} quads {hits:?}");
+        }
+    }
+
+    fn chart_sections(terra: &Terrain) -> Vec<SectionPos> {
+        let (body, cx, cz) = home_chart(terra);
+        let mut state = (cx as u64).wrapping_mul(0x9E37_79B9) ^ ((cz as u64) << 1) ^ 0xA5A5_5A5A;
+        let mut sites = vec![(cx, cz), (cx + 2048, cz), (cx - 1536, cz + 768)];
+        for _ in 0..2 {
+            let dx = (xs32(&mut state) % 6001) as i32 - 3000;
+            let dz = (xs32(&mut state) % 6001) as i32 - 3000;
+            sites.push((cx + dx, cz + dz));
+        }
+        let mut out = Vec::new();
+        for detail in FINEST_DETAIL.0..=FINEST_DETAIL.0 + 3 {
+            for &(wx, wz) in &sites {
+                out.push(section_at(body, Face::PosY, Detail(detail), wx, wz));
+            }
+        }
+        out
+    }
+
+    /// At a = 1 the child's top heightmap equals the parent's, parent column by parent
+    /// column. Relief-shift sections stay at dy 0. Columns whose unclamped dy does not
+    /// fit ±31 are counted and left out: clamping cannot reach the parent top.
+    #[test]
+    fn morph_child_matches_parent_top() {
+        const OWNER: i64 = 1791184794939118871;
+        for seed in [42i64, OWNER] {
+            let mut registry = BlockRegistry::with_builtins();
+            let terra = Terrain::new(&mut registry, seed);
+            let tables = registry.hot_tables();
+            let mut pm31 = 0u32;
+            let mut over = 0u32;
+            let mut neg = 0u32;
+            let mut compared = 0u32;
+            let mut fallbacks = 0u32;
+            let mut skipped = 0u32;
+            let nest = super::pack_shift(SECTION_N as i32);
+            for child_pos in chart_sections(&terra) {
+                if super::section_window(child_pos, &terra).is_none() {
+                    continue;
+                }
+                let parent_pos = child_pos.parent();
+                let child = extract_section_mesh(child_pos, &terra, &[], &tables);
+                let parent = extract_section_mesh(parent_pos, &terra, &[], &tables);
+                pm31 += count_pm31(&child);
+                if child.slabs.is_empty() {
+                    continue;
+                }
+                if child.shift as u32 != nest {
+                    fallbacks += 1;
+                    assert!(all_quads(&child).all(|(_, q)| q.iter().all(|v| v.morph() == 0)), "a relief-shift section morphed");
+                    continue;
+                }
+                if parent.slabs.is_empty() || parent.shift as u32 != nest {
+                    skipped += 1;
+                    continue;
+                }
+                let parent_tile = place_tile(parent_pos, &parent);
+                let cc = child_pos.cell_size();
+                let step = 1i32 << child.shift;
+                let scale = i64::from(cc) * i64::from(step);
+                let span = cc * 4;
+                for pz in 0..8 {
+                    for px in 0..8 {
+                        let x = child_pos.min_x().wrapping_add(px * span + span / 2);
+                        let z = child_pos.min_z().wrapping_add(pz * span + span / 2);
+                        let Some(p_top) = top_at(&parent_tile, x, z) else { continue };
+                        let mut clamp = false;
+                        for dz in 0..2 {
+                            for dx in 0..2 {
+                                let cx = px * 2 + dx;
+                                let cz = pz * 2 + dz;
+                                let sx = child_pos.min_x().wrapping_add(cx * cc * step + cc * step / 2);
+                                let sz = child_pos.min_z().wrapping_add(cz * cc * step + cc * step / 2);
+                                let Some(ct) = column_top_a(child_pos, &child, sx, sz, 0) else { continue };
+                                let raw = i64::from(p_top) - ct;
+                                if raw.rem_euclid(scale) != 0 {
+                                    continue;
+                                }
+                                let dy = raw.div_euclid(scale);
+                                if dy < 0 {
+                                    neg += 1;
+                                }
+                                if dy.abs() > 31 {
+                                    clamp = true;
+                                    over += 1;
+                                }
+                            }
+                        }
+                        if clamp {
+                            continue;
+                        }
+                        let got = column_top_a(child_pos, &child, x, z, 100);
+                        assert_eq!(
+                            got,
+                            Some(i64::from(p_top)),
+                            "seed {seed} {child_pos:?} parent column ({px},{pz}) at {x},{z}"
+                        );
+                        compared += 1;
+                    }
+                }
+            }
+            println!(
+                "morph_target seed={seed}: compared={compared} fallbacks={fallbacks} parent_skipped={skipped} \
+                 neg_columns={neg} columns_over_31={over} vertices_pm31={pm31}"
+            );
+            assert!(compared > 0, "seed {seed} compared no columns");
+        }
+    }
+
+    /// The moved mesh stays closed at a partial band and at the parent. Seam pairs are
+    /// a double-sided skirt; section-border edges may be used once.
+    #[test]
+    fn morph_stays_watertight() {
+        const OWNER: i64 = 1791184794939118871;
+        for seed in [42i64, OWNER] {
+            let mut registry = BlockRegistry::with_builtins();
+            let terra = Terrain::new(&mut registry, seed);
+            let tables = registry.hot_tables();
+            let mut n = 0u32;
+            for child_pos in chart_sections(&terra) {
+                if super::section_window(child_pos, &terra).is_none() {
+                    continue;
+                }
+                let child = extract_section_mesh(child_pos, &terra, &[], &tables);
+                if child.slabs.is_empty() {
+                    continue;
+                }
+                assert_watertight(&format!("{child_pos:?}"), &child, 37);
+                assert_watertight(&format!("{child_pos:?}"), &child, 100);
+                n += 1;
+            }
+            assert!(n > 0, "seed {seed} meshed nothing");
+        }
+    }
+
+    /// a = 0 does not move a vertex, and writing dy leaves every other vertex field alone.
+    /// A flat top still merges; its non-morph bits match a mesh built with morph off.
+    #[test]
+    fn morph_is_inert_at_zero() {
+        let (_r, tables, b) = setup();
+        let flat = extract(FINEST, &terrain_gen(&b, 200, 0, None));
+        let on = build_section_mesh(&flat, &tables, None);
+        let n_cells = (super::super::DOMAIN_H / flat.pos().cell_size()) as usize;
+        let off = super::mesh_section_with(n_cells, &tables, None, 0, flat.pos().cell_size(), false, ColumnClip::NONE, |dense| {
+            super::fill_from_section(dense, n_cells, &flat);
+        });
+        let tops = |m: &SectionMeshData| {
+            all_quads(m).filter(|(_, q)| q[0].normal() == Normal::PosY).collect::<Vec<_>>()
+        };
+        let (on_tops, off_tops) = (tops(&on), tops(&off));
+        assert_eq!(on_tops.len(), 1, "flat top still merges");
+        assert_eq!(off_tops.len(), 1);
+        for (a, c) in on_tops[0].1.iter().zip(off_tops[0].1.iter()) {
+            assert!(morph_clears_without_touching_other_bits(*a));
+            let cleared = a.with_morph(0);
+            assert_eq!(cleared.local_pos(), c.local_pos());
+            assert_eq!(cleared.normal(), c.normal());
+            assert_eq!(cleared.layer(), c.layer());
+            assert_eq!(cleared.ao(), c.ao());
+            assert_eq!(cleared.micro(), c.micro());
+        }
+        assert!(on_tops[0].1.iter().all(|v| v.morph() == on_tops[0].1[0].morph()));
+
+        const OWNER: i64 = 1791184794939118871;
+        for seed in [42i64, OWNER] {
+            let mut registry = BlockRegistry::with_builtins();
+            let terra = Terrain::new(&mut registry, seed);
+            let tables = registry.hot_tables();
+            for pos in chart_sections(&terra) {
+                if super::section_window(pos, &terra).is_none() {
+                    continue;
+                }
+                let morphed = extract_section_mesh(pos, &terra, &[], &tables);
+                let plain = super::extract_section_mesh_with(pos, &terra, &[], &tables, ColumnClip::NONE, false);
+                assert!(all_quads(&plain).all(|(_, q)| q.iter().all(|v| v.morph() == 0)));
+                let step = 1i32 << morphed.shift.max(1);
+                let cell = pos.cell_size() * step;
+                let nx = SECTION_N as i32 / step;
+                for z in 0..nx {
+                    for x in 0..nx {
+                        let wx = pos.min_x().wrapping_add(x * cell + cell / 2);
+                        let wz = pos.min_z().wrapping_add(z * cell + cell / 2);
+                        assert_eq!(
+                            column_top_a(pos, &morphed, wx, wz, 0),
+                            column_top_a(pos, &plain, wx, wz, 0),
+                            "a=0 top moved at {pos:?} ({x},{z})"
+                        );
+                    }
+                }
+                for (_, q) in all_quads(&morphed) {
+                    assert!(q.iter().all(|v| morph_clears_without_touching_other_bits(*v)));
+                    if q[0].normal() == Normal::PosY {
+                        assert!(q.iter().all(|v| v.morph() == q[0].morph()), "a top quad carries two dys");
+                    }
+                    let seam = matches!(q[0].normal(), Normal::PosX | Normal::NegX | Normal::PosZ | Normal::NegZ)
+                        && q.iter().all(|v| v.local_pos()[1] == q[0].local_pos()[1]);
+                    if seam {
+                        assert_eq!(q[0].micro(), [0, 0, 0], "a seam carries border micro");
+                    }
+                }
+            }
+        }
+    }
+
 }
