@@ -2735,3 +2735,45 @@ fn worldgen_digest_is_pinned() {
     let got: Vec<u64> = DIGEST_SEEDS.iter().map(|&s| worldgen_digest(s)).collect();
     assert_eq!(got, DIGEST_PINS, "worldgen digest changed; if intended, pin: [{:#018x}, {:#018x}, {:#018x}]", got[0], got[1], got[2]);
 }
+
+/// What a server and a joiner build from the Welcome's seed and knobs is one universe of the same
+/// matter, though the joiner's table interned other configurations first (so its ids differ); the
+/// content id they compare ignores interns.
+#[test]
+fn a_joiner_with_another_table_grows_the_same_universe() {
+    let seed = 157;
+    let mut server = BlockRegistry::with_builtins();
+    let mut joiner = BlockRegistry::with_builtins();
+    // The palette's last role first: every later id in the joiner's table shifts.
+    let entries = palette::of(joiner.law());
+    joiner.intern(&entries[entries.len() - 1].config).expect("room");
+    let id_before = crate::net::content_id(&joiner);
+    let a = Terrain::new(&mut server, seed);
+    let b = Terrain::new(&mut joiner, seed);
+    assert_eq!(crate::net::content_id(&server), crate::net::content_id(&joiner));
+    assert_eq!(crate::net::content_id(&joiner), id_before, "interning the suites leaves the content id");
+    assert_eq!(a.cosmos.bodies(), b.cosmos.bodies());
+    assert_eq!(a.cosmos.suites(), b.cosmos.suites());
+    let spawn = a.chart_spawn().expect("a charted start world");
+    assert_eq!(Some(spawn), b.chart_spawn());
+    let atlas = a.storage.home_atlas().expect("charted");
+    let cell = atlas.storage_of(spawn).expect("on the chart");
+    let (cx, cy, cz) = chunk_of(cell);
+    let mut chunks = vec![(cx, cy - 1, cz), (cx, cy - 8, cz), (cx, cy - 200, cz)];
+    for body in a.cosmos.bodies().iter().filter(|b| b.id != 0).take(6) {
+        if let cosmos::Shape::Cube { .. } = body.shape {
+            chunks.push(face_centre_chunk(&a, body, Face::PosY));
+        } else if let Some(atlas) = a.atlases().iter().find(|at| at.grid.is_none() && (at.centre - body.centre_f()).length() < 1.0) {
+            let b0 = atlas.bands[0];
+            let s = atlas.storage(Patch::Shell { band: 0, face: Face::PosY }, [b0.n / 2, 0, b0.n / 2]);
+            let y = a.surface(Face::PosY, s[0] as i32, s[2] as i32);
+            chunks.push((s[0] as i32 >> 4, (y - 1) >> 4, s[2] as i32 >> 4));
+        }
+    }
+    for (x, y, z) in chunks {
+        let (da, db) = (a.generate(x, y, z), b.generate(x, y, z));
+        for i in 0..CHUNK_VOLUME {
+            assert_eq!(server.configuration(da.get(i)), joiner.configuration(db.get(i)), "chunk ({x},{y},{z}) cell {i}");
+        }
+    }
+}
