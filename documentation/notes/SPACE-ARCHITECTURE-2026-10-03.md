@@ -23,7 +23,7 @@ InfiniteDiffusion v4 universe. Every task directive refers back to the section n
 
 | Stage | In scope | Where |
 |---|---|---|
-| 0 Geometry lab | yes — mappings, metrics at face centre/edge/corner/depths, core transition, report | `src/bin/planet_lab.rs`, `src/space/chart.rs` |
+| 0 Geometry lab | yes — mappings, metrics at face centre/edge/corner/depths, core transition, report | `src/space/chart.rs` (the stage-0 lab binary was removed in 0.6.1; see git history) |
 | 1 Identity & conservation | yes — amount = occurrence count, mass ledger, conservation tests | `src/gravity/mass.rs`, registry |
 | 2 Matter-derived gravity | yes — kernel, analytic sources, oracle, tree, samples, epochs | `src/gravity/` |
 | 3 Playable worlds | yes — face layouts, curved charts, any-direction player, physical raycasts, camera-relative render, save/net | everywhere |

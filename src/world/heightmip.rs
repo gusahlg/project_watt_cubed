@@ -9,7 +9,7 @@
 //! No resampling per level — children fully determine parents where coverage overlaps.
 //!
 //! The bake is immutable once computed: edits are applied elsewhere as a runtime overlay.
-use voxel_engine::{Color, DVec3};
+use voxel_engine::Color;
 
 use crate::block::registry::AIR;
 use crate::coord::{ChunkCoord, Face};
@@ -155,58 +155,7 @@ impl HeightMip {
     pub fn relief_band(&self, cell: SectionPos) -> Option<(f32, f32)> {
         self.cell(cell).map(|c| (c.lo, c.hi))
     }
-
-    /// Returns `true` if `cell` is definitely occluded from `eye` by nearer terrain.
-    /// Safe to use only for draw-time culling (false positive = hole). Never gate
-    /// selection or streaming on this result.
-    ///
-    /// Uses a conservative approach: march from eye toward cell top, checking if any
-    /// blocker's floor (`lo` height) intersects the line-of-sight. Reads blockers at
-    /// the coarsest level (widest coverage), so error favors under-culling (safe but misses
-    /// some occlusion). Finer-level blocking is possible future refinement.
-    #[allow(dead_code)] // draw-time occlusion culling, not yet wired to the renderer
-    pub fn occludes(&self, eye: DVec3, cell: SectionPos) -> bool {
-        let Some(target) = self.cell(cell) else { return false }; // unbaked, can't prove occlusion
-        let span = cell.span() as f64;
-        let (cx, cz) = (cell.min_x() as f64 + span * 0.5, cell.min_z() as f64 + span * 0.5);
-        let (dx, dz) = (cx - eye.x, cz - eye.z);
-        let horiz = (dx * dx + dz * dz).sqrt();
-        // Nothing between eye and cell (adjacent or overhead) means it can't be occluded.
-        if horiz < span {
-            return false;
-        }
-        // March XZ from eye toward the cell's TOP; if any blocker `lo` rises above
-        // the sightline to that top, every point of the cell is at or below it and
-        // the whole cell is hidden. Step ~one coarsest cell — finer is pointless
-        // when blockers are read at the coarsest level.
-        let top = target.hi as f64;
-        let coarse_span = section_span(self.coarsest) as f64;
-        let steps = ((horiz / coarse_span).ceil() as usize).clamp(2, OCCLUDE_MARCH_CAP);
-        for i in 1..steps {
-            let t = i as f64 / steps as f64;
-            let (sx, sz) = (eye.x + dx * t, eye.z + dz * t);
-            let y = eye.y + (top - eye.y) * t;
-            if let Some(lo) = self.coarse_lo(sx, sz) && lo as f64 >= y {
-                return true;
-            }
-        }
-        false
-    }
-
-    /// Blocker floor at a world XZ, read at the coarsest level.
-    /// `None` outside the baked grid (safe: missing data never causes false occlusion).
-    fn coarse_lo(&self, wx: f64, wz: f64) -> Option<f32> {
-        let lvl = self.levels.last()?;
-        let span = section_span(lvl.detail);
-        let gx = (wx.floor() as i32).div_euclid(span);
-        let gz = (wz.floor() as i32).div_euclid(span);
-        lvl.get(gx, gz).map(|c| c.lo)
-    }
-
 }
-
-/// Max march samples to prevent unbounded loops on very distant cells.
-const OCCLUDE_MARCH_CAP: usize = 64;
 
 /// Sample colour every 4th cell (reduces cost without visible loss for coarse tints).
 const COLOR_STRIDE: i32 = 4;
@@ -491,6 +440,7 @@ fn resample_origin_cell<G: TerrainGenerator + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use voxel_engine::DVec3;
     use crate::block::registry::BlockRegistry;
     use crate::world::terrain::Terrain;
     use crate::world::section::Section;
@@ -630,113 +580,6 @@ mod tests {
         let a = small(&reg, &g);
         let b = small(&reg, &g);
         assert!(a == b, "two bakes of one seed differ");
-    }
-
-    /// Build a single-level mip from a per-cell `(lo, hi)` closure — full control
-    /// over the terrain silhouette for the occlusion property tests. `occludes`
-    /// reads blockers at the coarsest level (here, the only one) and targets a
-    /// cell's own level, so one level exercises the whole march.
-    fn hand_mip(
-        detail: Detail,
-        x0: i32,
-        z0: i32,
-        nx: usize,
-        nz: usize,
-        f: impl Fn(i32, i32) -> (f32, f32),
-    ) -> HeightMip {
-        let mut cells = Vec::with_capacity(nx * nz);
-        for sz in 0..nz {
-            for sx in 0..nx {
-                let (lo, hi) = f(x0 + sx as i32, z0 + sz as i32);
-                cells.push(MipCell { lo, hi, color: Color::new(0, 0, 0, 255) });
-            }
-        }
-        HeightMip { finest: detail, coarsest: detail, levels: vec![MipLevel { detail, x0, z0, nx, nz, cells }] }
-    }
-
-    const OD: Detail = FINEST_DETAIL; // a modest detail so a few cells span a wide march
-
-    /// Flat terrain above the eye occludes nothing.
-    #[test]
-    fn occlude_flat_world_culls_nothing() {
-        let mip = hand_mip(OD, -8, -8, 16, 16, |_, _| (0.0, 0.0));
-        for gx in -8..8 {
-            let cell = SectionPos { body: 0, face: Face::PosY, detail: OD, x: gx, z: 0 };
-            assert!(
-                !mip.occludes(DVec3::new(0.0, 50.0, 0.0), cell),
-                "flat world culled cell x={gx}"
-            );
-        }
-    }
-
-    /// A wall between eye and target occludes the target.
-    #[test]
-    fn occlude_wall_hides_cell_behind() {
-        let span = section_span(OD);
-        // Wall at grid x==4 rises to 100; everything else is ground level 0.
-        let mip = hand_mip(OD, 0, -4, 12, 8, |x, _| if x == 4 { (100.0, 100.0) } else { (0.0, 0.0) });
-        let behind = SectionPos { body: 0, face: Face::PosY, detail: OD, x: 8, z: 0 };
-        // Eye just above the ground on the near side of the wall.
-        let eye = DVec3::new(0.5 * span as f64, 5.0, 0.5 * span as f64);
-        assert!(mip.occludes(eye, behind), "cell behind the wall not culled");
-    }
-
-    /// A cell whose top clears all blockers is never culled (no holes).
-    #[test]
-    fn occlude_no_false_positive_when_top_clears_ridge() {
-        let span = section_span(OD);
-        // Ridge floor 100 at x==4; a tall target at x==8 reaching 200.
-        let mip = hand_mip(OD, 0, -4, 12, 8, |x, _| match x {
-            4 => (100.0, 100.0),
-            8 => (0.0, 200.0),
-            _ => (0.0, 0.0),
-        });
-        let tower = SectionPos { body: 0, face: Face::PosY, detail: OD, x: 8, z: 0 };
-        // Eye high enough that the sightline to the tower top stays above the ridge.
-        let eye = DVec3::new(0.5 * span as f64, 150.0, 0.5 * span as f64);
-        assert!(!mip.occludes(eye, tower), "tower clearing the ridge was culled (hole)");
-    }
-
-    /// Occlusion only triggers when a blocker actually blocks the sightline to the target.
-    #[test]
-    fn occlude_never_culls_without_a_real_blocker() {
-        let span = section_span(OD) as f64;
-        // A diagonal ridge so blockers vary with position.
-        let mip = hand_mip(OD, -16, -16, 32, 32, |x, z| {
-            let h = if (x + z).rem_euclid(7) == 0 { 80.0 } else { 5.0 };
-            (h, h)
-        });
-        for &ey in &[0.0f64, 20.0, 90.0, 200.0] {
-            for tx in [-10, -3, 4, 11] {
-                for tz in [-8, 0, 9] {
-                    let cell = SectionPos { body: 0, face: Face::PosY, detail: OD, x: tx, z: tz };
-                    let Some((_, hi)) = mip.relief_band(cell) else { continue };
-                    let eye = DVec3::new(0.0, ey, 0.0);
-                    if mip.occludes(eye, cell) {
-                        // Re-derive: verify a blocker actually crosses the sightline.
-                        let (cx, cz) =
-                            (cell.min_x() as f64 + span * 0.5, cell.min_z() as f64 + span * 0.5);
-                        let horiz = (cx * cx + cz * cz).sqrt();
-                        let steps = ((horiz / span).ceil() as usize).clamp(2, 64);
-                        let blocked = (1..steps).any(|i| {
-                            let t = i as f64 / steps as f64;
-                            let y = ey + (hi as f64 - ey) * t;
-                            mip.coarse_lo(cx * t, cz * t).is_some_and(|lo| lo as f64 >= y)
-                        });
-                        assert!(blocked, "occludes fired with no blocker (eye_y={ey}, {tx},{tz})");
-                    }
-                }
-            }
-        }
-    }
-
-    /// Determinism: `occludes` is a pure function of `(eye, cell)`.
-    #[test]
-    fn occlude_deterministic() {
-        let mip = hand_mip(OD, -8, -8, 16, 16, |x, _| if x == 2 { (60.0, 60.0) } else { (0.0, 0.0) });
-        let eye = DVec3::new(3.0, 8.0, 1.0);
-        let cell = SectionPos { body: 0, face: Face::PosY, detail: OD, x: 6, z: 0 };
-        assert_eq!(mip.occludes(eye, cell), mip.occludes(eye, cell));
     }
 
     /// `resample_cell`'s lo/hi is exactly the min/max of `topmost_solid` over every

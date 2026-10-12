@@ -8,3 +8,6 @@
 /target-check
 # Local mod development trees (pwc mod add ./dev-mods/<mod>); never an installation directory.
 /dev-mods
+
+# Benchmark reports (scripts/bench-unit.sh, documentation/performance.md)
+/benchmarks

@@ -1,4 +1,4 @@
-//! Bricks and light: pure types + tests, nothing wired. `Brick` is the ONE
+//! Bricks and light. `ChunkPayload` is the chunk storage in production; `Brick` is the ONE
 //! structure a future GPU traversal walks; a chunk (k=0), an LOD section
 //! (k>0), and a half-block (k<0) are all values of this one type, not three
 //! parallel representations.

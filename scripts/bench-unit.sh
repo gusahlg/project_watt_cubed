@@ -37,13 +37,11 @@ for arg in "$@"; do
 done
 
 # name # ere capturing the printed number # doc-comment unit # scale (printed → unit)
-# generate_column_ms and admit_mesh_lane_20k_select are listed so they run when
-# those tests exist on the branch; missing names are skipped.
+# Missing names are skipped.
 BENCHES=(
     'mesh_result_channel_throughput#= ([0-9.]+) jobs/s#jobs/s#1'
     'padded_capture_throughput#= ([0-9.]+) captures/s#captures/s#1'
     'light_propagate_throughput#= ([0-9.]+) settles/s#settles/s#1'
-    'generate_column_ms#([0-9.]+) ms/column#ms/column#1'
     'worldgen_column_cost#diffusion=([0-9.]+)ms#ms#1'
     'admit_mesh_lane_20k_select#([0-9.]+) µs/pass#µs/pass#1'
     'far_lod_section_mesh#median ([0-9.]+)#ms/section#1'

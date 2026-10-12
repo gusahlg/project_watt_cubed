@@ -16,7 +16,6 @@ path = [
   "flake.lock",
   "flake.nix",
   "play.sh",
-  "guides/reaction-guide/*.zip",
   "scripts/**",
   "src/**",
 ]
@@ -34,7 +33,6 @@ path = [
   "assets/sounds/README.md",
   "assets/sounds/catalog.toml",
   "documentation/**",
-  "issues/**",
   "guides/*.md",
   "guides/reaction-guide/*.md",
 ]

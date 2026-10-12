@@ -13,7 +13,7 @@ Plan of record for the 2026-10-04 round. Guide: `guides/pwc_space_physics.md` §
   no fracture (6b), no retiling (7).
 - **Same physics for every body.** Every planet starts as plain matter in a cube; its shape comes from the
   relaxation law.
-- **Physics shape, fitted grid** (decided after the warp_lab measurements: a cube grid bent all the way to
+- **Physics shape, fitted grid** (decided after the warp lab measurements (lab removed in 0.6.1): a cube grid bent all the way to
   a ball shears its corner cells far past the guide's thresholds). Physics relaxes each generated body's
   cube of matter and decides its shape. A body that rounds is laid out on the cube-sphere charts with a
   **datum** fitted to its relaxed surface (`space::datum::DatumField`, guide §10.2: generation may choose
@@ -94,7 +94,7 @@ Plan of record for the 2026-10-04 round. Guide: `guides/pwc_space_physics.md` §
 
 | Phase | What | Status (2026-10-04) |
 |---|---|---|
-| W0 | `mechanics`: lattice, materials, solver, gravity tree, validity; `warp_lab` | done |
+| W0 | `mechanics`: lattice, materials, solver, gravity tree, validity (the `warp_lab` binary was removed in 0.6.1) | done |
 | W1 | Every body is cube matter (superseded by the fitted-grid decision) | dropped |
 | W2 | Layouts from physics: the start world on charts fitted to its relaxed datum (band-0 lift); sagging cubes (the twins) in storage, their grid bent by `space::warp` | done |
 | W3 | Generation relaxes every body: shapes tabulated by `Π_g` (`genesis_table.bin`, pinned to the worldgen version); start world and twins wired | done for the start world and twins; the other bodies wait on the owner's matter decision |

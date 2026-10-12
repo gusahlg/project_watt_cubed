@@ -71,8 +71,8 @@ Restitutor's contributions are substantial. Notable commits include:
 - `5cb1a466dcadcb057e96cde26c85dda07035a000`, performance work.
 
 MrOcelotGuy's surviving contribution is documentation in
-`documentation/IDEA.md`, `documentation/features-2.md`,
-`documentation/features.md`, and `documentation/philosophy.md`.
+`documentation/IDEA.md` and `documentation/philosophy.md` (`features.md` and
+`features-2.md` were removed in 6b52ae8).
 
 ## Supplied-patch resolution
 
