@@ -84,8 +84,9 @@ pub(in crate::world) struct Sampler<K, V> {
     got: Receiver<Vec<(K, V)>>,
     asked: FastSet<K>,
     held: Vec<(K, V)>,
-    /// Keys sent, and keys the thread has answered.
+    /// Keys sent, and keys the thread has answered (read by the headless tests' waits).
     sent: usize,
+    #[cfg_attr(not(test), allow(dead_code))]
     answered: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
@@ -149,6 +150,7 @@ impl<K: Copy + Eq + Hash + Send + 'static, V: Send + 'static> Sampler<K, V> {
     }
 
     /// Whether the thread has answered everything sent to it (the answers may not have landed).
+    #[cfg(test)]
     pub(in crate::world) fn answered(&self) -> bool {
         self.answered.load(std::sync::atomic::Ordering::Acquire) >= self.sent
     }
