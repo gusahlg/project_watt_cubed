@@ -84,6 +84,10 @@ pub(in crate::world) struct Sampler<K, V> {
     got: Receiver<Vec<(K, V)>>,
     asked: FastSet<K>,
     held: Vec<(K, V)>,
+    /// Keys sent, and keys the thread has answered (read by the headless tests' waits).
+    sent: usize,
+    #[cfg_attr(not(test), allow(dead_code))]
+    answered: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl<K: Copy + Eq + Hash + Send + 'static, V: Send + 'static> Sampler<K, V> {
@@ -92,6 +96,8 @@ impl<K: Copy + Eq + Hash + Send + 'static, V: Send + 'static> Sampler<K, V> {
     pub(in crate::world) fn start(name: &str, f: impl Fn(K) -> V + Send + 'static) -> Option<Self> {
         let (ask, todo) = channel::<Vec<K>>();
         let (done, got) = channel::<Vec<(K, V)>>();
+        let answered = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = answered.clone();
         std::thread::Builder::new()
             .name(name.into())
             .spawn(move || {
@@ -103,13 +109,15 @@ impl<K: Copy + Eq + Hash + Send + 'static, V: Send + 'static> Sampler<K, V> {
                     let _ = libc::setpriority(libc::PRIO_PROCESS, libc::gettid() as libc::id_t, 19);
                 }
                 while let Ok(batch) = todo.recv() {
+                    let n = batch.len();
                     if done.send(batch.into_iter().map(|k| (k, f(k))).collect()).is_err() {
                         break;
                     }
+                    count.fetch_add(n, std::sync::atomic::Ordering::Release);
                 }
             })
             .ok()?;
-        Some(Sampler { ask, got, asked: FastSet::default(), held: Vec::new() })
+        Some(Sampler { ask, got, asked: FastSet::default(), held: Vec::new(), sent: 0, answered })
     }
 
     /// Keys asked for that have not landed.
@@ -130,9 +138,21 @@ impl<K: Copy + Eq + Hash + Send + 'static, V: Send + 'static> Sampler<K, V> {
 
     /// Send `batch` (keys already [marked](Self::mark)), nearest need first.
     pub(in crate::world) fn send(&mut self, batch: Vec<K>) {
-        if !batch.is_empty() && self.ask.send(batch).is_err() {
-            self.asked.clear();
+        let n = batch.len();
+        if n == 0 {
+            return;
         }
+        if self.ask.send(batch).is_err() {
+            self.asked.clear();
+        } else {
+            self.sent += n;
+        }
+    }
+
+    /// Whether the thread has answered everything sent to it (the answers may not have landed).
+    #[cfg(test)]
+    pub(in crate::world) fn answered(&self) -> bool {
+        self.answered.load(std::sync::atomic::Ordering::Acquire) >= self.sent
     }
 
     /// Hand up to `most` of the answers that have landed to `keep`, oldest first; the rest wait for

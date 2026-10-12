@@ -927,7 +927,8 @@ impl World {
         self.set_far_center(eye_chunk(far));
         let _ = self.adopt_fold(center);
         let eye = self.phys_eye(center, false);
-        self.place_near(center, eye, true);
+        // The near field reads its columns' ground off the main thread: a settle waits for it.
+        self.place_near_settled(center, eye, true);
         let near = &self.near;
         let fold = self.fold;
         let coords: Vec<Coord> = self.mesh_box(center).coords().filter(|&c| near.draws(fold.fold(c))).collect();

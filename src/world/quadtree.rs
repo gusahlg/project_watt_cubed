@@ -32,6 +32,21 @@ pub(in crate::world) fn drawable_cover(
 /// Ready ancestor can (the first load).
 const STAND_IN_DEPTH: i8 = 2;
 
+/// Every node with one of the `ready` tiles at most [`STAND_IN_DEPTH`] levels under it: the only
+/// squares [`whole_cut`] searches for stand-ins (a first load holds thousands of unready tiles, and
+/// almost none has a Ready tile under it).
+pub(in crate::world) fn stand_in_nodes(ready: impl IntoIterator<Item = SectionPos>) -> FastSet<SectionPos> {
+    let mut out = FastSet::default();
+    for r in ready {
+        let mut p = r;
+        for _ in 0..STAND_IN_DEPTH {
+            p = p.parent();
+            out.insert(p);
+        }
+    }
+    out
+}
+
 /// The tiles to draw for the cut `desired` (the leaves of complete splits, coarsest at `max_detail`)
 /// given which tiles are Ready. A desired tile draws once it is Ready. Until every desired tile
 /// under a node is, the node's nearest Ready ancestor draws whole in their place: a split waits
@@ -39,7 +54,7 @@ const STAND_IN_DEPTH: i8 = 2;
 /// Ready do the Ready finer tiles under an unready desired tile draw it. Every tile is drawn whole
 /// and no two overlap; a square nothing Ready covers stays empty. Sorted by
 /// `(body, face, detail, x, z)`.
-pub(in crate::world) fn whole_cut(desired: &[SectionPos], max_detail: Detail, ready: &impl Fn(SectionPos) -> bool) -> Vec<SectionPos> {
+pub(in crate::world) fn whole_cut(desired: &[SectionPos], max_detail: Detail, ready: &impl Fn(SectionPos) -> bool, stand_ins: &FastSet<SectionPos>) -> Vec<SectionPos> {
     let leaves: FastSet<SectionPos> = desired.iter().copied().collect();
     let mut inner: FastSet<SectionPos> = FastSet::default();
     let mut tops: Vec<SectionPos> = Vec::new();
@@ -59,7 +74,7 @@ pub(in crate::world) fn whole_cut(desired: &[SectionPos], max_detail: Detail, re
     }
     tops.sort_unstable_by_key(|s| (s.body, s.face as u8, s.detail, s.x, s.z));
     tops.dedup();
-    let mut cut = Cut { leaves: &leaves, inner: &inner, ready, done: FastMap::default() };
+    let mut cut = Cut { leaves: &leaves, inner: &inner, ready, stand_ins, done: FastMap::default() };
     let mut out = Vec::with_capacity(desired.len());
     for t in tops {
         cut.draw(t, &mut out);
@@ -73,6 +88,7 @@ struct Cut<'a, F: Fn(SectionPos) -> bool> {
     leaves: &'a FastSet<SectionPos>,
     inner: &'a FastSet<SectionPos>,
     ready: &'a F,
+    stand_ins: &'a FastSet<SectionPos>,
     done: FastMap<SectionPos, bool>,
 }
 
@@ -115,7 +131,7 @@ impl<F: Fn(SectionPos) -> bool> Cut<'_, F> {
 
     /// The Ready tiles at most `depth` levels down `s`'s square, coarsest first.
     fn draw_below(&self, s: SectionPos, depth: i8, out: &mut Vec<SectionPos>) {
-        if depth <= 0 || s.detail.0 == 0 {
+        if depth <= 0 || s.detail.0 == 0 || !self.stand_ins.contains(&s) {
             return;
         }
         for q in Quadrant::ALL {
@@ -181,7 +197,7 @@ mod tests {
                     ready.extend(Quadrant::ALL.map(|q| s.child(q)));
                 }
             }
-            let drawn = whole_cut(&cut, Detail(6), &|p| ready.contains(&p));
+            let drawn = whole_cut(&cut, Detail(6), &|p| ready.contains(&p), &stand_in_nodes(ready.iter().copied()));
             for (i, &a) in drawn.iter().enumerate() {
                 assert!(ready.contains(&a), "round {round}: {a:?} drawn unready");
                 for &b in &drawn[i + 1..] {
@@ -201,7 +217,7 @@ mod tests {
                 }
             }
             let ready_all: FastSet<SectionPos> = cut.iter().copied().collect();
-            let mut full = whole_cut(&cut, Detail(6), &|p| ready_all.contains(&p));
+            let mut full = whole_cut(&cut, Detail(6), &|p| ready_all.contains(&p), &stand_in_nodes(ready_all.iter().copied()));
             let mut want = cut.clone();
             full.sort_unstable_by_key(|s| (s.detail, s.x, s.z));
             want.sort_unstable_by_key(|s| (s.detail, s.x, s.z));
@@ -216,9 +232,10 @@ mod tests {
         let parent = SectionPos { detail: Detail(3), body: 0, face: Face::PosY, x: 0, z: 0 };
         let kids = Quadrant::ALL.map(|q| parent.child(q));
         let mut ready: FastSet<SectionPos> = [parent, kids[0], kids[1], kids[2]].into_iter().collect();
-        assert_eq!(whole_cut(&kids, Detail(5), &|p| ready.contains(&p)), vec![parent]);
+        let below = |ready: &FastSet<SectionPos>| stand_in_nodes(ready.iter().copied());
+        assert_eq!(whole_cut(&kids, Detail(5), &|p| ready.contains(&p), &below(&ready)), vec![parent]);
         ready.insert(kids[3]);
-        assert_eq!(whole_cut(&kids, Detail(5), &|p| ready.contains(&p)).len(), 4);
-        assert_eq!(whole_cut(&[parent], Detail(5), &|p| ready.contains(&p)), vec![parent], "a merge draws the parent at once");
+        assert_eq!(whole_cut(&kids, Detail(5), &|p| ready.contains(&p), &below(&ready)).len(), 4);
+        assert_eq!(whole_cut(&[parent], Detail(5), &|p| ready.contains(&p), &below(&ready)), vec![parent], "a merge draws the parent at once");
     }
 }

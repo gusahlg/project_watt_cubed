@@ -74,13 +74,16 @@ pub(in crate::world) struct NearField {
     /// The farthest a point of a near column's box lies from the eye's cell: where the finest far
     /// level meets the full-res chunks.
     pub(in crate::world) reach: f64,
-    /// The thread reading the ground of the columns just outside the square, before the centre
-    /// moves onto them.
+    /// The thread reading every column's ground: the square's own as it is first met, and the
+    /// columns just outside it before the centre moves onto them.
     sampler: Option<Sampler<(Frame, ColumnKey), Option<(i32, i32)>>>,
+    /// Columns of the square whose ground was not in at the last layout: none of them is near or
+    /// kept until it is (the eye band still loads across them).
+    unknown: usize,
 }
 
-/// Most read-ahead columns one layout keeps.
-const LAND_MAX: usize = 1 << 10;
+/// Most column grounds one pass keeps.
+const LAND_MAX: usize = 1 << 12;
 
 /// Rings of columns outside the square whose ground is read ahead.
 const LEAD_RINGS: i32 = 2;
@@ -290,6 +293,15 @@ impl World {
         let up = self.live_up();
         let cell = PhysBox::eye_cell(eye);
         let cell_key = [cell.lo.x as i64, cell.lo.y as i64, cell.lo.z as i64];
+        if let Some(frame) = frame {
+            let landed = self.land_near_ground(frame);
+            if self.near.unknown > 0 && (landed > 0 || self.near.sampler.as_ref().is_none_or(|s| s.waiting() == 0)) {
+                // Ground the square waited on is in, or nothing it asked for is still out (an
+                // answer for another frame was dropped): lay it out again, asking for what is
+                // missing.
+                self.near.stale = true;
+            }
+        }
         let near = &self.near;
         let same = near.frame == frame && near.up == up && near.eye_cell == Some(cell_key) && !near.stale && !moved;
         if same && frame.is_some() {
@@ -338,13 +350,7 @@ impl World {
             let generator = self.generator.clone();
             near.sampler = Sampler::start("near-ground", move |(frame, real)| column_ground(&*generator, frame, real));
         }
-        if let Some(sampler) = &mut near.sampler {
-            sampler.land(LAND_MAX, |(f, real), ground| {
-                if f == frame && !near.ground.contains(&real) {
-                    near.ground.insert(real, ground);
-                }
-            });
-        }
+        let mut want: Vec<(i32, ColumnKey)> = Vec::new();
         let n = 2 * near.half + 1;
         let keep_r = r + f64::from(UNLOAD_MARGIN * CHUNK_SIZE as i32);
         let mut cols = vec![Col::default(); (n * n) as usize];
@@ -366,13 +372,10 @@ impl World {
                     let Some(real_chunk) = self.fold.unfold(folded) else { continue };
                     let (real, _) = ColumnKey::of(up, real_chunk);
                     col.real = Some(real);
-                    let ground = match near.ground.get(&real) {
-                        Some(g) => g,
-                        None => {
-                            let g = column_ground(&*self.generator, frame, real);
-                            near.ground.insert(real, g);
-                            g
-                        }
+                    // The ground is read off the main thread; until it is in, the column waits.
+                    let Some(ground) = near.ground.get(&real) else {
+                        want.push((da.abs().max(db.abs()), real));
+                        continue;
                     };
                     let Some((lo, hi)) = ground.map(|b| self.column_edits(frame, real, b)) else { continue };
                     let (a, b) = (self.frame_layer(frame, real, lo.saturating_sub(1)), self.frame_layer(frame, real, hi.saturating_sub(1)));
@@ -439,8 +442,53 @@ impl World {
         near.cols = cols;
         near.hull = hull_span;
         if held.is_none() {
+            near.unknown = want.len();
+            want.sort_unstable_by_key(|&(chess, _)| chess);
+            if let Some(sampler) = &mut near.sampler {
+                let ask: Vec<_> = want.into_iter().filter_map(|(_, real)| sampler.mark((frame, real)).then_some((frame, real))).collect();
+                sampler.send(ask);
+            }
             self.read_ahead(near, frame, up, key, alt);
         }
+    }
+
+    /// Keep the column grounds the near field's sampler has answered for `frame`; how many landed.
+    fn land_near_ground(&mut self, frame: Frame) -> usize {
+        let near = &mut self.near;
+        let Some(sampler) = &mut near.sampler else { return 0 };
+        let mut landed = 0;
+        sampler.land(LAND_MAX, |(f, real), ground| {
+            if f == frame && !near.ground.contains(&real) {
+                near.ground.insert(real, ground);
+                landed += 1;
+            }
+        });
+        landed
+    }
+
+    /// [`place_near`](Self::place_near), then again until every column's ground is in: the near
+    /// field a settled pass stands on.
+    #[cfg(test)]
+    pub(in crate::world) fn place_near_settled(&mut self, center: Coord, eye: DVec3, moved: bool) -> bool {
+        let mut changed = self.place_near(center, eye, moved);
+        let start = std::time::Instant::now();
+        while self.near_ground_pending() {
+            assert!(start.elapsed().as_secs() < 120, "the near field's ground never came");
+            std::thread::sleep(std::time::Duration::from_micros(200));
+            changed |= self.place_near(center, eye, false);
+        }
+        changed
+    }
+
+    /// Whether the near field's sampler has answered every column sent to it.
+    #[cfg(test)]
+    pub(in crate::world) fn near_sampler_answered(&self) -> bool {
+        self.near.sampler.as_ref().is_none_or(|s| s.answered())
+    }
+
+    /// Column grounds the near field waits on.
+    pub(in crate::world) fn near_ground_pending(&self) -> bool {
+        self.near.unknown > 0 || self.near.sampler.as_ref().is_some_and(|s| s.waiting() > 0)
     }
 
     /// Ask the near field's sampler for the ground of the [`LEAD_RINGS`] rings of columns just
@@ -539,8 +587,9 @@ impl World {
                 let atlas = self.seams.atlases().get(index)?;
                 let (x0, z0) = (real.a * cs, real.b * cs);
                 let (patch, _, _) = atlas.column(i64::from(x0 + cs / 2), i64::from(z0 + cs / 2))?;
-                let corners = (0..8).map(|c| DVec3::new(f64::from(x0 + cs * (c & 1)), if c & 2 == 0 { y0 } else { y1 }, f64::from(z0 + cs * ((c >> 2) & 1))));
-                PhysBox::around(corners.map(|p| atlas.embed_storage(patch, p)), 1.0, f64::from(cs))
+                // Each corner's column, at the floor and the top.
+                let column = |c: i32| atlas.embed_storage_column(patch, f64::from(x0 + cs * (c & 1)), f64::from(z0 + cs * (c >> 1)), [y0, y1]);
+                PhysBox::around([0, 1, 2, 3].into_iter().flat_map(column), 1.0, f64::from(cs))
             }
             Frame::Cube { body, face, shift } => {
                 let (u0, u1, v0, v1) = cube_cells(real, shift)?;

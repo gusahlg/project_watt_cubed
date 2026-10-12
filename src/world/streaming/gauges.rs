@@ -91,6 +91,8 @@ enum EntryBlocker {
     Uncovered,
     /// A far tile's clip still waits on chunks, or a drawn tile does not draw its clip yet.
     Clips,
+    /// The rule or the near field waits on terrain bounds from its sampler.
+    Bounds,
 }
 
 /// Cumulative counters the flight bench and the stress gauges read.
@@ -133,6 +135,10 @@ impl World {
 
     /// The first unsatisfied clause of [`entry_complete`](Self::entry_complete) around `center`.
     fn entry_blocker(&self, center: Coord) -> Option<EntryBlocker> {
+        // Every box and column stands on its tight bounds.
+        if self.near_ground_pending() || (self.lod2 && self.bounds_pending()) {
+            return Some(EntryBlocker::Bounds);
+        }
         // No near work queued or in flight, and nothing owed a final-light remesh.
         if !self.near_quiescent()
             || !self.upload_queue.is_empty()
@@ -331,6 +337,11 @@ impl World {
                 "far clips: {} waiting on chunks, {} re-extracting",
                 self.clips_waiting_count(),
                 usize::from(self.reclips_in_flight())
+            ),
+            Some(EntryBlocker::Bounds) => format!(
+                "terrain bounds owed: near field {}, rule {}",
+                self.near_ground_pending(),
+                self.lod2 && self.bounds_pending()
             ),
         }
     }

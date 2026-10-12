@@ -343,6 +343,13 @@ pub trait TerrainGenerator: Send + Sync {
         if face == Face::PosY { Some((0, 512)) } else { None }
     }
 
+    /// A superset of [`surface_bounds`](Self::surface_bounds) that costs O(1): the most the
+    /// square's body can rise or sink, without sampling it. What a frame may read before any
+    /// sample of the square is in.
+    fn relief_band(&self, body: u16, face: Face, u0: i32, v0: i32, span: i32) -> Option<(i32, i32)> {
+        self.surface_bounds(body, face, u0, v0, span)
+    }
+
     /// Min and max surface altitude over the face-local rectangle `[u0, u1) × [v0, v1)`.
     /// Default is [`surface_bounds`](Self::surface_bounds) of the bounding square.
     fn surface_rect(&self, body: u16, face: Face, u0: i32, v0: i32, u1: i32, v1: i32) -> Option<(i32, i32)> {

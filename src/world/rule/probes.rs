@@ -681,3 +681,68 @@ fn lod_rule_memory_census() {
         );
     }
 }
+
+/// Every pass from landing beside body `body` of `seed` the way `/cruise off` does (clear of the
+/// ground, on the side facing the start world, then `prepare_around`), at render distance `h`/`v`
+/// with LOD on: `(wall, cpu, phases)` for each of the first `passes` passes, the workers running.
+fn landing_passes(seed: i64, body: usize, tp: bool, h: i32, v: i32, passes: usize) -> Vec<(std::time::Duration, std::time::Duration, String)> {
+    use crate::world::streaming::headless::{Laps, PHASE_NAMES, step_timed};
+    let (lod_levels, lod_detail) = lod_for(h);
+    let render = RenderConfig { lod2: true, occlusion: true, lod_levels, lod_detail, ..RenderConfig::default() };
+    let mut world = round_world(seed, render);
+    world.set_view_distances(h, v);
+    world.section_pyramid.unit = world.view.lod_unit();
+    let bodies = world.generator.cosmos().expect("a cosmos").bodies().to_vec();
+    let (start, b) = (bodies[0].centre_f(), bodies[body]);
+    let land = if tp {
+        // `/tp <name>`: 2 000 blocks over the datum along +Y.
+        let top = match b.shape {
+            crate::world::terrain::cosmos::Shape::Cube { half } => half,
+            crate::world::terrain::cosmos::Shape::Ball { r } => r,
+            crate::world::terrain::cosmos::Shape::Shell { outer, .. } => outer,
+        };
+        b.centre_f() + DVec3::new(0.0, top as f64 + 2000.0, 0.0)
+    } else {
+        let dir = if body == 0 { DVec3::Y } else { (start - b.centre_f()).normalize_or(DVec3::Y) };
+        world.clear_of_ground(b.centre_f() + dir * b.reach())
+    };
+    world.prepare_around(land);
+    let mut out = Vec::with_capacity(passes);
+    for _ in 0..passes {
+        let mut laps = Some(Laps::default());
+        step_timed(&mut world, land, &mut laps);
+        let laps = laps.expect("laps");
+        let phases: Vec<String> =
+            PHASE_NAMES.iter().zip(laps.worst.1.iter()).filter(|(_, d)| d.as_secs_f64() > 5e-4).map(|(n, d)| format!("{n} {:.1}", d.as_secs_f64() * 1e3)).collect();
+        out.push((laps.last.0, laps.cpu.0, phases.join(", ")));
+        std::thread::sleep(std::time::Duration::from_millis(4));
+    }
+    out
+}
+
+/// Crash repro (owner, 2026-10-11): cruising to another body of seed 1791736458871982043 and
+/// turning cruise off froze the main thread for seconds (the cut sampled every new tile's terrain,
+/// about 24 s on a body without a relief bake). Land beside every body the way `/cruise off` does
+/// and time the first 120 passes at the owner's settings (RD20, V10, LOD on). Set `PWC_BODY` to
+/// probe one body, and `PWC_TP` to land the way `/tp <name>` does instead.
+#[test]
+#[ignore]
+fn cruise_landing_pass_costs() {
+    const SEED: i64 = 1_791_736_458_871_982_043;
+    let n = round_world(SEED, RenderConfig::default()).generator.cosmos().expect("a cosmos").bodies().len();
+    let only: Option<usize> = std::env::var("PWC_BODY").ok().and_then(|v| v.parse().ok());
+    let tp = std::env::var("PWC_TP").is_ok();
+    for body in (0..n).filter(|b| only.is_none_or(|o| o == *b)) {
+        let passes = landing_passes(SEED, body, tp, 20, 10, 120);
+        let (wall, worst) = passes.iter().enumerate().max_by_key(|(_, p)| p.0).map(|(i, p)| (p.0, i)).expect("passes");
+        let (cpu, costliest) = passes.iter().enumerate().max_by_key(|(_, p)| p.1).map(|(i, p)| (p.1, i)).expect("passes");
+        let over = passes.iter().filter(|p| p.0.as_secs_f64() > 0.016).count();
+        println!(
+            "body {body:>2}: first pass {:.1} ms; longest {:.1} ms wall (#{worst}); costliest {:.1} ms CPU (#{costliest}: {}); {over} passes over 16 ms",
+            passes[0].0.as_secs_f64() * 1e3,
+            wall.as_secs_f64() * 1e3,
+            cpu.as_secs_f64() * 1e3,
+            passes[costliest].2,
+        );
+    }
+}

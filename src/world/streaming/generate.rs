@@ -626,6 +626,18 @@ impl World {
             Classify::Uniform(id) => id,
         };
         let chunk = Chunk::from_data(coord.x, coord.y, coord.z, ChunkData::Uniform(id));
+        // Its light reads its column's ceiling unless it is inert rock. A column no worker has
+        // generated yet has none, and sampling it here stalls the pass (a landing stores thousands
+        // of such chunks at once): let a worker generate it, which brings the ceiling along.
+        if let Sky::Axis(face) = self.generator.sky(coord)
+            && self.lighting
+            && !self.ceilings.contains_key(&ColumnKey::of(face, coord).0)
+        {
+            self.refresh_tables();
+            if !chunk.is_uniform_opaque(&self.tables.get()) {
+                return false;
+            }
+        }
         self.store_chunk(coord, chunk);
         true
     }
