@@ -1098,7 +1098,7 @@ impl Game {
             look::apply(&mut self.player, input.look_delta);
             // The body frame follows the local up at render rate, from the gravity the last
             // physics step applied; it holds in weak gravity (zero-g keeps its orientation).
-            align_body(&mut self.player, dt);
+            crate::play::align_body(&mut self.player, dt);
 
             if let Some(mi) = &input.move_input {
                 self.pending_jump |= mi.jump();
@@ -1112,25 +1112,13 @@ impl Game {
                         // A cruise feels no gravity and moves physically (its steps outrun any patch).
                         let cruising = self.player.cruising();
                         let gravity = if cruising { DVec3::ZERO } else { self.gravity_at(self.player.position) };
-                        // On a round world the step runs in the storage frame of the patch underfoot.
-                        let patch = if cruising { None } else { self.world.atlas_at(self.player.position) };
-                        let trauma = match patch {
-                            Some(atlas) => movement::update_player_in(
-                                &mut self.player,
-                                &self.world,
-                                atlas,
-                                &tick_input,
-                                step_dt,
-                                gravity,
-                            ),
-                            None => movement::update_player(
-                                &mut self.player,
-                                &self.world,
-                                &tick_input,
-                                step_dt,
-                                gravity,
-                            ),
-                        };
+                        let trauma = crate::play::integrate(
+                            &mut self.player,
+                            &self.world,
+                            &tick_input,
+                            step_dt,
+                            gravity,
+                        );
                         if trauma > 0.0 {
                             self.camera.fx.add_trauma(trauma);
                         }
@@ -1445,18 +1433,6 @@ fn toggle_mouse(eng: &mut Engine, router: &mut Router) {
     }
 }
 
-
-/// Turn the body frame toward −gravity, weighted so weak gravity barely turns it and near-zero
-/// gravity leaves it alone (never normalising a vanishing vector).
-fn align_body(player: &mut Player, dt: f32) {
-    let g0 = crate::player::STANDARD_GRAVITY;
-    let g = player.gravity.length();
-    let weight = crate::math::smooth_between(0.02 * g0 as f32, 0.10 * g0 as f32, g as f32) as f64;
-    if weight > 0.0 {
-        let amount = 1.0 - (-crate::camera::ALIGN_RATE * weight * dt as f64).exp();
-        player.orientation.align(-player.gravity / g, amount);
-    }
-}
 
 #[cfg(test)]
 mod tests {

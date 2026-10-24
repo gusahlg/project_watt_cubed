@@ -47,9 +47,11 @@ mod's own source keeps its licence.
   `GameBuild::info()` is the read-only `BuildInfo` (`packages()`, `package(id)`, `environment()`).
 - `ModDescriptor { id, name, version, register }` with `GameBuild::with_mod` is the 2.x shorthand
   for a mod package with no description and no dependencies; tests still use it.
-- `project_watt_cubed::run(build)` starts the game; `harness::golden_main(build)` runs the
-  golden-shot harness for that build (blessed images in `WATT_GOLDEN_DIR`, default
-  `tests/golden`).
+- `project_watt_cubed::run(build)` starts the game. Before a window or an audio device opens,
+  a first argument that names a command registered with `ModRegistrar::cli` (or `help` /
+  `--commands`) runs that command and exits. Any other arguments are ignored and the game starts.
+  `harness::golden_main(build)` runs the golden-shot harness for that build (blessed images in
+  `WATT_GOLDEN_DIR`, default `tests/golden`).
 
 `src/main.rs` is the vanilla executable. `pwc build` generates a small crate (an *instance* crate
 plus the *mod bundle*) whose `main` is
@@ -76,6 +78,9 @@ order; the options the packages declare go into the app's `Options`, beside the 
   [Screens](#screens));
 - `provide(handle)` / `get::<T>()` share values between packages during registration — a package
   reads what its dependencies provided (the inventory reads the hotbar's shared state this way);
+- `cli(Cli { name, about, run })` registers a command-line entry point (see
+  [Command-line entry points](#command-line-entry-points-api-33)). The first registration of a
+  name wins;
 - `package()` is the package being registered, and `build()` the whole build as a `BuildInfo`:
   every package of every kind, including those registered later. A package that shows what is
   installed copies what it needs here (`PackageInfo` is `Copy`); `pwc_mod_api::bundles_of`
@@ -151,6 +156,42 @@ server that cannot run a world's saved model starts with it frozen, as single-pl
 `off` world adopts the server's model. Only committed block changes are replicated;
 experimental per-cell fields and input are not networked yet. The prototype mods therefore
 gate their injection actions to singleplayer.
+
+## Command-line entry points (API 3.3)
+
+A package registers a command from `register`:
+
+```rust
+registrar.cli(pwc_mod_api::Cli {
+    name: "swarm",
+    about: "run headless agents",
+    run: swarm::main,
+});
+```
+
+`project_watt_cubed::run` looks at the first argument before it opens a window or an audio device.
+When that argument equals a registered name, it registers the build's mods and loads options (so
+`on_options` has the saved values), calls `run` with a `CliContext { args, data_dir, build }`, and
+exits with the returned code. `args` is everything after the command name. `data_dir` is the data
+root from `Paths`. `pwc-game --commands` and `pwc-game help` print each command as
+`commands:` then `  {name}  {about}` and exit 0. Those two names stay reserved even when a mod
+registers a command with the same name. Any other arguments leave today's behaviour: the game
+starts.
+
+## Headless clients (API 3.3)
+
+`headless::HeadlessClient` is one player on a `watt_server`, with the game's world mirror and
+physics and none of the window, the audio device, the mods or the input devices. `connect` blocks
+on the calling thread until the join snapshot is applied and the collision slab around spawn is
+loaded. `step` polls the network, applies look and movement through the same physics as the
+windowed game, performs at most one `Act`, and sends the pose. `Place` and `UseTool` name a
+material that must be in the inventory. `Break` with no tool breaks into the inventory.
+`target` is the block the eye looks at; `ray` casts the same march along any direction. On a round
+world both name storage cells, and `cell_center` places a cell in world space.
+
+`World::keep_around(center, radius)` loads that collision slab and drops chunk data farther than
+`radius` from the player, so many clients can stay resident. The windowed stream does not use it.
+A headless client keeps a radius of 96 around the eye.
 
 Packages in the package-manager repository:
 

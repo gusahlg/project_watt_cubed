@@ -18,6 +18,7 @@
 //! suspended mods are skipped entirely. A mod therefore costs nothing where it would
 //! matter and only what it draws where it wouldn't.
 mod build;
+mod cli;
 mod frame;
 mod hud;
 mod message;
@@ -25,6 +26,8 @@ mod message;
 pub(crate) mod testing;
 
 pub use build::{BuildInfo, GameBuild, ModDescriptor, ModRegistrar, PackageInfo, PackageKind};
+pub use cli::{Cli, CliContext};
+pub(crate) use cli::dispatch;
 pub use frame::{Channel, FrameContext, GameContext, TextFrame};
 pub use hud::HudFacts;
 pub use message::{Message, Notice, NoticeLevel, Notices};
@@ -519,6 +522,8 @@ pub struct Mods {
     registered_screens: Vec<(Option<&'static str>, ScreenEntry)>,
     /// The screen entries of active packages, by order (ties in registration order).
     screens: Vec<ScreenEntry>,
+    /// Command-line entry points. The first registration of a name wins.
+    clis: Vec<cli::Cli>,
 }
 
 impl Mods {
@@ -551,7 +556,20 @@ impl Mods {
             capture: None,
             registered_screens: Vec::new(),
             screens: Vec::new(),
+            clis: Vec::new(),
         }
+    }
+
+    /// Register a command. A second command with the same name is ignored.
+    pub(crate) fn add_cli(&mut self, cli: cli::Cli) {
+        if self.clis.iter().any(|have| have.name == cli.name) {
+            return;
+        }
+        self.clis.push(cli);
+    }
+
+    pub(crate) fn clis(&self) -> &[cli::Cli] {
+        &self.clis
     }
 
     /// Offer a screen entry (see [`ModRegistrar::screen_entry`]).

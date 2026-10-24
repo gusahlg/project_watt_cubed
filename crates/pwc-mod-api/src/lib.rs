@@ -17,6 +17,17 @@
 //! requires a major version bump. The [`prelude`] covers what most mods need; the module
 //! re-exports give access to the game's subsystems a mod may read or drive.
 //!
+//! # 3.3.0
+//!
+//! Additive on 3.2 (`^3.0` still matches):
+//! - [`headless::HeadlessClient`] is one player on a server with the game's world mirror and
+//!   physics and none of the window. [`HeadlessClient::connect`](headless::HeadlessClient::connect)
+//!   blocks until a frame can run; [`step`](headless::HeadlessClient::step) polls, moves, acts
+//!   and sends. The caller names the held material for a place or a tool use. `target` and `ray`
+//!   use the game's raycast; `cell_center` embeds a round world's storage cell in world space.
+//! - [`ModRegistrar::cli`] registers a command-line entry point ([`Cli`], [`CliContext`]).
+//!   `help` and `--commands` list the registered commands. Any other first argument starts the game.
+//!
 //! # 3.2.0
 //!
 //! Additive native simulation providers on 3.1 (`^3.0` still matches):
@@ -161,8 +172,8 @@
 //! handle local simulation work and document its cost.
 
 pub use project_watt_cubed::modding::{
-    Action, ActionSet, BuildInfo, GameBuild, Mod, ModContext, ModDescriptor, ModRegistrar, PackageInfo, PackageKind,
-    ToolUse, VisualMask,
+    Action, ActionSet, BuildInfo, Cli, CliContext, GameBuild, Mod, ModContext, ModDescriptor, ModRegistrar,
+    PackageInfo, PackageKind, ToolUse, VisualMask,
 };
 
 pub mod testing;
@@ -224,8 +235,8 @@ pub mod audio {
 
 /// The game's subsystems, as far as mods may use them.
 pub use project_watt_cubed::{
-    block, derived, engine, gravity, input, inventory, material, math, net, player, render_config, screen, session,
-    settings, sim, sky, ui, world,
+    block, derived, engine, gravity, headless, input, inventory, material, math, net, player, render_config, screen,
+    session, settings, sim, sky, ui, world,
 };
 
 /// The mod API version this crate provides (`pwc-api` requirements are checked against it).

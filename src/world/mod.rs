@@ -930,6 +930,17 @@ impl World {
         world
     }
 
+    /// A client mirror of a server world: the seed, worldgen and terrain, with no origin pregenerate.
+    /// The windowed join and a headless client both start here.
+    pub(crate) fn mirror(
+        seed: i64,
+        render: crate::render_config::RenderConfig,
+        kind: WorldgenKind,
+        cfg: terrain::TerrainCfg,
+    ) -> Self {
+        Self::with_kind_cfg(seed, render, kind, cfg, false)
+    }
+
     /// The default world (seed [`DEFAULT_SEED`]).
     pub fn generate() -> Self {
         Self::new(DEFAULT_SEED)
