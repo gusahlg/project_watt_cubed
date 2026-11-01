@@ -1,21 +1,21 @@
-//! A test harness for mod packages: the packages of a build registered the way the game registers
+//! A test harness for module packages: the packages of a build registered the way the game registers
 //! them, with the options they declare and the hooks to drive them. The host type behind it is not
-//! part of the API, so a mod can neither name nor reach the other mods of a build.
+//! part of the API, so a module can neither name nor reach the other modules of a build.
 //!
 //! ```
-//! use pwc_mod_api::testing::Harness;
-//! use pwc_mod_api::{GameBuild, ModDescriptor, ModRegistrar, Mod};
+//! use pwc_module_api::testing::Harness;
+//! use pwc_module_api::{GameBuild, ModuleDescriptor, ModuleRegistrar, Module};
 //!
 //! struct Hello;
-//! impl Mod for Hello {
+//! impl Module for Hello {
 //!     fn id(&self) -> &'static str {
 //!         "hello"
 //!     }
 //! }
-//! fn register(registrar: &mut ModRegistrar) {
+//! fn register(registrar: &mut ModuleRegistrar) {
 //!     registrar.add(Hello);
 //! }
-//! let harness = Harness::new(GameBuild::new().with_mod(ModDescriptor {
+//! let harness = Harness::new(GameBuild::new().with_module(ModuleDescriptor {
 //!     id: "example.hello",
 //!     name: "Hello",
 //!     version: "1.0.0",
@@ -27,8 +27,8 @@
 use project_watt_cubed::block::appearance::BlockAppearance;
 use project_watt_cubed::block::naming::MaterialNamer;
 use project_watt_cubed::block::BlockId;
-use project_watt_cubed::modding::{
-    BuildInfo, FrameContext, GameBuild, HudFacts, Message, ModContext, Mods, ToolUse, VisualMask,
+use project_watt_cubed::modules::{
+    BuildInfo, FrameContext, GameBuild, HudFacts, Message, ModuleContext, Modules, ToolUse, VisualMask,
 };
 use project_watt_cubed::player::Player;
 use project_watt_cubed::render_config::{RenderConfig, VisualGroup};
@@ -38,71 +38,71 @@ use project_watt_cubed::ui::HudElement;
 use project_watt_cubed::world::generation::WorldgenKind;
 use project_watt_cubed::world::World;
 
-/// The mods a build installs, the options they declare, and the hooks to drive them, for tests.
+/// The modules a build installs, the options they declare, and the hooks to drive them, for tests.
 pub struct Harness {
     build: GameBuild,
-    mods: Mods,
+    modules: Modules,
     options: Options,
 }
 
 impl Harness {
     /// Native authoritative law chosen by this build's currently active providers.
     pub fn reaction_model(&self) -> Option<project_watt_cubed::sim::model::ModelSpec> {
-        self.mods.reaction_model()
+        self.modules.reaction_model()
     }
-    /// Register every package of `build` in order, as the game does; every mod hears the default
+    /// Register every package of `build` in order, as the game does; every module hears the default
     /// options.
     pub fn new(build: GameBuild) -> Self {
         let mut options = Options::new();
-        let mods = Mods::from_build(&build, &mut options);
-        Self { build, mods, options }
+        let modules = Modules::from_build(&build, &mut options);
+        Self { build, modules, options }
     }
 
-    /// The build's package list, as [`ModRegistrar::build`](crate::ModRegistrar::build) gave it.
+    /// The build's package list, as [`ModuleRegistrar::build`](crate::ModuleRegistrar::build) gave it.
     pub fn build(&self) -> &BuildInfo {
         self.build.info()
     }
 
-    // The installed mods, by install index.
+    // The installed modules, by install index.
 
-    /// How many mods the packages installed.
+    /// How many modules the packages installed.
     pub fn len(&self) -> usize {
-        self.mods.len()
+        self.modules.len()
     }
 
-    /// Whether the packages installed no mod.
+    /// Whether the packages installed no module.
     pub fn is_empty(&self) -> bool {
-        self.mods.is_empty()
+        self.modules.is_empty()
     }
 
-    /// The id of mod `i`.
+    /// The id of module `i`.
     pub fn id(&self, i: usize) -> &str {
-        self.mods.id(i)
+        self.modules.id(i)
     }
 
-    /// The name of mod `i` (its id unless it says otherwise).
+    /// The name of module `i` (its id unless it says otherwise).
     pub fn name(&self, i: usize) -> &str {
-        self.mods.name(i)
+        self.modules.name(i)
     }
 
-    /// The package that installed mod `i`.
+    /// The package that installed module `i`.
     pub fn package(&self, i: usize) -> Option<&'static str> {
-        self.mods.package(i)
+        self.modules.package(i)
     }
 
-    /// Whether mod `i` runs (false while its package is suspended).
+    /// Whether module `i` runs (false while its package is suspended).
     pub fn is_active(&self, i: usize) -> bool {
-        self.mods.is_active(i)
+        self.modules.is_active(i)
     }
 
-    /// The visual group mod `i` provides, if any.
+    /// The visual group module `i` provides, if any.
     pub fn visual_group(&self, i: usize) -> Option<VisualGroup> {
-        self.mods.visual_group(i)
+        self.modules.visual_group(i)
     }
 
-    /// Whether mod `i` replaces worldgen.
+    /// Whether module `i` replaces worldgen.
     pub fn is_worldgen(&self, i: usize) -> bool {
-        self.mods.is_worldgen(i)
+        self.modules.is_worldgen(i)
     }
 
     // Options.
@@ -112,17 +112,17 @@ impl Harness {
         &self.options
     }
 
-    /// The options, to change. Call [`options_changed`](Self::options_changed) to tell the mods.
+    /// The options, to change. Call [`options_changed`](Self::options_changed) to tell the modules.
     pub fn options_mut(&mut self) -> &mut Options {
         &mut self.options
     }
 
-    /// Tell every mod the options changed, as the core does after a change.
+    /// Tell every module the options changed, as the core does after a change.
     pub fn options_changed(&mut self) {
-        self.mods.options_changed(&self.options);
+        self.modules.options_changed(&self.options);
     }
 
-    /// Set the option `<package>.<key>` and tell the mods. False when no package declared it.
+    /// Set the option `<package>.<key>` and tell the modules. False when no package declared it.
     pub fn set_option(&mut self, full_key: &str, value: OptionValue) -> bool {
         let Some(id) = self.options.find(full_key) else { return false };
         self.options.set(id, value);
@@ -135,128 +135,128 @@ impl Harness {
     /// Suspend `packages` for the session, as a server that refuses them does.
     pub fn suspend(&mut self, packages: &[&str]) {
         let ids: Vec<String> = packages.iter().map(|id| id.to_string()).collect();
-        self.mods.suspend_packages(&ids);
+        self.modules.suspend_packages(&ids);
     }
 
     /// End every suspension.
     pub fn resume(&mut self) {
-        self.mods.resume_packages();
+        self.modules.resume_packages();
     }
 
     // Hooks, as the core arbitrates them.
 
-    /// Every active mod's `update`.
-    pub fn update(&mut self, ctx: &mut ModContext) {
-        self.mods.update(ctx);
+    /// Every active module's `update`.
+    pub fn update(&mut self, ctx: &mut ModuleContext) {
+        self.modules.update(ctx);
     }
 
-    /// Every active mod's `on_frame`, with the keyboard capture as the core keeps it.
+    /// Every active module's `on_frame`, with the keyboard capture as the core keeps it.
     pub fn frame(&mut self, ctx: &mut FrameContext) {
-        self.mods.on_frame(ctx);
+        self.modules.on_frame(ctx);
     }
 
-    /// Whether a mod holds the keyboard.
+    /// Whether a module holds the keyboard.
     pub fn text_captured(&self) -> bool {
-        self.mods.text_captured()
+        self.modules.text_captured()
     }
 
-    /// Hand `msg` to every active mod; true when one showed it.
+    /// Hand `msg` to every active module; true when one showed it.
     pub fn message(&mut self, msg: &Message) -> bool {
-        self.mods.on_message(msg)
+        self.modules.on_message(msg)
     }
 
-    /// Every active mod's HUD, in install order.
+    /// Every active module's HUD, in install order.
     pub fn hud(&self, facts: &HudFacts, world: &World, player: &Player, out: &mut Vec<HudElement>) {
-        self.mods.hud(facts, world, player, out);
+        self.modules.hud(facts, world, player, out);
     }
 
     /// Escape: the first open overlay closes. True when one did.
     pub fn close_overlay(&mut self) -> bool {
-        self.mods.close_overlay()
+        self.modules.close_overlay()
     }
 
     /// A block broke into this configuration.
     pub fn on_block_break(&mut self, id: BlockId, world: &World, overflow: bool) {
-        self.mods.on_block_break(id, world, overflow);
+        self.modules.on_block_break(id, world, overflow);
     }
 
     /// A tool reaction changed a held unit.
     pub fn on_tool_changed(&mut self, old: BlockId, new: BlockId) {
-        self.mods.on_tool_changed(old, new);
+        self.modules.on_tool_changed(old, new);
     }
 
     /// A primary action finished.
     pub fn on_tool_used(&mut self, outcome: ToolUse) {
-        self.mods.on_tool_used(outcome);
+        self.modules.on_tool_used(outcome);
     }
 
-    /// The tool a primary action applies: the first active mod that answers.
+    /// The tool a primary action applies: the first active module that answers.
     pub fn tool(&self, player: &Player) -> Option<BlockId> {
-        self.mods.tool(player)
+        self.modules.tool(player)
     }
 
     /// The first active appearance, or the core's flat one.
     pub fn appearance(&self) -> &dyn BlockAppearance {
-        self.mods.appearance()
+        self.modules.appearance()
     }
 
     /// The first active namer, if any.
     pub fn namer(&self) -> Option<&dyn MaterialNamer> {
-        self.mods.namer()
+        self.modules.namer()
     }
 
     /// The generator new worlds use.
     pub fn worldgen_kind(&self) -> WorldgenKind {
-        self.mods.worldgen_kind()
+        self.modules.worldgen_kind()
     }
 
-    /// The winning worldgen mod's payload.
+    /// The winning worldgen module's payload.
     pub fn worldgen_config(&self) -> Option<String> {
-        self.mods.worldgen_config()
+        self.modules.worldgen_config()
     }
 
-    /// The visual groups the active mods provide.
+    /// The visual groups the active modules provide.
     pub fn visual_mask(&self) -> VisualMask {
-        self.mods.visual_mask()
+        self.modules.visual_mask()
     }
 
-    /// The packages whose mods provide a visual group.
+    /// The packages whose modules provide a visual group.
     pub fn visual_packages(&self) -> Vec<String> {
-        self.mods.visual_packages()
+        self.modules.visual_packages()
     }
 
     /// The settings' render lanes with the unprovided groups stripped.
     pub fn effective_render(&self, settings: &Settings) -> RenderConfig {
-        self.mods.effective_render(settings)
+        self.modules.effective_render(settings)
     }
 
-    /// Every mod's per-world save line, as `(id, data)`.
+    /// Every module's per-world save line, as `(id, data)`.
     pub fn save_states(&self, world: &World) -> Vec<(String, String)> {
-        self.mods.save_states(world)
+        self.modules.save_states(world)
     }
 
-    /// Restore one save line; how many holdings the mod dropped.
+    /// Restore one save line; how many holdings the module dropped.
     pub fn load_state(&mut self, name: &str, data: &str, world: &mut World) -> u32 {
-        self.mods.load_state(name, data, world)
+        self.modules.load_state(name, data, world)
     }
 
-    /// Entering a world: every mod resets its per-world state.
+    /// Entering a world: every module resets its per-world state.
     pub fn reset(&mut self) {
-        self.mods.reset_state();
+        self.modules.reset_state();
     }
 
     /// The screen entries of the active packages, by order.
     pub fn screen_entries(&self) -> &[ScreenEntry] {
-        self.mods.screen_entries()
+        self.modules.screen_entries()
     }
 
-    /// The first active mod's root screen.
+    /// The first active module's root screen.
     pub fn root_screen(&self, facts: &ScreenFacts) -> Option<Box<dyn Screen>> {
-        self.mods.root_screen(facts)
+        self.modules.root_screen(facts)
     }
 
-    /// The first active mod's pause screen.
+    /// The first active module's pause screen.
     pub fn pause_screen(&self, facts: &ScreenFacts) -> Option<Box<dyn Screen>> {
-        self.mods.pause_screen(facts)
+        self.modules.pause_screen(facts)
     }
 }

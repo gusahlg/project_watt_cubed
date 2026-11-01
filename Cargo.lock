@@ -1784,7 +1784,7 @@ dependencies = [
 
 [[package]]
 name = "project_watt_cubed"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "ash",
  "bytemuck",
@@ -1807,7 +1807,14 @@ dependencies = [
 
 [[package]]
 name = "pwc-mod-api"
-version = "3.3.0"
+version = "3.4.0"
+dependencies = [
+ "pwc-module-api",
+]
+
+[[package]]
+name = "pwc-module-api"
+version = "3.4.0"
 dependencies = [
  "project_watt_cubed",
 ]

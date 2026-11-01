@@ -1,14 +1,11 @@
 [package]
 name = "pwc-mod-api"
-# The mod API version. Mods declare `pwc-api = "^3.0"` in mod.toml; the PWC package manager
-# checks that requirement against this version. A break old mods cannot compile through needs a
-# major bump. 3.0 is mods-v3: no switches, one options registry, screens, the frame hook, messages
-# and HUD facts (the changelog is at the top of src/lib.rs).
-version = "3.3.0"
+# Compatibility shim: the module API crate under its pre-3.4 name. Same version as pwc-module-api.
+version = "3.4.0"
 edition = "2024"
 license = "AGPL-3.0-or-later"
-description = "The interface PWC mods compile against: the mod trait, the registrar and the mod-facing parts of the game."
+description = "Compatibility shim: pwc-module-api under its old name, so packages written before the rename still compile."
 publish = false
 
 [dependencies]
-project_watt_cubed = { path = "../.." }
+pwc-module-api = { path = "../pwc-module-api" }
