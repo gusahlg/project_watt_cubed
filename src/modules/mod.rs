@@ -207,6 +207,10 @@ pub struct ModuleContext<'a> {
     /// Whether a module panel may open. Captured with the edge, so a toggle taken
     /// while the HUD is hidden does not open a panel when it is replayed.
     pub module_ui: bool,
+    /// The same as `module_ui`, under its name from before the rename, so a package written
+    /// for 3.3 or earlier still compiles.
+    #[doc(hidden)]
+    pub mod_ui: bool,
     /// True when a server owns evaluation (reactions and tool use run there).
     pub networked: bool,
     /// Block placements queued by modules this frame as `(x, y, z, id)`. The game
@@ -238,6 +242,7 @@ impl<'a> ModuleContext<'a> {
             nav_confirm: false,
             wheel: 0,
             module_ui: true,
+            mod_ui: true,
             networked: false,
             placements: Vec::new(),
             fired: ActionSet::NONE,

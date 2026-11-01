@@ -1231,6 +1231,7 @@ impl Game {
                     nav_confirm: edges.nav.has(MenuEvent::Confirm),
                     wheel: edges.wheel,
                     module_ui: edges.module_ui,
+                    mod_ui: edges.module_ui,
                     networked,
                     placements,
                     fired: edges.actions,

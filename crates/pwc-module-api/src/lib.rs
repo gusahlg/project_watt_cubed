@@ -26,12 +26,11 @@
 //!   [`audio::ModuleFrame`] and [`audio::ModuleLink`], `PackageKind::Mod` is [`PackageKind::Module`]
 //!   and `GameBuild::with_mod` is [`GameBuild::with_module`]. The old names remain as hidden
 //!   aliases (not deprecated), so a package written for 3.3 compiles unchanged.
-//! - Fields and enum variants cannot be aliased, so they are renamed: `ModuleContext::mod_ui` is
-//!   `module_ui`, `headless::ConnectError::mods_denied` and `net::client::ConnectError::mods_denied`
-//!   are `modules_denied`, `headless::JoinOptions::mods` is `modules`, the server `Config`'s
-//!   `mods_allow`/`mods_deny` are `modules_allow`/`modules_deny` and
-//!   `ServerMessage::ModsDenied` is `ModulesDenied` (same wire bytes; protocol stays 18).
-//!   Methods keep their names.
+//! - Fields cannot be aliased. `ModuleContext::mod_ui` is [`ModuleContext::module_ui`] and
+//!   `headless::ConnectError::mods_denied` is [`headless::ConnectError::modules_denied`]; the old
+//!   fields stay as hidden copies of the new ones, so packages that read them still compile.
+//!   One break: `headless::JoinOptions::mods` is [`headless::JoinOptions::modules`] (it shipped in
+//!   3.3, used only by `pwc.exploraswarm` 0.1.0, which 0.1.1 replaces). Methods keep their names.
 //! - Package manifests are `module.toml` with `kind = "module"` (the package manager still
 //!   reads `mod.toml` and `kind = "mod"`). Settings `mod_hz` and `mod_logic` are `module_hz` and
 //!   `module_logic`; the old keys still load.

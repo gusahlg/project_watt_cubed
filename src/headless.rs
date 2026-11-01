@@ -31,6 +31,9 @@ pub struct ConnectError {
     message: String,
     /// Package ids the server refuses. Empty unless it denied the module list.
     pub modules_denied: Vec<String>,
+    /// The same as `modules_denied`, under its name from before the rename (module API 3.3).
+    #[doc(hidden)]
+    pub mods_denied: Vec<String>,
 }
 
 impl ConnectError {
@@ -42,6 +45,7 @@ impl ConnectError {
         Self {
             message: message.into(),
             modules_denied: Vec::new(),
+            mods_denied: Vec::new(),
         }
     }
 }
@@ -50,6 +54,7 @@ impl From<crate::net::client::ConnectError> for ConnectError {
     fn from(err: crate::net::client::ConnectError) -> Self {
         Self {
             message: err.message().to_string(),
+            mods_denied: err.modules_denied.clone(),
             modules_denied: err.modules_denied,
         }
     }
