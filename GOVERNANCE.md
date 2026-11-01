@@ -23,7 +23,7 @@ sell, and host the software and content.
 5. Proprietary dependencies, accounts, SDKs, or services may not become
    mandatory for building, modifying, hosting, or meaningfully extending the
    official experience.
-6. Official mods and network services must provide corresponding source under
+6. Official modules and network services must provide corresponding source under
    the applicable policy and licence.
 7. Weakening copyleft requires permission from every affected copyright
    holder; a maintainer or community vote cannot replace that permission.

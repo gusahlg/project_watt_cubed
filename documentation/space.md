@@ -47,7 +47,7 @@ Air reaches `AIR_TOP` (20 000 blocks) above the nearest body. In it, walking is 
 integrator, and a fall already faster than terminal speed drags back toward that speed instead of
 stopping in one step. Above the air, and wherever no body is near, a walker is in free fall:
 velocity takes the whole gravity vector, with no terminal speed, and the movement keys do nothing.
-With the Developer Toolkit mod (`pwc.dev-toolkit`), `F` toggles walking and flying and `/noclip`
+With the Developer Toolkit module (`pwc.dev-toolkit`), `F` toggles walking and flying and `/noclip`
 toggles flight through geometry; the base game has neither.
 
 Because gravity is the honest vector sum, a cube that keeps its shape (the twins) is not "flat":
@@ -139,7 +139,7 @@ no night: the sun lights whatever faces it.
 
 ## Travel
 
-Travel tools come from the Developer Toolkit mod (`pwc.dev-toolkit`). `F` toggles walking and
+Travel tools come from the Developer Toolkit module (`pwc.dev-toolkit`). `F` toggles walking and
 flying. Flying is fast enough to cross a face, and it is how you steer in free fall. `/noclip`
 toggles flight through geometry. Above `AIR_TOP` a walker falls freely along the pull; in air a fall
 faster than terminal drags back toward it.

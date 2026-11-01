@@ -18,7 +18,7 @@ here limits truthful statements about compatibility or origin.
 You may:
 
 - discuss, review, criticise, teach, or report on Project Watt Cubed;
-- say truthfully that software, a mod, a server, or a service is “for”,
+- say truthfully that software, a module, a server, or a service is “for”,
   “compatible with”, “based on”, or “forked from” Project Watt Cubed;
 - operate a community site, wiki, forum, tutorial, or fan project that is
   clearly labelled unofficial;
@@ -43,7 +43,7 @@ Cubed, but it must:
 - state prominently that it is unofficial and modified;
 - remove or replace official logos and other in-product branding that would
   make users think it is an official build; and
-- avoid calling its own service, account system, server list, or mod registry
+- avoid calling its own service, account system, server list, or module registry
   the official Project Watt Cubed service.
 
 These requirements do not prevent a fork from preserving copyright notices,

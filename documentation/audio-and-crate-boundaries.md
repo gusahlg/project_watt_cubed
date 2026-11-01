@@ -12,7 +12,7 @@ The governing rule is:
 
 ## The current audio seam
 
-The audio path has a snapshot boundary. Policy lives in mods; the core only
+The audio path has a snapshot boundary. Policy lives in modules; the core only
 carries it out.
 
 ```text
@@ -42,14 +42,14 @@ backend -- Kira/device, silent fallback, or the recording backend
 once; the runtime then consumes the frame without cloning or repeating
 validation. [`audio/acoustics.rs`](../src/audio/acoustics.rs) is a pure kernel.
 Content loading, runtime voice allocation, capture, Opus sessions, and device
-backends stay in the core: a format-1 mod cannot depend on crates.io, and part
+backends stay in the core: a format-1 module cannot depend on crates.io, and part
 of this code is AGPL-only.
 
 [`audio/service.rs`](../src/audio/service.rs) is the client adapter. It keeps
 the gait (a footstep is a `GameEvent`), the acoustic window, the microphone,
 and the voice-session wishes. It does not choose cues. `pwc.sounds` maps
 events to catalog cues. `pwc.proximity-chat` maps the roster and push-to-talk
-onto sessions and the `"voice"` mod channel. With those mods disabled the core
+onto sessions and the `"voice"` module channel. With those modules disabled the core
 plays nothing and never opens the microphone.
 
 [`world/query.rs`](../src/world/query.rs) still builds `audio::AcousticWindow`.
@@ -58,8 +58,8 @@ leaf, or let the adapter build it from a generic occupancy query. `world` must
 not depend on the output system consuming the snapshot.
 
 `SoundClass` stays next to observations (`SoundClass::of` in
-[`block/registry.rs`](../src/block/registry.rs)). Mods read it through
-`AudioApi::block_sound`. The cue table is the sounds mod.
+[`block/registry.rs`](../src/block/registry.rs)). Modules read it through
+`AudioApi::block_sound`. The cue table is the sounds module.
 
 Settings stay a core mix (`Settings::mix_change`). The service reads it; a
 future audio runtime should still not import `Settings`.
@@ -98,7 +98,7 @@ watt-tools  --> client, never the reverse
 | `watt-domain` | coordinates, stable IDs, portable pose/stance values, bounded primitive codec | renderer types, devices, app state |
 | `watt-content` | law, configurations, encodings, observations, content fingerprint, region placement and deterministic world generation | GPU tables and resident meshes |
 | `watt-protocol` | message schema and pure encode/decode | QUIC endpoints, client interpolation, server authority |
-| `watt-save` | save document, codec, salvage, slot/store policy | `World`, `Player`, mods, renderer |
+| `watt-save` | save document, codec, salvage, slot/store policy | `World`, `Player`, modules, renderer |
 | `watt-audio` | catalog, acoustic kernel, runtime mixer, capture/voice decode, backend | `World`, network connection, console, settings |
 | `watt-server` | authority state, validation, interest management, server transport | window, renderer, client UI/audio |
 | `watt-client` | application composition, game adapters, UI, renderer integration | reusable wire/save formats |
@@ -114,8 +114,8 @@ unused code.
 
 1. Break the `world`/audio snapshot dependency described above.
 2. Keep `AudioService` (gait, window, capture, session wishes) in the client.
-   The mods own policy. Move only the runtime and pure kernels.
-3. Keep material sound classification next to observations. Mods read it; they
+   The modules own policy. Move only the runtime and pure kernels.
+3. Keep material sound classification next to observations. Modules read it; they
    do not own the enum.
 4. Preserve `AudioFrame` as the only commit boundary and keep silent fallback a
    normal runtime state.
@@ -237,7 +237,7 @@ remain intentionally separate:
   prerequisites.
 - **Settings.** It deliberately composes renderer, world, UI, and audio policy
   for the client. It has no second independent consumer yet.
-- **Mods.** Current mods borrow `World`, `Player`, UI data, and engine input.
+- **Modules.** Current modules borrow `World`, `Player`, UI data, and engine input.
   Define a stable capability/context API before treating them as an external
   crate or ABI.
 - **The entire `ident` module.** Its edit-log vocabulary is explicitly

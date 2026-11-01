@@ -13,11 +13,11 @@ cd "$(dirname "$0")"
 # at the live asset tree so newly dropped-in music and replacement sounds are
 # visible immediately; an explicit caller override still wins.
 export WATT_ASSET_DIR="${WATT_ASSET_DIR:-$PWD/assets}"
-# The mods screen writes `mods.toml` in the checkout, not the data dir.
+# The modules screen writes `modules.toml` in the checkout, not the data dir.
 export WATT_CHECKOUT_DIR="$PWD"
 nix flake update voxel-engine
 # The checkout builds vanilla PWC. With the PWC package manager installed and an instance
-# selected (`pwc instance use <name>`), `PWC_PLAY=instance ./play.sh` runs that modded build.
+# selected (`pwc instance use <name>`), `PWC_PLAY=instance ./play.sh` runs that build with modules.
 if [ "${PWC_PLAY:-}" = instance ] && command -v pwc >/dev/null; then
   exec pwc run -- "$@"
 fi

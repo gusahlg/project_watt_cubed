@@ -14,7 +14,7 @@ world should be interesting to explore.
 
 # Code Philosophy
 The code must always be very modular and may heavily use macros and generics to achieve minimal repetition. An important part is that the code
-should be maintainable and practical long term but also expose key parts to a simple api that can be used for writing mods. This means that the
+should be maintainable and practical long term but also expose key parts to a simple api that can be used for writing modules. This means that the
 complexity should be varied with more simple code as well. Naming should be very simple, no jargon or anything just the most simple name that
 works with naming conventions and conveys purpose in a clear and non-contradictory way. The comment style is conservative, write overall purpose
 of the file at the top of the file (this matches way with the modular rust thinking where one file often equals one explicit sub system)

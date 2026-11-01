@@ -5,8 +5,8 @@ lattice, identity = coordinates). Grass, rock, a lamp, a tool and a planet's cor
 configurations, with no named block types. The common material catalog, compatibility kernel,
 observations and presentation remain in `crates/material` and `src/block/registry.rs`.
 
-Material interaction models are optional native mods. The extracted
-[Selective Transfer Physics](https://github.com/gusahlg/pwc-package-manager/blob/main/mods/physics-selective/README.md) supplies the original integer
+Material interaction models are optional native modules. The extracted
+[Selective Transfer Physics](https://github.com/gusahlg/pwc-package-manager/blob/main/modules/physics-selective/README.md) supplies the original integer
 contact law and queue. `src/sim/model.rs` defines its interface; `src/sim/reactions.rs` hosts the
 selected model, authority and saved state. Production vanilla has no reaction provider and
 performs no automatic reactions or held-material reaction. The original law's specification
@@ -65,12 +65,12 @@ configuration in the registry hot tables (mesher, light, physics, audio read tho
 `visual(law, block)` → `Visual`: the base colour is periodic 4-D value noise sampled at the
 configuration's **centroid** on the torus (so a block that gains or loses constituents visibly
 drifts toward them), the accent is the least-held occurrence's colour mixed into a darker base,
-plus pattern frequency, roughness, alpha and glow. An appearance mod turns that (and the
-configuration itself) into the texture layer — see [mods](mods.md).
+plus pattern frequency, roughness, alpha and glow. An appearance module turns that (and the
+configuration itself) into the texture layer — see [modules](modules.md).
 
 ## Optional simulation in the world
 
-`Mod::reaction_model()` returns a `ModelSpec { id, version, create }`. The first active mod
+`Module::reaction_model()` returns a `ModelSpec { id, version, create }`. The first active module
 returning a provider wins. Its `Model: Send` instance owns its queue or per-cell fields,
 budgeted `tick`, optional `tool`, wakeups, counters, and `save`/`load` payload. Core supplies
 the `CellStore` adapter and mutation bookkeeping; pair writes require atomic admission.
@@ -79,9 +79,9 @@ Dynamic fields belong to voxel instances, not shared material IDs.
 A provider can declare an enabled option and return `None` when off. Switching or disabling
 it freezes its payload in the host; restoring the same id and version resumes that state.
 Only one model runs at once. Alternative bounded laboratories are
-[waves](https://github.com/gusahlg/pwc-package-manager/blob/main/mods/physics-wave/README.md), [packets](https://github.com/gusahlg/pwc-package-manager/blob/main/mods/physics-packets/README.md),
-[reservoir chemistry](https://github.com/gusahlg/pwc-package-manager/blob/main/mods/physics-reservoir/README.md), and
-[memory matter](https://github.com/gusahlg/pwc-package-manager/blob/main/mods/physics-rotor/README.md); see the
+[waves](https://github.com/gusahlg/pwc-package-manager/blob/main/modules/physics-wave/README.md), [packets](https://github.com/gusahlg/pwc-package-manager/blob/main/modules/physics-packets/README.md),
+[reservoir chemistry](https://github.com/gusahlg/pwc-package-manager/blob/main/modules/physics-reservoir/README.md), and
+[memory matter](https://github.com/gusahlg/pwc-package-manager/blob/main/modules/physics-rotor/README.md); see the
 [research notes](notes/2026-10-13-simulation/research.md) for their limitations.
 
 Eight more separately packaged laws explore fuel fronts, excitation/recovery, loop currents,
@@ -91,7 +91,7 @@ package-manager sources and records the small demonstrations. None is a selected
 
 ### Extracted selective-transfer scheduler
 
-`../pwc-package-manager/mods/physics-selective/src/model.rs`. Reactions start **only** when contact or material state
+`../pwc-package-manager/modules/physics-selective/src/model.rs`. Reactions start **only** when contact or material state
 changes: a block is placed, removed or moved, or its configuration changes (a tool use, a
 machine, another reaction).
 The affected voxel's six face contacts are queued — empty neighbours included; for a move both the
@@ -110,7 +110,7 @@ old and the new location are. Diagonals never interact.
 - The pending queue (with arrival ages) is saved with the world and restored on load.
 
 The host exposes model counters and samples through `World::simulation_stats` and
-`World::simulation_sample`; command and HUD mods can present them.
+`World::simulation_sample`; command and HUD modules can present them.
 
 ### Tools
 
@@ -138,7 +138,7 @@ the same generated configurations differently.
 ## Saves and protocol
 
 Save **v10** (`src/save/format.rs`) retains the catalog stamp, canonical specs, edits and legacy
-pending-contact field. Model state uses the existing opaque mod-state section:
+pending-contact field. Model state uses the existing opaque module-state section:
 `@simulation.selected` records `id@version` or `off`, and `@simulation.state.<id>` records a
 versioned payload. Paused providers' payloads remain present. This extraction does not bump
 the binary save format; the selective provider can also import legacy pending contacts.
@@ -153,6 +153,6 @@ future work; matching model identity does not make the experimental laboratory H
 
 To change the common catalog `Law` or fit table, bump `Law::version`, re-run palette search
 and material checks, and update save/protocol compatibility as needed. To change a simulation,
-implement a native `Model` in its own mod and bump `ModelSpec::version` when its law or saved
+implement a native `Model` in its own module and bump `ModelSpec::version` when its law or saved
 state interpretation changes. Game systems consume observations and visuals without adding
 named-material special cases.

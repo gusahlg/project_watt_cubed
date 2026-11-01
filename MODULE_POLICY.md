@@ -1,39 +1,39 @@
 <!-- SPDX-FileCopyrightText: 2026 Project Watt Cubed contributors -->
 <!-- SPDX-License-Identifier: CC-BY-SA-4.0 -->
 
-# Official Project Watt Cubed mod policy
+# Official Project Watt Cubed module policy
 
-The official mod ecosystem exists to distribute software that every recipient
-can study, modify, rebuild, and share. Commercial free-software mods are
-welcome. Binary-only or proprietary mods are not accepted by the official
+The official module ecosystem exists to distribute software that every recipient
+can study, modify, rebuild, and share. Commercial free-software modules are
+welcome. Binary-only or proprietary modules are not accepted by the official
 registry.
 
 This policy governs official registries, signing infrastructure, clients, and
-mod listings. It does not add restrictions to private activity or to
+module listings. It does not add restrictions to private activity or to
 independent forks beyond the licences of the relevant code and content.
 
 ## Current implementation
 
-Until the sandboxed WebAssembly ABI and the official registry exist, mods are distributed as
-`.pwcmod` source packages and compiled into the game by the
+Until the sandboxed WebAssembly ABI and the official registry exist, modules are distributed as
+`.pwcmodule` source packages and compiled into the game by the
 [PWC package manager](https://github.com/gusahlg/pwc-package-manager) (`pwc`). That native,
 compile-in stage is local and pre-registry: its packages are trusted native code, not sandboxed,
-and are not official registry mods. The package manager's `POLICY.md` carries this policy over
+and are not official registry modules. The package manager's `POLICY.md` carries this policy over
 and enforces what it can (allowlisted free code and content licences, complete source with no
 build scripts, content-addressed immutable versions).
 
 ## Licensing
 
-Proprietary mods are not accepted. Every mod must be free software that all of
+Proprietary modules are not accepted. Every module must be free software that all of
 its recipients may study, modify, rebuild, and share.
 
-All original software code in a submitted mod must be licensed under a
+All original software code in a submitted module must be licensed under a
 free-software licence on the registry's published allowlist of licences
-compatible with the game's `AGPL-3.0-or-later`; mods are combined with the AGPL
+compatible with the game's `AGPL-3.0-or-later`; modules are combined with the AGPL
 game, so the combination must remain distributable under the AGPL. This
 includes client, server, shared, and tool components, build scripts, generated
 software source, and project-specific SDK glue. Accepted licences include
-`Apache-2.0 OR MIT` (recommended, and used by the first-party mods), `MIT`,
+`Apache-2.0 OR MIT` (recommended, and used by the first-party modules), `MIT`,
 `MPL-2.0`, `GPL-3.0-or-later`, and `AGPL-3.0-or-later`; the full allowlist is
 maintained in the PWC package manager's `POLICY.md`. A package declares its
 licence as an SPDX expression, and every alternative a recipient may choose
@@ -44,9 +44,9 @@ Source dependencies must be free software under licences accepted by the
 registry's published compatibility allowlist. Their notices and source must be
 preserved.
 
-Mod assets must have complete provenance and use an approved free-content
+Module assets must have complete provenance and use an approved free-content
 licence, or the package's own allowlisted free-software licence (for example
-the first-party mods' icons, which are `Apache-2.0 OR MIT` like their code).
+the first-party modules' icons, which are `Apache-2.0 OR MIT` like their code).
 The initial approved free-content list is:
 
 - `CC-BY-SA-4.0`;
@@ -61,7 +61,7 @@ free-content licences may be added to the registry allowlist after compatibility
 and notice review. Noncommercial, no-derivatives, source-available-only, and
 custom field-of-use restrictions are not accepted.
 
-Receiving payment for a mod, support, or development is allowed. Recipients
+Receiving payment for a module, support, or development is allowed. Recipients
 must retain all freedoms and source rights required by the applicable licences.
 
 ## Complete source
@@ -83,13 +83,13 @@ grounds for rejection.
 
 ## Package and execution model
 
-Official user-installable mods must target the versioned, sandboxed WebAssembly
-mod ABI once that ABI and registry are available. Native dynamic libraries and
-arbitrary native executables are not accepted as official mods.
+Official user-installable modules must target the versioned, sandboxed WebAssembly
+module ABI once that ABI and registry are available. Native dynamic libraries and
+arbitrary native executables are not accepted as official modules.
 
 A package declares whether each component is `server`, `client`, `shared`, or
 `tool`, along with its ABI and game-version requirements. It must declare every
-requested capability. The host grants only declared capabilities; mods receive
+requested capability. The host grants only declared capabilities; modules receive
 snapshots and capability handles and submit typed intents rather than taking
 unrestricted mutable access to authoritative game state.
 
@@ -114,7 +114,7 @@ opaque executable as the release artifact. For every accepted revision it:
    metadata together.
 
 The official client installs registry-built, signed packages by default and
-shows each mod's source and licence. Because the client is free software, users
+shows each module's source and licence. Because the client is free software, users
 and forks remain able to use other distribution channels; registry signing is a
 statement of provenance, not DRM.
 
@@ -123,8 +123,8 @@ requirements, or undisclosed network behaviour are not accepted.
 
 ## Multiplayer and updates
 
-Required mods participate in the canonical multiplayer content fingerprint,
-including mod ID and version, source revision, WebAssembly hash, asset hash,
+Required modules participate in the canonical multiplayer content fingerprint,
+including module ID and version, source revision, WebAssembly hash, asset hash,
 content-registration hash, ABI version, save-schema version, and deterministic
 configuration. Incompatible clients must be rejected before world entry with a
 specific explanation.
@@ -142,4 +142,4 @@ free licences.
 
 Authors should receive a concrete reason and may submit a corrected revision or
 request maintainer review. Trademark permission is separate from registry
-acceptance; listing a mod does not make it an official project release.
+acceptance; listing a module does not make it an official project release.
