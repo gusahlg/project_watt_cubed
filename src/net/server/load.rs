@@ -273,7 +273,7 @@ fn hello(name: &str) -> Vec<u8> {
         simulation: content.simulation,
         name: name.into(),
         password: "".into(),
-        mods: vec![],
+        modules: vec![],
     }
     .encode()
 }

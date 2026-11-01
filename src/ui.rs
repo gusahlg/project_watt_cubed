@@ -1,4 +1,4 @@
-//! The closed set of UI primitives the core draws for mods: anchors, the HUD element vocabulary
+//! The closed set of UI primitives the core draws for modules: anchors, the HUD element vocabulary
 //! and its renderer, roles (the one colour table), lines of styled text, and the HUD modes. The
 //! text widgets (an editable line, the scrollback) live in the `pwc.ui-kit` library.
 use std::borrow::Cow;
@@ -123,9 +123,9 @@ impl HudMode {
         matches!(self, HudMode::Full)
     }
 
-    /// Whether mod-contributed HUD widgets are shown. Gameplay
+    /// Whether module-contributed HUD widgets are shown. Gameplay
     /// UI like the reticle: everything but `Off`.
-    pub fn shows_mod_hud(self) -> bool {
+    pub fn shows_module_hud(self) -> bool {
         !matches!(self, HudMode::Off)
     }
 
@@ -217,7 +217,7 @@ pub fn shadowed(f: &mut Frame, text: &str, x: i32, y: i32, font_size: i32, color
     f.draw_text(text, x, y, font_size, color);
 }
 
-// HUD widget vocabulary: mods describe what to show as data, [`render_hud`] draws it.
+// HUD widget vocabulary: modules describe what to show as data, [`render_hud`] draws it.
 
 /// One panel row's text plus its emphasis. The panel resolves the role to a
 /// colour and ellipsizes the text to the panel width. `swatch` is an optional
@@ -304,9 +304,9 @@ impl Panel {
     }
 }
 
-/// One thing a mod contributes to the HUD. Closed on purpose (see the module
+/// One thing a module contributes to the HUD. Closed on purpose (see the module
 /// note): a screen-anchored label, a boxed panel or a filled rectangle — nothing
-/// that lets a mod draw arbitrarily.
+/// that lets a module draw arbitrarily.
 #[derive(Clone)]
 pub enum HudElement {
     /// A screen-anchored line of text, scaled by the theme.
@@ -324,7 +324,7 @@ pub enum HudElement {
 }
 
 /// Flatten HUD labels and panel rows to text. Test helper: one place for the
-/// inventory and crafting mods to assert on what they painted.
+/// inventory and crafting modules to assert on what they painted.
 #[cfg(test)]
 pub(crate) fn hud_text(elements: &[HudElement]) -> String {
     let mut out = String::new();
@@ -346,7 +346,7 @@ pub(crate) fn hud_text(elements: &[HudElement]) -> String {
     out
 }
 
-/// Draw every mod's contributed HUD. The only place mod HUD reaches the frame.
+/// Draw every module's contributed HUD. The only place module HUD reaches the frame.
 pub fn render_hud(f: &mut Frame, theme: &Theme, screen: Px, elements: &[HudElement]) {
     for el in elements {
         match el {
@@ -366,7 +366,7 @@ pub fn render_hud(f: &mut Frame, theme: &Theme, screen: Px, elements: &[HudEleme
 /// resolves a role to a colour through [`Role::color`], so text can only ever be an
 /// on-palette colour and call sites speak emphasis (`Danger` vs `Dim`) instead of
 /// pixels. This is the single colour table for the whole UI: HUD, console, menus,
-/// and mods all ask for a role, never a raw `Color::`.
+/// and modules all ask for a role, never a raw `Color::`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Role {
     /// Primary text: coords, labels, the brightest normal text.
@@ -489,13 +489,13 @@ mod tests {
         assert!(HudMode::Minimal.shows_world_ui());
         assert!(!HudMode::Off.shows_world_ui());
         assert_eq!(HudMode::Off.next(), HudMode::Full);
-        // Off hides EVERY widget: minimap and mod HUD included, not just the reticle/info text.
+        // Off hides EVERY widget: minimap and module HUD included, not just the reticle/info text.
         assert!(HudMode::Full.shows_minimap());
         assert!(!HudMode::Minimal.shows_minimap());
         assert!(!HudMode::Off.shows_minimap());
-        assert!(HudMode::Full.shows_mod_hud());
-        assert!(HudMode::Minimal.shows_mod_hud());
-        assert!(!HudMode::Off.shows_mod_hud());
+        assert!(HudMode::Full.shows_module_hud());
+        assert!(HudMode::Minimal.shows_module_hud());
+        assert!(!HudMode::Off.shows_module_hud());
     }
 
     #[test]

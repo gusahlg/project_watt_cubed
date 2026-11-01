@@ -705,9 +705,10 @@ pub(super) fn settings_json(s: &Settings, eng: &Engine) -> Json {
         ("stream_hz", Json::from(s.stream_hz)),
         ("physics_hz", Json::from(s.physics_hz)),
         ("sky_hz", Json::from(s.sky_hz)),
-        ("mod_hz", Json::from(s.mod_hz)),
+        // Report keys keep their old spelling: pinned baselines are compared by key.
+        ("mod_hz", Json::from(s.module_hz)),
         ("simulation", Json::from(crate::settings::simulation_enabled())),
-        ("mod_logic", Json::from(s.mod_logic)),
+        ("mod_logic", Json::from(s.module_logic)),
         ("autosave", Json::from(s.autosave)),
         ("lighting", Json::from(s.lighting)),
         ("ambient_occlusion", Json::from(s.ao)),

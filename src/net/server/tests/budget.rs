@@ -1,4 +1,4 @@
-//! Rate windows, per-kind budgets and the mod-channel budget.
+//! Rate windows, per-kind budgets and the module-channel budget.
 use super::super::*;
 use super::support::XorShift;
 
@@ -106,7 +106,7 @@ fn each_message_kind_has_its_own_budget() {
 
 /// Cycling channel names cannot beat the connection's total, and new names stop at the cap.
 #[test]
-fn mod_channels_share_one_budget_and_a_name_cap() {
+fn module_channels_share_one_budget_and_a_name_cap() {
     let now = Instant::now();
     let channel = |i: usize| protocol::Channel::parse(&format!("c{i}")).unwrap();
     let mut names = ChannelBudget::new();
@@ -116,8 +116,8 @@ fn mod_channels_share_one_budget_and_a_name_cap() {
     assert!(!names.allow(&channel(MAX_CHANNELS), now), "a new name past the cap is dropped");
     assert!(names.allow(&channel(0), now), "a known name keeps its window");
     let mut flood = ChannelBudget::new();
-    let passed = (0..4 * MOD_DATA_RATE as usize).filter(|&i| flood.allow(&channel(i % MAX_CHANNELS), now)).count();
-    assert_eq!(passed, MOD_DATA_RATE as usize, "switching channels buys no extra rate");
+    let passed = (0..4 * MODULE_DATA_RATE as usize).filter(|&i| flood.allow(&channel(i % MAX_CHANNELS), now)).count();
+    assert_eq!(passed, MODULE_DATA_RATE as usize, "switching channels buys no extra rate");
 }
 
 /// The ring keeps the window's sliding behaviour when it wraps many times over.

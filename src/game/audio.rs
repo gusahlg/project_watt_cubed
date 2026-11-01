@@ -1,10 +1,10 @@
-//! The frame's audio commit: every peer sampled once for the frame, footsteps, the mods' audio
+//! The frame's audio commit: every peer sampled once for the frame, footsteps, the modules' audio
 //! hooks and the mixer.
 use voxel_engine::DVec3;
 
 use super::{FrameInput, Game};
-use crate::audio::{AudioService, AudioView, CueSymbols, GameEvent, ModLink, PeerAudio, SoundSystem, StepPose};
-use crate::modding::Mods;
+use crate::audio::{AudioService, AudioView, CueSymbols, GameEvent, ModuleLink, PeerAudio, SoundSystem, StepPose};
+use crate::modules::Modules;
 use crate::settings::Settings;
 
 /// Facts for the audio hook. `events` is what this frame already knows; footsteps are added inside.
@@ -17,7 +17,7 @@ pub(super) struct AudioPhase<'a> {
     pub(super) settings: &'a Settings,
     pub(super) events: Vec<GameEvent>,
     pub(super) active: bool,
-    pub(super) mods: &'a mut Mods,
+    pub(super) modules: &'a mut Modules,
     pub(super) ids: &'a [&'static str],
 }
 
@@ -41,7 +41,7 @@ impl Game {
         }));
     }
 
-    /// Hand this frame to the mods. A still singleplayer frame still runs the hook,
+    /// Hand this frame to the modules. A still singleplayer frame still runs the hook,
     /// on stack data, and skips the mixer unless the hook queued work.
     pub(super) fn commit_audio(&mut self, phase: AudioPhase<'_>) {
         let AudioPhase {
@@ -53,12 +53,12 @@ impl Game {
             settings,
             mut events,
             active,
-            mods,
+            modules,
             ids,
         } = phase;
         let idle = events.is_empty() && input.actions.is_empty();
         if self.net.is_none() && audio.can_skip(sound, idle, self.player.position) {
-            self.dispatch_audio(dt, input, sound, audio, cues, settings, mods, ids, &[], &events);
+            self.dispatch_audio(dt, input, sound, audio, cues, settings, modules, ids, &[], &events);
             if audio.dirty() {
                 self.submit_audio(dt, sound, audio);
             } else {
@@ -81,7 +81,7 @@ impl Game {
                 });
                 ups.push(r.up);
             }
-            // A frame a mod's text capture owns does not step the player, so a stale walk speed
+            // A frame a module's text capture owns does not step the player, so a stale walk speed
             // must not fire a footstep.
             let velocity = if active { self.player.velocity() } else { DVec3::ZERO };
             audio.footsteps(
@@ -97,7 +97,7 @@ impl Game {
                 &ups,
                 &mut events,
             );
-            self.dispatch_audio(dt, input, sound, audio, cues, settings, mods, ids, &peers, &events);
+            self.dispatch_audio(dt, input, sound, audio, cues, settings, modules, ids, &peers, &events);
             self.submit_audio(dt, sound, audio);
             self.peer_pose_scratch = peers;
             self.peer_up_scratch = ups;
@@ -114,7 +114,7 @@ impl Game {
         audio: &mut AudioService,
         cues: &CueSymbols,
         settings: &Settings,
-        mods: &mut Mods,
+        modules: &mut Modules,
         ids: &[&'static str],
         peers: &[PeerAudio],
         events: &[GameEvent],
@@ -129,12 +129,12 @@ impl Game {
             actions: input.actions,
             ids,
         };
-        let mut link = ModLink::new(self.net.as_mut());
+        let mut link = ModuleLink::new(self.net.as_mut());
         let mut api = audio.api(sound, cues, Some(&self.world), Some(&mut self.notices));
         for event in events {
-            mods.on_game_event(event, &mut api);
+            modules.on_game_event(event, &mut api);
         }
-        mods.on_audio(&view, &mut api, &mut link);
+        modules.on_audio(&view, &mut api, &mut link);
     }
 
     fn submit_audio(&mut self, dt: f32, sound: &mut SoundSystem, audio: &mut AudioService) {

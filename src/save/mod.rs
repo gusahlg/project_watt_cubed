@@ -3,7 +3,7 @@
 //! store manages atomic writes and the read ladder. autosave drives periodic
 //! background saves. bridge is the only game-specific glue to SaveDoc.
 //! A world is procedural, so saves are tiny: only player state, edited blocks,
-//! and mod state are stored, using portable by-name form shared with the network.
+//! and module state are stored, using portable by-name form shared with the network.
 
 pub mod autosave;
 mod bridge;
@@ -40,7 +40,7 @@ mod tests {
     use super::*;
     use super::bridge::{from_doc, unknown_material_notice, UnknownMaterials};
     use super::format::{PlayerState, SaveDoc, WorldgenStamp};
-    use crate::modding::Mods;
+    use crate::modules::Modules;
     use crate::player::Player;
     use crate::world::World;
     use crate::world::chunk::CHUNK_SIZE;
@@ -116,7 +116,7 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_preserves_seed_player_edits_and_mod_state() {
+    fn round_trip_preserves_seed_player_edits_and_module_state() {
         let id = slot("__unit_test_round_trip__");
 
         let mut world = World::new(4242);
@@ -137,16 +137,16 @@ mod tests {
         let soil = world.registry().id_by_label("soil").unwrap();
         player.inventory.add(rock, 2);
         player.inventory.add(soil, 1);
-        let mut mods = crate::modding::testing::standard();
+        let mut modules = crate::modules::testing::standard();
         let rock_spec = world.registry().spec(rock);
-        mods.load_state("hotbar", &format!("v1;sel=2;2={rock_spec}"), &mut world);
-        let states_before = mods.save_states(&world);
+        modules.load_state("hotbar", &format!("v1;sel=2;2={rock_spec}"), &mut world);
+        let states_before = modules.save_states(&world);
 
-        save(&id, &world, &player, &mods, meta("round trip")).unwrap();
+        save(&id, &world, &player, &modules, meta("round trip")).unwrap();
 
-        let mut fresh_mods = crate::modding::testing::standard();
+        let mut fresh_modules = crate::modules::testing::standard();
         let (loaded_world, loaded_player, loaded_meta, report) =
-            load(&id, &mut fresh_mods, make_world).unwrap();
+            load(&id, &mut fresh_modules, make_world).unwrap();
 
         assert_eq!(loaded_world.seed(), 4242);
         assert_eq!(loaded_meta.seed, 4242, "seed is stamped into the header");
@@ -173,9 +173,9 @@ mod tests {
         assert_eq!(report.source, Source::Live);
         assert!(report.salvage.is_none());
         assert_eq!(
-            fresh_mods.save_states(&loaded_world),
+            fresh_modules.save_states(&loaded_world),
             states_before,
-            "mod state survives the round trip"
+            "module state survives the round trip"
         );
         assert!(
             states_before.iter().all(|(k, _)| k != "inventory"),
@@ -205,7 +205,7 @@ mod tests {
             },
             specs: vec![],
             edits: vec![],
-            mods: vec![],
+            modules: vec![],
             pending: vec![],
         }
     }
@@ -232,8 +232,8 @@ mod tests {
     }
 
     fn load_flat(doc: SaveDoc) -> (World, Player) {
-        let mut mods = crate::modding::testing::standard();
-        let (world, player, _) = from_doc(doc, &mut mods, |seed, kind, cfg| {
+        let mut modules = crate::modules::testing::standard();
+        let (world, player, _) = from_doc(doc, &mut modules, |seed, kind, cfg| {
             World::with_kind_cfg(
                 seed,
                 crate::render_config::RenderConfig::default(),
@@ -318,8 +318,8 @@ mod tests {
         let world = World::new(3);
         let mut player = Player::new(DVec3::new(4.5, 10.0, 4.5)); // under the flat ground
         player.start_cruise(crate::player::CRUISE_MAX);
-        let mods = crate::modding::testing::standard();
-        let doc = super::bridge::to_doc(&world, &player, &mods, meta("cruise")).unwrap();
+        let modules = crate::modules::testing::standard();
+        let doc = super::bridge::to_doc(&world, &player, &modules, meta("cruise")).unwrap();
         let saved = &doc.player;
         assert_eq!(saved.velocity, [0.0; 3]);
         assert!(saved.flying && !saved.noclip);
@@ -327,12 +327,12 @@ mod tests {
     }
 
     #[test]
-    fn legacy_inventory_mod_line_is_ignored() {
+    fn legacy_inventory_module_line_is_ignored() {
         let mut doc = bare_doc();
-        doc.mods
+        doc.modules
             .push(("inventory".into(), "v1;Stone,Stone,Soil".into()));
-        let mut mods = crate::modding::testing::standard();
-        let (_, player, _) = from_doc(doc, &mut mods, make_world).unwrap();
+        let mut modules = crate::modules::testing::standard();
+        let (_, player, _) = from_doc(doc, &mut modules, make_world).unwrap();
         assert_eq!(player.inventory.total(), 0);
     }
 
@@ -340,8 +340,8 @@ mod tests {
     fn unknown_inventory_specs_are_skipped() {
         let mut doc = bare_doc();
         doc.player.inventory = Some(vec![("natural:Stone".into(), 2), ("air".into(), 1)]);
-        let mut mods = crate::modding::testing::standard();
-        let (_, player, _) = from_doc(doc, &mut mods, make_world).unwrap();
+        let mut modules = crate::modules::testing::standard();
+        let (_, player, _) = from_doc(doc, &mut modules, make_world).unwrap();
         assert_eq!(player.inventory.total(), 1);
         assert_eq!(player.inventory.count(AIR), 1);
     }
@@ -379,8 +379,8 @@ mod tests {
 
         let mut doc = bare_doc();
         doc.player.inventory = Some(vec![("natural:Stone".into(), 2), ("air".into(), 1)]);
-        let mut mods = crate::modding::testing::standard();
-        let (_, player, _) = from_doc(doc, &mut mods, make_world).unwrap();
+        let mut modules = crate::modules::testing::standard();
+        let (_, player, _) = from_doc(doc, &mut modules, make_world).unwrap();
         assert_eq!(player.inventory.total(), 1);
     }
 
@@ -391,8 +391,8 @@ mod tests {
         let spec = world.registry().spec(rock);
         let mut doc = bare_doc();
         doc.player.inventory = Some(vec![(spec, 4)]);
-        let mut mods = crate::modding::testing::standard();
-        let (_, player, _) = from_doc(doc, &mut mods, make_world).unwrap();
+        let mut modules = crate::modules::testing::standard();
+        let (_, player, _) = from_doc(doc, &mut modules, make_world).unwrap();
         assert_eq!(player.inventory.count(rock), 4);
     }
 
@@ -402,8 +402,8 @@ mod tests {
         doc.specs = vec!["natural:Stone".into()];
         doc.edits = vec![super::format::Edit { x: 1, y: 40, z: 1, spec: 0 }];
         doc.meta.edit_count = 1;
-        let mut mods = crate::modding::testing::standard();
-        let (world, _, _) = from_doc(doc, &mut mods, make_world).unwrap();
+        let mut modules = crate::modules::testing::standard();
+        let (world, _, _) = from_doc(doc, &mut modules, make_world).unwrap();
         assert_eq!(world.block_at(1, 40, 1), AIR);
     }
 
@@ -411,9 +411,9 @@ mod tests {
     fn law_mismatch_is_refused() {
         let mut doc = bare_doc();
         doc.law_stamp[0] ^= 0xff;
-        let mut mods = crate::modding::testing::standard();
+        let mut modules = crate::modules::testing::standard();
         assert!(matches!(
-            from_doc(doc, &mut mods, make_world),
+            from_doc(doc, &mut modules, make_world),
             Err(SaveError::LawMismatch)
         ));
     }
@@ -425,8 +425,8 @@ mod tests {
         for stamp in [law.stamp(), Vec::new(), vec![0u8; 80]] {
             let mut doc = bare_doc();
             doc.law_stamp = stamp;
-            let mut mods = crate::modding::testing::standard();
-            assert!(matches!(from_doc(doc, &mut mods, make_world), Err(SaveError::LawMismatch)));
+            let mut modules = crate::modules::testing::standard();
+            assert!(matches!(from_doc(doc, &mut modules, make_world), Err(SaveError::LawMismatch)));
         }
     }
 
@@ -439,9 +439,9 @@ mod tests {
         let before = world.reactions().snapshot();
         assert_eq!(before.len(), 12);
         let player = Player::new(DVec3::new(0.0, 70.0, 0.0));
-        let mut mods = crate::modding::testing::standard();
-        save(&id, &world, &player, &mods, meta("pending")).unwrap();
-        let (loaded, _, _, _) = load(&id, &mut mods, make_world).unwrap();
+        let mut modules = crate::modules::testing::standard();
+        save(&id, &world, &player, &modules, meta("pending")).unwrap();
+        let (loaded, _, _, _) = load(&id, &mut modules, make_world).unwrap();
         assert_eq!(loaded.reactions().snapshot(), before, "the queue resumes in order, nothing invented");
         cleanup(&id);
     }
@@ -467,10 +467,10 @@ mod tests {
             }
             world.note_cell_changed(x0, y0, z0);
             let player = Player::new(DVec3::new(0.5, 70.0, 0.5));
-            save(&id, &world, &player, &crate::modding::testing::standard(), meta("bulk")).unwrap();
+            save(&id, &world, &player, &crate::modules::testing::standard(), meta("bulk")).unwrap();
 
-            let mut mods = crate::modding::testing::standard();
-            let (loaded, _, _, _) = load(&id, &mut mods, unstreamed).unwrap();
+            let mut modules = crate::modules::testing::standard();
+            let (loaded, _, _, _) = load(&id, &mut modules, unstreamed).unwrap();
             let (format::Decoded::Intact(doc), _) = store::read(&id).unwrap() else { panic!("an intact save") };
             let mut rebuilt = unstreamed(doc.meta.seed, kind, TerrainCfg::default());
             for edit in &doc.edits {
@@ -499,10 +499,10 @@ mod tests {
         let mut player = Player::new(pos);
         player.orientation.yaw = 1.25;
         player.orientation.pitch = -0.5;
-        let mut mods = crate::modding::testing::standard();
-        save(&id, &world, &player, &mods, meta("far")).unwrap();
+        let mut modules = crate::modules::testing::standard();
+        save(&id, &world, &player, &modules, meta("far")).unwrap();
 
-        let (_, loaded, _, _) = load(&id, &mut mods, make_world).unwrap();
+        let (_, loaded, _, _) = load(&id, &mut modules, make_world).unwrap();
         assert_eq!(loaded.position.x.to_bits(), pos.x.to_bits());
         assert_eq!(loaded.position.y.to_bits(), pos.y.to_bits());
         assert_eq!(loaded.position.z.to_bits(), pos.z.to_bits());
@@ -518,10 +518,10 @@ mod tests {
 
         let world = World::new(1234);
         let player = Player::new(DVec3::new(0.0, 40.0, 0.0));
-        let mut mods = crate::modding::testing::standard();
-        save(&id, &world, &player, &mods, meta("empty")).unwrap();
+        let mut modules = crate::modules::testing::standard();
+        save(&id, &world, &player, &modules, meta("empty")).unwrap();
 
-        let (loaded_world, loaded_player, _, _) = load(&id, &mut mods, make_world).unwrap();
+        let (loaded_world, loaded_player, _, _) = load(&id, &mut modules, make_world).unwrap();
         assert_eq!(loaded_world.seed(), 1234);
         assert_eq!(loaded_player.position, DVec3::new(0.0, 40.0, 0.0));
         assert_eq!(loaded_player.inventory.total(), 0);
@@ -537,12 +537,12 @@ mod tests {
         let mut world = World::new(9);
         world.set_block(1, 200, 1, AIR);
         let player = Player::new(DVec3::new(0.0, 40.0, 0.0));
-        let mut mods = crate::modding::testing::standard();
-        save(&id, &world, &player, &mods, meta("v1")).unwrap();
-        save(&id, &world, &player, &mods, meta("v2")).unwrap(); // rotates v1 to .bak
+        let mut modules = crate::modules::testing::standard();
+        save(&id, &world, &player, &modules, meta("v1")).unwrap();
+        save(&id, &world, &player, &modules, meta("v2")).unwrap(); // rotates v1 to .bak
         fs::write(save_file(&id), b"NOPE not a save").unwrap();
 
-        let (loaded_world, _, loaded_meta, report) = load(&id, &mut mods, make_world).unwrap();
+        let (loaded_world, _, loaded_meta, report) = load(&id, &mut modules, make_world).unwrap();
         assert_eq!(report.source, Source::Backup);
         assert_eq!(loaded_meta.name, "v1");
         assert_eq!(loaded_world.block_at(1, 200, 1), AIR);
@@ -551,7 +551,7 @@ mod tests {
     }
 
     #[test]
-    fn mod_state_unknown_ids_are_ignored_duplicates_last_win() {
+    fn module_state_unknown_ids_are_ignored_duplicates_last_win() {
         let blank_player = PlayerState {
             pos: [0.0, 40.0, 0.0],
             yaw: 0.0,
@@ -568,23 +568,23 @@ mod tests {
             worldgen_version: crate::world::terrain::WORLDGEN_VERSION,
             worldgen: WorldgenStamp::default(),
             law_stamp: material::Law::current().stamp(),
-            meta: meta("mods"),
+            meta: meta("modules"),
             player: blank_player.clone(),
             specs: vec![],
             edits: vec![],
-            mods: vec![
+            modules: vec![
                 ("Hotbar".into(), "sel=4".into()),
-                ("no-such-mod".into(), "ignored".into()),
+                ("no-such-module".into(), "ignored".into()),
                 ("hotbar".into(), "v1;sel=2".into()),
             ],
             pending: vec![],
         };
-        let mut mods = crate::modding::testing::standard();
-        let (world, _, _) = super::bridge::from_doc(doc, &mut mods, make_world).unwrap();
-        let states = mods.save_states(&world);
+        let mut modules = crate::modules::testing::standard();
+        let (world, _, _) = super::bridge::from_doc(doc, &mut modules, make_world).unwrap();
+        let states = modules.save_states(&world);
         let bar = states.iter().find(|(n, _)| n == "hotbar").map(|(_, d)| d.as_str());
-        assert_eq!(bar, Some("v1;sel=2"), "duplicate mod lines: last wins");
-        assert!(states.iter().all(|(n, _)| n != "no-such-mod"));
+        assert_eq!(bar, Some("v1;sel=2"), "duplicate module lines: last wins");
+        assert!(states.iter().all(|(n, _)| n != "no-such-module"));
     }
 
     /// Independent of `SaveSnapshot::to_doc`: walk `World::edits` and
@@ -592,7 +592,7 @@ mod tests {
     fn doc_by_walking_overlay(
         world: &World,
         player: &Player,
-        mods: &Mods,
+        modules: &Modules,
         mut meta: SaveMeta,
     ) -> super::format::SaveDoc {
         use super::format::{Edit, PlayerState, SaveDoc};
@@ -632,7 +632,7 @@ mod tests {
             },
             specs,
             edits,
-            mods: mods.save_states(world).into_iter().chain(world.simulation_state_records()).collect(),
+            modules: modules.save_states(world).into_iter().chain(world.simulation_state_records()).collect(),
             pending: Vec::new(),
         }
     }
@@ -653,13 +653,13 @@ mod tests {
         let rock = world.registry().id_by_label("rock").unwrap();
         player.inventory.add(rock, 2);
         player.inventory.add(soil, 1);
-        let mut mods = crate::modding::testing::standard();
+        let mut modules = crate::modules::testing::standard();
         let rock_spec = world.registry().spec(rock);
-        mods.load_state("hotbar", &format!("v1;sel=1;1={rock_spec}"), &mut world);
+        modules.load_state("hotbar", &format!("v1;sel=1;1={rock_spec}"), &mut world);
 
-        let snap = snapshot(&world, &player, &mods, meta("snap"));
+        let snap = snapshot(&world, &player, &modules, meta("snap"));
         let snap_doc = snap.to_doc().unwrap();
-        let walked = doc_by_walking_overlay(&world, &player, &mods, snap_doc.meta.clone());
+        let walked = doc_by_walking_overlay(&world, &player, &modules, snap_doc.meta.clone());
         assert_eq!(snap_doc, walked, "snapshot document must match the old overlay walk");
         assert_eq!(
             snap.encode().unwrap(),
@@ -700,17 +700,17 @@ mod tests {
         assert!(before.iter().any(|c| c.iter().any(|&id| id != AIR)), "the spawn chart chunk must contain terrain");
 
         let player = Player::new(DVec3::new(0.0, 40.0, 0.0));
-        // The worldgen mod suspended: the save header, not the installed mods, decides the
+        // The worldgen module suspended: the save header, not the installed modules, decides the
         // generator on load.
-        let mut mods = crate::modding::testing::standard();
-        mods.suspend_packages(&["pwc.infinite-diffusion".to_string()]);
-        assert_eq!(mods.worldgen_kind(), WorldgenKind::Flat);
-        save(&id, &world, &player, &mods, meta("diffusion")).unwrap();
+        let mut modules = crate::modules::testing::standard();
+        modules.suspend_packages(&["pwc.infinite-diffusion".to_string()]);
+        assert_eq!(modules.worldgen_kind(), WorldgenKind::Flat);
+        save(&id, &world, &player, &modules, meta("diffusion")).unwrap();
 
-        let (loaded, _, _, _) = load(&id, &mut mods, make_world).unwrap();
+        let (loaded, _, _, _) = load(&id, &mut modules, make_world).unwrap();
         assert_eq!(loaded.worldgen(), WorldgenKind::Diffusion);
         assert_eq!(loaded.terrain_cfg(), cfg.clamp());
-        assert_eq!(mods.worldgen_kind(), WorldgenKind::Flat, "loading must not end the suspension");
+        assert_eq!(modules.worldgen_kind(), WorldgenKind::Flat, "loading must not end the suspension");
         for (i, &(cx, cy, cz)) in chunks.iter().enumerate() {
             assert_eq!(dump_chunk(&loaded, cx, cy, cz), before[i], "chunk {cx},{cy},{cz} must regenerate identically");
         }
@@ -722,9 +722,9 @@ mod tests {
         let id = slot("__unit_test_flat_kind__");
         let world = World::with_kind(7, crate::render_config::RenderConfig::default(), WorldgenKind::Flat, true);
         let player = Player::new(DVec3::new(0.0, 70.0, 0.0));
-        let mut mods = crate::modding::testing::standard();
-        save(&id, &world, &player, &mods, meta("flat")).unwrap();
-        let (loaded, _, _, _) = load(&id, &mut mods, make_world).unwrap();
+        let mut modules = crate::modules::testing::standard();
+        save(&id, &world, &player, &modules, meta("flat")).unwrap();
+        let (loaded, _, _, _) = load(&id, &mut modules, make_world).unwrap();
         assert_eq!(loaded.worldgen(), WorldgenKind::Flat);
         assert_eq!(loaded.worldgen_kind(), "flat");
         cleanup(&id);

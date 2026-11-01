@@ -1,7 +1,7 @@
-//! Per-connection rate budgets: one sliding window per message kind, and the mod-channel windows.
+//! Per-connection rate budgets: one sliding window per message kind, and the module-channel windows.
 use super::*;
 
-/// The connection's [`MOD_DATA_RATE`] window, then one [`RateWindow`] per channel name.
+/// The connection's [`MODULE_DATA_RATE`] window, then one [`RateWindow`] per channel name.
 /// The first packet of a channel allocates the slot, up to [`MAX_CHANNELS`]; later
 /// packets scan the small vec.
 pub(super) struct ChannelBudget {
@@ -11,7 +11,7 @@ pub(super) struct ChannelBudget {
 
 impl ChannelBudget {
     pub(super) fn new() -> Self {
-        Self { total: RateWindow::new(MOD_DATA_RATE), windows: Vec::new() }
+        Self { total: RateWindow::new(MODULE_DATA_RATE), windows: Vec::new() }
     }
 
     pub(super) fn allow(&mut self, channel: &protocol::Channel, now: Instant) -> bool {
@@ -62,8 +62,8 @@ impl RateWindow {
     }
 }
 
-/// One window per message kind. Cruise, hello and mod channels are not here: cruise is a
-/// declared state, and mod channels have their own [`ChannelBudget`].
+/// One window per message kind. Cruise, hello and module channels are not here: cruise is a
+/// declared state, and module channels have their own [`ChannelBudget`].
 pub(super) struct KindBudget {
     chat: RateWindow,
     swing: RateWindow,
@@ -104,7 +104,7 @@ pub(super) fn charge(budgets: &mut KindBudget, msg: &ClientMessage, now: Instant
     let (window, answer) = match msg {
         ClientMessage::Cruise { .. }
         | ClientMessage::Hello { .. }
-        | ClientMessage::ModData { .. } => return Charge::Pass,
+        | ClientMessage::ModuleData { .. } => return Charge::Pass,
         ClientMessage::Chat { .. } => (&mut budgets.chat, false),
         ClientMessage::Swing => (&mut budgets.swing, false),
         ClientMessage::Edit { .. } => (&mut budgets.edit, true),

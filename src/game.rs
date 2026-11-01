@@ -1,5 +1,5 @@
 //! game.rs owns the in-world state — world, player, physics — and runs a frame of it:
-//! input, the mods' frame hook, movement, block interaction, mods, streaming, and drawing.
+//! input, the modules' frame hook, movement, block interaction, modules, streaming, and drawing.
 //! The window and the menu/play state machine live one level up in [`app`](crate::app);
 //! a `Game` is handed the engine each frame and reports back whether to keep playing
 //! or return to the menu.
@@ -23,8 +23,8 @@ use crate::input::router::{Context, Router, View};
 use crate::input::{look, movement};
 use crate::interact;
 use crate::minimap::{MapSample, Minimap, MinimapConfig};
-use crate::modding::{
-    ActionSet, Channel, FrameContext, GameContext, Message, ModContext, Mods, NoticeLevel, Notices, TextFrame,
+use crate::modules::{
+    ActionSet, Channel, FrameContext, GameContext, Message, ModuleContext, Modules, NoticeLevel, Notices, TextFrame,
 };
 use crate::net::client::Connection;
 use crate::player::Player;
@@ -42,7 +42,7 @@ pub enum Signal {
     /// Keep playing.
     Continue,
     /// Esc that nothing in the world took: text capture (the console's `Context::Text`) and every
-    /// mod overlay ([`Mods::close_overlay`]) come first. The app opens the pause screen a mod
+    /// module overlay ([`Modules::close_overlay`]) come first. The app opens the pause screen a module
     /// gives, or leaves the world.
     Escape,
     /// Leave to the start menu (the app saves on the way out): the server ended the session.
@@ -67,7 +67,7 @@ pub enum DebugView {
 /// One frame's routed input, snapshotted into plain data by
 /// [`Game::input_phase`] so the router borrow ends before later phases take
 /// `&mut Engine`. Which fields are live depends on the frame's exclusive
-/// context: `is_text` carries the capturing mod's typing, everything else gameplay.
+/// context: `is_text` carries the capturing module's typing, everything else gameplay.
 #[derive(Debug, Default, PartialEq)]
 struct FrameInput {
     is_text: bool,
@@ -78,9 +78,9 @@ struct FrameInput {
     fly_axes: FlyAxes,
     do_break: bool,
     do_place: bool,
-    /// Mod actions that fired this frame.
+    /// Module actions that fired this frame.
     actions: ActionSet,
-    /// Immediate mod actions that fired this frame, for the frame hook (mod logic on or off).
+    /// Immediate module actions that fired this frame, for the frame hook (module logic on or off).
     immediate: ActionSet,
     /// Signed scroll steps this frame.
     wheel: i8,
@@ -120,29 +120,29 @@ struct OverlayPhase<'a> {
     input: &'a FrameInput,
     eng: &'a mut Engine,
     router: &'a mut Router,
-    mods: &'a mut Mods,
+    modules: &'a mut Modules,
     settings: &'a mut Settings,
     options: &'a mut Options,
     sound: &'a mut SoundSystem,
     events: &'a mut Vec<GameEvent>,
 }
 
-/// Edge-triggered mod intents from one render frame, retained in order when
-/// mod updates run at a fixed cadence.
+/// Edge-triggered module intents from one render frame, retained in order when
+/// module updates run at a fixed cadence.
 #[derive(Clone, Copy, Default)]
-struct PendingModInput {
+struct PendingModuleInput {
     place: bool,
-    /// Cell selected by the edge frame's player pose. Cadence-delayed mod
+    /// Cell selected by the edge frame's player pose. Cadence-delayed module
     /// replay must not re-raycast from a later camera direction.
     place_target: Option<(i32, i32, i32)>,
     actions: ActionSet,
     wheel: i8,
-    /// Whether a mod panel was allowed to open when this edge was captured.
-    mod_ui: bool,
+    /// Whether a module panel was allowed to open when this edge was captured.
+    module_ui: bool,
     nav: Nav,
 }
 
-impl PendingModInput {
+impl PendingModuleInput {
     fn capture(
         input: &FrameInput,
         allow_place: bool,
@@ -155,7 +155,7 @@ impl PendingModInput {
             place_target: place.then_some(place_target).flatten(),
             actions: input.actions,
             wheel: input.wheel,
-            mod_ui: allow_ui,
+            module_ui: allow_ui,
             nav: if allow_ui { input.nav } else { Nav::default() },
         }
     }
@@ -170,7 +170,7 @@ impl PendingModInput {
     fn clear_ui(&mut self) {
         self.actions = ActionSet::NONE;
         self.wheel = 0;
-        self.mod_ui = false;
+        self.module_ui = false;
         self.nav = Nav::default();
     }
 }
@@ -183,7 +183,7 @@ pub struct Game {
     player: Player,
     /// First/third person and freecam modes, plus shake effects.
     camera: GameCamera,
-    /// Notices for the player (save, audio, session), handed to the mods once per frame.
+    /// Notices for the player (save, audio, session), handed to the modules once per frame.
     notices: Notices,
     /// Retained buffers the frame hook's context borrows: chat lines to send and notices raised.
     chat_out: Vec<(Channel, String)>,
@@ -234,8 +234,8 @@ pub struct Game {
     /// A screen over the world (the pause screen) holds the input: the world runs without any,
     /// and the router is left to the screen.
     input_held: bool,
-    /// Visual groups enabled by mods; fancy lanes strip when a group is off.
-    visual_mask: crate::modding::VisualMask,
+    /// Visual groups enabled by modules; fancy lanes strip when a group is off.
+    visual_mask: crate::modules::VisualMask,
     /// The typed look/lane config this game draws with (was the `WATT_CLOUDS`/
     /// `WATT_WEATHER` env reads). `compose` reads the per-frame look lanes from
     /// it. The live path uses [`RenderConfig::default`]; the harness pins
@@ -252,7 +252,7 @@ pub struct Game {
     /// The autosave interval gate on the scheduler's frame clock
     /// (replaces the autosaver's `Instant` throttle). App reads
     /// [`Game::autosave_due`] and clears it via [`Game::mark_autosave`]; the
-    /// save itself stays in `App` (its inputs — mods, meta, slot — live there).
+    /// save itself stays in `App` (its inputs — modules, meta, slot — live there).
     autosave_interval: crate::sched::IntervalHandle,
     /// The minimap throttle gate on the scheduler's frame clock
     /// (replaces the minimap's `last_refresh: Instant`). The recenter half of
@@ -269,21 +269,21 @@ pub struct Game {
     force_stream: bool,
     physics_gate: RateGate,
     sky_gate: RateGate,
-    mod_gate: RateGate,
+    module_gate: RateGate,
 
     /// Edge input must survive render frames that do not execute a physics
     /// tick, so a tap between two 30 Hz ticks still jumps.
     pending_jump: bool,
-    /// Edge-bearing frames awaiting the next permitted mod tick, in order —
+    /// Edge-bearing frames awaiting the next permitted module tick, in order —
     /// ordered replay preserves discrete actions across a throttled cadence.
-    pending_mod_input: Vec<PendingModInput>,
-    /// An open mod overlay must be force-closed once when its HUD lane is
+    pending_module_input: Vec<PendingModuleInput>,
+    /// An open module overlay must be force-closed once when its HUD lane is
     /// hidden, so an invisible modal cannot keep consuming input.
-    pending_mod_overlay_close: bool,
+    pending_module_overlay_close: bool,
 
     // Settings-derived work gates: each stops its lane at the owning boundary
     // instead of merely hiding output.
-    mod_logic: bool,
+    module_logic: bool,
     player_models: bool,
     name_tags: bool,
 
@@ -309,10 +309,10 @@ pub struct Game {
     hud_scratch: Vec<HudElement>,
     /// Menu notice taken when a network session leaves.
     leave_notice: Option<String>,
-    /// The game changed the settings (HUD hotkey, a mod's frame hook); the app writes them off
+    /// The game changed the settings (HUD hotkey, a module's frame hook); the app writes them off
     /// the frame.
     settings_dirty: bool,
-    /// A mod's frame hook changed the settings: the app applies them after it has pushed the
+    /// A module's frame hook changed the settings: the app applies them after it has pushed the
     /// engine's half, so this game sees the fresh render extent.
     settings_changed: bool,
 }
@@ -389,7 +389,7 @@ impl Game {
             scripted: false,
             input_locked: false,
             input_held: false,
-            visual_mask: crate::modding::VisualMask::default(),
+            visual_mask: crate::modules::VisualMask::default(),
             render: crate::render_config::RenderConfig::default(),
             sched,
             sim_source: sim_id,
@@ -399,11 +399,11 @@ impl Game {
             force_stream: true,
             physics_gate: RateGate::from_hz(0),
             sky_gate: RateGate::from_hz(0),
-            mod_gate: RateGate::from_hz(0),
+            module_gate: RateGate::from_hz(0),
             pending_jump: false,
-            pending_mod_input: Vec::new(),
-            pending_mod_overlay_close: false,
-            mod_logic: true,
+            pending_module_input: Vec::new(),
+            pending_module_overlay_close: false,
+            module_logic: true,
             player_models: true,
             name_tags: true,
             content_rev: Revision::default(),
@@ -477,7 +477,7 @@ impl Game {
         settings: &Settings,
         render: crate::render_config::RenderConfig,
     ) {
-        let mod_ui_was_active = self.mod_ui_active();
+        let module_ui_was_active = self.module_ui_active();
         self.render = render;
         self.bump_content_rev();
 
@@ -487,7 +487,7 @@ impl Game {
         self.stream_gate.set_hz(settings.stream_hz);
         self.physics_gate.set_hz(settings.physics_hz);
         self.sky_gate.set_hz(settings.sky_hz);
-        self.mod_gate.set_hz(settings.mod_hz);
+        self.module_gate.set_hz(settings.module_hz);
         self.force_stream = true;
 
         // The sim lane stays registered on the scheduler; the gate merely
@@ -501,38 +501,38 @@ impl Game {
             self.minimap = None;
         }
 
-        let mod_ui_will_be_active = mod_ui_active(settings.mod_logic, self.theme.hud);
-        if mod_ui_will_be_active {
-            self.pending_mod_overlay_close = false;
-        } else if mod_ui_was_active {
-            self.on_mod_ui_hidden();
+        let module_ui_will_be_active = module_ui_active(settings.module_logic, self.theme.hud);
+        if module_ui_will_be_active {
+            self.pending_module_overlay_close = false;
+        } else if module_ui_was_active {
+            self.on_module_ui_hidden();
         }
-        self.mod_logic = settings.mod_logic;
-        if !self.mod_logic {
-            self.mod_gate.reset();
-            self.pending_mod_input.clear();
+        self.module_logic = settings.module_logic;
+        if !self.module_logic {
+            self.module_gate.reset();
+            self.pending_module_input.clear();
         }
         self.player_models = settings.player_models;
         self.name_tags = settings.name_tags;
     }
 
-    /// Whether a modal supplied by the mod layer can both be seen and receive
+    /// Whether a modal supplied by the module layer can both be seen and receive
     /// input. Keeping one predicate for routing and Escape prevents invisible
-    /// overlays when either the mod lane or the master HUD is disabled.
-    fn mod_ui_active(&self) -> bool {
-        mod_ui_active(self.mod_logic, self.theme.hud)
+    /// overlays when either the module lane or the master HUD is disabled.
+    fn module_ui_active(&self) -> bool {
+        module_ui_active(self.module_logic, self.theme.hud)
     }
 
-    /// The mod UI just became invisible: force-close any open overlay once and
+    /// The module UI just became invisible: force-close any open overlay once and
     /// drop queued UI edges (an invisible modal must not consume or replay
     /// input). The one implementation both the settings path and the HUD
     /// hotkey use.
-    fn on_mod_ui_hidden(&mut self) {
-        self.pending_mod_overlay_close = true;
-        for pending in &mut self.pending_mod_input {
+    fn on_module_ui_hidden(&mut self) {
+        self.pending_module_overlay_close = true;
+        for pending in &mut self.pending_module_input {
             pending.clear_ui();
         }
-        self.pending_mod_input.retain(|pending| pending.any());
+        self.pending_module_input.retain(|pending| pending.any());
     }
 
     /// A scripted game over the real InfiniteDiffusion terrain (benchmarks, goldens), the
@@ -582,15 +582,15 @@ impl Game {
         &self.save_name
     }
 
-    /// Report a status line to the player (save and load notices). It reaches the mods' message
-    /// hook on the next frame; with no mod showing it, stderr.
+    /// Report a status line to the player (save and load notices). It reaches the modules' message
+    /// hook on the next frame; with no module showing it, stderr.
     pub fn notify(&mut self, line: impl Into<String>) {
         self.notices.push(NoticeLevel::Info, line);
     }
 
-    /// Whether a mod holds the keyboard (see [`Mods::text_captured`]).
-    pub fn text_captured(&self, mods: &Mods) -> bool {
-        mods.text_captured()
+    /// Whether a module holds the keyboard (see [`Modules::text_captured`]).
+    pub fn text_captured(&self, modules: &Modules) -> bool {
+        modules.text_captured()
     }
 
     /// Whether this is a networked session (its world is a server mirror, not a
@@ -604,7 +604,7 @@ impl Game {
         std::mem::take(&mut self.settings_dirty)
     }
 
-    /// Whether a mod's frame hook changed the settings since the last take, so the app should
+    /// Whether a module's frame hook changed the settings since the last take, so the app should
     /// [`apply_settings`](Self::apply_settings) once it has pushed the engine's half.
     pub fn take_settings_changed(&mut self) -> bool {
         std::mem::take(&mut self.settings_changed)
@@ -646,7 +646,7 @@ impl Game {
         self.input_locked = locked;
     }
 
-    pub fn set_visual_mask(&mut self, mask: crate::modding::VisualMask) {
+    pub fn set_visual_mask(&mut self, mask: crate::modules::VisualMask) {
         self.visual_mask = mask;
     }
 
@@ -672,7 +672,7 @@ impl Game {
         &mut self,
         eng: &mut Engine,
         router: &mut Router,
-        mods: &mut Mods,
+        modules: &mut Modules,
         settings: &mut Settings,
         options: &mut Options,
         sound: &mut SoundSystem,
@@ -680,7 +680,7 @@ impl Game {
         cues: &CueSymbols,
     ) -> Signal {
         if self.net.is_none() {
-            let selected = mods.reaction_model();
+            let selected = modules.reaction_model();
             let key = selected.map(|s| (s.id, s.version));
             if self.simulation_choice != Some(key) {
                 self.simulation_choice = Some(key);
@@ -701,7 +701,7 @@ impl Game {
         // step the deterministic world so terrain streams in before the frame is
         // grabbed. See the `scripted` field for why this can't be optional.
         if self.scripted {
-            self.world.stream(self.player.position, Some(&mut *eng), mods.appearance());
+            self.world.stream(self.player.position, Some(&mut *eng), modules.appearance());
             let clocks = self.sched.clocks(dt);
             let mut sched_ctx = SchedCtx::new(&mut self.world);
             self.sched.tick(&mut sched_ctx, &clocks);
@@ -711,7 +711,7 @@ impl Game {
         self.tick_sky(dt);
 
         // This frame's audio facts, accumulated across the phases. Footsteps are
-        // added at the audio commit; mods choose the cues and the voice sessions.
+        // added at the audio commit; modules choose the cues and the voice sessions.
         let mut events = std::mem::take(&mut self.events_scratch);
 
         // Phase timings feed the stall log, which only debug builds and
@@ -721,24 +721,24 @@ impl Game {
             self.phases = FramePhases::default();
         }
         let t = Lap::start(watch);
-        if let Some(signal) = self.net_phase(mods, &mut events) {
+        if let Some(signal) = self.net_phase(modules, &mut events) {
             return signal;
         }
         t.stop(&mut self.phases.net);
         let t = Lap::start(watch);
-        let input = if self.input_held { FrameInput::default() } else { self.input_phase(eng, router, mods, dt) };
+        let input = if self.input_held { FrameInput::default() } else { self.input_phase(eng, router, modules, dt) };
         t.stop(&mut self.phases.input);
-        // The overlay may consume the frame (a mod typing, a capture starting): movement
+        // The overlay may consume the frame (a module typing, a capture starting): movement
         // and interaction run only on an unconsumed frame. Streaming still runs
         // while a spawn/teleport slab is outstanding so loading progresses while a
-        // mod types. A still singleplayer frame skips the mixer when
+        // module types. A still singleplayer frame skips the mixer when
         // nothing is sounding; only a real exit short-circuits the rest of the frame.
         let t = Lap::start(watch);
         let overlay = self.overlay_phase(OverlayPhase {
             input: &input,
             eng,
             router,
-            mods,
+            modules,
             settings,
             options,
             sound,
@@ -756,12 +756,12 @@ impl Game {
             let detached = self.motion_phase(&input, dt);
             t.stop(&mut self.phases.motion);
             let t = Lap::start(watch);
-            self.interact_phase(&input, detached, dt, eng, mods, &mut events, router.action_ids());
+            self.interact_phase(&input, detached, dt, eng, modules, &mut events, router.action_ids());
             t.stop(&mut self.phases.interact);
         }
         if !consumed || !ready {
             let t = Lap::start(watch);
-            self.stream_phase(eng, dt, mods);
+            self.stream_phase(eng, dt, modules);
             t.stop(&mut self.phases.stream);
         }
         let active = !consumed;
@@ -777,7 +777,7 @@ impl Game {
             settings,
             events,
             active,
-            mods,
+            modules,
             ids,
         });
         t.stop(&mut self.phases.audio);
@@ -800,12 +800,12 @@ impl Game {
     }
 
     /// The once-per-frame router transition: pick the exclusive context (Text
-    /// while a mod holds the keyboard) and snapshot every intent into plain
+    /// while a module holds the keyboard) and snapshot every intent into plain
     /// data, so the router borrow ends before any `&mut Engine` side effects
     /// (screenshot, cursor grab, a capture's char drain) run in later phases.
-    fn input_phase(&mut self, eng: &mut Engine, router: &mut Router, mods: &Mods, dt: f32) -> FrameInput {
-        router.sync_actions(mods);
-        router.set_context(if mods.text_captured() {
+    fn input_phase(&mut self, eng: &mut Engine, router: &mut Router, modules: &Modules, dt: f32) -> FrameInput {
+        router.sync_actions(modules);
+        router.set_context(if modules.text_captured() {
             Context::Text
         } else {
             Context::Gameplay
@@ -817,8 +817,8 @@ impl Game {
         }
 
         let mut f = FrameInput::default();
-        let mod_ui = self.mod_ui_active();
-        let input = router.frame_filtered(eng, dt, self.mod_logic, self.minimap.is_some());
+        let module_ui = self.module_ui_active();
+        let input = router.frame_filtered(eng, dt, self.module_logic, self.minimap.is_some());
         match input.view() {
             View::Gameplay(gp) => {
                 let move_input = movement::MoveInput::from_view(&gp);
@@ -834,13 +834,13 @@ impl Game {
                 };
                 f.do_break = gp.event(GameplayEvent::Break);
                 f.actions = gp.actions();
-                // Immediate actions reach the frame hook whatever the mod cadence.
+                // Immediate actions reach the frame hook whatever the module cadence.
                 f.immediate = gp.immediate_actions();
                 f.wheel = gp.wheel();
-                if self.mod_logic {
+                if self.module_logic {
                     f.do_place = gp.event(GameplayEvent::Place);
                 }
-                if mod_ui {
+                if module_ui {
                     f.nav = Nav::read(|e| gp.overlay_nav(e));
                 }
                 f.toggle_capture = gp.event(GameplayEvent::ToggleCapture);
@@ -864,33 +864,33 @@ impl Game {
         f
     }
 
-    /// The mods' frame hook, escape routing, and the global toggles (mouse capture, HUD
-    /// cycle, screenshot, minimap, camera modes). `Some` consumes the frame: while a mod
+    /// The modules' frame hook, escape routing, and the global toggles (mouse capture, HUD
+    /// cycle, screenshot, minimap, camera modes). `Some` consumes the frame: while a module
     /// holds the keyboard, and on the frame its capture starts, nothing below runs.
     fn overlay_phase(&mut self, phase: OverlayPhase<'_>) -> Option<Signal> {
         let OverlayPhase {
             input,
             eng,
             router,
-            mods,
+            modules,
             settings,
             options,
             sound,
             events,
         } = phase;
-        if std::mem::take(&mut self.pending_mod_overlay_close) {
-            mods.close_overlay();
+        if std::mem::take(&mut self.pending_module_overlay_close) {
+            modules.close_overlay();
         }
 
         let screen = (eng.screen_width(), eng.screen_height());
-        self.frame_hook(input, screen, router.action_ids(), mods, (settings, options), sound, events);
+        self.frame_hook(input, screen, router.action_ids(), modules, (settings, options), sound, events);
 
         if self.input_locked {
             return None;
         }
 
-        // Text context: the capturing mod owns all input; nothing else runs. Esc went to that
-        // mod and ended its capture (the frame hook), so it never means "leave the world" here.
+        // Text context: the capturing module owns all input; nothing else runs. Esc went to that
+        // module and ended its capture (the frame hook), so it never means "leave the world" here.
         if input.is_text {
             self.drop_pending_edges();
             return Some(Signal::Continue);
@@ -898,32 +898,32 @@ impl Game {
 
         // A capture started this frame: drain the char queue so the key that opened it isn't
         // also typed.
-        if mods.text_captured() {
+        if modules.text_captured() {
             self.drop_pending_edges();
             while eng.get_char_pressed().is_some() {}
             return Some(Signal::Continue);
         }
 
         if input.g_escape {
-            return Some(self.escape(mods));
+            return Some(self.escape(modules));
         }
 
         if input.toggle_capture {
             // A placement edge captured before the cursor is released must not
-            // fire later after a throttled mod tick.
+            // fire later after a throttled module tick.
             self.drop_pending_places();
             toggle_mouse(eng, router);
         }
         if input.g_hud {
-            let mod_ui_was_active = self.mod_ui_active();
+            let module_ui_was_active = self.module_ui_active();
             self.theme.cycle_hud();
             // The HUD hotkey and the settings row edit the same state; sync it
             // back (marking Custom) so the menu, `/gfx`, and persistence agree.
             settings.hud_mode = self.theme.hud;
             settings.mark_custom();
             self.settings_dirty = true;
-            if mod_ui_was_active && !self.mod_ui_active() {
-                self.on_mod_ui_hidden();
+            if module_ui_was_active && !self.module_ui_active() {
+                self.on_module_ui_hidden();
             }
             // Minimap/HUD re-activation must repaint promptly even at 15 Hz.
             self.force_stream = true;
@@ -959,32 +959,32 @@ impl Game {
         None
     }
 
-    /// Esc outside text capture (the text branch of `overlay_phase` takes it first): an open mod
+    /// Esc outside text capture (the text branch of `overlay_phase` takes it first): an open module
     /// overlay closes and keeps the frame; otherwise Esc is the app's, which opens the pause
     /// screen or leaves.
-    fn escape(&mut self, mods: &mut Mods) -> Signal {
+    fn escape(&mut self, modules: &mut Modules) -> Signal {
         self.drop_pending_edges();
-        if self.mod_ui_active() && mods.close_overlay() {
+        if self.module_ui_active() && modules.close_overlay() {
             Signal::Continue
         } else {
             Signal::Escape
         }
     }
 
-    /// Hand the queued notices to the mods' message hook; a notice no mod showed goes to stderr.
+    /// Hand the queued notices to the modules' message hook; a notice no module showed goes to stderr.
     /// An empty queue costs one length check.
-    fn deliver_notices(&mut self, mods: &mut Mods) {
+    fn deliver_notices(&mut self, modules: &mut Modules) {
         if self.notices.is_empty() {
             return;
         }
         for notice in self.notices.drain() {
-            if !mods.on_message(&Message::Notice(&notice)) {
+            if !modules.on_message(&Message::Notice(&notice)) {
                 eprintln!("{}", notice.text);
             }
         }
     }
 
-    /// The mods' frame hook ([`Mods::on_frame`]), then the core's follow-up on what it changed:
+    /// The modules' frame hook ([`Modules::on_frame`]), then the core's follow-up on what it changed:
     /// changed settings are marked for the app to apply and save and re-mix the audio; a changed
     /// clock is shared with the server, whose day length wins; a moved player streams its
     /// surroundings at once and is reported as a teleport; queued chat goes to the server (and
@@ -996,12 +996,12 @@ impl Game {
         input: &FrameInput,
         screen: (i32, i32),
         ids: &[&'static str],
-        mods: &mut Mods,
+        modules: &mut Modules,
         (settings, options): (&mut Settings, &mut Options),
         sound: &mut SoundSystem,
         events: &mut Vec<GameEvent>,
     ) {
-        self.deliver_notices(mods);
+        self.deliver_notices(modules);
         let day_before = self.sky.clock.day();
         let day_len_before = self.sky.day_length;
         let pos_before = self.player.position;
@@ -1018,7 +1018,7 @@ impl Game {
         game.detached = matches!(self.camera.mode, CameraMode::Free { .. });
         game.visuals = self.visual_mask;
         let mut ctx = FrameContext::frame(game, screen, input.immediate, ids, text);
-        mods.on_frame(&mut ctx);
+        modules.on_frame(&mut ctx);
         let (queued, mut chat_out, mut raised, settings_changed) = ctx.game.into_queues();
         *events = queued;
         self.notices.append(&mut raised);
@@ -1062,22 +1062,22 @@ impl Game {
         self.chat_out = chat_out;
     }
 
-    /// Drop every latched input edge — called when a modal (a mod's text capture,
+    /// Drop every latched input edge — called when a modal (a module's text capture,
     /// menu exit) takes over the frame, so stale edges can't fire after it closes.
     fn drop_pending_edges(&mut self) {
-        self.pending_mod_input.clear();
-        self.mod_gate.reset();
+        self.pending_module_input.clear();
+        self.module_gate.reset();
         self.pending_jump = false;
     }
 
     /// Drop only latched placement edges (aim is no longer meaningful), while
     /// UI navigation edges stay queued.
     fn drop_pending_places(&mut self) {
-        for pending in &mut self.pending_mod_input {
+        for pending in &mut self.pending_module_input {
             pending.place = false;
             pending.place_target = None;
         }
-        self.pending_mod_input.retain(|pending| pending.any());
+        self.pending_module_input.retain(|pending| pending.any());
     }
 
     /// Camera effects plus movement. Exactly one thing consumes look/move per
@@ -1142,27 +1142,27 @@ impl Game {
         self.world.gravity_at(p).accel
     }
 
-    /// World edits: block breaking, then cadence-controlled mod hooks and
+    /// World edits: block breaking, then cadence-controlled module hooks and
     /// queued placements. Edge-bearing render frames are replayed in order at
-    /// the next permitted mod tick; hooks never run inside the voxel loop.
+    /// the next permitted module tick; hooks never run inside the voxel loop.
     fn interact_phase(
         &mut self,
         input: &FrameInput,
         detached: bool,
         dt: f32,
         eng: &mut Engine,
-        mods: &mut Mods,
+        modules: &mut Modules,
         events: &mut Vec<GameEvent>,
         action_ids: &[&'static str],
     ) {
         // Break is capture-gated in the query; freecam additionally can't act
         // on the world (the crosshair isn't where the player aims).
         if input.do_break && !detached {
-            self.primary_action(mods, events);
+            self.primary_action(modules, events);
         }
 
-        // Disabled mod logic performs no probe, no queueing, no dispatch.
-        if !self.mod_logic {
+        // Disabled module logic performs no probe, no queueing, no dispatch.
+        if !self.module_logic {
             return;
         }
 
@@ -1172,7 +1172,7 @@ impl Game {
         if detached {
             self.drop_pending_places();
         }
-        let allow_ui = self.mod_ui_active();
+        let allow_ui = self.module_ui_active();
         let allow_place = !detached;
         // Resolve the placement cell AT THE EDGE, from this exact frame's
         // pose: cadence-delayed replay must not retarget from a later aim.
@@ -1187,36 +1187,36 @@ impl Game {
         } else {
             None
         };
-        let current = PendingModInput::capture(input, allow_place, allow_ui, place_target);
+        let current = PendingModuleInput::capture(input, allow_place, allow_ui, place_target);
         if current.any() {
-            self.pending_mod_input.push(current);
+            self.pending_module_input.push(current);
         }
-        if self.mod_gate.steps(dt) == 0 {
+        if self.module_gate.steps(dt) == 0 {
             return;
         }
-        self.mod_tick((eng.screen_width(), eng.screen_height()), mods, events, action_ids);
+        self.module_tick((eng.screen_width(), eng.screen_height()), modules, events, action_ids);
     }
 
-    /// One mod tick: replay the latched edge frames in order (one empty update when there are
+    /// One module tick: replay the latched edge frames in order (one empty update when there are
     /// none), applying each frame's queued placements before the next.
-    fn mod_tick(
+    fn module_tick(
         &mut self,
         (screen_w, screen_h): (i32, i32),
-        mods: &mut Mods,
+        modules: &mut Modules,
         events: &mut Vec<GameEvent>,
         action_ids: &[&'static str],
     ) {
-        let mut pending = std::mem::take(&mut self.pending_mod_input);
+        let mut pending = std::mem::take(&mut self.pending_module_input);
         let mut placements = std::mem::take(&mut self.placement_scratch);
         placements.clear();
         // Preserve ordering and multiplicity for edge-bearing render frames.
-        // With no edge, one empty update keeps periodic work at `mod_hz`.
-        let idle = PendingModInput { mod_ui: self.mod_ui_active(), ..PendingModInput::default() };
+        // With no edge, one empty update keeps periodic work at `module_hz`.
+        let idle = PendingModuleInput { module_ui: self.module_ui_active(), ..PendingModuleInput::default() };
         for index in 0..pending.len().max(1) {
             let edges = pending.get(index).copied().unwrap_or(idle);
             let networked = self.net.is_some();
             placements = {
-                let mut ctx = ModContext {
+                let mut ctx = ModuleContext {
                     player: &mut self.player,
                     world: &mut self.world,
                     screen_w,
@@ -1230,32 +1230,33 @@ impl Game {
                     nav_tab: edges.nav.has(MenuEvent::NextTab),
                     nav_confirm: edges.nav.has(MenuEvent::Confirm),
                     wheel: edges.wheel,
-                    mod_ui: edges.mod_ui,
+                    module_ui: edges.module_ui,
+                    mod_ui: edges.module_ui,
                     networked,
                     placements,
                     fired: edges.actions,
                     ids: action_ids,
                     extra: Vec::new(),
                 };
-                mods.update(&mut ctx);
+                modules.update(&mut ctx);
                 ctx.placements
             };
             // Apply after each event frame so repeated placements observe the
             // previous write and cannot spend twice against one empty cell.
-            self.apply_placements(&mut placements, events, mods);
+            self.apply_placements(&mut placements, events, modules);
         }
         placements.clear();
         self.placement_scratch = placements;
         pending.clear();
-        self.pending_mod_input = pending;
+        self.pending_module_input = pending;
     }
 
     /// Load/mesh/unload chunks around the camera (the player, unless the
     /// freecam rig has flown elsewhere), refresh the minimap (throttled), and
     /// step the simulation.
-    fn stream_phase(&mut self, eng: &mut Engine, dt: f32, mods: &Mods) {
+    fn stream_phase(&mut self, eng: &mut Engine, dt: f32, modules: &Modules) {
         // Name configurations interned since the last frame (presentation only; O(new)).
-        self.world.registry_mut().refresh_names(mods.namer());
+        self.world.registry_mut().refresh_names(modules.namer());
         // The scheduler drives the fixed-tick sim lane. Its clock
         // (fixed-tick accumulator + catch-up cap) is derived once per frame
         // here; other lanes still run directly below until they migrate in.
@@ -1264,7 +1265,7 @@ impl Game {
         self.sched.tick(&mut sched_ctx, &clocks);
 
         let due = self.take_stream_due(dt);
-        if !self.stream_or_pump(Some(&mut *eng), due, mods) {
+        if !self.stream_or_pump(Some(&mut *eng), due, modules) {
             return;
         }
 
@@ -1328,17 +1329,17 @@ impl Game {
     /// world still: in-flight work lands, nothing new streams around the
     /// player; ending it streams the destination like a teleport. Returns
     /// whether it streamed.
-    fn stream_or_pump(&mut self, eng: Option<&mut Engine>, due: bool, mods: &Mods) -> bool {
+    fn stream_or_pump(&mut self, eng: Option<&mut Engine>, due: bool, modules: &Modules) -> bool {
         if !due || self.player.cruising() {
-            self.world.pump(eng, mods.appearance());
+            self.world.pump(eng, modules.appearance());
             return false;
         }
         let center = self.stream_center();
-        self.world.stream(center, eng, mods.appearance());
+        self.world.stream(center, eng, modules.appearance());
         true
     }
 
-    /// Headless quiet frame: input drain, the mods' frame hook, motion (inert), scheduler,
+    /// Headless quiet frame: input drain, the modules' frame hook, motion (inert), scheduler,
     /// stream/pump, silent audio, HUD/lighting caches — the pieces `update` + `draw` run, in
     /// order, through the same helpers, without an Engine.
     #[cfg(test)]
@@ -1350,7 +1351,7 @@ impl Game {
         audio: &mut AudioService,
         cues: &CueSymbols,
         settings: &mut Settings,
-        mods: &mut Mods,
+        modules: &mut Modules,
     ) {
         self.tick_sky(dt);
         let mut events = std::mem::take(&mut self.events_scratch);
@@ -1359,7 +1360,7 @@ impl Game {
         }
         let input = FrameInput::default();
         let mut options = Options::new();
-        self.frame_hook(&input, (1280, 720), router.action_ids(), mods, (settings, &mut options), sound, &mut events);
+        self.frame_hook(&input, (1280, 720), router.action_ids(), modules, (settings, &mut options), sound, &mut events);
         if self.world.spawn_ready() {
             let _ = self.motion_phase(&input, dt);
         }
@@ -1367,7 +1368,7 @@ impl Game {
         let mut sched_ctx = SchedCtx::new(&mut self.world);
         self.sched.tick(&mut sched_ctx, &clocks);
         let due = self.take_stream_due(dt);
-        self.stream_or_pump(None, due, mods);
+        self.stream_or_pump(None, due, modules);
         self.sample_peers();
         let ids = router.action_ids();
         self.commit_audio(AudioPhase {
@@ -1379,10 +1380,10 @@ impl Game {
             settings,
             events,
             active: true,
-            mods,
+            modules,
             ids,
         });
-        self.compose_quiet(mods);
+        self.compose_quiet(modules);
     }
 
     /// Where this world's atmosphere ends: a body of the cosmos has air up to `AIR_TOP`, a flat
@@ -1414,11 +1415,11 @@ impl Game {
     }
 }
 
-/// Whether a mod-supplied modal can both be seen and receive input. Free over
+/// Whether a module-supplied modal can both be seen and receive input. Free over
 /// its inputs so the live predicate and the would-be-applied check in
 /// `apply_settings` share one rule instead of restating it.
-fn mod_ui_active(mod_logic: bool, hud: HudMode) -> bool {
-    mod_logic && hud.shows_mod_hud()
+fn module_ui_active(module_logic: bool, hud: HudMode) -> bool {
+    module_logic && hud.shows_module_hud()
 }
 
 /// Toggle capture and sync cursor grab with the OS.
@@ -1435,14 +1436,14 @@ fn toggle_mouse(eng: &mut Engine, router: &mut Router) {
 
 #[cfg(test)]
 mod tests {
-    use super::{FrameInput, Game, PendingModInput};
+    use super::{FrameInput, Game, PendingModuleInput};
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
     use crate::audio::{GameEvent, SoundSystem};
     use crate::input::intent::Chord;
     use crate::input::router::{Press, Router};
-    use crate::modding::{Action, ActionSet, Channel, FrameContext, Message, Mod, ModContext, Mods, NoticeLevel};
+    use crate::modules::{Action, ActionSet, Channel, FrameContext, Message, Module, ModuleContext, Modules, NoticeLevel};
     use crate::player::Player;
     use crate::render_config::RenderConfig;
     use crate::settings::Settings;
@@ -1453,13 +1454,13 @@ mod tests {
     /// The probe's immediate actions, in the router's bit order.
     const PROBE_IDS: &[&str] = &["probe.fly", "probe.type"];
 
-    /// A mod built on the frame hook: F flies (unless the camera is detached), T takes the
+    /// A module built on the frame hook: F flies (unless the camera is detached), T takes the
     /// keyboard, and a typed word edits whatever it names. It shows every notice.
     struct Probe {
         log: Rc<RefCell<Vec<String>>>,
     }
 
-    impl Mod for Probe {
+    impl Module for Probe {
         fn name(&self) -> &str {
             "Probe"
         }
@@ -1521,11 +1522,11 @@ mod tests {
         Game::new(world, Player::new(DVec3::new(0.5, 80.0, 0.5)), "probe".into())
     }
 
-    pub(super) fn probe_mods() -> (Mods, Rc<RefCell<Vec<String>>>) {
+    pub(super) fn probe_modules() -> (Modules, Rc<RefCell<Vec<String>>>) {
         let log = Rc::new(RefCell::new(Vec::new()));
-        let mut mods = Mods::empty();
-        mods.install(Box::new(Probe { log: log.clone() }));
-        (mods, log)
+        let mut modules = Modules::empty();
+        modules.install(Box::new(Probe { log: log.clone() }));
+        (modules, log)
     }
 
     /// The immediate actions named `ids` (from [`PROBE_IDS`]) fired.
@@ -1538,47 +1539,47 @@ mod tests {
     }
 
     /// Run the frame hook on `input`; the audio facts it queued.
-    fn hook(game: &mut Game, mods: &mut Mods, settings: &mut Settings, input: &FrameInput) -> Vec<GameEvent> {
+    fn hook(game: &mut Game, modules: &mut Modules, settings: &mut Settings, input: &FrameInput) -> Vec<GameEvent> {
         let (mut sound, _) = SoundSystem::mute();
         let mut events = Vec::new();
         let mut options = crate::settings::Options::new();
-        game.frame_hook(input, (800, 600), PROBE_IDS, mods, (settings, &mut options), &mut sound, &mut events);
+        game.frame_hook(input, (800, 600), PROBE_IDS, modules, (settings, &mut options), &mut sound, &mut events);
         events
     }
 
-    /// One typed frame, as the router reports it while a mod holds the keyboard.
+    /// One typed frame, as the router reports it while a module holds the keyboard.
     fn typing(word: &str, escape: bool) -> FrameInput {
         FrameInput { is_text: true, text_chars: word.chars().collect(), g_escape: escape, ..FrameInput::default() }
     }
 
     /// Take the keyboard with T, then type `word`.
-    pub(super) fn type_word(game: &mut Game, mods: &mut Mods, settings: &mut Settings, word: &str) -> Vec<GameEvent> {
-        hook(game, mods, settings, &FrameInput { immediate: fired(&["probe.type"]), ..FrameInput::default() });
-        assert!(mods.text_captured());
-        hook(game, mods, settings, &typing(word, false))
+    pub(super) fn type_word(game: &mut Game, modules: &mut Modules, settings: &mut Settings, word: &str) -> Vec<GameEvent> {
+        hook(game, modules, settings, &FrameInput { immediate: fired(&["probe.type"]), ..FrameInput::default() });
+        assert!(modules.text_captured());
+        hook(game, modules, settings, &typing(word, false))
     }
 
-    /// Flight is a mod's immediate action: it reaches the frame hook on the frame of the press with
-    /// mod logic off, once, and the mod sees a detached camera. The core never toggles flight.
+    /// Flight is a module's immediate action: it reaches the frame hook on the frame of the press with
+    /// module logic off, once, and the module sees a detached camera. The core never toggles flight.
     #[test]
-    fn an_immediate_action_reaches_the_frame_hook_with_mod_logic_off() {
+    fn an_immediate_action_reaches_the_frame_hook_with_module_logic_off() {
         let mut game = game();
         let mut settings = Settings::default();
-        game.mod_logic = false;
+        game.module_logic = false;
         let fly = FrameInput { immediate: fired(&["probe.fly"]), move_input: Some(Default::default()), ..FrameInput::default() };
         game.motion_phase(&fly, 1.0 / 60.0);
         assert!(!game.player.flying(), "the core never toggles flight");
-        assert!(!PendingModInput::capture(&fly, true, true, None).any(), "an immediate action is not a cadence edge");
+        assert!(!PendingModuleInput::capture(&fly, true, true, None).any(), "an immediate action is not a cadence edge");
 
-        hook(&mut game, &mut Mods::empty(), &mut settings, &fly);
-        assert!(!game.player.flying(), "without a mod that flies, F does nothing");
-        let (mut mods, _) = probe_mods();
-        hook(&mut game, &mut mods, &mut settings, &fly);
-        assert!(game.player.flying(), "the mod flies on this frame, mod logic off");
-        hook(&mut game, &mut mods, &mut settings, &FrameInput::default());
+        hook(&mut game, &mut Modules::empty(), &mut settings, &fly);
+        assert!(!game.player.flying(), "without a module that flies, F does nothing");
+        let (mut modules, _) = probe_modules();
+        hook(&mut game, &mut modules, &mut settings, &fly);
+        assert!(game.player.flying(), "the module flies on this frame, module logic off");
+        hook(&mut game, &mut modules, &mut settings, &FrameInput::default());
         assert!(game.player.flying(), "no key, no toggle");
         game.camera.toggle_freecam(&game.player, &game.world, 90.0);
-        hook(&mut game, &mut mods, &mut settings, &fly);
+        hook(&mut game, &mut modules, &mut settings, &fly);
         assert!(game.player.flying(), "a detached camera does not fly the frozen player");
     }
 
@@ -1587,33 +1588,33 @@ mod tests {
     #[test]
     fn a_text_capture_holds_the_keyboard_until_escape() {
         let (mut game, mut settings) = (game(), Settings::default());
-        let (mut mods, log) = probe_mods();
-        type_word(&mut game, &mut mods, &mut settings, "hi");
-        assert!(mods.text_captured() && game.text_captured(&mods));
-        hook(&mut game, &mut mods, &mut settings, &typing("", true));
-        assert!(!mods.text_captured(), "Escape ends the capture");
+        let (mut modules, log) = probe_modules();
+        type_word(&mut game, &mut modules, &mut settings, "hi");
+        assert!(modules.text_captured() && game.text_captured(&modules));
+        hook(&mut game, &mut modules, &mut settings, &typing("", true));
+        assert!(!modules.text_captured(), "Escape ends the capture");
         assert_eq!(log.take(), ["typed hi esc=false", "typed  esc=true"]);
-        type_word(&mut game, &mut mods, &mut settings, "done");
-        assert!(!mods.text_captured(), "the mod gave the keyboard back");
+        type_word(&mut game, &mut modules, &mut settings, "done");
+        assert!(!modules.text_captured(), "the module gave the keyboard back");
     }
 
     #[test]
     fn the_frame_hook_edits_the_player_world_and_settings() {
         let (mut game, mut settings) = (game(), Settings::default());
-        let (mut mods, _) = probe_mods();
+        let (mut modules, _) = probe_modules();
         let blocks = game.world.registry().block_count();
-        type_word(&mut game, &mut mods, &mut settings, "intern");
+        type_word(&mut game, &mut modules, &mut settings, "intern");
         assert_eq!(game.world.registry().block_count(), blocks + 1);
         assert!(!game.take_settings_changed() && !game.take_settings_dirty());
         let fov = settings.fov;
-        type_word(&mut game, &mut mods, &mut settings, "fov");
+        type_word(&mut game, &mut modules, &mut settings, "fov");
         assert_eq!(settings.fov, fov + 5.0);
         assert!(game.take_settings_changed() && game.take_settings_dirty(), "changed settings are applied and saved by the app");
         assert!(!game.take_settings_changed(), "taken once");
-        type_word(&mut game, &mut mods, &mut settings, "same");
+        type_word(&mut game, &mut modules, &mut settings, "same");
         assert!(!game.take_settings_changed(), "writing an unchanged value marks nothing");
         game.force_stream = false;
-        type_word(&mut game, &mut mods, &mut settings, "move");
+        type_word(&mut game, &mut modules, &mut settings, "move");
         assert_eq!(game.player.position.x, 10.5);
         assert!(game.force_stream, "a moved player streams its destination at once (and is reported as a teleport)");
     }
@@ -1621,25 +1622,25 @@ mod tests {
     #[test]
     fn the_frame_hook_queues_the_voice_test_chat_and_notices() {
         let (mut game, mut settings) = (game(), Settings::default());
-        let (mut mods, log) = probe_mods();
-        assert!(type_word(&mut game, &mut mods, &mut settings, "nothing").is_empty());
-        let events = type_word(&mut game, &mut mods, &mut settings, "voice");
+        let (mut modules, log) = probe_modules();
+        assert!(type_word(&mut game, &mut modules, &mut settings, "nothing").is_empty());
+        let events = type_word(&mut game, &mut modules, &mut settings, "voice");
         assert!(matches!(events.as_slice(), [GameEvent::VoiceTest]));
-        type_word(&mut game, &mut mods, &mut settings, "chat");
+        type_word(&mut game, &mut modules, &mut settings, "chat");
         assert!(game.chat_out.is_empty(), "single player has no wire: queued chat is dropped");
         log.take();
-        type_word(&mut game, &mut mods, &mut settings, "warn");
+        type_word(&mut game, &mut modules, &mut settings, "warn");
         game.notify("* saved");
         assert!(log.take().iter().all(|l| !l.starts_with("notice")), "notices wait for the next frame");
-        hook(&mut game, &mut mods, &mut settings, &FrameInput::default());
+        hook(&mut game, &mut modules, &mut settings, &FrameInput::default());
         assert_eq!(log.take(), ["notice careful", "notice * saved"], "a hook's notice first, then the app's");
         assert!(game.notices.is_empty());
     }
 
-    /// A mod overlay that is open until Esc closes it.
+    /// A module overlay that is open until Esc closes it.
     struct Overlay(bool);
 
-    impl Mod for Overlay {
+    impl Module for Overlay {
         fn id(&self) -> &'static str {
             "overlay"
         }
@@ -1653,10 +1654,10 @@ mod tests {
     #[test]
     fn esc_closes_an_overlay_before_it_reaches_the_app() {
         let mut game = game();
-        let mut mods = Mods::empty();
-        mods.install(Box::new(Overlay(true)));
-        assert_eq!(game.escape(&mut mods), super::Signal::Continue, "the overlay takes the first Esc");
-        assert_eq!(game.escape(&mut mods), super::Signal::Escape, "then Esc is the app's");
+        let mut modules = Modules::empty();
+        modules.install(Box::new(Overlay(true)));
+        assert_eq!(game.escape(&mut modules), super::Signal::Continue, "the overlay takes the first Esc");
+        assert_eq!(game.escape(&mut modules), super::Signal::Escape, "then Esc is the app's");
         game.hold_input(true);
         assert!(game.input_held);
         game.hold_input(false);
@@ -1683,16 +1684,16 @@ mod tests {
         assert!(!inert.do_break);
         assert!(!inert.do_place);
         assert!(inert.actions.is_empty());
-        assert!(!PendingModInput::capture(&inert, true, true, Some((1, 2, 3))).any());
+        assert!(!PendingModuleInput::capture(&inert, true, true, Some((1, 2, 3))).any());
     }
 
-    /// An edge captured while the mod tick is skipped is replayed on the next tick, once.
+    /// An edge captured while the module tick is skipped is replayed on the next tick, once.
     #[test]
-    fn actions_queue_across_a_skipped_mod_tick() {
+    fn actions_queue_across_a_skipped_module_tick() {
         struct Watch {
             seen: Rc<Cell<u32>>,
         }
-        impl Mod for Watch {
+        impl Module for Watch {
             fn name(&self) -> &str {
                 "Watch"
             }
@@ -1711,29 +1712,29 @@ mod tests {
                 }];
                 ACTIONS
             }
-            fn update(&mut self, ctx: &mut ModContext) {
+            fn update(&mut self, ctx: &mut ModuleContext) {
                 if ctx.action("probe.ping") {
                     self.seen.set(self.seen.get() + 1);
                 }
             }
         }
         let seen = Rc::new(Cell::new(0));
-        let mut mods = Mods::empty();
-        mods.install(Box::new(Watch { seen: seen.clone() }));
+        let mut modules = Modules::empty();
+        modules.install(Box::new(Watch { seen: seen.clone() }));
         let mut router = Router::new();
-        router.sync_actions(&mods);
+        router.sync_actions(&modules);
         let sample = router.sample(&Press::key(Key::Num3), 1.0 / 60.0, true, true);
         let input = FrameInput { actions: sample.actions, ..FrameInput::default() };
-        let pending = PendingModInput::capture(&input, true, true, None);
+        let pending = PendingModuleInput::capture(&input, true, true, None);
         assert!(pending.any());
         let mut game = game();
-        game.pending_mod_input.push(pending);
+        game.pending_module_input.push(pending);
         assert_eq!(seen.get(), 0);
-        assert_eq!(game.pending_mod_input.len(), 1);
+        assert_eq!(game.pending_module_input.len(), 1);
         let mut events = Vec::new();
-        game.mod_tick((800, 600), &mut mods, &mut events, router.action_ids());
+        game.module_tick((800, 600), &mut modules, &mut events, router.action_ids());
         assert_eq!(seen.get(), 1);
-        assert!(game.pending_mod_input.is_empty());
+        assert!(game.pending_module_input.is_empty());
     }
 
     #[test]
@@ -1795,7 +1796,7 @@ mod tests {
     fn quiet_frame_fixed_costs() {
         use crate::audio::{AudioService, SoundSystem};
         use crate::input::router::Router;
-        use crate::modding::Notices;
+        use crate::modules::Notices;
         use std::hint::black_box;
         use std::time::Instant;
 
@@ -1880,7 +1881,7 @@ mod tests {
         let (mut sound, symbols) = SoundSystem::mute();
         let mut audio = AudioService::new();
         let mut router = Router::new();
-        let mut mods = crate::modding::testing::standard();
+        let mut modules = crate::modules::testing::standard();
         const DT: f32 = 1.0 / 60.0;
 
         let mut last_allocs = u64::MAX;
@@ -1894,7 +1895,7 @@ mod tests {
         for i in 0..10 {
             alloc_count::reset();
             crate::sched::reset_clock();
-            game.tick_quiet(DT, &mut router, &mut sound, &mut audio, &symbols, &mut settings, &mut mods);
+            game.tick_quiet(DT, &mut router, &mut sound, &mut audio, &symbols, &mut settings, &mut modules);
             if i >= 5 {
                 last_allocs = alloc_count::alloc_count();
                 last_bytes = alloc_count::alloc_bytes();
@@ -1919,7 +1920,7 @@ mod tests {
         for i in 0..4 {
             alloc_count::reset();
             crate::sched::reset_clock();
-            game.tick_quiet(DT, &mut router, &mut sound, &mut audio, &symbols, &mut settings, &mut mods);
+            game.tick_quiet(DT, &mut router, &mut sound, &mut audio, &symbols, &mut settings, &mut modules);
             if i >= 2 {
                 assert_eq!(
                     alloc_count::alloc_bytes(),
@@ -1963,12 +1964,12 @@ mod tests {
         let (mut sound, symbols) = SoundSystem::mute();
         let mut audio = AudioService::new();
         let mut router = Router::new();
-        let mut mods = crate::modding::testing::standard();
+        let mut modules = crate::modules::testing::standard();
         const DT: f32 = 1.0 / 60.0;
         for i in 0..10 {
             alloc_count::reset();
             crate::sched::reset_clock();
-            game.tick_quiet(DT, &mut router, &mut sound, &mut audio, &symbols, &mut settings, &mut mods);
+            game.tick_quiet(DT, &mut router, &mut sound, &mut audio, &symbols, &mut settings, &mut modules);
             if i >= 5 {
                 assert_eq!(
                     alloc_count::alloc_bytes(),

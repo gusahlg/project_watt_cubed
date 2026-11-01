@@ -1,34 +1,34 @@
 A super awesome game, trust.
 
 A voxel is a **configuration** of points on a 4-D resource lattice. Optional native
-physics mods decide how neighbouring matter and dynamic fields change. Names are presentation only —
+physics modules decide how neighbouring matter and dynamic fields change. Names are presentation only —
 see [documentation/material-model.md](documentation/material-model.md).
 
-The original reaction law is now [a separate mod](https://github.com/gusahlg/pwc-package-manager/blob/main/mods/physics-selective). Four independent
+The original reaction law is now [a separate module](https://github.com/gusahlg/pwc-package-manager/blob/main/modules/physics-selective). Four independent
 experiments and a selectable native launcher are documented in the
 [fundamental simulation investigation](documentation/notes/2026-10-13-simulation/README.md).
 
-## Mods: vanilla and modded builds
+## Modules: vanilla builds and builds with modules
 
-PWC mods are compiled into the game. This repository is the **runtime**: `cargo run --release`
-(or `nix run`, `./play.sh`) starts **vanilla** PWC — the bare core with no mod at all (a flat
+PWC modules are compiled into the game. This repository is the **runtime**: `cargo run --release`
+(or `nix run`, `./play.sh`) starts **vanilla** PWC — the bare core with no module at all (a flat
 world, flat colours, the core menus, and an inventory list with no panel). The shipped experience —
 menus and start screen, the `pwc.hotbar` selection UI and the inventory panel, the fancy visual
 lanes, neural textures, material names and the InfiniteDiffusion world — is the `pwc.essentials`
-bundle of first-party mod packages, built by the
+bundle of first-party module packages, built by the
 [PWC package manager](https://github.com/gusahlg/pwc-package-manager):
 
 ```sh
-pwc setup                            # once: finds this checkout and the first-party mods
+pwc setup                            # once: finds this checkout and the first-party modules
 pwc instance create default --use
-pwc mod add pwc.essentials
-pwc run                              # builds PWC + the mods into one executable, then runs it
+pwc module add pwc.essentials
+pwc run                              # builds PWC + the modules into one executable, then runs it
 ```
 
-Mods compile against [`crates/pwc-mod-api`](crates/pwc-mod-api); the game side of the system is
-described in [documentation/mods.md](documentation/mods.md), the package format and tooling in the
-package manager's docs, and what mods may and may not do in [MOD_POLICY.md](MOD_POLICY.md).
-[`examples/mods/hello-hud`](examples/mods/hello-hud) is a complete minimal mod.
+Modules compile against [`crates/pwc-module-api`](crates/pwc-module-api); the game side of the system is
+described in [documentation/modules.md](documentation/modules.md), the package format and tooling in the
+package manager's docs, and what modules may and may not do in [MODULE_POLICY.md](MODULE_POLICY.md).
+[`examples/modules/hello-hud`](examples/modules/hello-hud) is a complete minimal module.
 
 ## Multiplayer
 
@@ -60,8 +60,8 @@ cargo run --release --bin watt_server -- --world world.save --port 5555 --passwo
 
 `--world` loads and saves the seed, generator, edits, and clock. A file already
 on disk wins over `--seed` and `--worldgen`. `--teleport` is `off`, `ops` (the
-default), or `all`. `--max-speed` is metres per second. `--mods-allow` and
-`--mods-deny` name package ids, and `mods.toml` beside the world does the same
+default), or `all`. `--max-speed` is metres per second. `--modules-allow` and
+`--modules-deny` name package ids, and `modules.toml` beside the world does the same
 (`deny = ["pwc.dev-toolkit"]` keeps the developer tools off). An allow list admits
 only the packages it names, so it must name every package players need (the
 Essentials packages: `pwc.menus`, `pwc.start-screen`, `pwc.hotbar`, ...). A refused
@@ -76,7 +76,7 @@ sets the data/config root (same as `WATT_DATA_DIR`).
 Press `T` to open the chat/console line. Plain text is **proximity chat** (only
 nearby players hear it); prefix a message with `!` for **global chat**; a line
 starting with `/` is a local command. The base game has no commands of its own:
-they come from mods, such as `/tp` from the Developer Toolkit (`pwc.dev-toolkit`).
+they come from modules, such as `/tp` from the Developer Toolkit (`pwc.dev-toolkit`).
 
 ### Safety
 
@@ -95,9 +95,9 @@ but an active man-in-the-middle can impersonate the server and capture the
 application password. Use a trusted network or VPN until certificate pinning
 or trust-on-first-use is implemented.
 
-Server-side mods: install `ServerMod` values on `Config.hooks` (`validate_edit`, `on_join`/`on_leave`, `on_chat`) with plain-data arguments and no wire change.
+Server-side modules: install `ServerModule` values on `Config.hooks` (`validate_edit`, `on_join`/`on_leave`, `on_chat`) with plain-data arguments and no wire change.
 Hooks run in order outside the roster lock; the first `Deny` wins (an edit `Deny` is the same `EditRejected` path as a lost race).
-A panicking hook is logged once and treated as `Allow` so a broken mod cannot take the server down.
+A panicking hook is logged once and treated as `Allow` so a broken module cannot take the server down.
 
 ## Graphics
 
@@ -106,13 +106,13 @@ Rendering runs on [voxel_engine](../voxel-engine), our own Vulkan 1.3 renderer
 chunks, frustum culling, reversed-Z depth, and uncapped frame rates by default.
 
 Graphics are tunable at runtime from **Settings** on the start menu, or in game with the
-Developer Toolkit mod's `/gfx` command (`/gfx fullscreen on`, `/gfx vsync off`,
+Developer Toolkit module's `/gfx` command (`/gfx fullscreen on`, `/gfx vsync off`,
 `/gfx msaa 4`, `/gfx fps 144`, `/gfx renderdist 8`, `/gfx fov 90`). Settings
 persist in `settings.cfg` under the config root.
 
 ## State location
 
-Worlds are stored in the data root; `settings.cfg`, `session.cfg`, and `mods.cfg` in the config root.
+Worlds are stored in the data root; `settings.cfg`, `session.cfg`, and `modules.cfg` in the config root.
 If the launch directory already contains `saves/`, both roots stay that folder (checkouts and existing installs).
 Otherwise `$XDG_DATA_HOME/project_watt_cubed` and `$XDG_CONFIG_HOME/project_watt_cubed`. Override with `WATT_DATA_DIR` or `watt_server --data-dir <dir>`.
 `WATT_CHECKOUT_DIR` is the source checkout (`play.sh` sets it to the repo root) and is ignored unless that directory contains `Cargo.toml`.

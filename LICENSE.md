@@ -17,7 +17,7 @@ Project-owned software is licensed under the GNU Affero General Public License,
 version 3 or any later version (`AGPL-3.0-or-later`). This includes:
 
 - Rust source for the client, dedicated server, engine, protocol, save system,
-  mod APIs, registry software, launchers, and development tools;
+  module APIs, registry software, launchers, and development tools;
 - build scripts, Nix expressions, CI configuration, schemas, software examples,
   and generated software metadata; and
 - shader source and generated shader binaries, including SPIR-V.
@@ -25,15 +25,15 @@ version 3 or any later version (`AGPL-3.0-or-later`). This includes:
 The full licence text is in
 [`LICENSES/AGPL-3.0-or-later.txt`](LICENSES/AGPL-3.0-or-later.txt).
 
-### Mod packages
+### Module packages
 
-Mods are separate packages, each licensed by its own `mod.toml` under any free
-licence that [MOD_POLICY.md](MOD_POLICY.md) accepts (free-software licences
-compatible with the game's `AGPL-3.0-or-later`). The project's first-party mods,
+Modules are separate packages, each licensed by its own `module.toml` under any free
+licence that [MODULE_POLICY.md](MODULE_POLICY.md) accepts (free-software licences
+compatible with the game's `AGPL-3.0-or-later`). The project's first-party modules,
 maintained in the [PWC package manager](https://github.com/gusahlg/pwc-package-manager)
-repository, and the example mods under [`examples/mods/`](examples/mods/) are
+repository, and the example modules under [`examples/modules/`](examples/modules/) are
 `Apache-2.0 OR MIT` ([`LICENSES/Apache-2.0.txt`](LICENSES/Apache-2.0.txt),
-[`LICENSES/MIT.txt`](LICENSES/MIT.txt)). A game executable built with mods is a
+[`LICENSES/MIT.txt`](LICENSES/MIT.txt)). A game executable built with modules is a
 combined work distributed under the AGPL as a whole.
 
 When a modified covered program is offered for use over a network, the AGPL's
@@ -57,8 +57,8 @@ Substantial source-code examples inside documentation are
 `CC-BY-SA-4.0`. Short command invocations and purely illustrative fragments do
 not change the licence of the surrounding document. Larger examples should
 normally live in an AGPL-licensed source file and be linked from the
-documentation. Mod code examples are the exception: they follow the mod
-packages' licence (see [Mod packages](#mod-packages)).
+documentation. Module code examples are the exception: they follow the module
+packages' licence (see [Module packages](#module-packages)).
 
 Generated creative assets carry the creative-content licence recorded in their
 sidecar or attribution manifest. The generator remains software under

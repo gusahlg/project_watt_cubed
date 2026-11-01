@@ -12,7 +12,7 @@
 //! entry-time number on the golden seed, then runs the image-match, sky-hole,
 //! entry-time, and frame-time criteria.
 
-use project_watt_cubed::modding::GameBuild;
+use project_watt_cubed::modules::GameBuild;
 
 fn main() {
     project_watt_cubed::harness::golden_main(GameBuild::vanilla());

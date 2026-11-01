@@ -1,17 +1,17 @@
-//! Test stand-ins for the first-party mods. The real ones are packages in the PWC package manager
+//! Test stand-ins for the first-party modules. The real ones are packages in the PWC package manager
 //! repository (they depend on this crate, so its own tests cannot link them); these mirror the
 //! behaviour the core's tests exercise — ids, persisted state, the visual groups and the worldgen
 //! payload — so host, menu and save tests keep their meaning. Each is installed under the id of
 //! the package that ships the real one, so tests can suspend it the way a server does.
 
-use super::{Action, Mod, Mods};
+use super::{Action, Module, Modules};
 use crate::input::intent::Chord;
 use crate::render_config::VisualGroup;
 use crate::world::generation::WorldgenKind;
 use crate::world::terrain::TerrainCfg;
 use crate::world::World;
 
-/// A test mod: an id and whichever hooks a test gives it.
+/// A test module: an id and whichever hooks a test gives it.
 #[derive(Clone, Copy)]
 pub(crate) struct Stub {
     id: &'static str,
@@ -28,7 +28,7 @@ impl Stub {
     }
 }
 
-impl Mod for Stub {
+impl Module for Stub {
     fn id(&self) -> &'static str {
         self.id
     }
@@ -47,7 +47,7 @@ pub(crate) struct Stand {
     id: &'static str,
     name: &'static str,
     visual: Option<VisualGroup>,
-    /// Persisted per-world state (echoed back verbatim), like a mod's own save line.
+    /// Persisted per-world state (echoed back verbatim), like a module's own save line.
     state: Option<String>,
     persists: bool,
 }
@@ -58,7 +58,7 @@ impl Stand {
     }
 }
 
-impl Mod for Stand {
+impl Module for Stand {
     fn name(&self) -> &str {
         self.name
     }
@@ -89,7 +89,7 @@ pub(crate) struct Worldgen {
     cfg: TerrainCfg,
 }
 
-impl Mod for Worldgen {
+impl Module for Worldgen {
     fn name(&self) -> &str {
         "InfiniteDiffusion"
     }
@@ -105,13 +105,13 @@ impl Mod for Worldgen {
 }
 
 /// Stand-ins for the essentials, in the old built-in order, each under its package id.
-pub(crate) fn standard() -> Mods {
-    let mut mods = Mods::empty();
-    mods.install_from(Some("pwc.start-screen"), Box::new(Stand::new("start", "Start")));
-    mods.install_from(Some("pwc.inventory"), Box::new(Stand::new("inventory", "Inventory")));
+pub(crate) fn standard() -> Modules {
+    let mut modules = Modules::empty();
+    modules.install_from(Some("pwc.start-screen"), Box::new(Stand::new("start", "Start")));
+    modules.install_from(Some("pwc.inventory"), Box::new(Stand::new("inventory", "Inventory")));
     let mut hotbar = Stand::new("hotbar", "Hotbar");
     hotbar.persists = true;
-    mods.install_from(Some("pwc.hotbar"), Box::new(hotbar));
+    modules.install_from(Some("pwc.hotbar"), Box::new(hotbar));
     for (id, name, group) in [
         ("atmosphere", "Atmosphere", VisualGroup::Atmosphere),
         ("post", "Post", VisualGroup::Post),
@@ -119,10 +119,10 @@ pub(crate) fn standard() -> Mods {
     ] {
         let mut m = Stand::new(id, name);
         m.visual = Some(group);
-        mods.install_from(Some("pwc.visuals"), Box::new(m));
+        modules.install_from(Some("pwc.visuals"), Box::new(m));
     }
-    mods.install_from(Some("pwc.neural-textures"), Box::new(Stand::new("neural_textures", "Neural textures")));
-    mods.install_from(Some("pwc.material-names"), Box::new(Stand::new("material_names", "Material names")));
-    mods.install_from(Some("pwc.infinite-diffusion"), Box::new(Worldgen { cfg: TerrainCfg::default() }));
-    mods
+    modules.install_from(Some("pwc.neural-textures"), Box::new(Stand::new("neural_textures", "Neural textures")));
+    modules.install_from(Some("pwc.material-names"), Box::new(Stand::new("material_names", "Material names")));
+    modules.install_from(Some("pwc.infinite-diffusion"), Box::new(Worldgen { cfg: TerrainCfg::default() }));
+    modules
 }

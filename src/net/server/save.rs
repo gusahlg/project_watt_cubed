@@ -91,9 +91,9 @@ pub(super) fn autosave_loop(
     }
 }
 
-/// Union `ops.txt` and `mods.toml` beside [`Config::world`] into the flag lists.
+/// Union `ops.txt` and `modules.toml` beside [`Config::world`] into the flag lists.
 /// An `ops.txt` line with a secret goes to [`Config::op_secrets`]. A missing file
-/// adds nothing. A `mods.toml` that is not `allow` / `deny` string arrays is an
+/// adds nothing. A `modules.toml` that is not `allow` / `deny` string arrays is an
 /// error, so a dedicated server refuses to start open.
 pub fn load_world_policy(config: &mut Config) -> Result<(), String> {
     let Some(world) = config.world.clone() else {
@@ -110,8 +110,8 @@ pub fn load_world_policy(config: &mut Config) -> Result<(), String> {
             config.op_secrets.push((name, secret));
         }
     }
-    push_unique(&mut config.mods_allow, side.allow);
-    push_unique(&mut config.mods_deny, side.deny);
+    push_unique(&mut config.modules_allow, side.allow);
+    push_unique(&mut config.modules_deny, side.deny);
     Ok(())
 }
 

@@ -1,16 +1,16 @@
-//! The per-frame mod hook: [`Mod::on_frame`](super::Mod::on_frame) and the context it gets.
+//! The per-frame module hook: [`Module::on_frame`](super::Module::on_frame) and the context it gets.
 //!
-//! The core offers three generic capabilities here and knows nothing of what a mod builds on
+//! The core offers three generic capabilities here and knows nothing of what a module builds on
 //! them (chat, commands, flight):
 //!
 //! - **Immediate actions.** An [`Action`](super::Action) with `immediate: true` is sampled every
-//!   frame, even with the `mod_logic` lane off, and reaches only [`FrameContext::action`], never the
+//!   frame, even with the `module_logic` lane off, and reaches only [`FrameContext::action`], never the
 //!   cadence-controlled `update`.
-//! - **Text capture.** A mod asks for the keyboard with [`FrameContext::capture_text`]. While it
+//! - **Text capture.** A module asks for the keyboard with [`FrameContext::capture_text`]. While it
 //!   holds it, the router reads typed text instead of gameplay keys, the world takes no input, and
-//!   only that mod sees a [`TextFrame`]. The press that started the capture does not also type its
+//!   only that module sees a [`TextFrame`]. The press that started the capture does not also type its
 //!   character. Escape always ends a capture: the holder sees `escape` once, then the core takes
-//!   the keyboard back, so Escape never leaves the world while a mod is typing.
+//!   the keyboard back, so Escape never leaves the world while a module is typing.
 //! - **Game state.** [`GameContext`] is the whole-game state the core owns (player, world, sky,
 //!   settings and the packages' options) plus three out-queues: audio facts, chat lines to send,
 //!   and notices. The core
@@ -18,7 +18,7 @@
 //!   shares a changed clock with the server, keeps the server's day length, and streams a moved
 //!   player's surroundings at once and reports the move as a teleport.
 //!
-//! **Performance:** one virtual call per mod per frame. A frame with no input builds the context
+//! **Performance:** one virtual call per module per frame. A frame with no input builds the context
 //! on the stack from retained buffers and allocates nothing.
 
 use crate::audio::GameEvent;
@@ -54,7 +54,7 @@ impl Channel {
     }
 }
 
-/// One frame of typing, for the mod that holds the keyboard.
+/// One frame of typing, for the module that holds the keyboard.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TextFrame<'a> {
     /// Characters typed this frame, layout and shift applied.
@@ -79,7 +79,7 @@ pub struct GameContext<'a> {
     pub detached: bool,
     /// Which visual groups this build provides.
     pub visuals: VisualMask,
-    /// Audio facts for the sounds mod, such as [`GameEvent::VoiceTest`].
+    /// Audio facts for the sounds module, such as [`GameEvent::VoiceTest`].
     pub events: Vec<GameEvent>,
     settings: &'a mut Settings,
     /// The settings as they were before the first [`settings_mut`](Self::settings_mut) this frame.
@@ -151,7 +151,7 @@ impl<'a> GameContext<'a> {
     }
 
     /// Queue a chat line for the server. The core sends it after the hook (truncated to the
-    /// protocol's limit); in single player it is dropped, so a chat mod echoes locally instead.
+    /// protocol's limit); in single player it is dropped, so a chat module echoes locally instead.
     pub fn send_chat(&mut self, channel: Channel, text: impl Into<String>) {
         self.chat_out.push((channel, text.into()));
     }
@@ -161,7 +161,7 @@ impl<'a> GameContext<'a> {
         &self.chat_out
     }
 
-    /// Report something to the player. A mod that shows messages prints it; with none, it goes to
+    /// Report something to the player. A module that shows messages prints it; with none, it goes to
     /// stderr.
     pub fn notice(&mut self, level: NoticeLevel, text: impl Into<String>) {
         self.notices.push(level, text);
@@ -214,7 +214,7 @@ impl OptionsSlot<'_> {
     }
 }
 
-/// The context of [`Mod::on_frame`](super::Mod::on_frame): the game state, this frame's immediate
+/// The context of [`Module::on_frame`](super::Module::on_frame): the game state, this frame's immediate
 /// actions, and the keyboard capture. Build one for a test with [`FrameContext::new`].
 #[non_exhaustive]
 pub struct FrameContext<'a> {
@@ -226,9 +226,9 @@ pub struct FrameContext<'a> {
     ids: &'a [&'static str],
     /// Ids from [`FrameContext::set_action`]. Empty on the game path.
     extra: Vec<&'static str>,
-    /// Which mod (by install index) holds the keyboard, as the hooks run.
+    /// Which module (by install index) holds the keyboard, as the hooks run.
     holder: Option<usize>,
-    /// The mod whose hook is running.
+    /// The module whose hook is running.
     me: usize,
 }
 
@@ -249,7 +249,7 @@ impl<'a> FrameContext<'a> {
         Self { game, screen, text, fired, ids, extra: Vec::new(), holder: None, me: 0 }
     }
 
-    /// Whether the immediate action `id` fired this frame (any installed mod's action with that id).
+    /// Whether the immediate action `id` fired this frame (any installed module's action with that id).
     /// A frame with no action fired answers without looking at a name.
     pub fn action(&self, id: &str) -> bool {
         if self.fired.is_empty() {
@@ -276,14 +276,14 @@ impl<'a> FrameContext<'a> {
         }
     }
 
-    /// This frame's typing, if this mod holds the keyboard and the capture was in place when the
+    /// This frame's typing, if this module holds the keyboard and the capture was in place when the
     /// frame's input was read.
     pub fn text(&self) -> Option<TextFrame<'a>> {
         self.text.filter(|_| self.holder == Some(self.me))
     }
 
     /// Ask for the keyboard (`true`) or give it back (`false`). Taking it fails, returning
-    /// `false`, while another mod holds it. Typing starts on the next frame; the key that asked
+    /// `false`, while another module holds it. Typing starts on the next frame; the key that asked
     /// does not also type its character.
     pub fn capture_text(&mut self, on: bool) -> bool {
         match (on, self.holder) {
@@ -300,18 +300,18 @@ impl<'a> FrameContext<'a> {
         }
     }
 
-    /// Whether this mod holds the keyboard.
+    /// Whether this module holds the keyboard.
     pub fn capturing(&self) -> bool {
         self.holder == Some(self.me)
     }
 
-    /// For tests: make this context's mod the keyboard holder and give it `text` this frame.
+    /// For tests: make this context's module the keyboard holder and give it `text` this frame.
     pub fn set_text(&mut self, text: TextFrame<'a>) {
         self.holder = Some(self.me);
         self.text = Some(text);
     }
 
-    /// The host runs mod `index`'s hook next.
+    /// The host runs module `index`'s hook next.
     pub(crate) fn enter(&mut self, index: usize) {
         self.me = index;
     }

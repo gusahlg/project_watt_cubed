@@ -17,9 +17,9 @@ By contributing, you agree that:
   under that licence.
 
 Substantial code examples belong under `AGPL-3.0-or-later`, even when they
-accompany documentation. The exception is mod code: the example mods under
-`examples/mods/` are `Apache-2.0 OR MIT`, like the first-party mods (see
-[LICENSE.md](LICENSE.md#mod-packages) and [MOD_POLICY.md](MOD_POLICY.md)), and
+accompany documentation. The exception is module code: the example modules under
+`examples/modules/` are `Apache-2.0 OR MIT`, like the first-party modules (see
+[LICENSE.md](LICENSE.md#module-packages) and [MODULE_POLICY.md](MODULE_POLICY.md)), and
 contributions to them are licensed that way.
 
 You retain your copyright. You do not assign it to the project, grant a
@@ -78,6 +78,6 @@ Do not replace those notices with the Project Watt Cubed licence.
 ## Changes to licensing or governance
 
 Ordinary contributions cannot weaken the project's copyleft or grant
-proprietary exceptions. Proposed licensing, governance, trademark, mod-policy,
+proprietary exceptions. Proposed licensing, governance, trademark, module-policy,
 or contributor-policy changes require explicit review under
 [GOVERNANCE.md](GOVERNANCE.md).

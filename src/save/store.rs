@@ -276,7 +276,7 @@ mod tests {
             },
             specs: vec!["air".to_string()],
             edits: (0..edits as i32).map(|i| Edit { x: i, y: 200, z: -i, spec: 0 }).collect(),
-            mods: vec![],
+            modules: vec![],
             pending: vec![],
         }
     }
@@ -482,7 +482,7 @@ mod tests {
         let _ = fs::remove_file(&parent);
         let _ = fs::remove_dir_all(&parent);
         fs::write(&parent, b"not a directory").unwrap();
-        let path = parent.join("mods.cfg");
+        let path = parent.join("modules.cfg");
         assert!(write_atomic_file(&path, b"nope").is_err());
         assert!(!sibling(&path, ".tmp").exists(), "failed write must not leave a .tmp");
         let _ = fs::remove_file(&parent);
@@ -490,7 +490,7 @@ mod tests {
 
     #[test]
     fn write_atomic_file_creates_missing_parents() {
-        let path = test_temp_path("atomic-nested").join("cfg").join("mods.cfg");
+        let path = test_temp_path("atomic-nested").join("cfg").join("modules.cfg");
         let _ = fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
         write_atomic_file(&path, b"nested\n").unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"nested\n");

@@ -165,7 +165,7 @@ mod tests {
     }
 
     /// A Diffusion world with `edits` edits around the spawn, a moved player, an inventory and
-    /// mod state.
+    /// module state.
     fn edited_save(id: &SlotId, edits: i32) {
         let mut world = diffusion(31).world();
         let mut player = super::super::spawn_player(&world);
@@ -181,22 +181,22 @@ mod tests {
         player.orientation.yaw = 1.25;
         player.set_flying(true);
         player.inventory.add(rock, 3);
-        let mut mods = crate::modding::testing::standard();
+        let mut modules = crate::modules::testing::standard();
         let rock_spec = world.registry().spec(rock);
-        mods.load_state("hotbar", &format!("v1;sel=1;1={rock_spec}"), &mut world);
+        modules.load_state("hotbar", &format!("v1;sel=1;1={rock_spec}"), &mut world);
         let meta = SaveMeta { name: id.as_str().into(), seed: 0, created: 1, last_played: 0, playtime_secs: 7, edit_count: 0 };
-        save::save(id, &world, &player, &mods, meta).unwrap();
+        save::save(id, &world, &player, &modules, meta).unwrap();
     }
 
     type Loaded = (World, Player, SaveMeta, LoadReport, Vec<(String, String)>);
 
     /// The load as the render thread ran it before: `save::load` inline.
     fn load_inline(id: &SlotId) -> Loaded {
-        let mut mods = crate::modding::testing::standard();
-        mods.reset_state();
+        let mut modules = crate::modules::testing::standard();
+        modules.reset_state();
         let (world, player, meta, report) =
-            save::load(id, &mut mods, |seed, kind, cfg| recipe(seed, kind, cfg).world()).unwrap();
-        let states = mods.save_states(&world);
+            save::load(id, &mut modules, |seed, kind, cfg| recipe(seed, kind, cfg).world()).unwrap();
+        let states = modules.save_states(&world);
         (world, player, meta, report, states)
     }
 
@@ -204,10 +204,10 @@ mod tests {
     fn load_by_job(id: &SlotId) -> Loaded {
         let Loading::Load(_, job) = Loading::load(id.clone(), RenderConfig::default()) else { unreachable!() };
         let (restored, report) = job.wait().unwrap();
-        let mut mods = crate::modding::testing::standard();
-        mods.reset_state();
-        let (world, player, meta) = restored.finish(&mut mods);
-        let states = mods.save_states(&world);
+        let mut modules = crate::modules::testing::standard();
+        modules.reset_state();
+        let (world, player, meta) = restored.finish(&mut modules);
+        let states = modules.save_states(&world);
         (world, player, meta, report, states)
     }
 
@@ -220,7 +220,7 @@ mod tests {
         assert_eq!(pose(&p1), pose(&p0));
         assert_eq!(m1, m0);
         assert_eq!((r1.source, r1.salvage), (r0.source, r0.salvage));
-        assert_eq!(s1, s0, "mod state lands the same");
+        assert_eq!(s1, s0, "module state lands the same");
         r1
     }
 

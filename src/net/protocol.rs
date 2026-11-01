@@ -26,7 +26,7 @@ use crate::presence::Stance;
 use crate::world::terrain::TerrainCfg;
 use crate::world::generation::WorldgenKind;
 
-use super::{MAX_FRAME, MAX_MOD_BYTES, MAX_SPEC};
+use super::{MAX_FRAME, MAX_MODULE_BYTES, MAX_SPEC};
 
 pub(crate) fn law_stamp() -> [u8; material::STAMP_LEN] {
     let v = material::Law::current().stamp();
@@ -176,7 +176,7 @@ impl Wire for bool {
     }
 }
 
-/// A mod channel name: 1..=16 bytes of UTF-8. The length prefix is a `u8`.
+/// A module channel name: 1..=16 bytes of UTF-8. The length prefix is a `u8`.
 /// Empty, over-long, and non-UTF-8 names reject the whole message.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Channel(Arc<str>);
@@ -214,12 +214,12 @@ impl Wire for Channel {
     }
 }
 
-/// Opaque bytes on a mod channel, already known to fit [`MAX_MOD_BYTES`].
+/// Opaque bytes on a module channel, already known to fit [`MAX_MODULE_BYTES`].
 /// Empty is legal. The bound is checked once, in `TryFrom` and in [`Wire::get`].
 #[derive(Clone, Debug, PartialEq)]
-pub struct ModBytes(Vec<u8>);
+pub struct ModuleBytes(Vec<u8>);
 
-impl ModBytes {
+impl ModuleBytes {
     #[cfg(test)]
     pub fn as_slice(&self) -> &[u8] {
         &self.0
@@ -230,103 +230,103 @@ impl ModBytes {
     }
 }
 
-/// `Err` if `bytes` exceeds [`MAX_MOD_BYTES`].
-impl TryFrom<Vec<u8>> for ModBytes {
+/// `Err` if `bytes` exceeds [`MAX_MODULE_BYTES`].
+impl TryFrom<Vec<u8>> for ModuleBytes {
     type Error = ();
     fn try_from(bytes: Vec<u8>) -> Result<Self, ()> {
-        (bytes.len() <= MAX_MOD_BYTES).then_some(Self(bytes)).ok_or(())
+        (bytes.len() <= MAX_MODULE_BYTES).then_some(Self(bytes)).ok_or(())
     }
 }
 
-/// A mod package id on the wire: 1..=[`MAX_MOD_ID`] bytes, which the decoder enforces.
+/// A module package id on the wire: 1..=[`MAX_MODULE_ID`] bytes, which the decoder enforces.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct ModId(Arc<str>);
+pub struct ModuleId(Arc<str>);
 
-impl ModId {
+impl ModuleId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
 }
 
-impl std::ops::Deref for ModId {
+impl std::ops::Deref for ModuleId {
     type Target = str;
     fn deref(&self) -> &str {
         &self.0
     }
 }
 
-impl AsRef<str> for ModId {
+impl AsRef<str> for ModuleId {
     fn as_ref(&self) -> &str {
         &self.0
     }
 }
 
-impl std::fmt::Display for ModId {
+impl std::fmt::Display for ModuleId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
     }
 }
 
-impl From<&str> for ModId {
+impl From<&str> for ModuleId {
     fn from(id: &str) -> Self {
         Self(Arc::from(id))
     }
 }
 
-impl From<Arc<str>> for ModId {
+impl From<Arc<str>> for ModuleId {
     fn from(id: Arc<str>) -> Self {
         Self(id)
     }
 }
 
-impl PartialEq<Arc<str>> for ModId {
+impl PartialEq<Arc<str>> for ModuleId {
     fn eq(&self, other: &Arc<str>) -> bool {
         *self.0 == **other
     }
 }
 
-impl Wire for ModId {
+impl Wire for ModuleId {
     fn put(&self, w: &mut codec::Writer) {
         w.str16(&self.0);
     }
     fn get(r: &mut codec::Reader) -> Option<Self> {
-        bounded_mod_str(r).map(Self)
+        bounded_module_str(r).map(Self)
     }
 }
 
-/// One enabled mod an honest client reports at join: the build's package id
+/// One enabled module an honest client reports at join: the build's package id
 /// and version. A modified client can put anything here. The server still
 /// enforces teleport, the speed cap, time permission, edit reach, and the
 /// movement envelope; this list is not a security boundary.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ModOffer {
-    pub id: ModId,
+pub struct ModuleOffer {
+    pub id: ModuleId,
     pub version: Arc<str>,
 }
 
-/// How many mod ids one Hello or ModsDenied may carry.
-const MAX_MOD_OFFERS: usize = 128;
-/// Longest accepted mod id or version, in bytes.
-const MAX_MOD_ID: usize = 64;
+/// How many module ids one Hello or ModulesDenied may carry.
+const MAX_MODULE_OFFERS: usize = 128;
+/// Longest accepted module id or version, in bytes.
+const MAX_MODULE_ID: usize = 64;
 
-impl Wire for ModOffer {
+impl Wire for ModuleOffer {
     fn put(&self, w: &mut codec::Writer) {
         self.id.put(w);
         w.str16(&self.version);
     }
     fn get(r: &mut codec::Reader) -> Option<Self> {
-        let id = ModId::get(r)?;
-        let version = bounded_mod_str(r)?;
+        let id = ModuleId::get(r)?;
+        let version = bounded_module_str(r)?;
         Some(Self { id, version })
     }
 }
 
-/// An item of a mod list: a `u16` count, at most [`MAX_MOD_OFFERS`] items, then the items.
-trait ModListItem: Wire {}
-impl ModListItem for ModOffer {}
-impl ModListItem for ModId {}
+/// An item of a module list: a `u16` count, at most [`MAX_MODULE_OFFERS`] items, then the items.
+trait ModuleListItem: Wire {}
+impl ModuleListItem for ModuleOffer {}
+impl ModuleListItem for ModuleId {}
 
-impl<T: ModListItem> Wire for Vec<T> {
+impl<T: ModuleListItem> Wire for Vec<T> {
     fn put(&self, w: &mut codec::Writer) {
         w.u16(self.len() as u16);
         for item in self {
@@ -335,7 +335,7 @@ impl<T: ModListItem> Wire for Vec<T> {
     }
     fn get(r: &mut codec::Reader) -> Option<Self> {
         let count = r.u16().ok()? as usize;
-        if count > MAX_MOD_OFFERS {
+        if count > MAX_MODULE_OFFERS {
             return None;
         }
         let mut items = Vec::with_capacity(count);
@@ -346,24 +346,24 @@ impl<T: ModListItem> Wire for Vec<T> {
     }
 }
 
-/// The enabled packages a `Hello` carries: at most [`MAX_MOD_OFFERS`], each id and version
-/// 1..=[`MAX_MOD_ID`] bytes, so the encoder never writes a list its decoder refuses. Also how
+/// The enabled packages a `Hello` carries: at most [`MAX_MODULE_OFFERS`], each id and version
+/// 1..=[`MAX_MODULE_ID`] bytes, so the encoder never writes a list its decoder refuses. Also how
 /// many packages were left out.
-pub(crate) fn hello_offers(mods: &[(String, String)]) -> (Vec<ModOffer>, usize) {
-    let fits = |text: &str| (1..=MAX_MOD_ID).contains(&text.len());
-    let offers: Vec<ModOffer> = mods
+pub(crate) fn hello_offers(modules: &[(String, String)]) -> (Vec<ModuleOffer>, usize) {
+    let fits = |text: &str| (1..=MAX_MODULE_ID).contains(&text.len());
+    let offers: Vec<ModuleOffer> = modules
         .iter()
         .filter(|(id, version)| fits(id) && fits(version))
-        .take(MAX_MOD_OFFERS)
-        .map(|(id, version)| ModOffer { id: id.as_str().into(), version: version.as_str().into() })
+        .take(MAX_MODULE_OFFERS)
+        .map(|(id, version)| ModuleOffer { id: id.as_str().into(), version: version.as_str().into() })
         .collect();
-    let dropped = mods.len() - offers.len();
+    let dropped = modules.len() - offers.len();
     (offers, dropped)
 }
 
-fn bounded_mod_str(r: &mut codec::Reader) -> Option<Arc<str>> {
+fn bounded_module_str(r: &mut codec::Reader) -> Option<Arc<str>> {
     let s = r.str16_lossy().ok()?;
-    if s.is_empty() || s.len() > MAX_MOD_ID {
+    if s.is_empty() || s.len() > MAX_MODULE_ID {
         return None;
     }
     Some(Arc::from(s))
@@ -371,14 +371,14 @@ fn bounded_mod_str(r: &mut codec::Reader) -> Option<Arc<str>> {
 
 /// u16 length prefix, then the bytes. Decode rejects a length prefix past the
 /// cap before the bytes are trusted.
-impl Wire for ModBytes {
+impl Wire for ModuleBytes {
     fn put(&self, w: &mut codec::Writer) {
         w.u16(self.0.len() as u16);
         w.raw(&self.0);
     }
     fn get(r: &mut codec::Reader) -> Option<Self> {
         let len = r.u16().ok()? as usize;
-        if len > MAX_MOD_BYTES {
+        if len > MAX_MODULE_BYTES {
             return None;
         }
         Some(Self(r.take(len).ok()?.to_vec()))
@@ -1000,7 +1000,7 @@ mod tag {
     pub const SWING: u8 = 5;
     pub const PING: u8 = 6;
     pub const TELEPORT: u8 = 7;
-    pub const MOD_DATA: u8 = 8;
+    pub const MODULE_DATA: u8 = 8;
     pub const TOOL_USE: u8 = 9;
     pub const CRUISE: u8 = 10;
 
@@ -1018,9 +1018,9 @@ mod tag {
     pub const EDIT_ACK: u8 = 11;
     pub const POSITION: u8 = 12;
     pub const PEER_EXITED: u8 = 13;
-    pub const PEER_MOD_DATA: u8 = 14;
+    pub const PEER_MODULE_DATA: u8 = 14;
     pub const TOOL_RESULT: u8 = 15;
-    pub const MODS_DENIED: u8 = 16;
+    pub const MODULES_DENIED: u8 = 16;
     pub const SNAPSHOT_END: u8 = 17;
 }
 
@@ -1030,7 +1030,7 @@ messages! {
         /// Content parts only: generator version, gravity, material law, palette.
         /// Worldgen kind and terrain knobs arrive in [`ServerMessage::Welcome`].
         /// `protocol` stays the first field so a peer can be told "server vX, client vY"
-        /// before the rest of the payload is decoded. `mods` follows the password:
+        /// before the rest of the payload is decoded. `modules` follows the password:
         /// enabled package ids and versions. That list is the client's own report.
         Hello = tag::HELLO {
             protocol: u32,
@@ -1041,7 +1041,7 @@ messages! {
             simulation: u64,
             name: Arc<str>,
             password: Arc<str>,
-            mods: Vec<ModOffer>,
+            modules: Vec<ModuleOffer>,
         },
         /// Declare cruise. `speed` 0 ends it; otherwise the movement envelope may
         /// follow up to `min(speed, CRUISE_MAX)`. Sent when the cruise state changes.
@@ -1065,8 +1065,8 @@ messages! {
         SetTime = tag::SET_TIME { day: f32 },
         /// Bytes on a named channel. `seq` orders the sender's own stream. The server
         /// stamps the sender on relay; the client never names itself. `bytes` is
-        /// bounded by [`MAX_MOD_BYTES`](super::MAX_MOD_BYTES). Rides the reliable stream.
-        ModData = tag::MOD_DATA { channel: Channel, seq: u32, bytes: ModBytes },
+        /// bounded by [`MAX_MODULE_BYTES`](super::MAX_MODULE_BYTES). Rides the reliable stream.
+        ModuleData = tag::MODULE_DATA { channel: Channel, seq: u32, bytes: ModuleBytes },
         /// Use the held configuration `tool_spec` as a tool on the cell: the server runs ONE
         /// operation of the law between the cell (A) and the tool (B) and answers with
         /// [`ServerMessage::ToolResult`]. `req`/`expect` as for [`Edit`](Self::Edit).
@@ -1111,7 +1111,7 @@ messages! {
         /// Sent to everyone except the editor (who gets the ack).
         Edit = tag::S_EDIT { x: i32, y: i32, z: i32, rev: u32, spec: Arc<str> },
         /// `accepted` with the committed revision, or rejected (stale expectation,
-        /// out of reach, invalid spec, or a server-mod `Deny`) — the signal
+        /// out of reach, invalid spec, or a server-module `Deny`) — the signal
         /// prediction rolls back on. A hook Deny does not advance the cell, so
         /// the client's `restore` is the same as a lost race.
         EditAck = tag::EDIT_ACK { req: u32, accepted: bool, rev: u32 },
@@ -1122,17 +1122,17 @@ messages! {
         /// `day` is a `[0,1)` fraction and `day_secs` the shared real-seconds
         /// length of a full cycle, so every clock advances in step.
         Time = tag::S_TIME { day: f32, day_secs: f32 },
-        /// A [`ClientMessage::ModData`] relayed to the sender's visible interest set.
+        /// A [`ClientMessage::ModuleData`] relayed to the sender's visible interest set.
         /// `sender` is stamped by the server from the authenticated player id.
         /// `seq` and `bytes` are the sender's own values, unchanged.
-        PeerModData = tag::PEER_MOD_DATA { channel: Channel, sender: u32, seq: u32, bytes: ModBytes },
+        PeerModuleData = tag::PEER_MODULE_DATA { channel: Channel, sender: u32, seq: u32, bytes: ModuleBytes },
         /// The outcome of the sender's [`ClientMessage::ToolUse`] `req`: whether the law moved
         /// anything, the cell's committed revision, and both configurations afterwards (unchanged
         /// specs when nothing reacted or the request was refused).
         ToolResult = tag::TOOL_RESULT { req: u32, reacted: bool, rev: u32, cell_spec: Arc<str>, tool_spec: Arc<str> },
-        /// The stream closes after this. `ids` are the enabled mods this server
+        /// The stream closes after this. `ids` are the enabled modules this server
         /// refuses. An honest client disables them for the session and joins once more.
-        ModsDenied = tag::MODS_DENIED { ids: Vec<ModId> },
+        ModulesDenied = tag::MODULES_DENIED { ids: Vec<ModuleId> },
     }
 }
 
@@ -1254,7 +1254,7 @@ mod tests {
                 simulation: 0,
                 name: "player".into(),
                 password: "hunter2".into(),
-                mods: vec![ModOffer { id: "pwc.hotbar".into(), version: "0.1.0".into() }],
+                modules: vec![ModuleOffer { id: "pwc.hotbar".into(), version: "0.1.0".into() }],
             },
             ClientMessage::Cruise { speed: 1.5e8 },
             ClientMessage::Cruise { speed: 0.0 },
@@ -1280,12 +1280,12 @@ mod tests {
             },
             ClientMessage::Chat { channel: 1, text: "hello world".into() },
             ClientMessage::SetTime { day: 0.5 },
-            ClientMessage::ModData {
+            ClientMessage::ModuleData {
                 channel: Channel::parse("voice").unwrap(),
                 seq: 5,
                 bytes: vec![1, 2, 3, 4].try_into().unwrap(),
             },
-            ClientMessage::ModData {
+            ClientMessage::ModuleData {
                 channel: Channel::parse("voice").unwrap(),
                 seq: 0,
                 bytes: Vec::new().try_into().unwrap(),
@@ -1366,13 +1366,13 @@ mod tests {
                 text: "hi".into(),
             },
             ServerMessage::Time { day: 0.75, day_secs: 600.0 },
-            ServerMessage::PeerModData {
+            ServerMessage::PeerModuleData {
                 channel: Channel::parse("voice").unwrap(),
                 sender: 3,
                 seq: 5,
                 bytes: vec![9, 8, 7].try_into().unwrap(),
             },
-            ServerMessage::PeerModData {
+            ServerMessage::PeerModuleData {
                 channel: Channel::parse("voice").unwrap(),
                 sender: 1,
                 seq: 0,
@@ -1385,7 +1385,7 @@ mod tests {
                 cell_spec: "air".into(),
                 tool_spec: "c:0201020304aabbccdd".into(),
             },
-            ServerMessage::ModsDenied { ids: vec!["pwc.dev-toolkit".into()] },
+            ServerMessage::ModulesDenied { ids: vec!["pwc.dev-toolkit".into()] },
             ServerMessage::SnapshotEnd,
         ]
     }
@@ -1482,7 +1482,7 @@ mod tests {
                 },
                 specs: vec![spec.clone()],
                 edits: vec![format::Edit { x: 1, y: 2, z: 3, spec: 0 }],
-                mods: vec![],
+                modules: vec![],
                 pending: vec![],
             };
             let bytes = format::encode(&doc).unwrap();
@@ -1688,24 +1688,24 @@ mod tests {
     }
 
     #[test]
-    fn mod_bytes_at_the_cap_round_trip_both_directions() {
-        let bytes: ModBytes = (0..MAX_MOD_BYTES).map(|i| i as u8).collect::<Vec<u8>>().try_into().unwrap();
+    fn module_bytes_at_the_cap_round_trip_both_directions() {
+        let bytes: ModuleBytes = (0..MAX_MODULE_BYTES).map(|i| i as u8).collect::<Vec<u8>>().try_into().unwrap();
         let channel = Channel::parse("voice").unwrap();
-        let cm = ClientMessage::ModData { channel: channel.clone(), seq: 99, bytes: bytes.clone() };
+        let cm = ClientMessage::ModuleData { channel: channel.clone(), seq: 99, bytes: bytes.clone() };
         assert_eq!(ClientMessage::decode(&cm.encode()), Some(cm));
-        let sm = ServerMessage::PeerModData { channel, sender: 7, seq: 99, bytes };
+        let sm = ServerMessage::PeerModuleData { channel, sender: 7, seq: 99, bytes };
         assert_eq!(ServerMessage::decode(&sm.encode()), Some(sm));
     }
 
-    /// A frame whose length prefix claims more than [`MAX_MOD_BYTES`] is refused
+    /// A frame whose length prefix claims more than [`MAX_MODULE_BYTES`] is refused
     /// before the bytes are trusted. The encode path can't build one
-    /// (`ModBytes::try_from` refuses it), so the frame is forged, channel prefix included.
+    /// (`ModuleBytes::try_from` refuses it), so the frame is forged, channel prefix included.
     #[test]
-    fn oversized_mod_frame_is_rejected_both_directions() {
-        let over = vec![0u8; MAX_MOD_BYTES + 1];
+    fn oversized_module_frame_is_rejected_both_directions() {
+        let over = vec![0u8; MAX_MODULE_BYTES + 1];
 
         let mut w = codec::Writer::new();
-        w.u8(super::tag::MOD_DATA);
+        w.u8(super::tag::MODULE_DATA);
         w.u8(5);
         w.raw(b"voice");
         w.u32(1);
@@ -1714,7 +1714,7 @@ mod tests {
         assert_eq!(ClientMessage::decode(&w.into_inner()), None);
 
         let mut w = codec::Writer::new();
-        w.u8(super::tag::PEER_MOD_DATA);
+        w.u8(super::tag::PEER_MODULE_DATA);
         w.u8(5);
         w.raw(b"voice");
         w.u32(2); // sender
@@ -1735,10 +1735,10 @@ mod tests {
             w.u16(0);
             w.into_inner()
         }
-        assert_eq!(ClientMessage::decode(&forged(super::tag::MOD_DATA, 0, b"")), None);
-        assert_eq!(ClientMessage::decode(&forged(super::tag::MOD_DATA, 17, &[b'a'; 17])), None);
-        assert_eq!(ClientMessage::decode(&forged(super::tag::MOD_DATA, 1, &[0xff])), None);
-        assert_eq!(ServerMessage::decode(&forged(super::tag::PEER_MOD_DATA, 0, b"")), None);
+        assert_eq!(ClientMessage::decode(&forged(super::tag::MODULE_DATA, 0, b"")), None);
+        assert_eq!(ClientMessage::decode(&forged(super::tag::MODULE_DATA, 17, &[b'a'; 17])), None);
+        assert_eq!(ClientMessage::decode(&forged(super::tag::MODULE_DATA, 1, &[0xff])), None);
+        assert_eq!(ServerMessage::decode(&forged(super::tag::PEER_MODULE_DATA, 0, b"")), None);
         assert!(Channel::parse("").is_none());
         assert!(Channel::parse(&"a".repeat(17)).is_none());
         assert!(Channel::parse("voice").is_some());
@@ -2052,7 +2052,7 @@ mod tests {
             simulation: 0,
             name: cap_name.clone(),
             password: "".into(),
-            mods: vec![],
+            modules: vec![],
         };
         assert_eq!(ClientMessage::decode(&hello.encode()), Some(hello));
 
@@ -2066,7 +2066,7 @@ mod tests {
             simulation: 0,
             name: over,
             password: "p".repeat(super::super::MAX_NAME + 1).into(),
-            mods: vec![],
+            modules: vec![],
         };
         decode_must_not_panic(&hello_over.encode());
 
@@ -2135,10 +2135,10 @@ mod tests {
     /// the count are left out and counted, and ones at the limits stay.
     #[test]
     fn hello_offers_stay_within_the_decoder_limits() {
-        let mut mods: Vec<(String, String)> = (0..=MAX_MOD_OFFERS).map(|i| (format!("pkg.{i}"), "1.0.0".into())).collect();
-        mods.insert(0, ("pkg.long".into(), "1".repeat(MAX_MOD_ID + 1)));
-        mods.insert(1, ("x".repeat(MAX_MOD_ID), "v".repeat(MAX_MOD_ID)));
-        let hello = |mods: Vec<ModOffer>| ClientMessage::Hello {
+        let mut modules: Vec<(String, String)> = (0..=MAX_MODULE_OFFERS).map(|i| (format!("pkg.{i}"), "1.0.0".into())).collect();
+        modules.insert(0, ("pkg.long".into(), "1".repeat(MAX_MODULE_ID + 1)));
+        modules.insert(1, ("x".repeat(MAX_MODULE_ID), "v".repeat(MAX_MODULE_ID)));
+        let hello = |modules: Vec<ModuleOffer>| ClientMessage::Hello {
             protocol: 1,
             worldgen: 0,
             gravity: 0,
@@ -2147,13 +2147,13 @@ mod tests {
             simulation: 0,
             name: "ada".into(),
             password: "".into(),
-            mods,
+            modules,
         };
-        let raw = mods.iter().map(|(id, version)| ModOffer { id: id.as_str().into(), version: version.as_str().into() }).collect();
+        let raw = modules.iter().map(|(id, version)| ModuleOffer { id: id.as_str().into(), version: version.as_str().into() }).collect();
         assert_eq!(ClientMessage::decode(&hello(raw).encode()), None, "the unfitted list is refused");
-        let (offers, dropped) = hello_offers(&mods);
-        assert_eq!((offers.len(), dropped), (MAX_MOD_OFFERS, mods.len() - MAX_MOD_OFFERS));
-        assert_eq!(offers[0].id.len(), MAX_MOD_ID, "an id and version at the limit are kept");
+        let (offers, dropped) = hello_offers(&modules);
+        assert_eq!((offers.len(), dropped), (MAX_MODULE_OFFERS, modules.len() - MAX_MODULE_OFFERS));
+        assert_eq!(offers[0].id.len(), MAX_MODULE_ID, "an id and version at the limit are kept");
         let sent = hello(offers);
         assert_eq!(ClientMessage::decode(&sent.encode()), Some(sent));
     }

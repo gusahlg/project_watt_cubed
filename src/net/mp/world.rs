@@ -14,7 +14,7 @@ use voxel_engine::DVec3;
 use super::{Lobby, listen};
 use crate::block::{AIR, BlockId};
 use crate::net::client::{APPLY_BUDGET, Connection, Incoming};
-use crate::net::hooks::{self, EditIntent, ServerMod};
+use crate::net::hooks::{self, EditIntent, ServerModule};
 use crate::net::persist;
 use crate::net::server::Config;
 use crate::render_config::RenderConfig;
@@ -599,10 +599,10 @@ fn a_refused_chain_on_one_cell_rolls_back_to_the_server_block() {
     assert_eq!(ps[0].view(cell), grass, "both predictions roll back to the server's grass");
 }
 
-/// Holds every edit before allowing it, as a slow mod or a stalled server would.
+/// Holds every edit before allowing it, as a slow module or a stalled server would.
 struct Stall(Duration);
 
-impl ServerMod for Stall {
+impl ServerModule for Stall {
     fn id(&self) -> &'static str {
         "stall"
     }

@@ -6,7 +6,9 @@
 # `cargo run --bin golden -- bless` regenerates them locally.
 /tests/golden
 /target-check
-# Local mod development trees (pwc mod add ./dev-mods/<mod>); never an installation directory.
+# Local module development trees (pwc module add ./dev-modules/<module>); never an installation directory.
+/dev-modules
+# The same trees under their pre-0.8 name.
 /dev-mods
 
 # Benchmark reports (scripts/bench-unit.sh, documentation/performance.md)

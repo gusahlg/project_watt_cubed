@@ -123,7 +123,7 @@ impl World {
         &self.registry
     }
 
-    /// Mutable access to the palette, so crafting and mods can register new blocks.
+    /// Mutable access to the palette, so crafting and modules can register new blocks.
     pub fn registry_mut(&mut self) -> &mut BlockRegistry {
         &mut self.registry
     }

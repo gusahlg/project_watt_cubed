@@ -15,7 +15,7 @@
 //! The movement intent comes from the input router: three axes in `[-1, 1]`
 //! and the held states, resolved from bindings (see [`MoveInput::from_view`])
 //! rather than read directly here. Switching between walking and flying is not
-//! movement's business: a mod (the Developer Toolkit) does it on the flight key.
+//! movement's business: a module (the Developer Toolkit) does it on the flight key.
 use voxel_engine::DVec3;
 
 use crate::coord::Face;

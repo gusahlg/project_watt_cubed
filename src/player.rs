@@ -158,7 +158,7 @@ pub struct Player {
     /// Flying speed in units/second — an intrinsic the movement code reads to
     /// scale the flying target, mirroring [`Player::speed`] for walking.
     pub fly_speed: f64,
-    /// Configurations this player holds. Core-owned; mods present and spend it.
+    /// Configurations this player holds. Core-owned; modules present and spend it.
     pub inventory: Inventory,
     /// Cruising past the speed limit (see [`Cruise`]); `None` in ordinary motion.
     pub cruise: Option<Cruise>,

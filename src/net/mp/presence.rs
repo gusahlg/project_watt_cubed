@@ -1,5 +1,5 @@
 //! Multiplayer presence tests: poses and their quantisation, interest range, the movement envelope
-//! against honest and lying clients, teleport policy, chat, swings, mod channels and voice. See
+//! against honest and lying clients, teleport policy, chat, swings, module channels and voice. See
 //! `super` for the harness.
 //!
 //! [`Raw`] speaks the protocol with no throttle, so a test sees every frame the server sends and
@@ -22,15 +22,15 @@ use tokio::runtime::Runtime;
 use voxel_engine::{DVec3, Vec3};
 
 use super::Lobby;
-use crate::audio::{ModFrame, ModLink};
+use crate::audio::{ModuleFrame, ModuleLink};
 use crate::block::BlockRegistry;
 use crate::coord::Face;
 use crate::input::movement::{self, MoveInput};
 use crate::math::PER_METER;
 use crate::net::client::{self, Connection, Incoming, RemotePlayer};
-use crate::net::protocol::{self, Channel, ClientMessage, ModBytes, POSE_STEP, PeerPose, ServerMessage};
+use crate::net::protocol::{self, Channel, ClientMessage, ModuleBytes, POSE_STEP, PeerPose, ServerMessage};
 use crate::net::server::{Config, NoclipPolicy, TeleportPolicy};
-use crate::net::{MAX_MOD_BYTES, PROTOCOL_VERSION, chat, quic};
+use crate::net::{MAX_MODULE_BYTES, PROTOCOL_VERSION, chat, quic};
 use crate::player::{CRUISE_DEFAULT, MAX_SPEED, Motion, Player};
 use crate::presence::Stance;
 use crate::world::World;
@@ -45,10 +45,10 @@ const CHAT_RATE: usize = 5;
 const SWING_RATE: usize = 10;
 const TELEPORT_RATE: usize = 4;
 const CHANNEL_RATE: usize = 100;
-const MOD_DATA_RATE: usize = 200;
+const MODULE_DATA_RATE: usize = 200;
 const MAX_CHANNELS: usize = 32;
 /// The client's receive ring per channel (`client.rs`).
-const MOD_RING: usize = 64;
+const MODULE_RING: usize = 64;
 /// The most one coordinate may move on the wire: half of [`POSE_STEP`].
 const HALF_STEP: f64 = POSE_STEP / 2.0;
 /// The most yaw or pitch may move on the wire: half a 16-bit fraction of a turn.
@@ -90,7 +90,7 @@ impl Raw {
             simulation: content.simulation,
             name: name.into(),
             password: "".into(),
-            mods: Vec::new(),
+            modules: Vec::new(),
         };
         let server = SocketAddr::from((Ipv4Addr::LOCALHOST, lobby.port));
         let (conn, send, mut recv, welcome) = rt.block_on(async {
@@ -139,11 +139,11 @@ impl Raw {
         } });
     }
 
-    fn mod_data(&mut self, channel: &str, seq: u32, bytes: &[u8]) {
-        self.send(&ClientMessage::ModData {
+    fn module_data(&mut self, channel: &str, seq: u32, bytes: &[u8]) {
+        self.send(&ClientMessage::ModuleData {
             channel: Channel::parse(channel).expect("a legal name"),
             seq,
-            bytes: ModBytes::try_from(bytes.to_vec()).expect("within the cap"),
+            bytes: ModuleBytes::try_from(bytes.to_vec()).expect("within the cap"),
         });
     }
 
@@ -235,13 +235,13 @@ impl Raw {
         self.log[mark..end].iter().filter(|(_, m)| want(m)).count()
     }
 
-    /// Mod frames logged from `mark` to `end`: channel, sender, seq.
-    fn mod_frames(&mut self, mark: usize, end: usize) -> Vec<(String, u32, u32)> {
+    /// Module frames logged from `mark` to `end`: channel, sender, seq.
+    fn module_frames(&mut self, mark: usize, end: usize) -> Vec<(String, u32, u32)> {
         self.pump();
         self.log[mark..end]
             .iter()
             .filter_map(|(_, m)| match m {
-                ServerMessage::PeerModData { channel, sender, seq, .. } => {
+                ServerMessage::PeerModuleData { channel, sender, seq, .. } => {
                     Some((channel.as_str().to_string(), *sender, *seq))
                 }
                 _ => None,
@@ -1230,7 +1230,7 @@ fn swings_past_the_rate_budget_are_dropped() {
 /// Channel bytes reach the sender's visible set unchanged, stamped with the sender's id, and no
 /// one else; illegal names and oversized payloads are refused before they leave the client.
 #[test]
-fn mod_data_reaches_only_the_visible_set_with_the_sender_stamped() {
+fn module_data_reaches_only_the_visible_set_with_the_sender_stamped() {
     let lobby = Lobby::flat();
     let mut players = vec![join(&lobby, "ada"), join(&lobby, "bob"), join(&lobby, "cy")];
     meet(&mut players);
@@ -1240,8 +1240,8 @@ fn mod_data_reaches_only_the_visible_set_with_the_sender_stamped() {
     let ada_id = ada.player_id();
     assert!(!ada.send_channel("", 0, b"x"));
     assert!(!ada.send_channel("seventeen-letters", 0, b"x"));
-    assert!(!ada.send_channel("chan", 0, &[0; MAX_MOD_BYTES + 1]));
-    let full: Vec<u8> = (0..MAX_MOD_BYTES).map(|i| i as u8).collect();
+    assert!(!ada.send_channel("chan", 0, &[0; MAX_MODULE_BYTES + 1]));
+    let full: Vec<u8> = (0..MAX_MODULE_BYTES).map(|i| i as u8).collect();
     assert!(ada.send_channel("chan", 7, b"hello"));
     assert!(ada.send_channel("chan", 8, &full));
     ada.send_chat(chat::GLOBAL, "sent");
@@ -1271,12 +1271,12 @@ fn one_channel_is_held_to_its_budget() {
     let (mut ada, mut bob) = pair(&lobby);
     let mark = bob.mark();
     for seq in 0..150 {
-        ada.mod_data("a", seq, &[seq as u8]);
+        ada.module_data("a", seq, &[seq as u8]);
     }
     ada.say("done");
     let end = bob.heard(mark, "done");
     let want: Vec<(String, u32, u32)> = (0..CHANNEL_RATE as u32).map(|seq| ("a".to_string(), ada.id, seq)).collect();
-    assert_eq!(bob.mod_frames(mark, end), want);
+    assert_eq!(bob.module_frames(mark, end), want);
 }
 
 /// All of a connection's channels share two hundred frames a second.
@@ -1287,13 +1287,13 @@ fn all_channels_share_one_budget() {
     let mark = bob.mark();
     for seq in 0..80 {
         for name in ["a", "b", "c"] {
-            ada.mod_data(name, seq, &[]);
+            ada.module_data(name, seq, &[]);
         }
     }
     ada.say("done");
     let end = bob.heard(mark, "done");
-    let frames = bob.mod_frames(mark, end);
-    assert_eq!(frames.len(), MOD_DATA_RATE, "three channels within their own windows still share one");
+    let frames = bob.module_frames(mark, end);
+    assert_eq!(frames.len(), MODULE_DATA_RATE, "three channels within their own windows still share one");
     for name in ["a", "b", "c"] {
         let seqs: Vec<u32> = frames.iter().filter(|f| f.0 == name).map(|f| f.2).collect();
         assert_eq!(seqs, (0..seqs.len() as u32).collect::<Vec<_>>(), "channel {name} keeps its order");
@@ -1307,14 +1307,14 @@ fn a_connection_names_at_most_thirty_two_channels() {
     let (mut ada, mut bob) = pair(&lobby);
     let mark = bob.mark();
     for n in 0..=MAX_CHANNELS {
-        ada.mod_data(&format!("n{n}"), 0, &[]);
+        ada.module_data(&format!("n{n}"), 0, &[]);
     }
-    ada.mod_data("n0", 1, &[]);
+    ada.module_data("n0", 1, &[]);
     ada.say("done");
     let end = bob.heard(mark, "done");
     let mut want: Vec<(String, u32, u32)> = (0..MAX_CHANNELS).map(|n| (format!("n{n}"), ada.id, 0)).collect();
     want.push(("n0".to_string(), ada.id, 1));
-    assert_eq!(bob.mod_frames(mark, end), want);
+    assert_eq!(bob.module_frames(mark, end), want);
 }
 
 /// A channel nobody drains keeps its newest 64 frames in order, and its overflow spares the others.
@@ -1328,13 +1328,13 @@ fn a_full_channel_ring_keeps_the_newest_frames() {
     ada.walk(at, Vec3::ZERO);
     poll_until(&mut bob, "ada in range", |c, _| c.peers().any(|p| p.id() == ada_id && p.visible()));
     for seq in 0..CHANNEL_RATE as u32 {
-        ada.mod_data("ring", seq, &seq.to_le_bytes());
+        ada.module_data("ring", seq, &seq.to_le_bytes());
     }
-    ada.mod_data("other", 0, b"kept");
+    ada.module_data("other", 0, b"kept");
     ada.say("done");
     hear(&mut bob, "done");
     let ring = bob.drain_channel("ring");
-    let first = (CHANNEL_RATE - MOD_RING) as u32;
+    let first = (CHANNEL_RATE - MODULE_RING) as u32;
     let want: Vec<(u32, u32, Vec<u8>)> = (first..CHANNEL_RATE as u32).map(|s| (ada_id, s, s.to_le_bytes().to_vec())).collect();
     assert_eq!(ring, want);
     assert_eq!(bob.drain_channel("other"), vec![(ada_id, 0, b"kept".to_vec())]);
@@ -1349,7 +1349,7 @@ fn opus(seq: u32) -> Vec<u8> {
 /// Speak `seqs` on the voice channel at the capture cadence, then say `after`.
 fn speak(conn: &mut Connection, seqs: Range<u32>, after: &str) {
     for seq in seqs {
-        assert!(ModLink::new(Some(&mut *conn)).send("voice", seq, &opus(seq)));
+        assert!(ModuleLink::new(Some(&mut *conn)).send("voice", seq, &opus(seq)));
         thread::sleep(Duration::from_millis(20));
     }
     conn.send_chat(chat::GLOBAL, after);
@@ -1358,8 +1358,8 @@ fn speak(conn: &mut Connection, seqs: Range<u32>, after: &str) {
 /// The voice frames that arrived before the line `after`.
 fn listen_voice(conn: &mut Connection, after: &str) -> Vec<(u32, u32)> {
     hear(conn, after);
-    let mut frames: Vec<ModFrame> = Vec::new();
-    ModLink::new(Some(conn)).drain("voice", &mut frames);
+    let mut frames: Vec<ModuleFrame> = Vec::new();
+    ModuleLink::new(Some(conn)).drain("voice", &mut frames);
     frames
         .into_iter()
         .map(|f| {
@@ -1369,7 +1369,7 @@ fn listen_voice(conn: &mut Connection, after: &str) -> Vec<(u32, u32)> {
         .collect()
 }
 
-/// Voice frames through the mod link reach a listener in range, in order and stamped with the
+/// Voice frames through the module link reach a listener in range, in order and stamped with the
 /// speaker, never one out of range or the speaker; they stop when the listener walks off and
 /// resume when the listener comes back.
 #[test]

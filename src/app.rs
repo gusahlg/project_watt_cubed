@@ -1,4 +1,4 @@
-//! app.rs owns the top-level state machine: the screens out of a world (hosted for the menu mods,
+//! app.rs owns the top-level state machine: the screens out of a world (hosted for the menu modules,
 //! see [`crate::screen`]), connecting to a server, building or loading a world, and the
 //! [`Game`] in it with its pause screen. It routes each engine frame to the active state,
 //! creates and loads worlds (off the render thread, in `entry`), and autosaves when leaving one.
@@ -15,12 +15,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use voxel_engine::{Color, DVec3, Engine};
 
-use crate::audio::{AudioService, AudioView, CueSymbols, GameEvent, ModLink, PeerAudio, SoundConfig, SoundSystem};
+use crate::audio::{AudioService, AudioView, CueSymbols, GameEvent, ModuleLink, PeerAudio, SoundConfig, SoundSystem};
 use crate::benchmark::Benchmark;
 use crate::game::{Game, Signal};
 use crate::input::intent::MenuEvent;
 use crate::input::router::{Context, Router, View};
-use crate::modding::{ActionSet, BuildInfo, Debounce, GameBuild, Mods, VisualMask};
+use crate::modules::{ActionSet, BuildInfo, Debounce, GameBuild, Modules, VisualMask};
 use crate::player::Player;
 use crate::save::{self, Autosaver, SaveMeta, Slot, SlotId, Tick};
 use crate::screen::{
@@ -56,7 +56,7 @@ fn pacing(in_world: bool, bench: bool, settings: &Settings) -> (bool, u32) {
 }
 
 enum Screen {
-    /// Out of a world: the root screen stack (if a mod gives one), maybe over a world being built.
+    /// Out of a world: the root screen stack (if a module gives one), maybe over a world being built.
     Menus,
     /// DNS, handshake, and Welcome, off the render thread.
     Connecting(ConnectJob),
@@ -66,7 +66,7 @@ enum Screen {
 /// What Esc in a world does once text capture and every overlay declined it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EscapeAction {
-    /// Open the pause screen a mod gave.
+    /// Open the pause screen a module gave.
     Pause,
     /// Save and return to the root screen.
     Leave,
@@ -95,7 +95,7 @@ fn install_quit_signals() {
     }
 }
 
-/// Esc's meaning in a world: the pause screen if a mod gives one, else leave to the root screen,
+/// Esc's meaning in a world: the pause screen if a module gives one, else leave to the root screen,
 /// else quit.
 fn escape_action(pause_screen: bool, root_screen: bool) -> EscapeAction {
     match (pause_screen, root_screen) {
@@ -111,7 +111,7 @@ fn default_entry(saves: &[Slot]) -> Option<&SlotId> {
     saves.iter().find(|slot| slot.meta.is_ok()).map(|slot| &slot.id)
 }
 
-/// The whole program: the installed mods (persist across worlds), the graphics
+/// The whole program: the installed modules (persist across worlds), the graphics
 /// settings, the screens and the current world.
 pub struct App {
     /// Available save slots, refreshed on menu return.
@@ -121,17 +121,17 @@ pub struct App {
     active: Option<ActiveSlot>,
     /// Shared router for menus and in-game input.
     router: Router,
-    /// Installed mods and what the core suspended; shared with the game while playing.
-    mods: Mods,
-    /// Packages compiled into this executable, of every kind. `Hello` reports the unsuspended mods.
+    /// Installed modules and what the core suspended; shared with the game while playing.
+    modules: Modules,
+    /// Packages compiled into this executable, of every kind. `Hello` reports the unsuspended modules.
     build: BuildInfo,
     screen: Screen,
-    /// The screens out of a world: the root screen a mod gave, and what it opened. `None` in a
+    /// The screens out of a world: the root screen a module gave, and what it opened. `None` in a
     /// world, and always in a build without a root screen.
     menus: Option<ScreenStack>,
     /// The pause screen and what it opened, while it is up in a world.
     pause: Option<ScreenStack>,
-    /// False when no mod gives a root screen: the app enters a world itself and quits on leaving.
+    /// False when no module gives a root screen: the app enters a world itself and quits on leaving.
     has_root: bool,
     /// A build without a root screen enters its world on the first frame.
     enter_pending: bool,
@@ -160,9 +160,9 @@ pub struct App {
     bench: Option<Benchmark>,
     /// Owns all playback continuation; enters/leaves world state as the screen changes.
     sound: SoundSystem,
-    /// Cue name → id table resolved once at catalog load. Mods name cues through it.
+    /// Cue name → id table resolved once at catalog load. Modules name cues through it.
     cues: CueSymbols,
-    /// Gait, the acoustic window, capture and voice sessions. Mods decide what plays.
+    /// Gait, the acoustic window, capture and voice sessions. Modules decide what plays.
     audio: AudioService,
     /// Last stall-detector log, so a hung frame names itself once per window.
     last_stall_log: Option<Instant>,
@@ -170,9 +170,9 @@ pub struct App {
     /// go quiet, or on leaving a world and on quit.
     settings_flush: Debounce,
     clock: Instant,
-    /// `WATT_BENCH_WORLDGEN`: the generator new worlds use, whatever the mods say.
+    /// `WATT_BENCH_WORLDGEN`: the generator new worlds use, whatever the modules say.
     worldgen_pin: Option<WorldgenKind>,
-    /// The options revision the mods last heard about ([`Mod::on_options`](crate::modding::Mod::on_options)).
+    /// The options revision the modules last heard about ([`Module::on_options`](crate::modules::Module::on_options)).
     options_seen: u64,
     /// Last graphics stamp pushed to the engine; `apply` runs only on change.
     gfx_applied: Option<GfxKey>,
@@ -209,9 +209,9 @@ impl GfxKey {
 }
 
 /// The one writer of the engine's graphics state: window mode, MSAA, render scale, face culling
-/// and the render-lane flags, masked by the visual mods. Pushes only when the stamp moves, so a
+/// and the render-lane flags, masked by the visual modules. Pushes only when the stamp moves, so a
 /// quiet frame or an idle menu does not wake the render thread; a resize moves it, so a fallback
-/// cannot be overwritten. One push writes the flags once, so a lane a mod strips never turns on
+/// cannot be overwritten. One push writes the flags once, so a lane a module strips never turns on
 /// in between (each turn resets the engine's temporal state). True when it pushed.
 fn push_gfx(eng: &mut impl GfxEngine, settings: &mut Settings, mask: VisualMask, applied: &mut Option<GfxKey>) -> bool {
     let extent = eng.window_extent();
@@ -260,14 +260,14 @@ struct ScreenParts<'a> {
     session: &'a Session,
     build: &'a BuildInfo,
     hosting: bool,
-    mods: &'a Mods,
+    modules: &'a Modules,
     settings: &'a mut Settings,
     options: &'a mut Options,
 }
 
 impl<'a> ScreenParts<'a> {
     fn ctx(self, phase: Phase, in_world: bool, notice: Option<&'a str>) -> ScreenContext<'a> {
-        let (suspended, entries, visuals) = self.mods.screen_view();
+        let (suspended, entries, visuals) = self.modules.screen_view();
         let facts = ScreenFacts {
             saves: self.saves,
             session: self.session,
@@ -309,7 +309,7 @@ impl ActiveSlot {
 }
 
 impl App {
-    /// The app for one build: `build` lists the mod packages compiled into this executable.
+    /// The app for one build: `build` lists the module packages compiled into this executable.
     pub fn new(build: &GameBuild) -> Self {
         crate::paths::Paths::init(None);
         match build.environment() {
@@ -320,11 +320,11 @@ impl App {
         // While the menu is up, so the first world's frame does not pay for it.
         crate::world::terrain::prewarm();
         let mut options = Options::new();
-        let mut mods = Mods::from_build(build, &mut options);
-        let pins = Benchmark::mod_pins_from_env();
+        let mut modules = Modules::from_build(build, &mut options);
+        let pins = Benchmark::module_pins_from_env();
         let mut pinned = pins.suspend;
         if pins.visuals_core == Some(true) {
-            for id in mods.visual_packages() {
+            for id in modules.visual_packages() {
                 if !pinned.contains(&id) {
                     pinned.push(id);
                 }
@@ -332,11 +332,11 @@ impl App {
         }
         if !pinned.is_empty() {
             eprintln!("PWC: suspended for this run: {}", pinned.join(", "));
-            mods.pin_suspended(&pinned);
+            modules.pin_suspended(&pinned);
         }
         let saves = save::list();
         let mut settings = Settings::load(&mut options);
-        mods.options_changed(&options);
+        modules.options_changed(&options);
         let options_seen = options.revision();
         let (caps, display) = crate::benchmark::graphics_caps();
         settings.set_device_caps(caps, display);
@@ -370,7 +370,7 @@ impl App {
             saves,
             active: None,
             router: Router::new(),
-            mods,
+            modules,
             build: build.info().clone(),
             screen: Screen::Menus,
             menus: None,
@@ -411,12 +411,12 @@ impl App {
         self.clock.elapsed().as_millis() as u64
     }
 
-    /// Tell the mods once the options moved since they last heard.
+    /// Tell the modules once the options moved since they last heard.
     fn tell_options(&mut self) {
         let revision = self.options.revision();
         if revision != self.options_seen {
             self.options_seen = revision;
-            self.mods.options_changed(&self.options);
+            self.modules.options_changed(&self.options);
         }
     }
 
@@ -433,7 +433,7 @@ impl App {
             session: &self.session,
             build: &self.build,
             hosting: self.host.running(),
-            mods: &self.mods,
+            modules: &self.modules,
             settings: &mut self.settings,
             options: &mut self.options,
         }
@@ -466,8 +466,8 @@ impl App {
             render_scale: session_gfx.render_scale,
             resizable: true,
             fullscreen: app.settings.fullscreen,
-            // Engine-side render lanes from the effective (mod-masked) config.
-            flags: app.mods.effective_render(&app.settings).engine_flags(),
+            // Engine-side render lanes from the effective (module-masked) config.
+            flags: app.modules.effective_render(&app.settings).engine_flags(),
         };
         install_quit_signals();
         voxel_engine::run(config, move |eng| app.frame(eng));
@@ -575,7 +575,7 @@ impl App {
     }
 
     fn push_gfx(&mut self, eng: &mut Engine) {
-        push_gfx(eng, &mut self.settings, self.mods.visual_mask(), &mut self.gfx_applied);
+        push_gfx(eng, &mut self.settings, self.modules.visual_mask(), &mut self.gfx_applied);
     }
 
     /// Refill this frame's menu input from the router (in the menu context).
@@ -589,7 +589,7 @@ impl App {
         }
     }
 
-    /// After a frame of screens: a moved options revision tells the mods, re-mixes the audio,
+    /// After a frame of screens: a moved options revision tells the modules, re-mixes the audio,
     /// and saves once the steps go quiet. True when it moved.
     fn after_screens(&mut self, revision_before: u64, now_ms: u64) -> bool {
         let changed = self.options.revision() != revision_before;
@@ -663,16 +663,16 @@ impl App {
         }
     }
 
-    /// A new root screen stack from the first active root-screen mod, telling it `notice`.
+    /// A new root screen stack from the first active root-screen module, telling it `notice`.
     /// `None` in a build without one.
     fn root_stack(&mut self, notice: Option<&str>) -> Option<ScreenStack> {
         let parts = self.screen_parts();
-        let (facts, mods) = Self::slot_facts(&parts, false, notice);
-        mods.root_screen(&facts).map(ScreenStack::new)
+        let (facts, modules) = Self::slot_facts(&parts, false, notice);
+        modules.root_screen(&facts).map(ScreenStack::new)
     }
 
-    /// Run the mods' audio hooks with no world under them: each menu frame (`dt`, and maybe a UI
-    /// click), so a mod can play a UI cue, and the edges into and out of a world, before the
+    /// Run the modules' audio hooks with no world under them: each menu frame (`dt`, and maybe a UI
+    /// click), so a module can play a UI cue, and the edges into and out of a world, before the
     /// service drops its sessions.
     fn fan_audio(&mut self, dt: f32, in_world: bool, event: Option<GameEvent>) {
         const EMPTY: &[PeerAudio] = &[];
@@ -686,18 +686,18 @@ impl App {
             actions: ActionSet::NONE,
             ids: NO_IDS,
         };
-        let mut link = ModLink::idle();
+        let mut link = ModuleLink::idle();
         {
             let mut api = self.audio.api(&mut self.sound, &self.cues, None, None);
             if let Some(event) = event.as_ref() {
-                self.mods.on_game_event(event, &mut api);
+                self.modules.on_game_event(event, &mut api);
             }
-            self.mods.on_audio(&view, &mut api, &mut link);
+            self.modules.on_audio(&view, &mut api, &mut link);
         }
         self.audio.settle_menu();
     }
 
-    /// Tell the mods the world is changing.
+    /// Tell the modules the world is changing.
     fn fan_world_edge(&mut self, event: GameEvent) {
         let in_world = matches!(event, GameEvent::EnterWorld);
         self.fan_audio(0.0, in_world, Some(event));
@@ -707,7 +707,7 @@ impl App {
     /// a root screen has nothing to return to: it prints the notice and quits.
     fn return_to_menu(&mut self, notice: Option<String>) {
         // Packages a server suspended for the session come back on leave. Nothing was saved.
-        self.mods.resume_packages();
+        self.modules.resume_packages();
         self.fan_world_edge(GameEvent::LeaveWorld);
         self.sound.leave_world();
         self.audio.enter_world();
@@ -766,9 +766,9 @@ impl App {
         // spawn slab — the previous eager default-volume generation is avoided.
         let recipe = Recipe {
             seed,
-            render: self.mods.effective_render(&self.settings),
-            kind: self.worldgen_pin.unwrap_or_else(|| self.mods.worldgen_kind()),
-            cfg: terrain_cfg_from_mods(&self.mods),
+            render: self.modules.effective_render(&self.settings),
+            kind: self.worldgen_pin.unwrap_or_else(|| self.modules.worldgen_kind()),
+            cfg: terrain_cfg_from_modules(&self.modules),
         };
         self.entry_notice = stopped;
         self.begin_loading(eng, Loading::new_world(recipe));
@@ -777,9 +777,9 @@ impl App {
     /// Start loading a save. A save that fails to load returns to the menu.
     fn load_world(&mut self, eng: &mut Engine, id: &SlotId) {
         // Stopping saves first, so the world loads with the friends' last edits. The save header
-        // names the generator; the installed worldgen mod only chooses the next *new* world.
+        // names the generator; the installed worldgen module only chooses the next *new* world.
         self.entry_notice = self.host.stop();
-        let render = self.mods.effective_render(&self.settings);
+        let render = self.modules.effective_render(&self.settings);
         self.begin_loading(eng, Loading::load(id.clone(), render));
     }
 
@@ -822,10 +822,10 @@ impl App {
         }
     }
 
-    /// Swap a built world in: fresh mod state, the save's mod state for a load, then the game.
+    /// Swap a built world in: fresh module state, the save's module state for a load, then the game.
     fn arrive(&mut self, eng: &mut Engine, loading: Loading) {
-        // Every world starts from a clean default mod state (empty inventory, etc.).
-        self.mods.reset_state();
+        // Every world starts from a clean default module state (empty inventory, etc.).
+        self.modules.reset_state();
         match loading {
             Loading::New(job) => {
                 let (world, player, id) = job.wait();
@@ -845,7 +845,7 @@ impl App {
             }
             Loading::Load(id, job) => match job.wait() {
                 Ok((restored, report)) => {
-                    let (world, player, meta) = restored.finish(&mut self.mods);
+                    let (world, player, meta) = restored.finish(&mut self.modules);
                     self.active = Some(ActiveSlot::new(id.clone(), meta));
                     let mut game = Game::new(world, player, id.as_str().to_string());
                     // Degraded loads still enter the world, but say so.
@@ -893,8 +893,8 @@ impl App {
         }
         // World-construction lanes apply on entry only, before streaming spins;
         // everything live-applicable goes through the same path `/gfx` uses.
-        let render = self.mods.effective_render(&self.settings);
-        game.set_visual_mask(self.mods.visual_mask());
+        let render = self.modules.effective_render(&self.settings);
+        game.set_visual_mask(self.modules.visual_mask());
         game.world_mut()
             .set_render_lanes(render.occlusion, render.lod2);
         // Entry re-fits MSAA and scale to the VRAM free now, as it always has; the game then
@@ -918,8 +918,8 @@ impl App {
     }
 
     /// The facts a slot screen is created with: idle, in or out of a world, with `notice`.
-    fn slot_facts<'a>(parts: &'a ScreenParts<'_>, in_world: bool, notice: Option<&'a str>) -> (ScreenFacts<'a>, &'a Mods) {
-        let (suspended, entries, visuals) = parts.mods.screen_view();
+    fn slot_facts<'a>(parts: &'a ScreenParts<'_>, in_world: bool, notice: Option<&'a str>) -> (ScreenFacts<'a>, &'a Modules) {
+        let (suspended, entries, visuals) = parts.modules.screen_view();
         let facts = ScreenFacts {
             saves: parts.saves,
             session: parts.session,
@@ -933,15 +933,15 @@ impl App {
             entries,
             visuals,
         };
-        (facts, &*parts.mods)
+        (facts, &*parts.modules)
     }
 
     /// Esc in a world that text capture and every overlay declined: the pause screen, or leave.
     fn on_escape(&mut self, eng: &mut Engine) {
         let screen = {
             let parts = self.screen_parts();
-            let (facts, mods) = Self::slot_facts(&parts, true, None);
-            mods.pause_screen(&facts)
+            let (facts, modules) = Self::slot_facts(&parts, true, None);
+            modules.pause_screen(&facts)
         };
         match escape_action(screen.is_some(), self.has_root) {
             EscapeAction::Pause => {
@@ -987,7 +987,7 @@ impl App {
         self.read_menu_input(eng);
         if let Some(click) = menu_click(&self.menu_input) {
             let mut api = self.audio.api(&mut self.sound, &self.cues, None, None);
-            self.mods.on_game_event(&click, &mut api);
+            self.modules.on_game_event(&click, &mut api);
         }
         let before = self.options.revision();
         let now_ms = self.now_ms();
@@ -1037,7 +1037,7 @@ impl App {
         let signal = game.update(
             eng,
             &mut self.router,
-            &mut self.mods,
+            &mut self.modules,
             &mut self.settings,
             &mut self.options,
             &mut self.sound,
@@ -1049,7 +1049,7 @@ impl App {
             game.on_enter(eng, &mut self.router);
         }
         let dirty = game.take_settings_dirty();
-        // A frame hook may have changed an option (`/set`): the mods hear it now.
+        // A frame hook may have changed an option (`/set`): the modules hear it now.
         self.tell_options();
         if settings_write_due(&mut self.settings_flush, dirty, now_ms) && self.bench.is_none() {
             self.settings.save(&self.options);
@@ -1098,7 +1098,7 @@ impl App {
             let started = autosaver.start(
                 id,
                 game.world().save_generation(),
-                save::snapshot(game.world(), game.player(), &self.mods, meta.clone()),
+                save::snapshot(game.world(), game.player(), &self.modules, meta.clone()),
             );
             if let Tick::Finished(Err(e)) = started {
                 game.notify(format!("* autosave failed: {e}"));
@@ -1126,7 +1126,7 @@ impl App {
             ..
         } = active;
         if let Err(e) = autosaver.flush_now(id, game.world().save_generation(), || {
-            save::encode_current(game.world(), game.player(), &self.mods, meta.clone())
+            save::encode_current(game.world(), game.player(), &self.modules, meta.clone())
         }) {
             eprintln!("could not save {id}: {e}");
         }
@@ -1141,7 +1141,7 @@ impl App {
                 if let Screen::Playing(game) = &mut self.screen {
                     let fov = self.settings.fov;
                     let shake = self.settings.shake;
-                    game.draw(eng, &mut self.mods, fov, shake, &[]);
+                    game.draw(eng, &mut self.modules, fov, shake, &[]);
                 }
                 return;
             }
@@ -1164,7 +1164,7 @@ impl App {
         // has the frame to itself.
         if let Screen::Playing(game) = &mut self.screen {
             let (fov, shake) = (self.settings.fov, self.settings.shake);
-            game.draw(eng, &mut self.mods, fov, shake, &ui);
+            game.draw(eng, &mut self.modules, fov, shake, &ui);
         } else {
             let mut f = eng.begin_frame(MENU_CLEAR.to_linear());
             crate::screen::render(&mut f, &ui);
@@ -1180,8 +1180,8 @@ impl App {
 
 
 /// Parse the winning worldgen payload as generator knobs.
-fn terrain_cfg_from_mods(mods: &Mods) -> TerrainCfg {
-    mods.worldgen_config().as_deref().map(TerrainCfg::from_text).unwrap_or_default()
+fn terrain_cfg_from_modules(modules: &Modules) -> TerrainCfg {
+    modules.worldgen_config().as_deref().map(TerrainCfg::from_text).unwrap_or_default()
 }
 
 /// A world seed from the wall clock, so each new world differs.
@@ -1209,7 +1209,7 @@ mod tests {
 
     #[test]
     fn vanilla_client_joins_a_diffusion_server() {
-        assert_eq!(Mods::empty().worldgen_kind(), WorldgenKind::Flat);
+        assert_eq!(Modules::empty().worldgen_kind(), WorldgenKind::Flat);
         let terrain = TerrainCfg { relief: 150, caves: 25, ..TerrainCfg::default() }.clamp();
         let handle = server::spawn(
             0,
@@ -1284,7 +1284,7 @@ mod tests {
     /// Enter one world the way the app does, timing what starting the job costs the clicking
     /// frame, how long the job runs, and what the switching frame still does on the render thread
     /// (all of `arrive` but the engine calls of `enter_game`).
-    fn probe_entry(label: &str, mods: &mut Mods, start: impl FnOnce() -> Loading) {
+    fn probe_entry(label: &str, modules: &mut Modules, start: impl FnOnce() -> Loading) {
         let ms = |a: Instant, b: Instant| (b - a).as_secs_f64() * 1000.0;
         let t0 = Instant::now();
         let loading = start();
@@ -1293,14 +1293,14 @@ mod tests {
             std::thread::sleep(Duration::from_micros(100));
         }
         let t2 = Instant::now();
-        mods.reset_state();
+        modules.reset_state();
         let mut game = match loading {
             Loading::New(job) => {
                 let (world, player, id) = job.wait();
                 Game::new(world, player, id.as_str().to_string())
             }
             Loading::Load(id, job) => {
-                let (world, player, _) = job.wait().unwrap().0.finish(mods);
+                let (world, player, _) = job.wait().unwrap().0.finish(modules);
                 Game::new(world, player, id.as_str().to_string())
             }
             Loading::Join { job, conn, .. } => {
@@ -1341,9 +1341,9 @@ mod tests {
         println!("parts: registry {:.1}ms palette {:.1}ms generator {:.1}ms gravity {:.1}ms", ms(a, b), ms(b, c), ms(c, d), ms(d, e));
         let render = RenderConfig::default();
         let recipe = Recipe { seed: 1234, render, kind: WorldgenKind::Diffusion, cfg: TerrainCfg::default() };
-        let mut mods = crate::modding::testing::standard();
+        let mut modules = crate::modules::testing::standard();
         for label in ["new cold", "new warm"] {
-            probe_entry(label, &mut mods, || Loading::new_world(recipe));
+            probe_entry(label, &mut modules, || Loading::new_world(recipe));
         }
         for (label, edits) in [("load small", 100), ("load 100k", 100_000)] {
             let id = SlotId::new(&format!("__probe_{edits}__")).unwrap();
@@ -1361,14 +1361,14 @@ mod tests {
             }
             assert_eq!(world.edits().count(), edits);
             let meta = SaveMeta { name: label.into(), seed: 0, created: 0, last_played: 0, playtime_secs: 0, edit_count: 0 };
-            save::save(&id, &world, &player, &mods, meta).unwrap();
+            save::save(&id, &world, &player, &modules, meta).unwrap();
             drop(world);
             let t = Instant::now();
             let _ = black_box(save::store::read(&id).unwrap());
             println!("{label}: read and decode alone {:.1}ms", ms(t, Instant::now()));
-            probe_entry(label, &mut mods, || Loading::load(id.clone(), render));
+            probe_entry(label, &mut modules, || Loading::load(id.clone(), render));
             if edits == 100_000 {
-                probe_join_overlay(&save::file_path(&id), render, &mut mods);
+                probe_join_overlay(&save::file_path(&id), render, &mut modules);
             }
             for path in [save::file_path(&id), save::file_path(&id).with_extension("save.bak")] {
                 let _ = std::fs::remove_file(path);
@@ -1376,13 +1376,13 @@ mod tests {
         }
         let handle = server::spawn(0, Config { seed: 1234, worldgen: WorldgenKind::Diffusion, ..Config::default() }).unwrap();
         let conn = Connection::connect("127.0.0.1", handle.addr().port(), "probe", "").expect("join");
-        probe_entry("join", &mut mods, || Loading::join(conn, render, None, false));
+        probe_entry("join", &mut modules, || Loading::join(conn, render, None, false));
         handle.stop();
     }
 
     /// Join a server serving the world file at `path` twice: applying each overlay cell as it
     /// arrives (the old path), then through the game's budgeted bulk install. Polls ~8 ms apart.
-    fn probe_join_overlay(path: &std::path::Path, render: RenderConfig, mods: &mut Mods) {
+    fn probe_join_overlay(path: &std::path::Path, render: RenderConfig, modules: &mut Modules) {
         use crate::net::client::Incoming;
         let ms = |t: Instant| t.elapsed().as_secs_f64() * 1000.0;
         let world = Some(path.to_path_buf());
@@ -1412,12 +1412,12 @@ mod tests {
         let conn = Connection::connect("127.0.0.1", port, "bulk", "").expect("join");
         let Loading::Join { job, conn, .. } = Loading::join(conn, render, None, false) else { unreachable!() };
         let (world, player) = job.wait();
-        mods.reset_state();
+        modules.reset_state();
         let mut game = Game::new(world, player, "multiplayer".into()).with_net(conn);
         let (start, mut frames, mut worst) = (Instant::now(), 0, 0.0f64);
         loop {
             let t = Instant::now();
-            let settled = game.pump_net(mods);
+            let settled = game.pump_net(modules);
             worst = worst.max(ms(t));
             frames += 1;
             if settled {
@@ -1516,10 +1516,10 @@ mod tests {
         }
     }
 
-    /// With the Post mod off, a push writes the masked flags once: one transition per change of
-    /// a live lane, none for a lane the mod strips, and bloom never turns on in between.
+    /// With the Post module off, a push writes the masked flags once: one transition per change of
+    /// a live lane, none for a lane the module strips, and bloom never turns on in between.
     #[test]
-    fn with_a_visual_mod_off_each_apply_is_one_flag_transition() {
+    fn with_a_visual_module_off_each_apply_is_one_flag_transition() {
         use crate::render_config::VisualGroup;
         let mask = VisualMask::of([VisualGroup::Atmosphere, VisualGroup::Lighting]);
         let mut settings = Settings::default();
@@ -1546,7 +1546,7 @@ mod tests {
         assert!(push_gfx(&mut eng, &mut settings, mask, &mut applied), "a resize pushes");
         assert!(eng.transitions <= before + 1);
         assert!(!push_gfx(&mut eng, &mut settings, mask, &mut applied), "and settles in the same frame");
-        assert!(!eng.bloom_ever_on, "the Post mod's bloom never reached the engine");
+        assert!(!eng.bloom_ever_on, "the Post module's bloom never reached the engine");
     }
 
     /// A device that cannot allocate the MSAA asked for: the fallback is adopted once, and every
@@ -1590,7 +1590,7 @@ mod tests {
     fn holding_left_writes_settings_at_most_once_per_debounce_window() {
         let mut settings = Settings::default();
         let mut options = Options::new();
-        let mods = Mods::empty();
+        let modules = Modules::empty();
         let session = Session::default();
         let build = BuildInfo::EMPTY;
         let mut stack = ScreenStack::new(Box::new(DistanceRow));
@@ -1601,7 +1601,7 @@ mod tests {
             let held = now_ms < 2000 && frame % 4 == 0;
             let input = if held { MenuInput::new().with(MenuEvent::Left) } else { MenuInput::new() };
             let before = options.revision();
-            let parts = ScreenParts { saves: &[], session: &session, build: &build, hosting: false, mods: &mods, settings: &mut settings, options: &mut options };
+            let parts = ScreenParts { saves: &[], session: &session, build: &build, hosting: false, modules: &modules, settings: &mut settings, options: &mut options };
             let mut ctx = parts.ctx(Phase::Idle, false, None);
             stack.update(&input, &mut ctx);
             let changed = options.revision() != before;
@@ -1616,7 +1616,7 @@ mod tests {
         assert!(!flush.take(), "nothing left pending");
     }
 
-    /// Esc in a world: the pause screen when a mod gives one, else back to the root screen, else
+    /// Esc in a world: the pause screen when a module gives one, else back to the root screen, else
     /// (a build without screens) save and quit.
     #[test]
     fn escape_opens_the_pause_screen_or_leaves_or_quits() {

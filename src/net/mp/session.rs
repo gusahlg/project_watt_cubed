@@ -1,5 +1,5 @@
 //! Multiplayer session tests: joining, leaving and rejoining, the roster, names and passwords,
-//! version and content refusals, the mod whitelist, operators and the shared clock, disconnect
+//! version and content refusals, the module whitelist, operators and the shared clock, disconnect
 //! reasons, the silence watchdog, and the world file across restarts. See `super` for the harness.
 
 use std::collections::{HashMap, HashSet};
@@ -18,7 +18,7 @@ use voxel_engine::DVec3;
 use super::{Lobby, listen, settle};
 use crate::block::AIR;
 use crate::net::client::{ConnectError, Connection, INTERRUPTED, Incoming};
-use crate::net::protocol::{self, ClientMessage, ModOffer, ServerMessage};
+use crate::net::protocol::{self, ClientMessage, ModuleOffer, ServerMessage};
 use crate::net::server::{self, Config};
 use crate::net::{ContentId, PROTOCOL_VERSION, chat, quic};
 use crate::save::format::{self, Decoded};
@@ -36,8 +36,8 @@ const FRESH_DAY: f32 = 0.3;
 const SET_TIME_GAP: Duration = Duration::from_millis(1050);
 
 /// Join and wait for the overlay and the clock, keeping every event the join produced.
-fn enter(port: u16, name: &str, password: &str, mods: &[(String, String)]) -> (Connection, Vec<Incoming>) {
-    let conn = Connection::connect_with(HOST, port, name, password, mods)
+fn enter(port: u16, name: &str, password: &str, modules: &[(String, String)]) -> (Connection, Vec<Incoming>) {
+    let conn = Connection::connect_with(HOST, port, name, password, modules)
         .unwrap_or_else(|e| panic!("{name} should join: {e}"));
     let mut clients = [conn];
     let mut events = settle(&mut clients, WAIT, |c, seen| c.snapshot_ready() && clock(seen).is_some());
@@ -45,20 +45,20 @@ fn enter(port: u16, name: &str, password: &str, mods: &[(String, String)]) -> (C
     (conn, events.remove(0))
 }
 
-fn refused(port: u16, name: &str, password: &str, mods: &[(String, String)]) -> ConnectError {
-    match Connection::connect_with(HOST, port, name, password, mods) {
+fn refused(port: u16, name: &str, password: &str, modules: &[(String, String)]) -> ConnectError {
+    match Connection::connect_with(HOST, port, name, password, modules) {
         Ok(_) => panic!("{name:?} was admitted"),
         Err(e) => e,
     }
 }
 
-/// The game's join: a refusal that names mods turns those off and tries once more.
-fn join_like_the_game(port: u16, name: &str, mods: &[(String, String)]) -> (Result<Connection, ConnectError>, Vec<String>) {
-    match Connection::connect_with(HOST, port, name, "", mods) {
-        Err(e) if !e.mods_denied.is_empty() => {
+/// The game's join: a refusal that names modules turns those off and tries once more.
+fn join_like_the_game(port: u16, name: &str, modules: &[(String, String)]) -> (Result<Connection, ConnectError>, Vec<String>) {
+    match Connection::connect_with(HOST, port, name, "", modules) {
+        Err(e) if !e.modules_denied.is_empty() => {
             let kept: Vec<(String, String)> =
-                mods.iter().filter(|(id, _)| !e.mods_denied.contains(id)).cloned().collect();
-            (Connection::connect_with(HOST, port, name, "", &kept), e.mods_denied)
+                modules.iter().filter(|(id, _)| !e.modules_denied.contains(id)).cloned().collect();
+            (Connection::connect_with(HOST, port, name, "", &kept), e.modules_denied)
         }
         other => (other, Vec::new()),
     }
@@ -220,7 +220,7 @@ fn ours() -> ContentId {
     crate::net::content_id_with_model(&crate::block::BlockRegistry::with_builtins(), crate::net::default_reaction_model())
 }
 
-fn hello(name: &str, password: &str, protocol: u32, content: ContentId, mods: &[&str]) -> ClientMessage {
+fn hello(name: &str, password: &str, protocol: u32, content: ContentId, modules: &[&str]) -> ClientMessage {
     ClientMessage::Hello {
         protocol,
         worldgen: content.worldgen,
@@ -230,7 +230,7 @@ fn hello(name: &str, password: &str, protocol: u32, content: ContentId, mods: &[
         simulation: content.simulation,
         name: name.into(),
         password: password.into(),
-        mods: mods.iter().map(|id| ModOffer { id: (*id).into(), version: "1.0.0".into() }).collect(),
+        modules: modules.iter().map(|id| ModuleOffer { id: (*id).into(), version: "1.0.0".into() }).collect(),
     }
 }
 
@@ -702,8 +702,8 @@ fn different_world_content_is_refused_naming_what_differs() {
 }
 
 #[test]
-fn version_and_content_come_before_the_password_and_the_password_before_mods() {
-    let lobby = flat(Config { password: "pw".into(), mods_deny: vec!["pwc.dev-toolkit".into()], ..Config::default() });
+fn version_and_content_come_before_the_password_and_the_password_before_modules() {
+    let lobby = flat(Config { password: "pw".into(), modules_deny: vec!["pwc.dev-toolkit".into()], ..Config::default() });
     let port = lobby.port;
     let old = reject_reason(port, &hello("ada", "nope", PROTOCOL_VERSION - 1, ours(), &[]));
     assert!(old.starts_with("protocol version mismatch"), "{old}");
@@ -711,10 +711,10 @@ fn version_and_content_come_before_the_password_and_the_password_before_mods() {
     let drifted = reject_reason(port, &hello("ada", "nope", PROTOCOL_VERSION, drifted, &[]));
     assert!(drifted.starts_with("world content mismatch"), "{drifted}");
     let hidden = reject_reason(port, &hello("ada", "nope", PROTOCOL_VERSION, ours(), &["pwc.dev-toolkit"]));
-    assert_eq!(hidden, "wrong password", "a stranger learns nothing about the mod policy");
+    assert_eq!(hidden, "wrong password", "a stranger learns nothing about the module policy");
     match raw_reply(port, &hello("ada", "pw", PROTOCOL_VERSION, ours(), &["pwc.dev-toolkit"])) {
-        ServerMessage::ModsDenied { ids } => assert_eq!(ids, [Arc::<str>::from("pwc.dev-toolkit")]),
-        other => panic!("expected ModsDenied, got {other:?}"),
+        ServerMessage::ModulesDenied { ids } => assert_eq!(ids, [Arc::<str>::from("pwc.dev-toolkit")]),
+        other => panic!("expected ModulesDenied, got {other:?}"),
     }
 }
 
@@ -726,20 +726,20 @@ fn a_server_running_another_law_is_refused_by_the_client() {
     let mute = Mute::start(vec![welcome(law)]);
     let err = refused(mute.port, "ada", "", &[]);
     assert!(err.message().contains("law"), "the refusal names the law: {err}");
-    assert!(err.mods_denied.is_empty());
+    assert!(err.modules_denied.is_empty());
 }
 
 #[test]
-fn a_denied_mod_is_named_and_the_client_rejoins_once_without_it() {
-    let lobby = flat(Config { mods_deny: vec!["pwc.dev-toolkit".into()], ..Config::default() });
+fn a_denied_module_is_named_and_the_client_rejoins_once_without_it() {
+    let lobby = flat(Config { modules_deny: vec!["pwc.dev-toolkit".into()], ..Config::default() });
     let mut room = Room::new(lobby.port);
     room.join("bob");
     room.clear();
-    let mods = offer(&["pwc.dev-toolkit", "pwc.hotbar"]);
-    let first = refused(lobby.port, "ada", "", &mods);
-    assert_eq!(first.mods_denied, ["pwc.dev-toolkit"]);
-    assert_eq!(first.message(), "server refused mods: pwc.dev-toolkit");
-    let (retry, denied) = join_like_the_game(lobby.port, "ada", &mods);
+    let modules = offer(&["pwc.dev-toolkit", "pwc.hotbar"]);
+    let first = refused(lobby.port, "ada", "", &modules);
+    assert_eq!(first.modules_denied, ["pwc.dev-toolkit"]);
+    assert_eq!(first.message(), "server refused modules: pwc.dev-toolkit");
+    let (retry, denied) = join_like_the_game(lobby.port, "ada", &modules);
     assert_eq!(denied, ["pwc.dev-toolkit"]);
     let ada = retry.unwrap_or_else(|e| panic!("the retry without the toolkit joins: {e}"));
     let mut ada = [ada];
@@ -751,20 +751,20 @@ fn a_denied_mod_is_named_and_the_client_rejoins_once_without_it() {
 }
 
 /// `hello_offers` leaves out an offer whose version is over 64 bytes, and every offer past
-/// the 128th, with only a console warning. The server never hears of those mods, so an honest
-/// client joins with a denied mod still on.
+/// the 128th, with only a console warning. The server never hears of those modules, so an honest
+/// client joins with a denied module still on.
 #[test]
-fn a_denied_mod_the_hello_cannot_carry_still_keeps_the_client_out() {
-    let lobby = flat(Config { mods_deny: vec!["pwc.dev-toolkit".into()], ..Config::default() });
+fn a_denied_module_the_hello_cannot_carry_still_keeps_the_client_out() {
+    let lobby = flat(Config { modules_deny: vec!["pwc.dev-toolkit".into()], ..Config::default() });
     let long = vec![("pwc.dev-toolkit".to_string(), format!("1.0.0+{}", "f".repeat(64)))];
     let mut crowded: Vec<(String, String)> = (0..128).map(|i| (format!("pkg.n{i}"), "1.0.0".to_string())).collect();
     crowded.push(("pwc.dev-toolkit".into(), "1.0.0".into()));
     let admitted: Vec<&str> = [("long version", long), ("129th offer", crowded)]
         .into_iter()
-        .filter_map(|(case, mods)| match Connection::connect_with(HOST, lobby.port, case, "", &mods) {
+        .filter_map(|(case, modules)| match Connection::connect_with(HOST, lobby.port, case, "", &modules) {
             Ok(_) => Some(case),
             Err(e) => {
-                assert!(e.message().contains("pwc.dev-toolkit"), "{case}: the refusal names the mod: {e}");
+                assert!(e.message().contains("pwc.dev-toolkit"), "{case}: the refusal names the module: {e}");
                 None
             }
         })
@@ -774,29 +774,29 @@ fn a_denied_mod_the_hello_cannot_carry_still_keeps_the_client_out() {
 
 #[test]
 fn an_allow_list_admits_only_what_it_names() {
-    let lobby = flat(Config { mods_allow: vec!["pwc.hotbar".into(), "pwc.sounds".into()], ..Config::default() });
+    let lobby = flat(Config { modules_allow: vec!["pwc.hotbar".into(), "pwc.sounds".into()], ..Config::default() });
     let port = lobby.port;
     let (listed, _) = enter(port, "ada", "", &offer(&["pwc.hotbar", "pwc.sounds"]));
     let (bare, _) = enter(port, "bob", "", &[]);
-    let mods = offer(&["pwc.hotbar", "pwc.dev-toolkit", "x.extra"]);
-    let err = refused(port, "cy", "", &mods);
-    assert_eq!(err.mods_denied, ["pwc.dev-toolkit", "x.extra"], "the unlisted ones, in the client's order");
-    assert_eq!(err.message(), "server refused mods: pwc.dev-toolkit, x.extra");
-    let (retry, _) = join_like_the_game(port, "cy", &mods);
+    let modules = offer(&["pwc.hotbar", "pwc.dev-toolkit", "x.extra"]);
+    let err = refused(port, "cy", "", &modules);
+    assert_eq!(err.modules_denied, ["pwc.dev-toolkit", "x.extra"], "the unlisted ones, in the client's order");
+    assert_eq!(err.message(), "server refused modules: pwc.dev-toolkit, x.extra");
+    let (retry, _) = join_like_the_game(port, "cy", &modules);
     let cy = retry.unwrap_or_else(|e| panic!("cy joins with only the hotbar: {e}"));
-    assert_eq!(refused(port, "dee", "", &offer(&["PWC.hotbar"])).mods_denied, ["PWC.hotbar"], "ids are case-sensitive");
+    assert_eq!(refused(port, "dee", "", &offer(&["PWC.hotbar"])).modules_denied, ["PWC.hotbar"], "ids are case-sensitive");
     assert!(listed.is_alive() && bare.is_alive() && cy.is_alive());
 }
 
 #[test]
 fn deny_wins_over_allow_and_a_repeated_id_is_named_once() {
     let lobby = flat(Config {
-        mods_allow: vec!["a.one".into(), "a.two".into()],
-        mods_deny: vec!["a.two".into()],
+        modules_allow: vec!["a.one".into(), "a.two".into()],
+        modules_deny: vec!["a.two".into()],
         ..Config::default()
     });
-    assert_eq!(refused(lobby.port, "ada", "", &offer(&["a.one", "a.two", "a.two"])).mods_denied, ["a.two"]);
-    let open = flat(Config { mods_deny: vec!["pwc.Toolkit".into()], ..Config::default() });
+    assert_eq!(refused(lobby.port, "ada", "", &offer(&["a.one", "a.two", "a.two"])).modules_denied, ["a.two"]);
+    let open = flat(Config { modules_deny: vec!["pwc.Toolkit".into()], ..Config::default() });
     let (ada, _) = enter(open.port, "ada", "", &offer(&["pwc.toolkit"]));
     assert!(ada.is_alive(), "a deny entry matches its exact id only");
 }
@@ -944,14 +944,14 @@ fn operator_status_ends_with_the_session() {
 }
 
 #[test]
-fn operators_and_mod_policy_beside_the_world_file_apply() {
+fn operators_and_module_policy_beside_the_world_file_apply() {
     let dir = Dir::new("side-files");
     fs::write(dir.file("ops.txt"), "# operators\nbob\nada s3cret\n").expect("ops.txt");
-    fs::write(dir.file("mods.toml"), "deny = [\"pwc.dev-toolkit\"]\n").expect("mods.toml");
+    fs::write(dir.file("modules.toml"), "deny = [\"pwc.dev-toolkit\"]\n").expect("modules.toml");
     let mut config = Config { seed: 1, worldgen: WorldgenKind::Flat, world: Some(dir.file("world.save")), ..Config::default() };
     server::load_world_policy(&mut config).expect("side files load");
     let lobby = Lobby::start(config);
-    assert_eq!(refused(lobby.port, "cy", "", &offer(&["pwc.dev-toolkit"])).mods_denied, ["pwc.dev-toolkit"]);
+    assert_eq!(refused(lobby.port, "cy", "", &offer(&["pwc.dev-toolkit"])).modules_denied, ["pwc.dev-toolkit"]);
     let mut room = Room::new(lobby.port);
     room.join("ada");
     room.join("bob");

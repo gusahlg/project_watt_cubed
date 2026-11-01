@@ -1,13 +1,13 @@
 //! The options registry: every value a player may tune, in one place.
 //!
 //! The core's own settings are one owner, `"core"`: the [`SETTINGS`] table over [`Settings`].
-//! Every package can declare more with [`ModRegistrar::option`](crate::modding::ModRegistrar::option);
+//! Every package can declare more with [`ModuleRegistrar::option`](crate::modules::ModuleRegistrar::option);
 //! the core keeps their values here, persists them in `settings.cfg` as `<package-id>.<key>=`, and
 //! any UI renders both through one [`OptionsView`]. Neither side knows the other: a package does
 //! not depend on a settings menu, and a settings menu names no package.
 //!
 //! Reads are by [`OptionId`], an index the declaration returned, so no frame path compares
-//! strings. A mod copies what it needs in [`Mod::on_options`](crate::modding::Mod::on_options),
+//! strings. A module copies what it needs in [`Module::on_options`](crate::modules::Module::on_options),
 //! which the core calls once the file is loaded and again whenever [`Options::revision`] moves.
 
 use std::fmt::Write as _;
@@ -41,7 +41,7 @@ pub enum OptionValue {
 }
 
 /// When a changed value takes effect. Metadata for menus: the core stores the value at once
-/// either way, and the owning mod reads it when it needs it.
+/// either way, and the owning module reads it when it needs it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Applies {
     /// At once.
@@ -178,7 +178,7 @@ fn round_to(v: f32, decimals: usize) -> f32 {
     ((v as f64 * scale).round() / scale) as f32
 }
 
-/// An option's typed index: what [`ModRegistrar::option`](crate::modding::ModRegistrar::option)
+/// An option's typed index: what [`ModuleRegistrar::option`](crate::modules::ModuleRegistrar::option)
 /// returns, and what every read takes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct OptionId(u32);
@@ -300,7 +300,7 @@ impl Options {
     }
 
     /// Changes whenever a value changes (through an [`OptionsView`] that includes the core's
-    /// settings, too), so a mod can cache what it derives from its options.
+    /// settings, too), so a module can cache what it derives from its options.
     pub fn revision(&self) -> u64 {
         self.revision
     }
@@ -418,7 +418,7 @@ impl Options {
 
     /// Read the option lines of a `settings.cfg` text: `<package>.<key>=` lines (kept when no
     /// declared option claims them), then the legacy keys of options the text has no line for,
-    /// from `text` first and then from `legacy` (old files flattened by [`flatten_mods_cfg`]).
+    /// from `text` first and then from `legacy` (old files flattened by [`flatten_modules_cfg`]).
     /// `core` claims the keys of the core's own table first.
     pub(crate) fn read_text(&mut self, text: &str, legacy: &str, core: impl Fn(&str) -> bool) {
         let mut seen = vec![false; self.declared.len()];
@@ -465,12 +465,12 @@ impl Options {
     }
 }
 
-/// The knob payloads of an old `mods.cfg` as legacy keys: each `<mod-id>.state=<k>=<v>,<k>=<v>`
-/// line becomes one `<mod-id>.state.<k>=<v>` line per pair; every other line is dropped. A
+/// The knob payloads of an old `modules.cfg` as legacy keys: each `<module-id>.state=<k>=<v>,<k>=<v>`
+/// line becomes one `<module-id>.state.<k>=<v>` line per pair; every other line is dropped. A
 /// package option names such a key with [`OptionSpec::legacy_key`] to carry a player's old knob
-/// value over once. The core reads `mods.cfg` only until `settings.cfg` records
+/// value over once. The core reads `modules.cfg` only until `settings.cfg` records
 /// [`FORMAT_KEY`].
-pub(crate) fn flatten_mods_cfg(text: &str) -> String {
+pub(crate) fn flatten_modules_cfg(text: &str) -> String {
     let mut out = String::new();
     super::each_kv_line(text, |key, value| {
         let Some(id) = key.strip_suffix(".state") else { return };
@@ -481,7 +481,7 @@ pub(crate) fn flatten_mods_cfg(text: &str) -> String {
     out
 }
 
-/// The `settings.cfg` line that says the options format is in use, so an old `mods.cfg` has been
+/// The `settings.cfg` line that says the options format is in use, so an old `modules.cfg` has been
 /// read once and never needs reading again.
 pub(crate) const FORMAT_KEY: &str = "options_format";
 
@@ -509,7 +509,7 @@ fn parse_value(kind: OptionKind, text: &str) -> Option<OptionValue> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Entry {
     Core(usize),
-    Mod(OptionId),
+    Module(OptionId),
 }
 
 /// One row of an [`OptionsView`], as a menu or a command lists it.
@@ -543,7 +543,7 @@ impl<'a> OptionsRef<'a> {
         if i < SETTINGS.len() {
             Entry::Core(i)
         } else {
-            Entry::Mod(OptionId((i - SETTINGS.len()) as u32))
+            Entry::Module(OptionId((i - SETTINGS.len()) as u32))
         }
     }
 
@@ -580,7 +580,7 @@ impl<'a> OptionsRef<'a> {
                     applies: Applies::Live,
                 }
             }
-            Entry::Mod(id) => {
+            Entry::Module(id) => {
                 let spec = self.options.spec(id);
                 OptionInfo {
                     owner: self.options.owner(id),
@@ -598,7 +598,7 @@ impl<'a> OptionsRef<'a> {
     pub fn show(&self, i: usize) -> String {
         match self.entry(i) {
             Entry::Core(i) => SETTINGS[i].show(self.settings),
-            Entry::Mod(id) => self.options.show(id),
+            Entry::Module(id) => self.options.show(id),
         }
     }
 
@@ -606,7 +606,7 @@ impl<'a> OptionsRef<'a> {
     pub fn toggled(&self, i: usize) -> Option<bool> {
         match self.entry(i) {
             Entry::Core(i) if SETTINGS[i].menu_kind() == MenuKind::Toggle => Some(SETTINGS[i].show(self.settings) == "On"),
-            Entry::Mod(id) => match self.options.value(id) {
+            Entry::Module(id) => match self.options.value(id) {
                 OptionValue::Bool(on) => Some(on),
                 _ => None,
             },
@@ -618,7 +618,7 @@ impl<'a> OptionsRef<'a> {
     pub fn fraction(&self, i: usize) -> f32 {
         match self.entry(i) {
             Entry::Core(i) => SETTINGS[i].fraction(self.settings),
-            Entry::Mod(id) => self.options.fraction(id),
+            Entry::Module(id) => self.options.fraction(id),
         }
     }
 
@@ -635,7 +635,7 @@ impl<'a> OptionsRef<'a> {
     pub fn full_key(&self, i: usize) -> String {
         match self.entry(i) {
             Entry::Core(i) => SETTINGS[i].key().to_string(),
-            Entry::Mod(id) => format!("{}.{}", self.options.owner(id), self.options.spec(id).key),
+            Entry::Module(id) => format!("{}.{}", self.options.owner(id), self.options.spec(id).key),
         }
     }
 
@@ -644,7 +644,7 @@ impl<'a> OptionsRef<'a> {
     pub fn hint(&self, i: usize) -> String {
         match self.entry(i) {
             Entry::Core(i) => SETTINGS[i].usage().split_once(' ').map_or(String::new(), |(_, v)| v.to_string()),
-            Entry::Mod(id) => match self.options.spec(id).kind {
+            Entry::Module(id) => match self.options.spec(id).kind {
                 OptionKind::Toggle => "on|off".to_string(),
                 OptionKind::Choice(choices) => choices.join("|"),
                 OptionKind::Percent { min, max, step } => format!("{min}-{max}% (steps of {step})"),
@@ -749,7 +749,7 @@ impl<'a> OptionsView<'a> {
                     self.options.touch();
                 }
             }
-            Entry::Mod(id) => {
+            Entry::Module(id) => {
                 self.options.step(id, dir);
             }
         }
@@ -765,7 +765,7 @@ impl<'a> OptionsView<'a> {
                 }
                 parsed
             }
-            Entry::Mod(id) => self.options.parse(id, text),
+            Entry::Module(id) => self.options.parse(id, text),
         }
     }
 }

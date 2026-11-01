@@ -1,7 +1,7 @@
 //! Presentation: a smooth map from a configuration to a render descriptor. Colour is periodic noise
 //! over the resource torus (no axis means a colour); a configuration takes the colour at its
 //! centroid, so a block that gains or loses constituents visibly drifts toward or away from them,
-//! and its least-held occurrence lends the accent. Texture mods turn the descriptor (and the
+//! and its least-held occurrence lends the accent. Texture modules turn the descriptor (and the
 //! configuration itself) into pixels.
 
 use crate::element::{Element, D};

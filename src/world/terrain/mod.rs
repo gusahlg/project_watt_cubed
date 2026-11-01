@@ -149,7 +149,7 @@ impl TerrainCfg {
         self
     }
 
-    /// Text form (`relief=100,...,deep=100`): saves, the wire, mod state.
+    /// Text form (`relief=100,...,deep=100`): saves, the wire, module state.
     pub fn to_text(self) -> String {
         format!(
             "relief={},caves={},mines={},space={},variety={},features={},structures={},deep={}",

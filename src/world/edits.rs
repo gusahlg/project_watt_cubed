@@ -394,7 +394,7 @@ impl World {
     pub fn simulation_state_records(&self) -> Vec<(String, String)> { self.reactions.state_records() }
     pub fn load_simulation_records(&mut self, records: &[(String, String)]) -> Result<(), String> { self.reactions.load_records(records) }
 
-    /// Tools use exactly the selected mod's law; no provider means no hidden old-law operation.
+    /// Tools use exactly the selected module's law; no provider means no hidden old-law operation.
     pub fn react_tool(&mut self, cell: BlockId, tool: BlockId) -> Option<(BlockId, BlockId)> {
         if !self.reactions_authority { return None; }
         self.reactions.tool(&mut self.registry, cell, tool)

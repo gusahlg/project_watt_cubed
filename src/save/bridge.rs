@@ -1,4 +1,4 @@
-//! Game-typed glue between `World`/`Player`/`Mods` and `SaveDoc`.
+//! Game-typed glue between `World`/`Player`/`Modules` and `SaveDoc`.
 //! Only file in `save/` that knows about game types.
 
 use voxel_engine::DVec3;
@@ -6,7 +6,7 @@ use voxel_engine::DVec3;
 use crate::block::registry::SpecKind;
 use crate::block::{AIR, BlockId};
 use crate::coord::{BlockCoord, ChunkCoord, Local};
-use crate::modding::Mods;
+use crate::modules::Modules;
 use crate::coord::Face;
 use crate::player::{Motion, Player};
 use crate::world::chunk::Chunk;
@@ -38,7 +38,7 @@ pub fn unix_now() -> u64 {
 pub struct SaveSnapshot {
     overlay: FastMap<ChunkCoord, FastMap<usize, BlockId>>,
     player: PlayerState,
-    mods: Vec<(String, String)>,
+    modules: Vec<(String, String)>,
     meta: SaveMeta,
     worldgen_version: u16,
     worldgen: WorldgenStamp,
@@ -50,7 +50,7 @@ pub struct SaveSnapshot {
 impl SaveSnapshot {
     /// Capture live game state. O(edits) overlay clone plus O(palette) spec
     /// strings.
-    pub fn capture(world: &World, player: &Player, mods: &Mods, mut meta: SaveMeta) -> Self {
+    pub fn capture(world: &World, player: &Player, modules: &Modules, mut meta: SaveMeta) -> Self {
         meta.seed = world.seed();
         meta.last_played = unix_now();
         let registry = world.registry();
@@ -77,8 +77,8 @@ impl SaveSnapshot {
                 noclip,
                 inventory: Some(player.inventory.to_portable(|id| world.registry().spec(id))),
             },
-            mods: {
-                let mut states = mods.save_states(world);
+            modules: {
+                let mut states = modules.save_states(world);
                 states.extend(world.simulation_state_records());
                 states
             },
@@ -103,7 +103,7 @@ impl SaveSnapshot {
         Self {
             overlay: FastMap::default(),
             player,
-            mods: Vec::new(),
+            modules: Vec::new(),
             meta,
             worldgen_version: crate::world::terrain::WORLDGEN_VERSION,
             worldgen: WorldgenStamp::default(),
@@ -162,7 +162,7 @@ impl SaveSnapshot {
             player: self.player.clone(),
             specs: table.specs,
             edits,
-            mods: self.mods.clone(),
+            modules: self.modules.clone(),
             pending: self.pending.clone(),
         })
     }
@@ -179,15 +179,15 @@ impl SaveSnapshot {
 pub fn to_doc(
     world: &World,
     player: &Player,
-    mods: &Mods,
+    modules: &Modules,
     meta: SaveMeta,
 ) -> Result<SaveDoc, SaveError> {
-    snapshot(world, player, mods, meta).to_doc()
+    snapshot(world, player, modules, meta).to_doc()
 }
 
 /// Cheap main-thread capture; encode happens later via [`SaveSnapshot::encode`].
-pub fn snapshot(world: &World, player: &Player, mods: &Mods, meta: SaveMeta) -> SaveSnapshot {
-    SaveSnapshot::capture(world, player, mods, meta)
+pub fn snapshot(world: &World, player: &Player, modules: &Modules, meta: SaveMeta) -> SaveSnapshot {
+    SaveSnapshot::capture(world, player, modules, meta)
 }
 
 fn stamp_from_world(world: &World) -> WorldgenStamp {
@@ -265,26 +265,26 @@ fn kind_cfg_from_stamp(stamp: WorldgenStamp) -> (WorldgenKind, TerrainCfg) {
     (kind, TerrainCfg::from_wire(stamp.knobs))
 }
 
-/// A save rebuilt up to its mod state and pending reactions, which wait for the live mods:
+/// A save rebuilt up to its module state and pending reactions, which wait for the live modules:
 /// [`finish`](Self::finish) adds them on the thread that owns them.
 pub struct Restored {
     world: World,
     player: Player,
     meta: SaveMeta,
-    mods: Vec<(String, String)>,
+    modules: Vec<(String, String)>,
     pending: Vec<(u32, crate::sim::reactions::Contact)>,
     unknown: UnknownMaterials,
 }
 
 impl Restored {
-    /// Restore mod state into `mods`, then the pending reaction work, in the order a save
+    /// Restore module state into `modules`, then the pending reaction work, in the order a save
     /// always loaded them.
-    pub fn finish(mut self, mods: &mut Mods) -> (World, Player, SaveMeta) {
-        for (name, data) in &self.mods {
-            self.unknown.legacy_holdings += mods.load_state(name, data, &mut self.world);
+    pub fn finish(mut self, modules: &mut Modules) -> (World, Player, SaveMeta) {
+        for (name, data) in &self.modules {
+            self.unknown.legacy_holdings += modules.load_state(name, data, &mut self.world);
         }
         self.world.restore_reactions(&self.pending);
-        if let Err(error) = self.world.configure_simulation(mods.reaction_model()) {
+        if let Err(error) = self.world.configure_simulation(modules.reaction_model()) {
             eprintln!("simulation paused: {error}");
         }
         if let Some(msg) = unknown_material_notice(self.unknown) {
@@ -317,10 +317,10 @@ fn rebuild(
     let mut world = make_world(doc.meta.seed, kind, cfg);
     // Match the dedicated loader: all actual pre-extraction saves used selective transfer,
     // including settled worlds with no pending contacts. Fresh worlds do not use this path.
-    if !doc.mods.iter().any(|(key, _)| key == "@simulation.selected") {
-        doc.mods.push(("@simulation.selected".into(), format!("{}@1", crate::sim::model::LEGACY_ID)));
+    if !doc.modules.iter().any(|(key, _)| key == "@simulation.selected") {
+        doc.modules.push(("@simulation.selected".into(), format!("{}@1", crate::sim::model::LEGACY_ID)));
     }
-    world.load_simulation_records(&doc.mods).map_err(|_| SaveError::Corrupt("invalid simulation records"))?;
+    world.load_simulation_records(&doc.modules).map_err(|_| SaveError::Corrupt("invalid simulation records"))?;
 
     // A saved position outside the world (a corrupt or runaway save) restarts at the spawn rather than
     // streaming around nonsense.
@@ -385,18 +385,18 @@ fn rebuild(
         .iter()
         .map(|c| (c.age, crate::sim::reactions::Contact { lo: (c.x, c.y, c.z), axis: c.axis }))
         .collect();
-    Ok(Restored { world, player, meta: doc.meta, mods: doc.mods, pending, unknown })
+    Ok(Restored { world, player, meta: doc.meta, modules: doc.modules, pending, unknown })
 }
 
-/// Rebuild a ready-to-play world and player from a doc, restoring mod state into `mods` and
+/// Rebuild a ready-to-play world and player from a doc, restoring module state into `modules` and
 /// the pending reaction work into the world's scheduler.
 #[cfg(test)]
 pub fn from_doc(
     doc: SaveDoc,
-    mods: &mut Mods,
+    modules: &mut Modules,
     make_world: impl FnOnce(i64, WorldgenKind, TerrainCfg) -> World,
 ) -> Result<(World, Player, SaveMeta), SaveError> {
-    Ok(rebuild(doc, make_world)?.finish(mods))
+    Ok(rebuild(doc, make_world)?.finish(modules))
 }
 
 /// Snapshot straight to bytes — the synchronous encode the exit-flush path
@@ -404,10 +404,10 @@ pub fn from_doc(
 pub fn encode_current(
     world: &World,
     player: &Player,
-    mods: &Mods,
+    modules: &Modules,
     meta: SaveMeta,
 ) -> Result<Vec<u8>, SaveError> {
-    format::encode(&to_doc(world, player, mods, meta)?)
+    format::encode(&to_doc(world, player, modules, meta)?)
 }
 
 /// Save synchronously (exit paths; the in-game path goes through the
@@ -418,15 +418,15 @@ pub fn save(
     id: &SlotId,
     world: &World,
     player: &Player,
-    mods: &Mods,
+    modules: &Modules,
     meta: SaveMeta,
 ) -> Result<(), SaveError> {
-    store::write(id, &encode_current(world, player, mods, meta)?)?;
+    store::write(id, &encode_current(world, player, modules, meta)?)?;
     Ok(())
 }
 
 /// Read a slot, laddering to the backup and salvaging a truncated tail if it comes to that, and
-/// rebuild it up to [`Restored::finish`]. Needs no mods, so it runs on any thread. The report says
+/// rebuild it up to [`Restored::finish`]. Needs no modules, so it runs on any thread. The report says
 /// how far down the ladder we went. `make_world` builds the world from the save's seed and generator.
 pub fn restore(
     id: &SlotId,
@@ -446,10 +446,10 @@ pub fn restore(
 #[cfg(test)]
 pub fn load(
     id: &SlotId,
-    mods: &mut Mods,
+    modules: &mut Modules,
     make_world: impl FnOnce(i64, WorldgenKind, TerrainCfg) -> World,
 ) -> Result<(World, Player, SaveMeta, LoadReport), SaveError> {
     let (restored, report) = restore(id, make_world)?;
-    let (world, player, meta) = restored.finish(mods);
+    let (world, player, meta) = restored.finish(modules);
     Ok((world, player, meta, report))
 }

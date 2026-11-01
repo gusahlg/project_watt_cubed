@@ -1,4 +1,4 @@
-//! Server-side mod seam: plain-data hooks so communities can add rules without
+//! Server-side module seam: plain-data hooks so communities can add rules without
 //! forking the server. Signatures stay serialisable (ids, names, coords, specs)
 //! so a future manifest/wasm boundary remains possible.
 //!
@@ -11,8 +11,8 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
 /// A unit of server-side policy. Every method but [`id`](Self::id) has a
-/// default, so a mod implements only the events it cares about.
-pub trait ServerMod: Send {
+/// default, so a module implements only the events it cares about.
+pub trait ServerModule: Send {
     /// Short, stable name used in panic logs.
     fn id(&self) -> &'static str;
 
@@ -87,15 +87,15 @@ pub struct ChatFacts {
     pub text: Arc<str>,
 }
 
-/// Installed mods plus the set of ids already logged for a panic.
+/// Installed modules plus the set of ids already logged for a panic.
 pub(crate) struct Table {
-    mods: Vec<Box<dyn ServerMod>>,
+    modules: Vec<Box<dyn ServerModule>>,
     panicked: HashSet<&'static str>,
 }
 
 impl Table {
-    pub(crate) fn new(mods: Vec<Box<dyn ServerMod>>) -> Self {
-        Self { mods, panicked: HashSet::new() }
+    pub(crate) fn new(modules: Vec<Box<dyn ServerModule>>) -> Self {
+        Self { modules, panicked: HashSet::new() }
     }
 
     pub(crate) fn validate_edit(&mut self, intent: &EditIntent) -> Verdict {
@@ -114,10 +114,10 @@ impl Table {
         self.gate(|m| m.on_chat(msg))
     }
 
-    /// Ask each mod in order; the first Deny wins and the rest are not asked. A mod that
+    /// Ask each module in order; the first Deny wins and the rest are not asked. A module that
     /// panics allows.
-    fn gate(&mut self, mut ask: impl FnMut(&mut dyn ServerMod) -> Verdict) -> Verdict {
-        for m in &mut self.mods {
+    fn gate(&mut self, mut ask: impl FnMut(&mut dyn ServerModule) -> Verdict) -> Verdict {
+        for m in &mut self.modules {
             let id = m.id();
             match catch_unwind(AssertUnwindSafe(|| ask(m.as_mut()))) {
                 Ok(Verdict::Deny { reason }) => return Verdict::Deny { reason },
@@ -128,9 +128,9 @@ impl Table {
         Verdict::Allow
     }
 
-    /// Tell each mod in order; a mod that panics is logged and skipped.
-    fn each(&mut self, mut tell: impl FnMut(&mut dyn ServerMod)) {
-        for m in &mut self.mods {
+    /// Tell each module in order; a module that panics is logged and skipped.
+    fn each(&mut self, mut tell: impl FnMut(&mut dyn ServerModule)) {
+        for m in &mut self.modules {
             let id = m.id();
             if catch_unwind(AssertUnwindSafe(|| tell(m.as_mut()))).is_err() {
                 note_panic(&mut self.panicked, id);
@@ -191,7 +191,7 @@ impl Recording {
 }
 
 #[cfg(test)]
-impl ServerMod for Recording {
+impl ServerModule for Recording {
     fn id(&self) -> &'static str {
         self.id
     }

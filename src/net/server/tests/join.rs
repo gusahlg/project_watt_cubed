@@ -1,4 +1,4 @@
-//! Handshakes, admission, bootstrap, names, mod policy and operators.
+//! Handshakes, admission, bootstrap, names, module policy and operators.
 use super::super::*;
 use super::support::*;
 use crate::net::client::Incoming;
@@ -85,7 +85,7 @@ fn mismatched_content_fingerprint_is_rejected() {
     handle.stop();
 }
 
-/// Kind is not part of the content id. A client whose local mods would build Flat
+/// Kind is not part of the content id. A client whose local modules would build Flat
 /// still joins a Diffusion server and adopts the kind Welcome carries.
 /// (Re-pinned: this used to reject `content_fingerprint_kind(Flat)`.)
 #[test]
@@ -455,12 +455,12 @@ fn duplicate_and_reserved_names_are_rejected() {
 #[test]
 fn allow_list_admits_a_fully_listed_client() {
     let handle = flat(Config {
-        mods_allow: vec!["pwc.hotbar".into()],
+        modules_allow: vec!["pwc.hotbar".into()],
         ..Config::default()
     });
     let port = handle.addr().port();
     let listed = [("pwc.hotbar".into(), "0.1.0".into())];
-    let ok = Connection::connect_with("127.0.0.1", port, "ada", "", &listed).expect("listed mod");
+    let ok = Connection::connect_with("127.0.0.1", port, "ada", "", &listed).expect("listed module");
     assert!(ok.is_alive());
     drop(ok);
     let extra = [
@@ -468,39 +468,39 @@ fn allow_list_admits_a_fully_listed_client() {
         ("pwc.dev-toolkit".into(), "1.0.0".into()),
     ];
     let err = match Connection::connect_with("127.0.0.1", port, "bea", "", &extra) {
-        Ok(_) => panic!("an unlisted mod was admitted"),
+        Ok(_) => panic!("an unlisted module was admitted"),
         Err(err) => err,
     };
-    assert_eq!(err.mods_denied, vec!["pwc.dev-toolkit".to_string()]);
-    let none = Connection::connect_with("127.0.0.1", port, "cy", "", &[]).expect("no mods enabled");
+    assert_eq!(err.modules_denied, vec!["pwc.dev-toolkit".to_string()]);
+    let none = Connection::connect_with("127.0.0.1", port, "cy", "", &[]).expect("no modules enabled");
     assert!(none.is_alive());
     handle.stop();
 }
 
 #[test]
-fn denied_mod_is_refused_then_admitted_when_off() {
+fn denied_module_is_refused_then_admitted_when_off() {
     let handle = flat(Config {
-        mods_deny: vec!["pwc.dev-toolkit".into()],
+        modules_deny: vec!["pwc.dev-toolkit".into()],
         ..Config::default()
     });
     let port = handle.addr().port();
     let on = [("pwc.dev-toolkit".into(), "1.0.0".into())];
     let err = match Connection::connect_with("127.0.0.1", port, "ada", "", &on) {
-        Ok(_) => panic!("a denied mod was admitted"),
+        Ok(_) => panic!("a denied module was admitted"),
         Err(err) => err,
     };
-    assert_eq!(err.mods_denied, vec!["pwc.dev-toolkit".to_string()]);
-    let retry = Connection::connect_with("127.0.0.1", port, "ada", "", &[]).expect("retry with the mod off");
+    assert_eq!(err.modules_denied, vec!["pwc.dev-toolkit".to_string()]);
+    let retry = Connection::connect_with("127.0.0.1", port, "ada", "", &[]).expect("retry with the module off");
     assert!(retry.is_alive());
     handle.stop();
 }
 
 #[test]
-fn no_mod_restriction_admits_everyone() {
+fn no_module_restriction_admits_everyone() {
     let handle = flat(Config::default());
     let port = handle.addr().port();
-    let mods = [("pwc.dev-toolkit".into(), "1.0.0".into()), ("pwc.hotbar".into(), "0.1.0".into())];
-    let conn = Connection::connect_with("127.0.0.1", port, "ada", "", &mods).expect("default is open");
+    let modules = [("pwc.dev-toolkit".into(), "1.0.0".into()), ("pwc.hotbar".into(), "0.1.0".into())];
+    let conn = Connection::connect_with("127.0.0.1", port, "ada", "", &modules).expect("default is open");
     assert!(conn.is_alive());
     handle.stop();
 }

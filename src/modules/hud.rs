@@ -1,10 +1,10 @@
-//! What a HUD mod may read about the frame: the facts the core owns and a mod cannot derive
+//! What a HUD module may read about the frame: the facts the core owns and a module cannot derive
 //! (frame rate, the network link, loading state, the HUD mode and scale). The core draws no HUD
-//! text of its own; the information HUD is a mod built on these facts.
+//! text of its own; the information HUD is a module built on these facts.
 
 use crate::ui::HudMode;
 
-/// This frame's facts for [`Mod::hud`](super::Mod::hud). Plain `Copy` data built on the stack.
+/// This frame's facts for [`Module::hud`](super::Module::hud). Plain `Copy` data built on the stack.
 /// Build one for a test with [`HudFacts::new`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[non_exhaustive]
@@ -24,7 +24,7 @@ pub struct HudFacts {
     pub spawn_ready: bool,
     /// The server has gone quiet and the link may be lost.
     pub link_interrupted: bool,
-    /// The master HUD cycle (F1). The core calls `hud` in every mode, Off included; each mod
+    /// The master HUD cycle (F1). The core calls `hud` in every mode, Off included; each module
     /// decides what the mode means for it.
     pub hud_mode: HudMode,
     /// The player's UI scale. A label's `base_fs` is drawn at `round(base_fs * ui_scale)` pixels,

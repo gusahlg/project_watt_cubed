@@ -1,5 +1,5 @@
 //! Pure save codec: `SaveDoc` ↔ bytes. No game types — the bridge converts
-//! `World`/`Player`/`Mods` to and from `SaveDoc`, so this whole module is
+//! `World`/`Player`/`Modules` to and from `SaveDoc`, so this whole module is
 //! testable without constructing a world.
 //!
 //! Layout, version 10 (all integers little-endian):
@@ -26,7 +26,7 @@
 //!                inventory: u16 len + utf8 "spec=count,..."        variable
 //! spec table     u16 count, then per spec: u16 len + utf8
 //! edits          edit_count records of i32 x, i32 y, i32 z, u16 spec index
-//! mods           u8 count, then per mod: u8 name-len + utf8,
+//! modules           u8 count, then per module: u8 name-len + utf8,
 //!                                        u32 state-len + utf8
 //! reactions      u32 count, then per active contact: i32 x, i32 y, i32 z,
 //!                u8 axis, u32 age (turns waiting) — the pending work, in order
@@ -107,7 +107,7 @@ const EDIT_BYTES: usize = 14;
 /// The spec-table count is a u16, so the table can hold every `u16` index.
 const MAX_SPECS: usize = 65_535;
 pub(crate) const MAX_EDITS: u32 = 50_000_000;
-pub(crate) const MAX_MOD_STATE: u32 = 16 * 1024 * 1024;
+pub(crate) const MAX_MODULE_STATE: u32 = 16 * 1024 * 1024;
 /// Bytes of one pending reaction contact.
 const CONTACT_BYTES: usize = 4 * 3 + 1 + 4;
 const MAX_PENDING: u32 = 1 << 20;
@@ -128,8 +128,8 @@ pub struct SaveDoc {
     /// Deduplicated block-spec table; edits reference it by index.
     pub specs: Vec<String>,
     pub edits: Vec<Edit>,
-    /// Per-mod `(name, state)` in each mod's own string format.
-    pub mods: Vec<(String, String)>,
+    /// Per-module `(name, state)` in each module's own string format.
+    pub modules: Vec<(String, String)>,
     /// Reaction work in progress: active contacts `(x, y, z, axis, age)` in processing order.
     pub pending: Vec<PendingContact>,
 }
@@ -349,18 +349,18 @@ pub fn encode(doc: &SaveDoc) -> Result<Vec<u8>, SaveError> {
         out.extend_from_slice(&edit.spec.to_le_bytes());
     }
 
-    let count = u8::try_from(doc.mods.len())
-        .map_err(|_| SaveError::Corrupt("too many mod states to save"))?;
+    let count = u8::try_from(doc.modules.len())
+        .map_err(|_| SaveError::Corrupt("too many module states to save"))?;
     out.push(count);
-    for (name, data) in &doc.mods {
+    for (name, data) in &doc.modules {
         let name_len =
-            u8::try_from(name.len()).map_err(|_| SaveError::Corrupt("mod name too long to save"))?;
+            u8::try_from(name.len()).map_err(|_| SaveError::Corrupt("module name too long to save"))?;
         out.push(name_len);
         out.extend_from_slice(name.as_bytes());
         let data_len = u32::try_from(data.len())
             .ok()
-            .filter(|&n| n <= MAX_MOD_STATE)
-            .ok_or(SaveError::Corrupt("mod state too long to save"))?;
+            .filter(|&n| n <= MAX_MODULE_STATE)
+            .ok_or(SaveError::Corrupt("module state too long to save"))?;
         out.extend_from_slice(&data_len.to_le_bytes());
         out.extend_from_slice(data.as_bytes());
     }
@@ -615,9 +615,9 @@ pub fn decode(bytes: &[u8]) -> Result<Decoded, SaveError> {
     }
     let recovered = edits.len() as u32;
 
-    // Mod state is best-effort once edits are intact: keep whole entries
+    // Module state is best-effort once edits are intact: keep whole entries
     // until one fails to parse.
-    let mut mods = Vec::new();
+    let mut modules = Vec::new();
     if clean {
         clean = (|| -> Result<(), SaveError> {
             let count = r.u8()?;
@@ -625,11 +625,11 @@ pub fn decode(bytes: &[u8]) -> Result<Decoded, SaveError> {
                 let name_len = r.u8()? as usize;
                 let name = r.string(name_len)?;
                 let data_len = r.u32()?;
-                if data_len > MAX_MOD_STATE {
-                    return Err(SaveError::Corrupt("mod state too large"));
+                if data_len > MAX_MODULE_STATE {
+                    return Err(SaveError::Corrupt("module state too large"));
                 }
                 let data = r.string(data_len as usize)?;
-                mods.push((name, data));
+                modules.push((name, data));
             }
             Ok(())
         })()
@@ -657,7 +657,7 @@ pub fn decode(bytes: &[u8]) -> Result<Decoded, SaveError> {
         .is_ok();
     }
 
-    let doc = SaveDoc { meta, worldgen_version, worldgen, law_stamp, player, specs, edits, mods, pending };
+    let doc = SaveDoc { meta, worldgen_version, worldgen, law_stamp, player, specs, edits, modules, pending };
     Ok(if clean {
         Decoded::Intact(doc)
     } else {
@@ -700,7 +700,7 @@ mod tests {
                 Edit { x: 2, y: 61, z: -2, spec: 1 },
                 Edit { x: 3, y: 62, z: -3, spec: 0 },
             ],
-            mods: vec![("inventory".to_string(), "Stone,Iron".to_string())],
+            modules: vec![("inventory".to_string(), "Stone,Iron".to_string())],
             pending: vec![
                 PendingContact { x: 4, y: -9, z: 1, axis: 0, age: 0 },
                 PendingContact { x: -1, y: 70, z: 9, axis: 2, age: 3 },
@@ -708,7 +708,7 @@ mod tests {
         }
     }
 
-    /// Bytes after the edits in [`sample`]: the mod states and the pending reactions.
+    /// Bytes after the edits in [`sample`]: the module states and the pending reactions.
     const TAIL: usize = (1 + 1 + "inventory".len() + 4 + "Stone,Iron".len()) + 4 + 2 * CONTACT_BYTES;
 
     fn expect_intact(d: Decoded) -> SaveDoc {
@@ -774,19 +774,19 @@ mod tests {
             Decoded::Salvaged { doc: got, recovered, expected } => {
                 assert_eq!((recovered, expected), (2, 3));
                 assert_eq!(got.edits, doc.edits[..2]);
-                assert!(got.mods.is_empty(), "mods after the break are dropped");
+                assert!(got.modules.is_empty(), "modules after the break are dropped");
             }
             Decoded::Intact(_) => panic!("truncation must not decode as intact"),
         }
     }
 
     #[test]
-    fn truncated_mods_keep_all_edits() {
+    fn truncated_modules_keep_all_edits() {
         let doc = sample();
         let bytes = encode(&doc).unwrap();
         match decode(&bytes[..bytes.len() - 3]).unwrap() {
             Decoded::Salvaged { doc: got, recovered, expected } => {
-                assert_eq!((recovered, expected), (3, 3), "only mod state was lost");
+                assert_eq!((recovered, expected), (3, 3), "only module state was lost");
                 assert_eq!(got.edits, doc.edits);
             }
             Decoded::Intact(_) => panic!("truncation must not decode as intact"),

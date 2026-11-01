@@ -891,10 +891,10 @@ mod tests {
         let rep = body.relax(&Relax { max_iterations: 40_000, tolerance: 1e-4, ..Relax::default() });
         assert!(rep.converged, "{rep:?}");
         let (len, height, width) = ((nx as i64 * h) as f64, (ny as i64 * h) as f64, (nz as i64 * h) as f64);
-        let e_mod = 3.0 * p.shear;
+        let e_module = 3.0 * p.shear;
         let inertia = width * height.powi(3) / 12.0;
         let q = p.density * 10.0 * width * height;
-        let want = q * len.powi(4) / (8.0 * e_mod * inertia);
+        let want = q * len.powi(4) / (8.0 * e_module * inertia);
         let tip = body.lattice.nodes[body.lattice.node(nx, ny / 2, nz / 2)];
         let got = -(tip.y - (ny as f64 / 2.0) * h as f64);
         // Trilinear hexes are stiff in bending at two elements through the depth: accept 40%.

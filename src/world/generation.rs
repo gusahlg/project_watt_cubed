@@ -2,7 +2,7 @@
 //!
 //! [`TerrainGenerator`] is the seam: a pure function of `(seed, coordinate)` that worker threads
 //! and multiplayer clients reproduce bit for bit. The shipped generator is InfiniteDiffusion
-//! ([`super::terrain`]); the core fallback is [`FlatTerrain`] (used when no worldgen mod is
+//! ([`super::terrain`]); the core fallback is [`FlatTerrain`] (used when no worldgen module is
 //! enabled, and by tests that want a plain world).
 use std::ops::RangeInclusive;
 use std::sync::Arc;

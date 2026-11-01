@@ -40,8 +40,8 @@ const STEP: Duration = Duration::from_millis(10);
 const CHANNEL: &str = "chaos";
 const OP: &str = "warden";
 const SECRET: &str = "s3cret";
-/// A client that reports this mod is refused at the door.
-const BANNED_MOD: &str = "chaos.wallhack";
+/// A client that reports this module is refused at the door.
+const BANNED_MODULE: &str = "chaos.wallhack";
 /// The client's own wait for a verdict (`client::PENDING_TTL`). A verdict this late was made up by
 /// the client because the server never answered.
 const VERDICT_TTL: Duration = Duration::from_secs(3);
@@ -220,14 +220,14 @@ fn config(seed: i64, world: Option<PathBuf>) -> Config {
         noclip: NoclipPolicy::Off,
         op_secrets: vec![(OP.into(), SECRET.into())],
         max_speed: MAX_SPEED,
-        mods_deny: vec![BANNED_MOD.into()],
+        modules_deny: vec![BANNED_MODULE.into()],
         world,
         ..Config::default()
     }
 }
 
-fn begin(port: u16, name: &str, mods: &[(String, String)]) -> PendingConnect {
-    Connection::begin_connect("127.0.0.1", port, name, "", mods)
+fn begin(port: u16, name: &str, modules: &[(String, String)]) -> PendingConnect {
+    Connection::begin_connect("127.0.0.1", port, name, "", modules)
 }
 
 #[derive(Clone, Copy)]
@@ -288,7 +288,7 @@ struct Owned {
 /// A cheat that touches other players, so the driver runs it.
 enum Ask {
     Impersonate,
-    BannedMod,
+    BannedModule,
 }
 
 struct Bot {
@@ -879,7 +879,7 @@ impl Bot {
                 conn.send_teleport(DVec3::new(2.0e9, CRUISE, 0.0));
             }
             13 => return Some(Ask::Impersonate),
-            _ => return Some(Ask::BannedMod),
+            _ => return Some(Ask::BannedModule),
         }
         None
     }
@@ -987,13 +987,13 @@ impl Chaos {
                 (Ok(conn), kind) => {
                     let what = match kind {
                         Ask::Impersonate => "the operator's name in capitals",
-                        Ask::BannedMod => "a banned mod",
+                        Ask::BannedModule => "a banned module",
                     };
                     referee.fault(format!("a join with {what} got in"));
                     referee.drops.push(thread::spawn(move || drop(conn)));
                 }
                 (Err(e), Ask::Impersonate) if e.message().contains("already in use") => {}
-                (Err(e), Ask::BannedMod) if e.mods_denied == [BANNED_MOD] => {}
+                (Err(e), Ask::BannedModule) if e.modules_denied == [BANNED_MODULE] => {}
                 (Err(e), _) if e.message() == "cancelled" => {}
                 (Err(e), _) => referee.fault(format!("a refused join gave the wrong reason: {}", e.message())),
             }
@@ -1028,9 +1028,9 @@ impl Chaos {
                     referee.probes.push(Probe { pending, kind: Ask::Impersonate, target: Some(0) });
                 }
             }
-            Some(Ask::BannedMod) => {
-                let pending = begin(*port, &format!("mallory{step}"), &[(BANNED_MOD.into(), "1.0".into())]);
-                referee.probes.push(Probe { pending, kind: Ask::BannedMod, target: None });
+            Some(Ask::BannedModule) => {
+                let pending = begin(*port, &format!("mallory{step}"), &[(BANNED_MODULE.into(), "1.0".into())]);
+                referee.probes.push(Probe { pending, kind: Ask::BannedModule, target: None });
             }
             None => {}
         }

@@ -1,10 +1,10 @@
-//! Two clients on one headless server, so a mod can test a channel without a window.
+//! Two clients on one headless server, so a module can test a channel without a window.
 use std::thread;
 use std::time::Duration;
 
 use voxel_engine::DVec3;
 
-use crate::audio::ModLink;
+use crate::audio::ModuleLink;
 use crate::world::generation::WorldgenKind;
 
 use super::client::Connection;
@@ -55,12 +55,12 @@ impl ChannelPair {
         self.b.player_id()
     }
 
-    pub fn with_a<R>(&mut self, body: impl FnOnce(ModLink<'_>) -> R) -> R {
-        body(ModLink::new(Some(&mut self.a)))
+    pub fn with_a<R>(&mut self, body: impl FnOnce(ModuleLink<'_>) -> R) -> R {
+        body(ModuleLink::new(Some(&mut self.a)))
     }
 
-    pub fn with_b<R>(&mut self, body: impl FnOnce(ModLink<'_>) -> R) -> R {
-        body(ModLink::new(Some(&mut self.b)))
+    pub fn with_b<R>(&mut self, body: impl FnOnce(ModuleLink<'_>) -> R) -> R {
+        body(ModuleLink::new(Some(&mut self.b)))
     }
 
     pub fn pump(&mut self) {

@@ -49,7 +49,7 @@ Throughout:
 
 ### 1.1 The philosophy recovered from your own statements
 
-Your recurring priorities are a small capable core, freedom arising from reusable rules, meaningful building and experimentation, community and multiplayer, and deep modding. You have described PWC as a platform for an unusually creative sandbox, rather than a game organized around a prescribed objective.
+Your recurring priorities are a small capable core, freedom arising from reusable rules, meaningful building and experimentation, community and multiplayer, and deep modules. You have described PWC as a platform for an unusually creative sandbox, rather than a game organized around a prescribed objective.
 
 Your material discussions add a more specific preference: new behavior should arise from configurations and their relationships, without requiring a hand-authored category for every material or outcome.
 
@@ -1593,13 +1593,13 @@ Even established physics libraries document conditions concerning operation orde
 
 Test CPU/GPU mapping agreement separately. A client renderer should not derive different boundary positions from an allegedly identical descriptor.
 
-### 13.8 Native compiled mods belong in the world contract
+### 13.8 Native compiled modules belong in the world contract
 
-Because PWC compiles mods into its binaries, a world should retain a simulation fingerprint covering the relevant material, generator, geometry, and physics rules.
+Because PWC compiles modules into its binaries, a world should retain a simulation fingerprint covering the relevant material, generator, geometry, and physics rules.
 
 The client and headless server do not need identical executable files. They do need compatible world semantics and protocol interpretation.
 
-A purely visual mod should not unnecessarily invalidate a save. A mod changing mass, material response, or topology behavior should require an explicit compatibility decision or migration.
+A purely visual module should not unnecessarily invalidate a save. A module changing mass, material response, or topology behavior should require an explicit compatibility decision or migration.
 
 The package manager resolves and builds the chosen code. The runtime still owns the world's authoritative law identifiers and validates compatibility.
 
@@ -1997,7 +1997,7 @@ No benchmark in this document establishes that final gate.
 | Two clients straddling a seam | Shared selection, collision, and placement | Independent chart ownership |
 | Save during a background solve | Last committed state restores coherently | Partially committed deformation |
 | Different render LOD settings | Identical authoritative physics | Graphics resolution leaking into simulation |
-| Modified material-law mod | Explicit compatibility or migration | World semantics changing unnoticed |
+| Modified material-law module | Explicit compatibility or migration | World semantics changing unnoticed |
 
 For approximate quantities, record absolute error as well as relative error. Relative gravity error alone is misleading near a true zero.
 

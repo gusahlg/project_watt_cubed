@@ -1,4 +1,4 @@
-//! Client audio. The device, mixer, codecs and acoustics stay here. Mods decide
+//! Client audio. The device, mixer, codecs and acoustics stay here. Modules decide
 //! which cue plays and who hears voice, through [`service`].
 
 pub(crate) mod acoustics;
@@ -20,6 +20,6 @@ pub(crate) use runtime::{Fault, MixChange, Smoothed, SoundSystem};
 
 pub(crate) use service::StepPose;
 pub use service::{
-    AudioApi, AudioBench, AudioService, AudioView, BlockSound, CapturedFrame, GameEvent, ModFrame, ModLink, PeerAudio,
+    AudioApi, AudioBench, AudioService, AudioView, BlockSound, CapturedFrame, GameEvent, ModuleFrame, ModuleLink, PeerAudio,
     Play,
 };

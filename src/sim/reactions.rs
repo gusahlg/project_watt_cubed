@@ -1,4 +1,4 @@
-//! Optional authoritative simulation host. Queueing and interaction laws live in native mods;
+//! Optional authoritative simulation host. Queueing and interaction laws live in native modules;
 //! core keeps the cell adapter, identity, lifecycle, persistence and common budget vocabulary.
 use super::Tick;
 use super::model::{Model, ModelSpec, Sample, Stats};
@@ -114,12 +114,12 @@ impl Budget {
     };
 }
 
-/// The extracted legacy mod's default active-contact guard. Refusals increment `dropped`;
+/// The extracted legacy module's default active-contact guard. Refusals increment `dropped`;
 /// other models choose and document their own state bounds.
 pub const DEFAULT_CAPACITY: usize = 1 << 16;
 
-/// The longest simulation record value a save holds: the save's cap on one mod-state value.
-const MAX_RECORD: usize = crate::save::format::MAX_MOD_STATE as usize;
+/// The longest simulation record value a save holds: the save's cap on one module-state value.
+const MAX_RECORD: usize = crate::save::format::MAX_MODULE_STATE as usize;
 
 #[derive(Clone)]
 struct Saved {
@@ -329,9 +329,9 @@ impl ReactionScheduler {
         }
         self.sync_stats();
     }
-    /// Reserved records travel in the existing save's opaque mod-state section.
+    /// Reserved records travel in the existing save's opaque module-state section.
     /// Each payload is copied once, in id order, with the live model's state in place of its
-    /// frozen copy. A record over the save's mod-state cap is left out with a notice, so one
+    /// frozen copy. A record over the save's module-state cap is left out with a notice, so one
     /// oversized model never fails the whole save.
     pub fn state_records(&self) -> Vec<(String, String)> {
         // An unavailable provider is frozen, not an intentional conversion to an off-world.
@@ -438,7 +438,7 @@ impl ReactionScheduler {
     }
 }
 
-/// Generic fixed-tick adapter; the selected mod supplies all simulation work.
+/// Generic fixed-tick adapter; the selected module supplies all simulation work.
 pub struct Reactions;
 impl Tick for Reactions {
     fn name(&self) -> &'static str {
@@ -489,7 +489,7 @@ mod tests {
     }
 
     #[test]
-    fn switching_off_preserves_the_real_mod_state_for_later() {
+    fn switching_off_preserves_the_real_module_state_for_later() {
         let mut host = ReactionScheduler::disabled();
         host.configure(crate::sim::model::test_default()).unwrap();
         host.wake_cell((2, 3, 4));

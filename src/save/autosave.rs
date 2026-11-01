@@ -1,6 +1,6 @@
 //! Periodic autosave with dirty tracking.
 //!
-//! A cheap main-thread snapshot (overlay-map clone + player/mod records) is
+//! A cheap main-thread snapshot (overlay-map clone + player/module records) is
 //! handed to the writer thread, which encodes the document and writes it.
 //! `in_flight` ensures at most one pending write to prevent races. The *how
 //! often* — the interval throttle — is not here: it rides the scheduler's
@@ -147,7 +147,7 @@ impl Autosaver {
 
     /// Exit flush: drain pending writes then save unconditionally, on this
     /// thread — a clean exit never spawns the writer just to say goodbye.
-    /// Edit generation doesn't track position/mods, so exit captures complete state.
+    /// Edit generation doesn't track position/modules, so exit captures complete state.
     pub fn flush_now(
         &mut self,
         id: &SlotId,
@@ -326,7 +326,7 @@ mod tests {
         world.set_block(8, y0, 8, AIR);
         let gen1 = world.edit_generation();
         let player = Player::new(DVec3::new(0.0, 40.0, 0.0));
-        let mut mods = crate::modding::testing::standard();
+        let mut modules = crate::modules::testing::standard();
         let meta = SaveMeta {
             name: "race".to_string(),
             seed: 0,
@@ -337,7 +337,7 @@ mod tests {
         };
 
         let mut auto = Autosaver::new();
-        let snap = save::snapshot(&world, &player, &mods, meta.clone());
+        let snap = save::snapshot(&world, &player, &modules, meta.clone());
         assert!(matches!(auto.start(&id, gen1, snap), Tick::Started));
 
         // Edit while the first snapshot is in flight — must not land in it.
@@ -346,12 +346,12 @@ mod tests {
         assert_ne!(gen2, gen1);
         assert!(!auto.wants_write(gen2), "in-flight write is the artifact mutex");
         assert!(matches!(
-            auto.start(&id, gen2, save::snapshot(&world, &player, &mods, meta.clone())),
+            auto.start(&id, gen2, save::snapshot(&world, &player, &modules, meta.clone())),
             Tick::Idle
         ));
 
         wait_finished(&mut auto);
-        let (loaded, _, _, report) = save::load(&id, &mut mods, load_world).unwrap();
+        let (loaded, _, _, report) = save::load(&id, &mut modules, load_world).unwrap();
         assert_eq!(report.source, Source::Live);
         assert_eq!(loaded.block_at(8, y0, 8), AIR, "first edit is in this snapshot");
         assert_ne!(
@@ -362,12 +362,12 @@ mod tests {
 
         assert!(auto.wants_write(gen2), "new edit dirties the next snapshot");
         assert!(matches!(
-            auto.start(&id, gen2, save::snapshot(&world, &player, &mods, meta)),
+            auto.start(&id, gen2, save::snapshot(&world, &player, &modules, meta)),
             Tick::Started
         ));
         wait_finished(&mut auto);
-        let mut mods = crate::modding::testing::standard();
-        let (loaded, _, _, _) = save::load(&id, &mut mods, load_world).unwrap();
+        let mut modules = crate::modules::testing::standard();
+        let (loaded, _, _, _) = save::load(&id, &mut modules, load_world).unwrap();
         assert_eq!(loaded.block_at(9, y1, 8), AIR, "second edit lands in the next snapshot");
 
         let _ = fs::remove_file(save_file(&id));
@@ -394,7 +394,7 @@ mod tests {
         world.test_fill_overlay(N, BlockId(1));
         assert_eq!(world.edits().count(), N);
         let player = Player::new(DVec3::new(0.0, 40.0, 0.0));
-        let mods = crate::modding::testing::standard();
+        let modules = crate::modules::testing::standard();
         let meta = SaveMeta {
             name: "bench".to_string(),
             seed: 0,
@@ -413,7 +413,7 @@ mod tests {
         let mut encode_allocs = (0, 0);
         for _ in 0..LOOPS {
             let t0 = Instant::now();
-            let snap = crate::save::snapshot(&world, &player, &mods, meta.clone());
+            let snap = crate::save::snapshot(&world, &player, &modules, meta.clone());
             snap_ns.push(t0.elapsed().as_nanos());
             crate::alloc_count::reset();
             let t1 = Instant::now();

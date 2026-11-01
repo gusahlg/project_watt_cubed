@@ -1,21 +1,21 @@
-//! The mod host: the game's "minimal core, layers on top" made real. Core
+//! The module host: the game's "minimal core, layers on top" made real. Core
 //! gameplay owns the world, the law and physics; everything player-facing that
 //! isn't essential — the inventory panel, block looks and names, HUD
-//! widgets, menus — is a [`Mod`]. The build decides which mods are in: there is no
+//! widgets, menus — is a [`Module`]. The build decides which modules are in: there is no
 //! runtime switch. The core can only *suspend* a package for one session, when the
 //! server it joins refuses it (or a benchmark pins it off); suspension has no UI and is
 //! never saved.
 //!
-//! Mods are **compiled in**. A mod package (`.pwcmod`, see the PWC package
+//! Modules are **compiled in**. A module package (`.pwcmodule`, see the PWC package
 //! manager) is a Rust crate whose `register` function receives a
-//! [`ModRegistrar`]; a [`GameBuild`] lists the packages of one exact build, and
-//! [`Mods::from_build`] calls each `register` in dependency order. The core
-//! itself installs no mod: `GameBuild::vanilla()` is the bare game.
+//! [`ModuleRegistrar`]; a [`GameBuild`] lists the packages of one exact build, and
+//! [`Modules::from_build`] calls each `register` in dependency order. The core
+//! itself installs no module: `GameBuild::vanilla()` is the bare game.
 //!
-//! **Performance:** mod hooks fire only at frame and event granularity —
+//! **Performance:** module hooks fire only at frame and event granularity —
 //! `update`/`draw` once per frame, `on_block_break` once per broken block. Nothing
 //! here is ever called from the voxel hot path (meshing, collision, streaming), and
-//! suspended mods are skipped entirely. A mod therefore costs nothing where it would
+//! suspended modules are skipped entirely. A module therefore costs nothing where it would
 //! matter and only what it draws where it wouldn't.
 mod build;
 mod cli;
@@ -25,7 +25,7 @@ mod message;
 #[cfg(test)]
 pub(crate) mod testing;
 
-pub use build::{BuildInfo, GameBuild, ModDescriptor, ModRegistrar, PackageInfo, PackageKind};
+pub use build::{BuildInfo, GameBuild, ModuleDescriptor, ModuleRegistrar, PackageInfo, PackageKind};
 pub use cli::{Cli, CliContext};
 pub(crate) use cli::dispatch;
 pub use frame::{Channel, FrameContext, GameContext, TextFrame};
@@ -43,7 +43,7 @@ use crate::ui::HudElement;
 use crate::world::generation::WorldgenKind;
 use crate::world::World;
 
-/// Which fancy visual groups the installed, unsuspended mods provide.
+/// Which fancy visual groups the installed, unsuspended modules provide.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VisualMask {
     pub atmosphere: bool,
@@ -71,7 +71,7 @@ impl VisualMask {
         lighting: true,
     };
 
-    /// The mask with exactly `groups` on: a group is on when any enabled mod owns it. The mods
+    /// The mask with exactly `groups` on: a group is on when any enabled module owns it. The modules
     /// screen and the renderer both build their mask here.
     pub fn of(groups: impl IntoIterator<Item = VisualGroup>) -> Self {
         let mut mask = Self::NONE;
@@ -111,19 +111,19 @@ impl VisualMask {
         self.apply(settings.render_config())
     }
 
-    /// Whether this mask strips the settings lane `key`: no installed, unsuspended mod provides
+    /// Whether this mask strips the settings lane `key`: no installed, unsuspended module provides
     /// its visual group. False for a lane outside every group.
     pub fn strips(self, key: &str) -> bool {
         crate::render_config::lane_group(key).is_some_and(|group| !self.get(group))
     }
 }
 
-/// One rebindable control a mod declares. The core keeps the chord table and
+/// One rebindable control a module declares. The core keeps the chord table and
 /// reports which fired; it does not know what the action means. There is no
 /// controls screen yet: [`Action::label`] is what that screen will show.
 #[derive(Clone, Copy)]
 pub struct Action {
-    /// Stable id (`"inventory.toggle"`). [`ModContext::action`] matches it.
+    /// Stable id (`"inventory.toggle"`). [`ModuleContext::action`] matches it.
     pub id: &'static str,
     /// Text a controls screen would show next to the binding.
     pub label: &'static str,
@@ -134,15 +134,15 @@ pub struct Action {
     pub repeat: bool,
     /// When true, the action is on for every frame the chord is down, not only the press.
     pub held: bool,
-    /// When true, the action is sampled every frame, even with the mod-logic lane off, and
-    /// reaches only [`Mod::on_frame`] ([`FrameContext::action`]), never [`Mod::update`]. For keys
+    /// When true, the action is sampled every frame, even with the module-logic lane off, and
+    /// reaches only [`Module::on_frame`] ([`FrameContext::action`]), never [`Module::update`]. For keys
     /// that must always work, such as opening the chat.
     pub immediate: bool,
 }
 
 /// Which declared actions fired this frame. At most [`ActionSet::CAP`] actions;
 /// the bit is the action's index in the router's table. [`Copy`], so a skipped
-/// mod tick can queue the set.
+/// module tick can queue the set.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ActionSet(u128);
 
@@ -166,7 +166,7 @@ impl ActionSet {
 }
 
 /// What a primary action did with a tool. `cell` is the targeted configuration
-/// before the reaction. The core does not draw this; a mod may.
+/// before the reaction. The core does not draw this; a module may.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolUse {
     NoReaction,
@@ -182,11 +182,11 @@ pub enum ToolUse {
     Exchanged { cell: BlockId },
 }
 
-/// The coarse, per-frame state a mod may read and mutate. Deliberately holds only
-/// whole-game handles (never a voxel), so a mod can't reach into the hot path.
-/// `#[non_exhaustive]`: build one with [`ModContext::new`] and set the fields you need.
+/// The coarse, per-frame state a module may read and mutate. Deliberately holds only
+/// whole-game handles (never a voxel), so a module can't reach into the hot path.
+/// `#[non_exhaustive]`: build one with [`ModuleContext::new`] and set the fields you need.
 #[non_exhaustive]
-pub struct ModContext<'a> {
+pub struct ModuleContext<'a> {
     pub player: &'a mut Player,
     pub world: &'a mut World,
     pub screen_w: i32,
@@ -202,25 +202,29 @@ pub struct ModContext<'a> {
     pub nav_right: bool,
     pub nav_tab: bool,
     pub nav_confirm: bool,
-    /// Signed scroll steps this frame (a notch is about 1). Zero when mod logic is off.
+    /// Signed scroll steps this frame (a notch is about 1). Zero when module logic is off.
     pub wheel: i8,
-    /// Whether a mod panel may open. Captured with the edge, so a toggle taken
+    /// Whether a module panel may open. Captured with the edge, so a toggle taken
     /// while the HUD is hidden does not open a panel when it is replayed.
+    pub module_ui: bool,
+    /// The same as `module_ui`, under its name from before the rename, so a package written
+    /// for 3.3 or earlier still compiles.
+    #[doc(hidden)]
     pub mod_ui: bool,
     /// True when a server owns evaluation (reactions and tool use run there).
     pub networked: bool,
-    /// Block placements queued by mods this frame as `(x, y, z, id)`. The game
-    /// drains these after `mods.update` and applies each only if the cell is air
-    /// and doesn't overlap the player — mods that spend resources on a placement
+    /// Block placements queued by modules this frame as `(x, y, z, id)`. The game
+    /// drains these after `modules.update` and applies each only if the cell is air
+    /// and doesn't overlap the player — modules that spend resources on a placement
     /// should pre-check the same so their accounting stays exact.
     pub placements: Vec<(i32, i32, i32, crate::block::registry::BlockId)>,
     pub(crate) fired: ActionSet,
     pub(crate) ids: &'a [&'static str],
-    /// Ids from [`ModContext::set_action`]. Empty on the game path, so it allocates nothing.
+    /// Ids from [`ModuleContext::set_action`]. Empty on the game path, so it allocates nothing.
     pub(crate) extra: Vec<&'static str>,
 }
 
-impl<'a> ModContext<'a> {
+impl<'a> ModuleContext<'a> {
     /// A context for tests: 800×600, panels allowed, no edges, empty placements.
     pub fn new(player: &'a mut Player, world: &'a mut World) -> Self {
         Self {
@@ -237,6 +241,7 @@ impl<'a> ModContext<'a> {
             nav_tab: false,
             nav_confirm: false,
             wheel: 0,
+            module_ui: true,
             mod_ui: true,
             networked: false,
             placements: Vec::new(),
@@ -246,7 +251,7 @@ impl<'a> ModContext<'a> {
         }
     }
 
-    /// Whether the action `id` fired this frame. True if any enabled mod's
+    /// Whether the action `id` fired this frame. True if any enabled module's
     /// action with that id fired.
     pub fn action(&self, id: &str) -> bool {
         self.ids.iter().enumerate().any(|(i, name)| *name == id && self.fired.contains(i))
@@ -279,32 +284,32 @@ impl<'a> ModContext<'a> {
     }
 }
 
-/// A unit of layered-on functionality. Every method but [`id`](Self::id) has a default, so a mod
-/// implements only the hooks it cares about. This is the public surface mod authors write
+/// A unit of layered-on functionality. Every method but [`id`](Self::id) has a default, so a module
+/// implements only the hooks it cares about. This is the public surface module authors write
 /// against — kept small on purpose.
 ///
-/// Arbitration when more than one active mod implements a hook (a mod is active unless the core
+/// Arbitration when more than one active module implements a hook (a module is active unless the core
 /// suspended its package for the session):
 /// - **Fan-out**, install order: `update`, `on_frame`, `on_message`, `on_block_break`,
 ///   `on_break_rejected`, `on_place_rejected`, `on_tool_changed`, `on_tool_used`. `hud` uses the
 ///   same order as z-order (later draws on top). `actions` are collected, not arbitrated: each
-///   active mod's list is its own.
+///   active module's list is its own.
 /// - **First active wins**: `close_overlay` (first `true`), `root_screen`, `pause_screen`,
 ///   `worldgen`, `worldgen_config`, `appearance`, `namer`, `tool` (first `Some`). The keyboard
-///   capture ([`FrameContext::capture_text`]) belongs to the first mod that asks until it gives it
+///   capture ([`FrameContext::capture_text`]) belongs to the first module that asks until it gives it
 ///   back or Escape ends it.
 /// - **Compose**: `visual_group` bits OR into the render mask.
 ///
-/// Save hooks are per-mod. `worldgen_config` is an opaque string; the winning worldgen kind
-/// parses it. What a package is called and what it does are its `mod.toml` (see
-/// [`ModRegistrar::package`]); a mod has no display text of its own.
-pub trait Mod {
+/// Save hooks are per-module. `worldgen_config` is an opaque string; the winning worldgen kind
+/// parses it. What a package is called and what it does are its `module.toml` (see
+/// [`ModuleRegistrar::package`]); a module has no display text of its own.
+pub trait Module {
     /// Optional authoritative simulation. The first active provider wins; no provider means no
-    /// reactions. A native factory is copied into world/server construction, never the UI mod.
+    /// reactions. A native factory is copied into world/server construction, never the UI module.
     fn reaction_model(&self) -> Option<crate::sim::model::ModelSpec> {
         None
     }
-    /// Name for logs, and the key old saves used before mods had ids. Defaults to
+    /// Name for logs, and the key old saves used before modules had ids. Defaults to
     /// [`id`](Self::id).
     fn name(&self) -> &str {
         self.id()
@@ -314,9 +319,9 @@ pub trait Mod {
     /// fallback for saves older than ids.
     fn id(&self) -> &'static str;
 
-    /// The options changed: the values are loaded, or a player changed one. Copy what this mod
+    /// The options changed: the values are loaded, or a player changed one. Copy what this module
     /// reads (by the [`OptionId`](crate::settings::OptionId)s its package got from
-    /// [`ModRegistrar::option`]); [`Options::revision`] moves with every change. Called once after
+    /// [`ModuleRegistrar::option`]); [`Options::revision`] moves with every change. Called once after
     /// registration, once more when `settings.cfg` is read, then at event granularity.
     fn on_options(&mut self, options: &Options) {
         let _ = options;
@@ -326,23 +331,23 @@ pub trait Mod {
     /// different world. The inventory lives on the player, not here.
     fn reset(&mut self) {}
 
-    /// Cadence-controlled logic while active (the game's `mod_hz`). Runs
+    /// Cadence-controlled logic while active (the game's `module_hz`). Runs
     /// after movement, before rendering; edge inputs accumulated between
     /// ticks are replayed in order without loss.
-    fn update(&mut self, ctx: &mut ModContext) {
+    fn update(&mut self, ctx: &mut ModuleContext) {
         let _ = ctx;
     }
 
-    /// Every in-world frame, after input and before movement, whatever the mod cadence and even
-    /// with the mod-logic lane off. `ctx` has this frame's immediate actions, the keyboard capture
-    /// (and the typing, while this mod holds it), and the game state; the core follows up on what
+    /// Every in-world frame, after input and before movement, whatever the module cadence and even
+    /// with the module-logic lane off. `ctx` has this frame's immediate actions, the keyboard capture
+    /// (and the typing, while this module holds it), and the game state; the core follows up on what
     /// the hook changed (see [`GameContext`]). Keep it cheap: it runs at frame rate.
     fn on_frame(&mut self, ctx: &mut FrameContext) {
         let _ = ctx;
     }
 
     /// A chat line, a join or leave, or a core notice (see [`Message`]). Return `true` when this
-    /// mod showed it to the player; a notice no mod showed goes to stderr.
+    /// module showed it to the player; a notice no module showed goes to stderr.
     fn on_message(&mut self, msg: &Message) -> bool {
         let _ = msg;
         false
@@ -368,13 +373,13 @@ pub trait Mod {
         let _ = (id, world);
     }
 
-    /// Controls this mod wants sampled while it is active. The core owns the chord
+    /// Controls this module wants sampled while it is active. The core owns the chord
     /// table; a core binding wins any clash. Default is none.
     fn actions(&self) -> &[Action] {
         &[]
     }
 
-    /// The configuration a primary action applies, if any (first active mod that answers
+    /// The configuration a primary action applies, if any (first active module that answers
     /// wins). `None` means no tool: the primary action breaks the block into the inventory.
     fn tool(&self, player: &Player) -> Option<BlockId> {
         let _ = player;
@@ -397,27 +402,27 @@ pub trait Mod {
         let _ = (ev, audio);
     }
 
-    /// Every frame, menus included. `view` is the listener and the roster; `link` is the mod channel.
+    /// Every frame, menus included. `view` is the listener and the roster; `link` is the module channel.
     fn on_audio(
         &mut self,
         view: &crate::audio::AudioView,
         audio: &mut crate::audio::AudioApi,
-        link: &mut crate::audio::ModLink,
+        link: &mut crate::audio::ModuleLink,
     ) {
         let _ = (view, audio, link);
     }
 
-    /// Optional material namer. First active mod that returns `Some` names every
+    /// Optional material namer. First active module that returns `Some` names every
     /// configuration; without one the core describes materials by their readings.
     fn namer(&self) -> Option<&dyn MaterialNamer> {
         None
     }
 
-    /// This mod's HUD contribution while enabled, as data — [`HudElement`]s
-    /// pushed into a caller-owned buffer the core renders over the world. A mod
+    /// This module's HUD contribution while enabled, as data — [`HudElement`]s
+    /// pushed into a caller-owned buffer the core renders over the world. A module
     /// describes *what* to show and never draws, so panel chrome and layout live in
     /// one place ([`crate::ui::render_hud`]). Called every frame in every HUD mode,
-    /// Off included: `facts.hud_mode` says which mode it is, and each mod decides
+    /// Off included: `facts.hud_mode` says which mode it is, and each module decides
     /// what to show in it. `facts` also has the screen size, the UI scale and the
     /// facts only the core knows (frame rate, the link, loading). `world` gives read
     /// access to the registry so names resolve at build time rather than being
@@ -427,13 +432,13 @@ pub trait Mod {
     }
 
     /// Close a modal in-world overlay before the core interprets Escape as
-    /// "leave the world". Returns whether this mod consumed the key.
+    /// "leave the world". Returns whether this module consumed the key.
     fn close_overlay(&mut self) -> bool {
         false
     }
 
     /// The screen out of a world (a start screen), built each time the player returns to it;
-    /// `facts.notice` says why when the core has a reason. The first active mod that returns
+    /// `facts.notice` says why when the core has a reason. The first active module that returns
     /// `Some` wins. With none, the core enters the most recent world (or a new one) and Esc saves
     /// and quits. See [`crate::screen`].
     fn root_screen(&self, facts: &ScreenFacts) -> Option<Box<dyn Screen>> {
@@ -442,15 +447,15 @@ pub trait Mod {
     }
 
     /// The screen Esc opens in a world, once text capture and every overlay declined the key. The
-    /// first active mod that returns `Some` wins. With none, Esc leaves the world as it always
+    /// first active module that returns `Some` wins. With none, Esc leaves the world as it always
     /// did. The world keeps running underneath; only input goes to the screen.
     fn pause_screen(&self, facts: &ScreenFacts) -> Option<Box<dyn Screen>> {
         let _ = facts;
         None
     }
 
-    /// Serialise persistent state, or `None` if the mod has nothing to persist.
-    /// The `u16` is the payload version; [`Mods::save_states`] encodes it as a
+    /// Serialise persistent state, or `None` if the module has nothing to persist.
+    /// The `u16` is the payload version; [`Modules::save_states`] encodes it as a
     /// `v<N>;` prefix so the save codec stays a plain string.
     fn save_state(&self, world: &World) -> Option<(u16, String)> {
         let _ = world;
@@ -466,57 +471,57 @@ pub trait Mod {
         0
     }
 
-    /// Which fancy render group this mod provides, if any. The host reads it when the mod is
+    /// Which fancy render group this module provides, if any. The host reads it when the module is
     /// installed and when a suspension starts or ends.
     fn visual_group(&self) -> Option<VisualGroup> {
         None
     }
 
-    /// If this mod replaces worldgen, the kind new worlds use while it is active.
+    /// If this module replaces worldgen, the kind new worlds use while it is active.
     fn worldgen(&self) -> Option<WorldgenKind> {
         None
     }
 
-    /// Opaque payload for the winning [`worldgen`](Self::worldgen) kind. `None` if this mod
+    /// Opaque payload for the winning [`worldgen`](Self::worldgen) kind. `None` if this module
     /// does not replace worldgen. InfiniteDiffusion builds it from its options.
     fn worldgen_config(&self) -> Option<String> {
         None
     }
 
-    /// Optional block appearance. First active mod that returns `Some` wins;
+    /// Optional block appearance. First active module that returns `Some` wins;
     /// [`FlatAppearance`](crate::block::appearance::FlatAppearance) is used
-    /// when every active mod returns `None`.
+    /// when every active module returns `None`.
     fn appearance(&self) -> Option<&dyn BlockAppearance> {
         None
     }
 }
 
-/// One installed mod and whether it runs this session.
+/// One installed module and whether it runs this session.
 struct Entry {
-    module: Box<dyn Mod>,
-    /// Id of the package that registered it (`None` for mods installed directly).
+    module: Box<dyn Module>,
+    /// Id of the package that registered it (`None` for modules installed directly).
     package: Option<&'static str>,
-    /// False while the core suspends its package (see [`Mods::suspend_packages`]).
+    /// False while the core suspends its package (see [`Modules::suspend_packages`]).
     active: bool,
 }
 
-/// The installed mods. Every mod the build installs runs, unless the core suspends its package
-/// for the session; per-world state is saved through each mod's `save_state`/`load_state`.
-pub struct Mods {
+/// The installed modules. Every module the build installs runs, unless the core suspends its package
+/// for the session; per-world state is saved through each module's `save_state`/`load_state`.
+pub struct Modules {
     entries: Vec<Entry>,
-    /// Bumped when a mod is installed or a suspension starts or ends, so the input
+    /// Bumped when a module is installed or a suspension starts or ends, so the input
     /// table can rebuild once instead of every frame.
     action_gen: u64,
-    /// The active mods' visual groups, rebuilt with `action_gen`.
+    /// The active modules' visual groups, rebuilt with `action_gen`.
     visuals: VisualMask,
-    /// Bumped whenever what a mods screen lists may have changed.
+    /// Bumped whenever what a modules screen lists may have changed.
     revision: u64,
     /// Package ids suspended for the whole process (`WATT_BENCH_SUSPEND`). Never saved.
     pinned: Vec<String>,
     /// Package ids suspended now: the pinned ones plus what the current server refused. Never
     /// saved.
     suspended: Vec<String>,
-    /// Install index of the mod holding the keyboard (see [`FrameContext::capture_text`]).
+    /// Install index of the module holding the keyboard (see [`FrameContext::capture_text`]).
     capture: Option<usize>,
     /// Every registered screen entry, with its package.
     registered_screens: Vec<(Option<&'static str>, ScreenEntry)>,
@@ -526,25 +531,25 @@ pub struct Mods {
     clis: Vec<cli::Cli>,
 }
 
-impl Mods {
+impl Modules {
     /// Instantiate every package of `build` that has an entry point, in its (dependency) order.
     /// Each package's `register` sees the resources its dependencies provided and the whole
     /// package list, and declares its options into `options` (the app keeps them beside the
-    /// settings). Every mod hears the defaults before this returns.
+    /// settings). Every module hears the defaults before this returns.
     pub fn from_build(build: &GameBuild, options: &mut Options) -> Self {
-        let mut mods = Self::empty();
+        let mut modules = Self::empty();
         let mut resources = build::Resources::default();
         let info = build.info();
         for package in info.packages() {
             let Some(register) = package.register else { continue };
-            let mut registrar = ModRegistrar::new(package, info, &mut mods, options, &mut resources);
+            let mut registrar = ModuleRegistrar::new(package, info, &mut modules, options, &mut resources);
             register(&mut registrar);
         }
-        mods.options_changed(options);
-        mods
+        modules.options_changed(options);
+        modules
     }
 
-    /// No mods installed. Appearance is [`FLAT`].
+    /// No modules installed. Appearance is [`FLAT`].
     pub fn empty() -> Self {
         Self {
             entries: Vec::new(),
@@ -572,7 +577,7 @@ impl Mods {
         &self.clis
     }
 
-    /// Offer a screen entry (see [`ModRegistrar::screen_entry`]).
+    /// Offer a screen entry (see [`ModuleRegistrar::screen_entry`]).
     pub fn add_screen_entry(&mut self, entry: ScreenEntry) {
         self.add_entry_from(None, entry);
     }
@@ -605,21 +610,21 @@ impl Mods {
     }
 
 
-    /// The first active mod's root screen, if any (see [`Mod::root_screen`]).
+    /// The first active module's root screen, if any (see [`Module::root_screen`]).
     pub fn root_screen(&self, facts: &ScreenFacts) -> Option<Box<dyn Screen>> {
-        self.active_mods().find_map(|m| m.root_screen(facts))
+        self.active_modules().find_map(|m| m.root_screen(facts))
     }
 
-    /// The first active mod's pause screen, if any (see [`Mod::pause_screen`]).
+    /// The first active module's pause screen, if any (see [`Module::pause_screen`]).
     pub fn pause_screen(&self, facts: &ScreenFacts) -> Option<Box<dyn Screen>> {
-        self.active_mods().find_map(|m| m.pause_screen(facts))
+        self.active_modules().find_map(|m| m.pause_screen(facts))
     }
 
-    fn active_mods(&self) -> impl Iterator<Item = &dyn Mod> + '_ {
+    fn active_modules(&self) -> impl Iterator<Item = &dyn Module> + '_ {
         self.entries.iter().filter(|e| e.active).map(|e| &*e.module)
     }
 
-    /// Tell every mod, suspended ones too, that `options` changed.
+    /// Tell every module, suspended ones too, that `options` changed.
     pub fn options_changed(&mut self, options: &Options) {
         for entry in &mut self.entries {
             entry.module.on_options(options);
@@ -628,13 +633,13 @@ impl Mods {
 
 
 
-    /// Install a mod directly (tests, the vanilla harness). Packages install through
-    /// [`ModRegistrar::add`].
-    pub fn install(&mut self, module: Box<dyn Mod>) {
+    /// Install a module directly (tests, the vanilla harness). Packages install through
+    /// [`ModuleRegistrar::add`].
+    pub fn install(&mut self, module: Box<dyn Module>) {
         self.install_from(None, module);
     }
 
-    fn install_from(&mut self, package: Option<&'static str>, module: Box<dyn Mod>) {
+    fn install_from(&mut self, package: Option<&'static str>, module: Box<dyn Module>) {
         let active = !package.is_some_and(|pkg| self.suspended.iter().any(|id| id == pkg));
         self.entries.push(Entry { module, package, active });
         self.active_changed();
@@ -652,29 +657,29 @@ impl Mods {
         self.revision = self.revision.wrapping_add(1);
     }
 
-    /// Generation of the active action lists. Changes when a mod is installed or a suspension
+    /// Generation of the active action lists. Changes when a module is installed or a suspension
     /// starts or ends.
     pub fn action_generation(&self) -> u64 {
         self.action_gen
     }
 
-    /// Changes whenever what a mods screen lists may have changed: a mod installed, or a
+    /// Changes whenever what a modules screen lists may have changed: a module installed, or a
     /// suspension started or ended.
     pub fn revision(&self) -> u64 {
         self.revision
     }
 
-    /// Actions of every active mod, in install order.
+    /// Actions of every active module, in install order.
     pub fn enabled_actions(&self) -> impl Iterator<Item = &Action> + '_ {
         self.entries.iter().filter(|e| e.active).flat_map(|e| e.module.actions())
     }
 
-    /// The package that registered the mod at `index`, if any.
+    /// The package that registered the module at `index`, if any.
     pub fn package(&self, index: usize) -> Option<&'static str> {
         self.entries[index].package
     }
 
-    /// Reset every mod's per-world state (entering a new/loaded/networked world).
+    /// Reset every module's per-world state (entering a new/loaded/networked world).
     pub fn reset_state(&mut self) {
         self.capture = None;
         for entry in &mut self.entries {
@@ -682,7 +687,7 @@ impl Mods {
         }
     }
 
-    fn each_active(&mut self, mut f: impl FnMut(&mut dyn Mod)) {
+    fn each_active(&mut self, mut f: impl FnMut(&mut dyn Module)) {
         for entry in &mut self.entries {
             if entry.active {
                 f(&mut *entry.module);
@@ -690,12 +695,12 @@ impl Mods {
         }
     }
 
-    /// Run every active mod's per-frame logic.
-    pub fn update(&mut self, ctx: &mut ModContext) {
+    /// Run every active module's per-frame logic.
+    pub fn update(&mut self, ctx: &mut ModuleContext) {
         self.each_active(|m| m.update(ctx));
     }
 
-    /// Run every active mod's frame hook, in install order. Only the keyboard holder sees the
+    /// Run every active module's frame hook, in install order. Only the keyboard holder sees the
     /// typing; Escape ends its capture after its hook. A holder whose package was suspended loses
     /// the keyboard first.
     pub fn on_frame(&mut self, ctx: &mut FrameContext) {
@@ -718,13 +723,13 @@ impl Mods {
         self.capture = ctx.holder();
     }
 
-    /// Whether a mod holds the keyboard. While it does the router reads typing, the world takes
-    /// no input, and Escape goes to that mod (and ends the capture) before anything else sees it.
+    /// Whether a module holds the keyboard. While it does the router reads typing, the world takes
+    /// no input, and Escape goes to that module (and ends the capture) before anything else sees it.
     pub fn text_captured(&self) -> bool {
         self.capture.is_some()
     }
 
-    /// Hand one message to every active mod. True when any of them showed it.
+    /// Hand one message to every active module. True when any of them showed it.
     pub fn on_message(&mut self, msg: &Message) -> bool {
         let mut shown = false;
         for entry in &mut self.entries {
@@ -735,32 +740,32 @@ impl Mods {
         shown
     }
 
-    /// Fan a block-break event out to every active mod.
+    /// Fan a block-break event out to every active module.
     pub fn on_block_break(&mut self, id: BlockId, world: &World, overflow: bool) {
         self.each_active(|m| m.on_block_break(id, world, overflow));
     }
 
-    /// Fan a rejected-break rollback out to every active mod.
+    /// Fan a rejected-break rollback out to every active module.
     pub fn on_break_rejected(&mut self, id: BlockId) {
         self.each_active(|m| m.on_break_rejected(id));
     }
 
-    /// Fan a rejected-placement refund out to every active mod.
+    /// Fan a rejected-placement refund out to every active module.
     pub fn on_place_rejected(&mut self, id: crate::block::BlockId, world: &World) {
         self.each_active(|m| m.on_place_rejected(id, world));
     }
 
-    /// Fan a held unit's change of configuration out to every active mod.
+    /// Fan a held unit's change of configuration out to every active module.
     pub fn on_tool_changed(&mut self, old: BlockId, new: BlockId) {
         self.each_active(|m| m.on_tool_changed(old, new));
     }
 
-    /// Fan a finished primary action out to every active mod.
+    /// Fan a finished primary action out to every active module.
     pub fn on_tool_used(&mut self, outcome: ToolUse) {
         self.each_active(|m| m.on_tool_used(outcome));
     }
 
-    /// Fan one game fact out to every active mod.
+    /// Fan one game fact out to every active module.
     pub fn on_game_event(&mut self, ev: &crate::audio::GameEvent, audio: &mut crate::audio::AudioApi) {
         self.each_active(|m| m.on_game_event(ev, audio));
     }
@@ -770,12 +775,12 @@ impl Mods {
         &mut self,
         view: &crate::audio::AudioView,
         audio: &mut crate::audio::AudioApi,
-        link: &mut crate::audio::ModLink,
+        link: &mut crate::audio::ModuleLink,
     ) {
         self.each_active(|m| m.on_audio(view, audio, link));
     }
 
-    /// The configuration a primary action applies: the first active mod that answers.
+    /// The configuration a primary action applies: the first active module that answers.
     pub fn tool(&self, player: &Player) -> Option<BlockId> {
         self.entries.iter().filter(|e| e.active).find_map(|e| e.module.tool(player))
     }
@@ -790,8 +795,8 @@ impl Mods {
         self.entries.iter().filter(|e| e.active).find_map(|e| e.module.namer())
     }
 
-    /// Push every active mod's HUD contribution into `out`, in install order
-    /// (so a later mod draws over an earlier one). The caller owns `out` and
+    /// Push every active module's HUD contribution into `out`, in install order
+    /// (so a later module draws over an earlier one). The caller owns `out` and
     /// clears it per frame so capacity is retained.
     pub fn hud(&self, facts: &HudFacts, world: &World, player: &Player, out: &mut Vec<HudElement>) {
         for entry in &self.entries {
@@ -801,60 +806,60 @@ impl Mods {
         }
     }
 
-    /// Give active mods first refusal on Escape. The first open overlay closes
+    /// Give active modules first refusal on Escape. The first open overlay closes
     /// and consumes it; otherwise the game can return to its main menu.
     pub fn close_overlay(&mut self) -> bool {
         self.entries.iter_mut().filter(|e| e.active).any(|e| e.module.close_overlay())
     }
 
-    /// Number of installed mods.
+    /// Number of installed modules.
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
-    /// Whether there are no installed mods.
+    /// Whether there are no installed modules.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
-    /// The name of the mod at `index` (its id unless it says otherwise).
+    /// The name of the module at `index` (its id unless it says otherwise).
     pub fn name(&self, index: usize) -> &str {
         self.entries[index].module.name()
     }
 
-    /// The code id of the mod at `index`.
+    /// The code id of the module at `index`.
     pub fn id(&self, index: usize) -> &str {
         self.entries[index].module.id()
     }
 
-    /// Whether the mod at `index` runs: false while its package is suspended.
+    /// Whether the module at `index` runs: false while its package is suspended.
     pub fn is_active(&self, index: usize) -> bool {
         self.entries[index].active
     }
 
-    /// Visual group the mod at `index` provides, if it is a visual mod.
+    /// Visual group the module at `index` provides, if it is a visual module.
     pub fn visual_group(&self, index: usize) -> Option<VisualGroup> {
         self.entries[index].module.visual_group()
     }
 
-    /// Whether the mod at `index` replaces worldgen.
+    /// Whether the module at `index` replaces worldgen.
     pub fn is_worldgen(&self, index: usize) -> bool {
         self.entries[index].module.worldgen().is_some()
     }
 
-    /// Worldgen used for the next world: the first active worldgen mod's kind, else the flat
+    /// Worldgen used for the next world: the first active worldgen module's kind, else the flat
     /// core fallback.
     pub fn worldgen_kind(&self) -> WorldgenKind {
         self.first_worldgen().and_then(|m| m.worldgen()).unwrap_or(WorldgenKind::Flat)
     }
 
-    /// Opaque payload of the winning worldgen mod. The kind parses it
+    /// Opaque payload of the winning worldgen module. The kind parses it
     /// (`TerrainCfg::from_text` for InfiniteDiffusion).
     pub fn worldgen_config(&self) -> Option<String> {
         self.first_worldgen().and_then(|m| m.worldgen_config())
     }
 
-    fn first_worldgen(&self) -> Option<&dyn Mod> {
+    fn first_worldgen(&self) -> Option<&dyn Module> {
         self.entries
             .iter()
             .filter(|e| e.active)
@@ -862,19 +867,19 @@ impl Mods {
             .map(|e| &*e.module)
     }
 
-    /// First active appearance mod, or the core flat fallback.
+    /// First active appearance module, or the core flat fallback.
     pub fn appearance(&self) -> &dyn BlockAppearance {
         self.entries.iter().filter(|e| e.active).find_map(|e| e.module.appearance()).unwrap_or(&FLAT)
     }
 
-    /// The visual groups the active mods provide (see [`VisualMask::of`]): installed and not
+    /// The visual groups the active modules provide (see [`VisualMask::of`]): installed and not
     /// suspended.
     pub fn visual_mask(&self) -> VisualMask {
         self.visuals
     }
 
     /// Suspend every package in `package_ids` for the session, on top of the pinned ones
-    /// ([`pin_suspended`](Self::pin_suspended)): their mods stop running until
+    /// ([`pin_suspended`](Self::pin_suspended)): their modules stop running until
     /// [`resume_packages`](Self::resume_packages). A server that refuses packages is the
     /// authority for its session; this is how the client honours it. Nothing is saved, and
     /// there is no way to undo it but leaving. The list is what the server said; it is not a
@@ -915,7 +920,7 @@ impl Mods {
         &self.suspended
     }
 
-    /// Ids of the packages whose mods provide a visual group, in install order, each once.
+    /// Ids of the packages whose modules provide a visual group, in install order, each once.
     pub fn visual_packages(&self) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         for entry in &self.entries {
@@ -929,24 +934,24 @@ impl Mods {
         out
     }
 
-    /// The mod packages this client runs, as `(id, version)`, in build order: every package of
-    /// kind mod that is not suspended. Libraries and bundles are never reported. This is what an
+    /// The module packages this client runs, as `(id, version)`, in build order: every package of
+    /// kind module that is not suspended. Libraries and bundles are never reported. This is what an
     /// honest client puts on `Hello`.
     pub fn active_package_reports(&self, packages: &[PackageInfo]) -> Vec<(String, String)> {
         packages
             .iter()
-            .filter(|p| p.kind == PackageKind::Mod && !self.suspended.iter().any(|id| id == p.id))
+            .filter(|p| p.kind == PackageKind::Module && !self.suspended.iter().any(|id| id == p.id))
             .map(|p| (p.id.to_string(), p.version.to_string()))
             .collect()
     }
 
-    /// Settings lanes with the visual groups no active mod provides stripped. The one
+    /// Settings lanes with the visual groups no active module provides stripped. The one
     /// composition world construction, `/gfx` apply, and the engine flags share.
     pub fn effective_render(&self, settings: &Settings) -> RenderConfig {
         self.visual_mask().effective_render(settings)
     }
 
-    /// Persistent state of every mod that has any, as `(id, data)` lines.
+    /// Persistent state of every module that has any, as `(id, data)` lines.
     /// Version is encoded inside `data` as a leading `v<N>;` so the save
     /// codec does not change; old unprefixed strings load as version 0.
     pub fn save_states(&self, world: &World) -> Vec<(String, String)> {
@@ -960,11 +965,11 @@ impl Mods {
             .collect()
     }
 
-    /// Restore a mod's state by id, or by display name for old saves.
-    /// Returns how many holdings that mod dropped as unknown specs.
+    /// Restore a module's state by id, or by display name for old saves.
+    /// Returns how many holdings that module dropped as unknown specs.
     pub fn load_state(&mut self, name: &str, data: &str, world: &mut World) -> u32 {
         if let Some(entry) = self.entries.iter_mut().find(|e| e.module.id() == name || e.module.name() == name) {
-            let (version, payload) = split_mod_version(data);
+            let (version, payload) = split_module_version(data);
             return entry.module.load_state(version, payload, world);
         }
         0
@@ -1011,9 +1016,9 @@ impl Default for Debounce {
     }
 }
 
-/// Pull a leading `v<N>;` version prefix off a saved mod blob. No prefix
+/// Pull a leading `v<N>;` version prefix off a saved module blob. No prefix
 /// (or a prefix that isn't a `u16`) is version 0, the pre-versioning format.
-pub(crate) fn split_mod_version(data: &str) -> (u16, &str) {
+pub(crate) fn split_module_version(data: &str) -> (u16, &str) {
     let Some(rest) = data.strip_prefix('v') else {
         return (0, data);
     };
@@ -1032,47 +1037,47 @@ mod tests {
     use std::rc::Rc;
 
     use super::*;
-    use super::split_mod_version;
+    use super::split_module_version;
     use super::testing::Stub;
     use crate::world::terrain::TerrainCfg;
     use crate::world::World;
 
-    fn suspend(mods: &mut Mods, ids: &[&str]) {
-        mods.suspend_packages(&ids.iter().map(|id| id.to_string()).collect::<Vec<_>>());
+    fn suspend(modules: &mut Modules, ids: &[&str]) {
+        modules.suspend_packages(&ids.iter().map(|id| id.to_string()).collect::<Vec<_>>());
     }
 
     #[test]
-    fn worldgen_kind_follows_the_active_worldgen_mod() {
-        let mut mods = crate::modding::testing::standard();
-        assert_eq!(mods.worldgen_kind(), WorldgenKind::Diffusion, "the worldgen stand-in is installed");
-        suspend(&mut mods, &["pwc.infinite-diffusion"]);
-        assert_eq!(mods.worldgen_kind(), WorldgenKind::Flat, "the core fallback is the flat world");
-        assert_eq!(mods.worldgen_config(), None);
-        mods.resume_packages();
-        assert_eq!(mods.worldgen_kind(), WorldgenKind::Diffusion);
-        let text = mods.worldgen_config().expect("payload");
+    fn worldgen_kind_follows_the_active_worldgen_module() {
+        let mut modules = crate::modules::testing::standard();
+        assert_eq!(modules.worldgen_kind(), WorldgenKind::Diffusion, "the worldgen stand-in is installed");
+        suspend(&mut modules, &["pwc.infinite-diffusion"]);
+        assert_eq!(modules.worldgen_kind(), WorldgenKind::Flat, "the core fallback is the flat world");
+        assert_eq!(modules.worldgen_config(), None);
+        modules.resume_packages();
+        assert_eq!(modules.worldgen_kind(), WorldgenKind::Diffusion);
+        let text = modules.worldgen_config().expect("payload");
         assert_eq!(TerrainCfg::from_text(&text), TerrainCfg::default());
-        assert_eq!(Mods::empty().worldgen_kind(), WorldgenKind::Flat);
+        assert_eq!(Modules::empty().worldgen_kind(), WorldgenKind::Flat);
     }
 
     #[test]
-    fn effective_render_strips_the_groups_no_active_mod_provides() {
-        let mut mods = crate::modding::testing::standard();
+    fn effective_render_strips_the_groups_no_active_module_provides() {
+        let mut modules = crate::modules::testing::standard();
         let settings = Settings::default();
-        let full = mods.effective_render(&settings);
+        let full = modules.effective_render(&settings);
         assert_eq!(full.clouds, settings.clouds);
         assert_eq!(full.bloom, settings.bloom);
         assert_eq!(full.shadows, settings.shadows);
-        suspend(&mut mods, &["pwc.visuals"]);
-        let stripped = mods.effective_render(&settings);
+        suspend(&mut modules, &["pwc.visuals"]);
+        let stripped = modules.effective_render(&settings);
         assert!(!stripped.clouds && !stripped.bloom && !stripped.shadows);
         assert!(stripped.sunlight, "a lane outside every group stays");
-        assert_eq!(mods.visual_mask(), VisualMask::NONE);
-        mods.resume_packages();
-        assert_eq!(mods.visual_mask(), VisualMask::default(), "installed and not suspended");
+        assert_eq!(modules.visual_mask(), VisualMask::NONE);
+        modules.resume_packages();
+        assert_eq!(modules.visual_mask(), VisualMask::default(), "installed and not suspended");
     }
 
-    /// `strips` marks exactly the lanes the renderer strips, and names no mod.
+    /// `strips` marks exactly the lanes the renderer strips, and names no module.
     #[test]
     fn strips_marks_exactly_the_lanes_the_mask_strips() {
         let mask = VisualMask::of([VisualGroup::Atmosphere, VisualGroup::Lighting]);
@@ -1088,28 +1093,28 @@ mod tests {
     }
 
     #[test]
-    fn split_mod_version_reads_prefix_and_treats_absent_as_zero() {
-        assert_eq!(split_mod_version("Stone,Iron"), (0, "Stone,Iron"));
-        assert_eq!(split_mod_version("v1;Stone,Iron"), (1, "Stone,Iron"));
-        assert_eq!(split_mod_version("v0;"), (0, ""));
-        assert_eq!(split_mod_version("v12;a=b"), (12, "a=b"));
-        assert_eq!(split_mod_version("v;nope"), (0, "v;nope"));
-        assert_eq!(split_mod_version("vx;nope"), (0, "vx;nope"));
+    fn split_module_version_reads_prefix_and_treats_absent_as_zero() {
+        assert_eq!(split_module_version("Stone,Iron"), (0, "Stone,Iron"));
+        assert_eq!(split_module_version("v1;Stone,Iron"), (1, "Stone,Iron"));
+        assert_eq!(split_module_version("v0;"), (0, ""));
+        assert_eq!(split_module_version("v12;a=b"), (12, "a=b"));
+        assert_eq!(split_module_version("v;nope"), (0, "v;nope"));
+        assert_eq!(split_module_version("vx;nope"), (0, "vx;nope"));
     }
 
     #[test]
     fn save_states_key_by_id_and_load_accepts_display_name() {
         let mut world = World::new(1);
-        let mut mods = crate::modding::testing::standard();
+        let mut modules = crate::modules::testing::standard();
         let rock = world.registry().id_by_label("rock").unwrap();
         let spec = world.registry().spec(rock);
-        mods.load_state("Hotbar", &format!("sel=2;2={spec}"), &mut world);
-        let saved = mods.save_states(&world);
+        modules.load_state("Hotbar", &format!("sel=2;2={spec}"), &mut world);
+        let saved = modules.save_states(&world);
         assert!(saved.iter().any(|(k, _)| k == "hotbar"), "save keys are stable ids, not display names");
         assert!(!saved.iter().any(|(k, _)| k == "Hotbar"));
         let data = saved.iter().find(|(k, _)| k == "hotbar").map(|(_, d)| d.clone()).expect("hotbar persists");
         for key in ["hotbar", "Hotbar"] {
-            let mut fresh = crate::modding::testing::standard();
+            let mut fresh = crate::modules::testing::standard();
             fresh.load_state(key, &data, &mut world);
             assert_eq!(
                 fresh.save_states(&world).iter().find(|(k, _)| k == "hotbar").map(|(_, d)| d.as_str()),
@@ -1119,124 +1124,124 @@ mod tests {
     }
 
     #[test]
-    fn mod_state_round_trips_version_prefix() {
+    fn module_state_round_trips_version_prefix() {
         let mut world = World::new(1);
-        let mut mods = crate::modding::testing::standard();
+        let mut modules = crate::modules::testing::standard();
         let rock = world.registry().id_by_label("rock").unwrap();
         let spec = world.registry().spec(rock);
-        mods.load_state("hotbar", &format!("v1;sel=1;1={spec}"), &mut world);
-        let saved = mods.save_states(&world);
+        modules.load_state("hotbar", &format!("v1;sel=1;1={spec}"), &mut world);
+        let saved = modules.save_states(&world);
         assert!(saved.iter().all(|(k, _)| k != "inventory"), "the inventory is core state, not an inventory save line");
         let bar = saved.iter().find(|(k, _)| k == "hotbar").map(|(_, d)| d.as_str()).expect("hotbar");
         assert_eq!(bar, format!("v1;sel=1;1={spec}"));
-        let mut fresh = crate::modding::testing::standard();
+        let mut fresh = crate::modules::testing::standard();
         for (k, v) in &saved {
             fresh.load_state(k, v, &mut world);
         }
         assert_eq!(fresh.save_states(&world), saved);
     }
 
-    /// A mod that counts its `update` calls.
+    /// A module that counts its `update` calls.
     struct Counter {
         id: &'static str,
         calls: Rc<Cell<u32>>,
     }
 
-    impl Mod for Counter {
+    impl Module for Counter {
         fn id(&self) -> &'static str {
             self.id
         }
-        fn update(&mut self, _ctx: &mut ModContext) {
+        fn update(&mut self, _ctx: &mut ModuleContext) {
             self.calls.set(self.calls.get() + 1);
         }
     }
 
     /// A refused package stops running for the session and comes back on resume; nothing about
-    /// it is written anywhere, and a mod's display name defaults to its id.
+    /// it is written anywhere, and a module's display name defaults to its id.
     #[test]
     fn a_suspended_package_skips_every_hook_until_resumed() {
         let calls = Rc::new(Cell::new(0));
-        let mut mods = Mods::empty();
-        mods.install_from(Some("pwc.dev-toolkit"), Box::new(Counter { id: "tools", calls: calls.clone() }));
-        mods.install_from(Some("pwc.hotbar"), Box::new(Stub::new("hotbar")));
-        assert_eq!(mods.name(0), "tools");
+        let mut modules = Modules::empty();
+        modules.install_from(Some("pwc.dev-toolkit"), Box::new(Counter { id: "tools", calls: calls.clone() }));
+        modules.install_from(Some("pwc.hotbar"), Box::new(Stub::new("hotbar")));
+        assert_eq!(modules.name(0), "tools");
         let mut world = World::new(1);
         let mut player = Player::new(glam::DVec3::ZERO);
-        let mut tick = |mods: &mut Mods| mods.update(&mut ModContext::new(&mut player, &mut world));
-        tick(&mut mods);
+        let mut tick = |modules: &mut Modules| modules.update(&mut ModuleContext::new(&mut player, &mut world));
+        tick(&mut modules);
         assert_eq!(calls.get(), 1);
-        let generation = mods.action_generation();
-        suspend(&mut mods, &["pwc.dev-toolkit"]);
-        assert!(!mods.is_active(0) && mods.is_active(1));
-        assert_eq!(mods.suspended(), ["pwc.dev-toolkit"]);
-        assert_ne!(mods.action_generation(), generation, "the input table rebuilds once");
-        tick(&mut mods);
-        assert_eq!(calls.get(), 1, "a suspended mod's update does not run");
-        mods.install_from(Some("pwc.dev-toolkit"), Box::new(Stub::new("late")));
-        assert!(!mods.is_active(2), "a later mod of a suspended package starts suspended");
-        mods.resume_packages();
-        assert!(mods.is_active(0) && mods.is_active(2));
-        assert!(mods.suspended().is_empty());
-        tick(&mut mods);
+        let generation = modules.action_generation();
+        suspend(&mut modules, &["pwc.dev-toolkit"]);
+        assert!(!modules.is_active(0) && modules.is_active(1));
+        assert_eq!(modules.suspended(), ["pwc.dev-toolkit"]);
+        assert_ne!(modules.action_generation(), generation, "the input table rebuilds once");
+        tick(&mut modules);
+        assert_eq!(calls.get(), 1, "a suspended module's update does not run");
+        modules.install_from(Some("pwc.dev-toolkit"), Box::new(Stub::new("late")));
+        assert!(!modules.is_active(2), "a later module of a suspended package starts suspended");
+        modules.resume_packages();
+        assert!(modules.is_active(0) && modules.is_active(2));
+        assert!(modules.suspended().is_empty());
+        tick(&mut modules);
         assert_eq!(calls.get(), 2);
     }
 
     /// Bench pins stay through a server's session suspension and its end.
     #[test]
     fn pinned_packages_stay_suspended_through_a_session() {
-        let mut mods = crate::modding::testing::standard();
-        mods.pin_suspended(&["pwc.visuals".to_string()]);
-        assert_eq!(mods.visual_mask(), VisualMask::NONE);
-        suspend(&mut mods, &["pwc.hotbar", "pwc.visuals"]);
-        assert_eq!(mods.suspended(), ["pwc.visuals", "pwc.hotbar"], "pinned first, each once");
-        mods.resume_packages();
-        assert_eq!(mods.suspended(), ["pwc.visuals"]);
-        assert_eq!(mods.visual_mask(), VisualMask::NONE);
-        assert_eq!(mods.visual_packages(), ["pwc.visuals"], "the package behind every visual group, once");
+        let mut modules = crate::modules::testing::standard();
+        modules.pin_suspended(&["pwc.visuals".to_string()]);
+        assert_eq!(modules.visual_mask(), VisualMask::NONE);
+        suspend(&mut modules, &["pwc.hotbar", "pwc.visuals"]);
+        assert_eq!(modules.suspended(), ["pwc.visuals", "pwc.hotbar"], "pinned first, each once");
+        modules.resume_packages();
+        assert_eq!(modules.suspended(), ["pwc.visuals"]);
+        assert_eq!(modules.visual_mask(), VisualMask::NONE);
+        assert_eq!(modules.visual_packages(), ["pwc.visuals"], "the package behind every visual group, once");
     }
 
-    fn register_tools(r: &mut ModRegistrar) {
+    fn register_tools(r: &mut ModuleRegistrar) {
         r.add(Stub::new("tools"));
     }
 
-    fn register_hud(r: &mut ModRegistrar) {
+    fn register_hud(r: &mut ModuleRegistrar) {
         r.add(Stub::new("hud"));
     }
 
-    fn register_nothing(_: &mut ModRegistrar) {}
+    fn register_nothing(_: &mut ModuleRegistrar) {}
 
     #[test]
-    fn hello_reports_every_mod_package_that_is_not_suspended() {
-        const fn package(id: &'static str, kind: PackageKind, register: Option<fn(&mut ModRegistrar)>) -> PackageInfo {
+    fn hello_reports_every_module_package_that_is_not_suspended() {
+        const fn package(id: &'static str, kind: PackageKind, register: Option<fn(&mut ModuleRegistrar)>) -> PackageInfo {
             PackageInfo { id, name: id, version: "1.0.0", description: "", kind, dependencies: &[], register }
         }
         static PACKAGES: &[PackageInfo] = &[
             package("test.names", PackageKind::Library, None),
-            package("test.tools", PackageKind::Mod, Some(register_tools)),
-            package("test.hud", PackageKind::Mod, Some(register_hud)),
-            package("test.empty", PackageKind::Mod, Some(register_nothing)),
+            package("test.tools", PackageKind::Module, Some(register_tools)),
+            package("test.hud", PackageKind::Module, Some(register_hud)),
+            package("test.empty", PackageKind::Module, Some(register_nothing)),
             package("test.bundle", PackageKind::Bundle, None),
         ];
         let build = GameBuild::from_static("sha256:02", PACKAGES);
-        let mut mods = build.mods();
-        let report = |mods: &Mods| mods.active_package_reports(build.packages());
+        let mut modules = build.modules();
+        let report = |modules: &Modules| modules.active_package_reports(build.packages());
         let pair = |id: &str| (id.to_string(), "1.0.0".to_string());
         let all = vec![pair("test.tools"), pair("test.hud"), pair("test.empty")];
-        assert_eq!(report(&mods), all, "libraries and bundles are never reported; a mod package always is");
-        suspend(&mut mods, &["test.tools"]);
-        assert_eq!(report(&mods), all[1..], "a suspended package is not reported");
-        mods.resume_packages();
-        assert_eq!(report(&mods), all);
+        assert_eq!(report(&modules), all, "libraries and bundles are never reported; a module package always is");
+        suspend(&mut modules, &["test.tools"]);
+        assert_eq!(report(&modules), all[1..], "a suspended package is not reported");
+        modules.resume_packages();
+        assert_eq!(report(&modules), all);
     }
 
-    /// A mod that asks for the keyboard on its action and logs what it types and is told.
+    /// A module that asks for the keyboard on its action and logs what it types and is told.
     struct Typist {
         id: &'static str,
         log: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
         shows: bool,
     }
 
-    impl Mod for Typist {
+    impl Module for Typist {
         fn name(&self) -> &str {
             self.id
         }
@@ -1261,18 +1266,18 @@ mod tests {
         }
     }
 
-    fn typists(shows: bool) -> (Mods, std::rc::Rc<std::cell::RefCell<Vec<String>>>) {
+    fn typists(shows: bool) -> (Modules, std::rc::Rc<std::cell::RefCell<Vec<String>>>) {
         let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-        let mut mods = Mods::empty();
+        let mut modules = Modules::empty();
         for (id, package) in [("a", "test.a"), ("b", "test.b")] {
-            mods.install_from(Some(package), Box::new(Typist { id, log: log.clone(), shows }));
+            modules.install_from(Some(package), Box::new(Typist { id, log: log.clone(), shows }));
         }
-        (mods, log)
+        (modules, log)
     }
 
-    /// Run one frame of `mods` with `action` fired and `text` typed (as the core would pass it:
+    /// Run one frame of `modules` with `action` fired and `text` typed (as the core would pass it:
     /// only while a capture was held when the input was read).
-    fn frame(mods: &mut Mods, action: bool, text: Option<TextFrame<'_>>) {
+    fn frame(modules: &mut Modules, action: bool, text: Option<TextFrame<'_>>) {
         let mut world = World::new(1);
         let mut player = Player::new(glam::DVec3::ZERO);
         let (mut settings, mut sky) = (Settings::default(), crate::sky::Sky::new());
@@ -1281,37 +1286,37 @@ mod tests {
         if action {
             ctx.set_action("open");
         }
-        mods.on_frame(&mut ctx);
+        modules.on_frame(&mut ctx);
     }
 
     #[test]
-    fn the_keyboard_belongs_to_the_first_mod_that_asks_until_escape() {
-        let (mut mods, log) = typists(false);
-        assert!(!mods.text_captured());
-        frame(&mut mods, true, None);
-        assert!(mods.text_captured());
+    fn the_keyboard_belongs_to_the_first_module_that_asks_until_escape() {
+        let (mut modules, log) = typists(false);
+        assert!(!modules.text_captured());
+        frame(&mut modules, true, None);
+        assert!(modules.text_captured());
         assert_eq!(log.take(), ["a open true", "b open false"], "the first asker holds it; the second is refused");
 
         let typed = ['h', 'i'];
-        frame(&mut mods, false, Some(TextFrame { chars: &typed, edit: None, escape: false }));
+        frame(&mut modules, false, Some(TextFrame { chars: &typed, edit: None, escape: false }));
         assert_eq!(log.take(), ["a typed hi esc=false"], "only the holder sees the typing");
 
-        frame(&mut mods, false, Some(TextFrame { chars: &[], edit: None, escape: true }));
+        frame(&mut modules, false, Some(TextFrame { chars: &[], edit: None, escape: true }));
         assert_eq!(log.take(), ["a typed  esc=true"], "the holder sees Escape once");
-        assert!(!mods.text_captured(), "Escape ends the capture");
+        assert!(!modules.text_captured(), "Escape ends the capture");
 
-        frame(&mut mods, true, None);
-        assert!(mods.text_captured());
-        mods.reset_state();
-        assert!(!mods.text_captured(), "a new world starts with the keyboard free");
-        frame(&mut mods, true, None);
-        suspend(&mut mods, &["test.a"]);
-        frame(&mut mods, false, None);
-        assert!(!mods.text_captured(), "a holder whose package was suspended loses the keyboard");
+        frame(&mut modules, true, None);
+        assert!(modules.text_captured());
+        modules.reset_state();
+        assert!(!modules.text_captured(), "a new world starts with the keyboard free");
+        frame(&mut modules, true, None);
+        suspend(&mut modules, &["test.a"]);
+        frame(&mut modules, false, None);
+        assert!(!modules.text_captured(), "a holder whose package was suspended loses the keyboard");
     }
 
     #[test]
-    fn messages_reach_every_active_mod_and_say_whether_one_showed_them() {
+    fn messages_reach_every_active_module_and_say_whether_one_showed_them() {
         let notice = Notice { level: NoticeLevel::Info, text: "saved".into() };
         let (mut quiet, log) = typists(false);
         assert!(!quiet.on_message(&Message::Notice(&notice)), "nobody showed it: the core logs it");
@@ -1319,7 +1324,7 @@ mod tests {
         let (mut shown, _) = typists(true);
         suspend(&mut shown, &["test.b"]);
         assert!(shown.on_message(&Message::Notice(&notice)));
-        assert!(!Mods::empty().on_message(&Message::Joined { name: "x" }));
+        assert!(!Modules::empty().on_message(&Message::Joined { name: "x" }));
     }
 
     /// The settings count as changed only when a hook changed a value, not when it looked.
@@ -1387,14 +1392,14 @@ mod tests {
         assert!(!flush.poll(10 + Debounce::IDLE_MS));
     }
 
-    /// A worldgen mod with one option: it reads the value in `on_options` and builds its payload
+    /// A worldgen module with one option: it reads the value in `on_options` and builds its payload
     /// from it, so a change reaches the next new world.
     struct Knobbed {
         relief_id: crate::settings::OptionId,
         relief: i32,
     }
 
-    impl Mod for Knobbed {
+    impl Module for Knobbed {
         fn id(&self) -> &'static str {
             "knobbed"
         }
@@ -1409,54 +1414,54 @@ mod tests {
         }
     }
 
-    fn register_knobbed(r: &mut ModRegistrar) {
+    fn register_knobbed(r: &mut ModuleRegistrar) {
         use crate::settings::{Category, OptionSpec};
         let relief_id = r.option(OptionSpec::percent("relief", "Relief", Category::World, (25, 300, 25), 100).next_world());
         r.add(Knobbed { relief_id, relief: 0 });
     }
 
     #[test]
-    fn a_package_option_reaches_its_mod_and_the_next_new_world() {
+    fn a_package_option_reaches_its_module_and_the_next_new_world() {
         use crate::settings::{Applies, OptionValue};
         static PACKAGES: &[PackageInfo] = &[PackageInfo {
             id: "test.worldgen",
             name: "Worldgen",
             version: "1.0.0",
             description: "",
-            kind: PackageKind::Mod,
+            kind: PackageKind::Module,
             dependencies: &[],
             register: Some(register_knobbed),
         }];
         let mut options = Options::new();
-        let mut mods = Mods::from_build(&GameBuild::from_static("sha256:03", PACKAGES), &mut options);
-        assert_eq!(mods.worldgen_config().as_deref(), Some("relief=100"), "registration ends with the defaults delivered");
+        let mut modules = Modules::from_build(&GameBuild::from_static("sha256:03", PACKAGES), &mut options);
+        assert_eq!(modules.worldgen_config().as_deref(), Some("relief=100"), "registration ends with the defaults delivered");
         let id = options.find("test.worldgen.relief").expect("declared under the package id");
         assert_eq!(options.spec(id).applies, Applies::NextWorld);
         assert_eq!(options.owner(id), "test.worldgen");
         assert!(options.set(id, OptionValue::Int(175)));
-        assert_eq!(mods.worldgen_config().as_deref(), Some("relief=100"), "the mod hears at the next fan-out");
-        mods.suspend_packages(&["test.worldgen".to_string()]);
-        mods.options_changed(&options);
-        mods.resume_packages();
-        assert_eq!(mods.worldgen_config().as_deref(), Some("relief=175"), "suspended mods hear too");
+        assert_eq!(modules.worldgen_config().as_deref(), Some("relief=100"), "the module hears at the next fan-out");
+        modules.suspend_packages(&["test.worldgen".to_string()]);
+        modules.options_changed(&options);
+        modules.resume_packages();
+        assert_eq!(modules.worldgen_config().as_deref(), Some("relief=175"), "suspended modules hear too");
     }
 
-    /// Every host change a mods screen can show moves the revision; reading does not.
+    /// Every host change a modules screen can show moves the revision; reading does not.
     #[test]
-    fn revision_moves_with_what_a_mods_screen_lists() {
-        let mut mods = crate::modding::testing::standard();
-        let mut last = mods.revision();
-        let _ = (mods.visual_mask(), mods.suspended(), mods.worldgen_config());
-        assert_eq!(mods.revision(), last, "reads");
-        let mut moved = |mods: &Mods, what: &str| {
-            assert_ne!(mods.revision(), last, "{what}");
-            last = mods.revision();
+    fn revision_moves_with_what_a_modules_screen_lists() {
+        let mut modules = crate::modules::testing::standard();
+        let mut last = modules.revision();
+        let _ = (modules.visual_mask(), modules.suspended(), modules.worldgen_config());
+        assert_eq!(modules.revision(), last, "reads");
+        let mut moved = |modules: &Modules, what: &str| {
+            assert_ne!(modules.revision(), last, "{what}");
+            last = modules.revision();
         };
-        suspend(&mut mods, &["pwc.visuals"]);
-        moved(&mods, "a suspension");
-        mods.resume_packages();
-        moved(&mods, "a resume");
-        mods.install(Box::new(Stub::new("extra")));
-        moved(&mods, "an install");
+        suspend(&mut modules, &["pwc.visuals"]);
+        moved(&modules, "a suspension");
+        modules.resume_packages();
+        moved(&modules, "a resume");
+        modules.install(Box::new(Stub::new("extra")));
+        moved(&modules, "an install");
     }
 }

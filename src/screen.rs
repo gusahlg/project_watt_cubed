@@ -1,4 +1,4 @@
-//! The screen host: every menu is a mod, and the core only hosts them.
+//! The screen host: every menu is a module, and the core only hosts them.
 //!
 //! A [`Screen`] reads the core's raw menu input and the [`ScreenFacts`], and answers with a
 //! [`ScreenOutcome`]: stay, go back, push another screen, open a registered entry, or ask the core
@@ -6,17 +6,17 @@
 //! core renders with a closed primitive renderer: a screen never touches the frame.
 //!
 //! Screens reach the player through two slots and an entry registry, so no menu names another:
-//! - the **root** slot ([`Mod::root_screen`](crate::modding::Mod::root_screen)): the screen out of
+//! - the **root** slot ([`Module::root_screen`](crate::modules::Module::root_screen)): the screen out of
 //!   a world (a start screen). It also draws the waiting page while the core connects or loads,
 //!   from [`ScreenFacts::phase`];
-//! - the **pause** slot ([`Mod::pause_screen`](crate::modding::Mod::pause_screen)): opened by Esc in a
+//! - the **pause** slot ([`Module::pause_screen`](crate::modules::Module::pause_screen)): opened by Esc in a
 //!   world once text capture and every overlay declined it. It draws over the running world, so a
 //!   pause screen paints a translucent backdrop of its own (`facts.in_world` says it is one);
-//! - **entries** ([`ModRegistrar::screen_entry`](crate::modding::ModRegistrar::screen_entry)): a
+//! - **entries** ([`ModuleRegistrar::screen_entry`](crate::modules::ModuleRegistrar::screen_entry)): a
 //!   label and an `open` function, offered in [`Places::MAIN`] and/or [`Places::PAUSE`]. A root or
 //!   pause screen lists `facts.entries_for(place)` without knowing who registered them.
 //!
-//! The first active mod that answers a slot wins. Without a root screen the core enters the most
+//! The first active module that answers a slot wins. Without a root screen the core enters the most
 //! recent world (or a new one) and Esc saves and quits; without a pause screen Esc leaves the
 //! world as it always did.
 
@@ -26,11 +26,11 @@ use voxel_engine::{Color, Frame};
 
 use crate::input::intent::{EditKey, MenuEvent};
 use crate::input::router;
-use crate::modding::{BuildInfo, VisualMask};
+use crate::modules::{BuildInfo, VisualMask};
 use crate::session::Session;
 use crate::settings::{Options, OptionsRef, OptionsView, Settings};
 
-/// The save-slot types a screen sees in [`ScreenFacts::saves`], re-exported for mods.
+/// The save-slot types a screen sees in [`ScreenFacts::saves`], re-exported for modules.
 pub use crate::save::slot::{SaveError, SaveMeta, Slot, SlotId};
 
 /// The game version a screen may show.
@@ -304,7 +304,7 @@ pub enum ScreenOutcome {
     Request(AppRequest),
 }
 
-/// One menu page or form, as a mod writes it.
+/// One menu page or form, as a module writes it.
 pub trait Screen {
     /// One frame of input. `ctx` reads the facts and changes tunables.
     fn update(&mut self, input: &MenuInput, ctx: &mut ScreenContext) -> ScreenOutcome;
@@ -439,12 +439,12 @@ mod tests {
         Scripted::boxed("settings", Vec::new())
     }
 
-    fn open_mods(_facts: &ScreenFacts) -> Box<dyn Screen> {
-        Scripted::boxed("mods", Vec::new())
+    fn open_modules(_facts: &ScreenFacts) -> Box<dyn Screen> {
+        Scripted::boxed("modules", Vec::new())
     }
 
     const ENTRIES: &[ScreenEntry] = &[
-        ScreenEntry { id: "test.mods", label: "Mods", places: Places::BOTH, order: 10, open: open_mods },
+        ScreenEntry { id: "test.modules", label: "Modules", places: Places::BOTH, order: 10, open: open_modules },
         ScreenEntry { id: "test.settings", label: "Settings", places: Places::MAIN, order: 20, open: open_settings },
     ];
 
@@ -532,8 +532,8 @@ mod tests {
         let ctx = parts.ctx();
         let main: Vec<&str> = ctx.facts.entries_for(Places::MAIN).map(|e| e.label).collect();
         let pause: Vec<&str> = ctx.facts.entries_for(Places::PAUSE).map(|e| e.label).collect();
-        assert_eq!(main, ["Mods", "Settings"]);
-        assert_eq!(pause, ["Mods"]);
+        assert_eq!(main, ["Modules", "Settings"]);
+        assert_eq!(pause, ["Modules"]);
         assert!(Places::BOTH.contains(Places::PAUSE) && !Places::MAIN.contains(Places::PAUSE));
         assert_eq!(Places::MAIN | Places::PAUSE, Places::BOTH);
         assert_eq!(ctx.facts.entry("test.settings").map(|e| e.order), Some(20));

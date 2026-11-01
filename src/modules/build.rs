@@ -1,27 +1,27 @@
 //! A build's package list: which packages are compiled into this executable, what each one is,
-//! and the registrar each mod package's entry point receives.
+//! and the registrar each module package's entry point receives.
 //!
-//! A modded PWC is an exact build: one game version plus one exact set of packages. The PWC
+//! A PWC with modules is an exact build: one game version plus one exact set of packages. The PWC
 //! builder (`pwc build`) generates a tiny crate whose `main` hands [`crate::run`] a [`GameBuild`]
-//! made by [`GameBuild::from_static`]: one [`PackageInfo`] per locked package of every kind (mods,
+//! made by [`GameBuild::from_static`]: one [`PackageInfo`] per locked package of every kind (modules,
 //! libraries and bundles), dependencies before dependents. The vanilla executable passes
 //! [`GameBuild::vanilla`]. Nothing here scans directories or loads code at run time.
 //!
 //! The list is data the builder generated. The core iterates it and names no package; packages
-//! read it through [`ModRegistrar::build`].
+//! read it through [`ModuleRegistrar::build`].
 
 use std::any::{Any, TypeId};
 use std::borrow::Cow;
 use std::collections::HashMap;
 
-use super::{Mod, Mods};
+use super::{Module, Modules};
 use crate::settings::{OptionId, OptionSpec, Options};
 
-/// What a package is: `kind` in its `mod.toml`.
+/// What a package is: `kind` in its `module.toml`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PackageKind {
-    /// Code with an entry point. Its `register` installs mods.
-    Mod,
+    /// Code with an entry point. Its `register` installs modules.
+    Module,
     /// Code other packages call. It has no entry point.
     Library,
     /// No code: a named set of packages, its dependencies.
@@ -29,60 +29,65 @@ pub enum PackageKind {
 }
 
 impl PackageKind {
-    /// The `mod.toml` spelling: `"mod"`, `"library"` or `"bundle"`.
+    /// The pre-3.4 name of [`PackageKind::Module`], so packages written before the rename compile.
+    #[doc(hidden)]
+    #[allow(non_upper_case_globals)]
+    pub const Mod: PackageKind = PackageKind::Module;
+
+    /// The `module.toml` spelling: `"module"`, `"library"` or `"bundle"`.
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Mod => "mod",
+            Self::Module => "module",
             Self::Library => "library",
             Self::Bundle => "bundle",
         }
     }
 }
 
-/// One package of a build, as the builder generated it from `mod.toml` and `pwc.lock`.
+/// One package of a build, as the builder generated it from `module.toml` and `pwc.lock`.
 /// Everything is `'static` and the value is `Copy`, so a package can keep what it needs.
 #[derive(Clone, Copy, Debug)]
 pub struct PackageInfo {
     /// The permanent, namespaced package id (`pwc.example`).
     pub id: &'static str,
-    /// Display name from `mod.toml`.
+    /// Display name from `module.toml`.
     pub name: &'static str,
     /// Exact package version.
     pub version: &'static str,
-    /// Description from `mod.toml`.
+    /// Description from `module.toml`.
     pub description: &'static str,
-    /// Mod, library or bundle.
+    /// Module, library or bundle.
     pub kind: PackageKind,
     /// Ids of the packages this one depends on directly, sorted. A bundle's are its members.
     pub dependencies: &'static [&'static str],
-    /// The entry point. The builder sets it for `kind = "mod"` packages only; packages without
+    /// The entry point. The builder sets it for `kind = "module"` packages only; packages without
     /// one are listed but install nothing.
-    pub register: Option<fn(&mut ModRegistrar)>,
+    pub register: Option<fn(&mut ModuleRegistrar)>,
 }
 
-/// One compiled-in mod package by its identity and entry point: the 2.x shorthand that
-/// [`GameBuild::with_mod`] turns into a [`PackageInfo`] of kind [`PackageKind::Mod`] with no
+/// One compiled-in module package by its identity and entry point: the 2.x shorthand that
+/// [`GameBuild::with_module`] turns into a [`PackageInfo`] of kind [`PackageKind::Module`] with no
 /// description and no dependencies. Kept so 2.x tests build unchanged; prefer [`PackageInfo`].
 #[derive(Clone, Copy, Debug)]
-pub struct ModDescriptor {
-    /// The permanent, namespaced package id from `mod.toml` (`pwc.example`).
+pub struct ModuleDescriptor {
+    /// The permanent, namespaced package id from `module.toml` (`pwc.example`).
     pub id: &'static str,
-    /// Display name from `mod.toml`.
+    /// Display name from `module.toml`.
     pub name: &'static str,
     /// Exact package version.
     pub version: &'static str,
     /// The package's `register` function.
-    pub register: fn(&mut ModRegistrar),
+    pub register: fn(&mut ModuleRegistrar),
 }
 
-impl From<ModDescriptor> for PackageInfo {
-    fn from(package: ModDescriptor) -> Self {
+impl From<ModuleDescriptor> for PackageInfo {
+    fn from(package: ModuleDescriptor) -> Self {
         Self {
             id: package.id,
             name: package.name,
             version: package.version,
             description: "",
-            kind: PackageKind::Mod,
+            kind: PackageKind::Module,
             dependencies: &[],
             register: Some(package.register),
         }
@@ -90,7 +95,7 @@ impl From<ModDescriptor> for PackageInfo {
 }
 
 /// What one build is made of: every package in registration (dependency) order, and the
-/// environment that produced them. Read-only; packages see it through [`ModRegistrar::build`].
+/// environment that produced them. Read-only; packages see it through [`ModuleRegistrar::build`].
 #[derive(Clone, Debug, Default)]
 pub struct BuildInfo {
     packages: Cow<'static, [PackageInfo]>,
@@ -149,9 +154,15 @@ impl GameBuild {
         self
     }
 
-    /// Add a mod package from its 2.x descriptor (see [`ModDescriptor`]).
-    pub fn with_mod(self, package: ModDescriptor) -> Self {
+    /// Add a module package from its 2.x descriptor (see [`ModuleDescriptor`]).
+    pub fn with_module(self, package: ModuleDescriptor) -> Self {
         self.with_package(package.into())
+    }
+
+    /// The pre-3.4 name of [`with_module`](Self::with_module).
+    #[doc(hidden)]
+    pub fn with_mod(self, package: ModuleDescriptor) -> Self {
+        self.with_module(package)
     }
 
     /// Record the environment hash of the `pwc.lock` this build was made from.
@@ -175,11 +186,11 @@ impl GameBuild {
         self.info.environment()
     }
 
-    /// Instantiate this build's mods, dropping the options they declare (tests that read options
-    /// call [`Mods::from_build`] with their own).
+    /// Instantiate this build's modules, dropping the options they declare (tests that read options
+    /// call [`Modules::from_build`] with their own).
     #[cfg(test)]
-    pub(crate) fn mods(&self) -> Mods {
-        Mods::from_build(self, &mut Options::new())
+    pub(crate) fn modules(&self) -> Modules {
+        Modules::from_build(self, &mut Options::new())
     }
 }
 
@@ -190,25 +201,25 @@ pub(super) struct Resources {
     values: HashMap<TypeId, Box<dyn Any>>,
 }
 
-/// What a package's `register` function gets: the place to install its mods, share handles with
+/// What a package's `register` function gets: the place to install its modules, share handles with
 /// the packages that depend on it, and read what the build contains.
-pub struct ModRegistrar<'a> {
+pub struct ModuleRegistrar<'a> {
     package: &'a PackageInfo,
     build: &'a BuildInfo,
-    mods: &'a mut Mods,
+    modules: &'a mut Modules,
     options: &'a mut Options,
     resources: &'a mut Resources,
 }
 
-impl<'a> ModRegistrar<'a> {
+impl<'a> ModuleRegistrar<'a> {
     pub(super) fn new(
         package: &'a PackageInfo,
         build: &'a BuildInfo,
-        mods: &'a mut Mods,
+        modules: &'a mut Modules,
         options: &'a mut Options,
         resources: &'a mut Resources,
     ) -> Self {
-        Self { package, build, mods, options, resources }
+        Self { package, build, modules, options, resources }
     }
 
     /// The package being registered.
@@ -222,17 +233,17 @@ impl<'a> ModRegistrar<'a> {
         self.build
     }
 
-    /// Install a mod. It runs for as long as the build has it, unless the core suspends this
+    /// Install a module. It runs for as long as the build has it, unless the core suspends this
     /// package for a session.
-    pub fn add(&mut self, module: impl Mod + 'static) {
-        self.mods.install_from(Some(self.package.id), Box::new(module));
+    pub fn add(&mut self, module: impl Module + 'static) {
+        self.modules.install_from(Some(self.package.id), Box::new(module));
     }
 
     /// Declare one tunable of this package in the core's options registry, and get the index
     /// its value is read by ([`Options::bool`](crate::settings::Options::bool), `int`, `float`,
     /// `choice`). It persists in `settings.cfg` as `<package-id>.<key>=`, and any settings screen
     /// lists it on `spec.page` without knowing this package. Read it in
-    /// [`Mod::on_options`](super::Mod::on_options).
+    /// [`Module::on_options`](super::Module::on_options).
     pub fn option(&mut self, spec: OptionSpec) -> OptionId {
         self.options.declare(self.package.id, spec)
     }
@@ -241,13 +252,13 @@ impl<'a> ModRegistrar<'a> {
     /// pause screen: a root or pause screen lists the entries for its place without knowing this
     /// package. See [`crate::screen`].
     pub fn screen_entry(&mut self, entry: crate::screen::ScreenEntry) {
-        self.mods.add_entry_from(Some(self.package.id), entry);
+        self.modules.add_entry_from(Some(self.package.id), entry);
     }
 
     /// Register a command-line entry point. The first registration of a name wins. `help` and
     /// `--commands` stay reserved and list every registered command.
     pub fn cli(&mut self, cli: super::cli::Cli) {
-        self.mods.add_cli(cli);
+        self.modules.add_cli(cli);
     }
 
     /// Share a value with the packages registered after this one (handles are usually `Rc`s).
@@ -267,17 +278,17 @@ mod tests {
     use std::cell::RefCell;
 
     use super::*;
-    use crate::modding::testing::Stub;
+    use crate::modules::testing::Stub;
 
     #[derive(Clone)]
     struct Shared(u32);
 
-    fn provider(r: &mut ModRegistrar) {
+    fn provider(r: &mut ModuleRegistrar) {
         r.provide(Shared(7));
         r.add(Stub::new("first"));
     }
 
-    fn consumer(r: &mut ModRegistrar) {
+    fn consumer(r: &mut ModuleRegistrar) {
         let shared = r.get::<Shared>().expect("the dependency provided it");
         assert_eq!(shared.0, 7);
         r.add(Stub::new("second"));
@@ -286,16 +297,16 @@ mod tests {
     #[test]
     fn packages_register_in_order_and_share_resources() {
         let build = GameBuild::new()
-            .with_mod(ModDescriptor { id: "test.provider", name: "Provider", version: "1.0.0", register: provider })
-            .with_mod(ModDescriptor { id: "test.consumer", name: "Consumer", version: "1.0.0", register: consumer })
+            .with_module(ModuleDescriptor { id: "test.provider", name: "Provider", version: "1.0.0", register: provider })
+            .with_module(ModuleDescriptor { id: "test.consumer", name: "Consumer", version: "1.0.0", register: consumer })
             .with_environment("sha256:00");
-        let mods = build.mods();
-        assert_eq!(mods.len(), 2);
-        assert_eq!((mods.id(0), mods.package(0)), ("first", Some("test.provider")));
-        assert_eq!((mods.id(1), mods.package(1), mods.is_active(1)), ("second", Some("test.consumer"), true));
+        let modules = build.modules();
+        assert_eq!(modules.len(), 2);
+        assert_eq!((modules.id(0), modules.package(0)), ("first", Some("test.provider")));
+        assert_eq!((modules.id(1), modules.package(1), modules.is_active(1)), ("second", Some("test.consumer"), true));
         assert_eq!(build.environment(), Some("sha256:00"));
         let kinds: Vec<PackageKind> = build.packages().iter().map(|p| p.kind).collect();
-        assert_eq!(kinds, [PackageKind::Mod, PackageKind::Mod], "a 2.x descriptor is a mod package");
+        assert_eq!(kinds, [PackageKind::Module, PackageKind::Module], "a 2.x descriptor is a module package");
     }
 
     #[test]
@@ -303,7 +314,7 @@ mod tests {
         for build in [GameBuild::vanilla(), GameBuild::new()] {
             assert!(build.packages().is_empty());
             assert_eq!(build.environment(), None);
-            assert!(build.mods().is_empty());
+            assert!(build.modules().is_empty());
         }
     }
 
@@ -314,13 +325,13 @@ mod tests {
         static SEEN: RefCell<Seen> = const { RefCell::new(Vec::new()) };
     }
 
-    fn probe(r: &mut ModRegistrar) {
+    fn probe(r: &mut ModuleRegistrar) {
         let listed = r.build().packages().iter().map(|p| (p.id, p.kind)).collect();
         SEEN.with(|s| s.borrow_mut().push((r.package().id, listed)));
         r.add(Stub::new(r.package().name));
     }
 
-    /// A build as the builder generates it: a library, two mods and a bundle, in registration
+    /// A build as the builder generates it: a library, two modules and a bundle, in registration
     /// order, in a `static`.
     static GENERATED: &[PackageInfo] = &[
         PackageInfo {
@@ -337,7 +348,7 @@ mod tests {
             name: "alpha",
             version: "1.2.0",
             description: "Needs the names.",
-            kind: PackageKind::Mod,
+            kind: PackageKind::Module,
             dependencies: &["test.names"],
             register: Some(probe),
         },
@@ -346,7 +357,7 @@ mod tests {
             name: "beta",
             version: "0.1.0",
             description: "",
-            kind: PackageKind::Mod,
+            kind: PackageKind::Module,
             dependencies: &[],
             register: Some(probe),
         },
@@ -354,7 +365,7 @@ mod tests {
             id: "test.bundle",
             name: "Bundle",
             version: "2.0.0",
-            description: "Both mods.",
+            description: "Both modules.",
             kind: PackageKind::Bundle,
             dependencies: &["test.alpha", "test.beta"],
             register: None,
@@ -365,16 +376,16 @@ mod tests {
     fn a_generated_build_registers_only_entry_points_and_every_package_sees_the_whole_list() {
         let build = GameBuild::from_static("sha256:01", GENERATED);
         SEEN.with(|s| s.borrow_mut().clear());
-        let mods = build.mods();
+        let modules = build.modules();
         let all = vec![
             ("test.names", PackageKind::Library),
-            ("test.alpha", PackageKind::Mod),
-            ("test.beta", PackageKind::Mod),
+            ("test.alpha", PackageKind::Module),
+            ("test.beta", PackageKind::Module),
             ("test.bundle", PackageKind::Bundle),
         ];
         let seen = SEEN.with(|s| s.take());
         assert_eq!(seen, [("test.alpha", all.clone()), ("test.beta", all)], "the library and bundle register nothing");
-        assert_eq!((mods.len(), mods.id(0), mods.package(1)), (2, "alpha", Some("test.beta")));
+        assert_eq!((modules.len(), modules.id(0), modules.package(1)), (2, "alpha", Some("test.beta")));
         assert_eq!(build.environment(), Some("sha256:01"));
         assert!(std::ptr::eq(build.packages(), GENERATED), "a generated list is borrowed, not copied");
 
@@ -393,7 +404,7 @@ mod tests {
 
     #[test]
     fn kinds_spell_like_the_manifest() {
-        let spelled = [PackageKind::Mod, PackageKind::Library, PackageKind::Bundle].map(PackageKind::as_str);
-        assert_eq!(spelled, ["mod", "library", "bundle"]);
+        let spelled = [PackageKind::Module, PackageKind::Library, PackageKind::Bundle].map(PackageKind::as_str);
+        assert_eq!(spelled, ["module", "library", "bundle"]);
     }
 }

@@ -18,7 +18,7 @@ pub use crate::benchmark::StreamPeaks;
 use crate::benchmark::percentile;
 use crate::camera::CameraPose;
 use crate::game::{DebugView, Game, SKY_KEY, TERRAIN_KEY};
-use crate::modding::{GameBuild, Mods};
+use crate::modules::{GameBuild, Modules};
 use crate::settings::Settings;
 use crate::world::{RemeshDistribution, StreamGauges};
 
@@ -676,7 +676,7 @@ fn execute(stages: Vec<Stage>, build: &GameBuild) -> Outcomes {
         return Outcomes::default();
     }
     let mut options = crate::settings::Options::new();
-    let mut mods = Mods::from_build(build, &mut options);
+    let mut modules = Modules::from_build(build, &mut options);
     let mut settings = Settings::default();
     // Update requires a router even though scripted games consume no live input.
     let mut router = crate::input::router::Router::new();
@@ -755,7 +755,7 @@ fn execute(stages: Vec<Stage>, build: &GameBuild) -> Outcomes {
         g.update(
             eng,
             &mut router,
-            &mut mods,
+            &mut modules,
             &mut settings,
             &mut options,
             &mut sound,
@@ -764,7 +764,7 @@ fn execute(stages: Vec<Stage>, build: &GameBuild) -> Outcomes {
         );
         // Shake 0: captures must be deterministic (no live trauma exists in the
         // scripted path anyway).
-        g.draw(eng, &mut mods, settings.fov, 0.0, &[]);
+        g.draw(eng, &mut modules, settings.fov, 0.0, &[]);
 
         // A live stress run owns its stage's frames from here: it deliberately
         // flies THROUGH the un-entry states the gate below waits out, so it
@@ -1311,7 +1311,7 @@ fn carve_cave(game: &mut Game) {
 }
 
 /// The `golden` command for one build: check (or, with a `bless` argument, regenerate) the
-/// golden-shot acceptance set of `build`'s mods. The vanilla `golden` binary and every
+/// golden-shot acceptance set of `build`'s modules. The vanilla `golden` binary and every
 /// `pwc`-generated instance (`pwc-golden`) call this. Exits the process with status 1 when a
 /// criterion fails.
 pub fn golden_main(build: GameBuild) {

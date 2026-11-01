@@ -26,9 +26,9 @@ This includes:
 
 Since the game is about people, coöperation, and having fun together, the community around the game should play a major role.
 
-## Modding and Customisation
+## Modules and Customisation
 
-Every part of the game should be built with modding and customization in mind.
+Every part of the game should be built with modules and customization in mind.
 
 This means that the power of a passionate community can be used to create a huge number of solutions, allowing every player
 to find a UI, feature, or playstyle that fits them perfectly — or to easily make their own.

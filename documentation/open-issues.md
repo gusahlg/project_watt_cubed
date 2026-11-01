@@ -34,3 +34,9 @@ the rest of it described code that no longer exists; it remains in git history.
   to say when it is quiescent.
 - **A tool use consults the model before the edit policy.** A stateful model keeps whatever it changed when the
   policy then denies the edit; the policy should decide first.
+
+## Headless client (0.7.0)
+- **`headless::tests::two_clients_walk_break_place_and_leave` is intermittent under a loaded full test run.** The
+  breaking client sees its edit and the confirmation, but the second client reports no `WorldChanged` within 8 s;
+  run alone it passes. Suspect the second client receiving the edit before its mirror holds that chunk, so the
+  change is applied without an event.

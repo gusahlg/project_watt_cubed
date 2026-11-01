@@ -319,7 +319,7 @@ impl SoundSystem {
         }
     }
 
-    /// The loaded catalog. Mods resolve cue names through the audio service.
+    /// The loaded catalog. Modules resolve cue names through the audio service.
     pub fn catalog(&self) -> &Catalog {
         &self.catalog
     }
@@ -860,7 +860,7 @@ impl SoundSystem {
         self.mix
     }
 
-    /// A recording backend plus an in-memory catalog. Mod tests drive this; the game does not.
+    /// A recording backend plus an in-memory catalog. Module tests drive this; the game does not.
     pub(crate) fn assemble_recording(
         backend: Box<dyn Backend>,
         catalog: Catalog,
@@ -1502,7 +1502,7 @@ mod seam_tests {
     #[test]
     fn live_sources_block_the_service_skip() {
         use crate::audio::AudioService;
-        use crate::modding::Notices;
+        use crate::modules::Notices;
         use crate::world::World;
 
         let (mut sound, syms, _rec) = system(32);

@@ -193,8 +193,8 @@ pub(super) fn handshake(
             reject(rt, &mut send, &conn, &reason);
             return Ok(None);
         }
-        Err(HelloFail::Mods(ids)) => {
-            deny_mods(rt, &mut send, &conn, ids);
+        Err(HelloFail::Modules(ids)) => {
+            deny_modules(rt, &mut send, &conn, ids);
             return Ok(None);
         }
     };
@@ -205,12 +205,12 @@ pub(super) fn handshake(
 
 pub(super) enum HelloFail {
     Reject(String),
-    Mods(Vec<ModId>),
+    Modules(Vec<ModuleId>),
 }
 
 /// Protocol number first, then the content parts. A tag or version mismatch is
 /// named without decoding the rest of the payload (a v12 `Hello` is a different shape).
-/// Password is checked before the mod list, so a scanner without the password
+/// Password is checked before the module list, so a scanner without the password
 /// learns nothing about the whitelist.
 pub(super) fn hello_name(frame: &[u8], ctx: &Ctx) -> Result<Arc<str>, HelloFail> {
     let protocol = match protocol::peek_hello(frame) {
@@ -224,7 +224,7 @@ pub(super) fn hello_name(frame: &[u8], ctx: &Ctx) -> Result<Arc<str>, HelloFail>
         )));
     }
     match ClientMessage::decode(frame) {
-        Some(ClientMessage::Hello { worldgen, gravity, law, palette, simulation, name, password, mods, .. }) => {
+        Some(ClientMessage::Hello { worldgen, gravity, law, palette, simulation, name, password, modules, .. }) => {
             let client = crate::net::ContentId { worldgen, gravity, law, palette, simulation };
             if let Some(why) = crate::net::content_mismatch(ctx.content, client) {
                 return Err(HelloFail::Reject(why));
@@ -232,9 +232,9 @@ pub(super) fn hello_name(frame: &[u8], ctx: &Ctx) -> Result<Arc<str>, HelloFail>
             if *password != *ctx.password {
                 return Err(HelloFail::Reject("wrong password".into()));
             }
-            let refused = refused_mods(ctx, &mods);
+            let refused = refused_modules(ctx, &modules);
             if !refused.is_empty() {
-                return Err(HelloFail::Mods(refused));
+                return Err(HelloFail::Modules(refused));
             }
             Ok(name)
         }
@@ -244,13 +244,13 @@ pub(super) fn hello_name(frame: &[u8], ctx: &Ctx) -> Result<Arc<str>, HelloFail>
 
 /// Allow list (when set) admits only those ids. Deny always refuses. An id in
 /// both is refused. Ids match the registered package id, case-sensitive.
-pub(super) fn refused_mods(ctx: &Ctx, mods: &[ModOffer]) -> Vec<ModId> {
+pub(super) fn refused_modules(ctx: &Ctx, modules: &[ModuleOffer]) -> Vec<ModuleId> {
     let mut refused = Vec::new();
-    for offer in mods {
+    for offer in modules {
         let id = offer.id.as_str();
-        let denied = ctx.mods_deny.iter().any(|d| d == id);
-        let blocked = !ctx.mods_allow.is_empty() && !ctx.mods_allow.iter().any(|a| a == id);
-        if (denied || blocked) && !refused.iter().any(|have: &ModId| have.as_str() == id) {
+        let denied = ctx.modules_deny.iter().any(|d| d == id);
+        let blocked = !ctx.modules_allow.is_empty() && !ctx.modules_allow.iter().any(|a| a == id);
+        if (denied || blocked) && !refused.iter().any(|have: &ModuleId| have.as_str() == id) {
             refused.push(offer.id.clone());
         }
     }
@@ -470,10 +470,10 @@ pub(super) fn reject(rt: &Runtime, send: &mut SendStream, conn: &quinn::Connecti
     println!("[x] rejected a connection: {}", console_text(reason));
 }
 
-pub(super) fn deny_mods(rt: &Runtime, send: &mut SendStream, conn: &quinn::Connection, ids: Vec<ModId>) {
+pub(super) fn deny_modules(rt: &Runtime, send: &mut SendStream, conn: &quinn::Connection, ids: Vec<ModuleId>) {
     let listed = ids.iter().map(|id| console_text(id)).collect::<Vec<_>>().join(", ");
-    refuse(rt, send, conn, &ServerMessage::ModsDenied { ids });
-    println!("[x] refused mods: {listed}");
+    refuse(rt, send, conn, &ServerMessage::ModulesDenied { ids });
+    println!("[x] refused modules: {listed}");
 }
 
 /// Send the last word of a refused connection and close the stream. QUIC (unlike TCP) can
