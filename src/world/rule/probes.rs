@@ -15,6 +15,8 @@ use crate::world::fixtures::round_world;
 use crate::world::streaming::headless::{step, step_finished};
 
 const OWNER_SEED: i64 = 1_791_184_794_939_118_871;
+/// The owner's seed of the cruise crash and the break freeze (2026-10-11 and -12).
+const CRASH_SEED: i64 = 1_791_736_458_871_982_043;
 const OWNER_EYE: DVec3 = DVec3::new(-19.1, 390.8, -0.6);
 
 /// The start world of `seed` at the owner's view.
@@ -600,6 +602,107 @@ fn flying_never_overlaps_or_bares_and_settles() {
     assert_eq!(audit_cut(&world, eye).coarser, 0, "stopped: tiles coarser than their distance");
 }
 
+/// Levels too coarse: for each drawn far tile, how many levels finer the rule would draw at the
+/// tile's distance (each finer level judged at the tile's own nearest point with half the span, an
+/// estimate within a level). Returns the most levels any drawn tile is too coarse, and how many
+/// drawn tiles are two or more levels too coarse.
+fn too_coarse(world: &World, eye: DVec3) -> (i8, usize) {
+    let cell = PhysBox::eye_cell(eye);
+    let (mut worst, mut count) = (0i8, 0usize);
+    for s in drawn(world) {
+        let rule = rule_of(world, s.body);
+        let Some(b) = world.node_box(s) else { continue };
+        let d = b.dist_box(&cell);
+        let (mut e, mut span) = (0i8, b.span);
+        while rule.splits(s.detail.0 - e, d, span) {
+            e += 1;
+            span /= 2.0;
+        }
+        worst = worst.max(e);
+        count += usize::from(e >= 2);
+    }
+    (worst, count)
+}
+
+/// Flying low over the start world at the owner's view (render distance 20, vertical 10), the
+/// workers racing the flight: how much coarser than the rule the drawn far field gets (see
+/// [`too_coarse`]). A report, not a gate: the race depends on the machine, and `quadtree`'s tests
+/// pin the stand-in rule. On 2026-10-12 the topmost Ready ancestor stood in for a tile still being
+/// built, 6 levels too coarse on most passes at 100 m/s; the nearest one is 1 level at 100 m/s, and
+/// 2 to 4 at 1000 m/s while the ancestors between are still being built.
+/// `cargo test --release --lib lod_flight_cover_coarseness -- --ignored --nocapture --test-threads 1`
+#[test]
+#[ignore]
+fn lod_flight_cover_coarseness() {
+    for speed in [100.0, 300.0, 1_000.0] {
+        let mut world = view_of(42, 20, 10);
+        world.section_pyramid.unit = world.view.lod_unit();
+        let spawn = world.chart_spawn().expect("charted");
+        let centre = world.generator.cosmos().expect("cosmos").home().centre_f();
+        let from = spawn - centre;
+        let radius = from.length();
+        let start = world.home_eye(from, 30.0);
+        world.prepare_around(start);
+        world.drive_spawn_ready();
+        settle(&mut world, start);
+        let (mut worst, mut bad, mut most) = (0i8, 0usize, 0usize);
+        let passes = 360;
+        for k in 1..=passes {
+            let eye = arc_eye(&world, from, DVec3::X, speed / 60.0 * f64::from(k) / radius, 30.0);
+            step(&mut world, eye);
+            let (w, n) = too_coarse(&world, eye);
+            worst = worst.max(w);
+            bad += usize::from(n > 0);
+            most = most.max(n);
+        }
+        println!("{speed} m/s: the worst drawn tile {worst} levels too coarse; {bad} of {passes} passes draw a tile two or more too coarse (at most {most} in a pass)");
+    }
+}
+
+/// Freeze repro (owner, 2026-10-12): breaking a block on another body froze the game. On every
+/// body of the crash seed, under where `/cruise off` lands, the main thread's cost of one break:
+/// the edit itself (gravity, overlay, dirty sections) and the edit overlay it queues.
+/// `cargo test --release --lib edit_costs_on_every_body -- --ignored --nocapture --test-threads 1`
+#[test]
+#[ignore]
+fn edit_costs_on_every_body() {
+    use voxel_engine::producer::{Budget, Progress};
+    let mut bodies = usize::MAX;
+    for body in 0.. {
+        if body >= bodies {
+            break;
+        }
+        let mut world = view_of(CRASH_SEED, 20, 10);
+        bodies = world.generator.cosmos().expect("a cosmos").bodies().len();
+        let land = cruise_off_point(&world, body);
+        let Some(storage) = world.chart_eye(land) else {
+            println!("body {body:>2}: not on a chart");
+            continue;
+        };
+        // A chart's storage +Y is its up.
+        let (x, z) = (storage.x.floor() as i32, storage.z.floor() as i32);
+        let top = world.generator.surface(Face::PosY, x, z);
+        if top == i32::MIN {
+            println!("body {body:>2}: no ground under ({x}, {z})");
+            continue;
+        }
+        let y = top - 1;
+        let chunk = World::chunk_of(x, y, z);
+        world.ensure_data(chunk);
+        let t = std::time::Instant::now();
+        world.set_block(x, y, z, crate::block::registry::AIR);
+        let edit = t.elapsed();
+        let (dirty, t) = (world.section_overlay_dirty.len(), std::time::Instant::now());
+        while !matches!(world.refresh_section_overlay(Budget::Millis(1.0e9)), Progress::Idle) {}
+        let overlay = t.elapsed();
+        println!(
+            "body {body:>2}: break at ({x}, {y}, {z}): edit {:.1} ms, overlay {:.1} ms over {dirty} tiles",
+            edit.as_secs_f64() * 1e3,
+            overlay.as_secs_f64() * 1e3
+        );
+    }
+}
+
 /// Settled at spawn (render distance 6) and on a flat world, every level from two above the finest
 /// to the next-to-coarsest morphs over a band that starts past where the finer level reaches and
 /// ends short of where the coarser one begins; the coarsest level does not morph and is meshed
@@ -682,6 +785,15 @@ fn lod_rule_memory_census() {
     }
 }
 
+/// Where `/cruise off` lands beside body `body`: clear of the ground, on the side facing the start
+/// world (over the start world itself, along +Y).
+fn cruise_off_point(world: &World, body: usize) -> DVec3 {
+    let bodies = world.generator.cosmos().expect("a cosmos").bodies();
+    let (start, b) = (bodies[0].centre_f(), bodies[body]);
+    let dir = if body == 0 { DVec3::Y } else { (start - b.centre_f()).normalize_or(DVec3::Y) };
+    world.clear_of_ground(b.centre_f() + dir * b.reach())
+}
+
 /// Every pass from landing beside body `body` of `seed` the way `/cruise off` does (clear of the
 /// ground, on the side facing the start world, then `prepare_around`), at render distance `h`/`v`
 /// with LOD on: `(wall, cpu, phases)` for each of the first `passes` passes, the workers running.
@@ -692,10 +804,9 @@ fn landing_passes(seed: i64, body: usize, tp: bool, h: i32, v: i32, passes: usiz
     let mut world = round_world(seed, render);
     world.set_view_distances(h, v);
     world.section_pyramid.unit = world.view.lod_unit();
-    let bodies = world.generator.cosmos().expect("a cosmos").bodies().to_vec();
-    let (start, b) = (bodies[0].centre_f(), bodies[body]);
     let land = if tp {
         // `/tp <name>`: 2 000 blocks over the datum along +Y.
+        let b = world.generator.cosmos().expect("a cosmos").bodies()[body];
         let top = match b.shape {
             crate::world::terrain::cosmos::Shape::Cube { half } => half,
             crate::world::terrain::cosmos::Shape::Ball { r } => r,
@@ -703,8 +814,7 @@ fn landing_passes(seed: i64, body: usize, tp: bool, h: i32, v: i32, passes: usiz
         };
         b.centre_f() + DVec3::new(0.0, top as f64 + 2000.0, 0.0)
     } else {
-        let dir = if body == 0 { DVec3::Y } else { (start - b.centre_f()).normalize_or(DVec3::Y) };
-        world.clear_of_ground(b.centre_f() + dir * b.reach())
+        cruise_off_point(&world, body)
     };
     world.prepare_around(land);
     let mut out = Vec::with_capacity(passes);
@@ -728,12 +838,11 @@ fn landing_passes(seed: i64, body: usize, tp: bool, h: i32, v: i32, passes: usiz
 #[test]
 #[ignore]
 fn cruise_landing_pass_costs() {
-    const SEED: i64 = 1_791_736_458_871_982_043;
-    let n = round_world(SEED, RenderConfig::default()).generator.cosmos().expect("a cosmos").bodies().len();
+    let n = round_world(CRASH_SEED, RenderConfig::default()).generator.cosmos().expect("a cosmos").bodies().len();
     let only: Option<usize> = std::env::var("PWC_BODY").ok().and_then(|v| v.parse().ok());
     let tp = std::env::var("PWC_TP").is_ok();
     for body in (0..n).filter(|b| only.is_none_or(|o| o == *b)) {
-        let passes = landing_passes(SEED, body, tp, 20, 10, 120);
+        let passes = landing_passes(CRASH_SEED, body, tp, 20, 10, 120);
         let (wall, worst) = passes.iter().enumerate().max_by_key(|(_, p)| p.0).map(|(i, p)| (p.0, i)).expect("passes");
         let (cpu, costliest) = passes.iter().enumerate().max_by_key(|(_, p)| p.1).map(|(i, p)| (p.1, i)).expect("passes");
         let over = passes.iter().filter(|p| p.0.as_secs_f64() > 0.016).count();

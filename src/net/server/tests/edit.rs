@@ -4,6 +4,76 @@ use super::support::*;
 use crate::net::client::Incoming;
 
 #[test]
+fn disabled_simulation_refuses_tools_and_does_not_wake_contacts() {
+    let (shared, [rx]) = lobby([(1, DVec3::new(8.5, 20.0, 8.5))]);
+    let (original, tool) = place_pair(&shared, (8, 20, 8));
+    shared.lock_recover().reactions.configure(None).unwrap();
+    on_tool_use(&shared, None, chartless(), 1, 7, 8, 20, 8, 1, &tool.into());
+    assert!(matches!(drain(&rx).as_slice(), [ServerMessage::ToolResult { reacted: false, .. }]));
+    {
+        let state = shared.lock_recover();
+        assert_eq!(state.edits[&(8, 20, 8)].spec.as_ref(), original);
+        assert_eq!(state.reactions.pending(), 0);
+    }
+    on_edit(&shared, None, chartless(), 1, 8, 8, 20, 8, 1, "air");
+    assert_eq!(shared.lock_recover().reactions.pending(), 0);
+}
+
+#[test]
+fn protected_cells_refuse_computed_tool_products() {
+    let (shared, [rx]) = lobby([(1, DVec3::new(8.5, 20.0, 8.5))]);
+    let (original, tool) = place_pair(&shared, (8, 20, 8));
+    let (mut policy, log) = hooks::Recording::new("protected");
+    policy.deny_edit = true;
+    let policies = Mutex::new(hooks::Table::new(vec![Box::new(policy)]));
+    on_tool_use(&shared, Some(&policies), chartless(), 1, 7, 8, 20, 8, 1, &tool.into());
+    assert!(matches!(drain(&rx).as_slice(), [ServerMessage::ToolResult { reacted: false, .. }]));
+    let state = shared.lock_recover();
+    assert_eq!(state.edits[&(8, 20, 8)].spec.as_ref(), original);
+    assert_eq!(state.edits[&(8, 20, 8)].rev, 1);
+    assert_eq!(state.reactions.pending(), 0);
+    assert_eq!(log.lock().unwrap().len(), 1, "the proposed product reached edit policy");
+}
+
+#[test]
+fn reaction_pair_admission_never_commits_half_at_the_spec_pool_limit() {
+    let mut state = test_state(HashMap::new());
+    let (a, b) = crate::sim::reactions::destructive_pair(&mut state.registry);
+    let (_, na, nb) = state.registry.react(a, b).unwrap();
+    let (lo, hi) = ((0, 80, 0), (1, 80, 0));
+    state.write(lo, a, false).unwrap();
+    state.write(hi, b, false).unwrap();
+    state.write((0, 90, 0), a, false).unwrap();
+    state.write((1, 90, 0), na, false).unwrap();
+    let mut i = 0u32;
+    while state.spec_pool.len() < MAX_SPEC_POOL {
+        let cfg = material::Configuration::single(material::Element::new([i as u8, (i >> 8) as u8, 211, 17]));
+        let id = state.registry.intern(&cfg).unwrap();
+        if id != nb { state.write((i as i32 + 100, 90, 0), id, false).unwrap(); }
+        i += 1;
+    }
+    // B is also retained, so neither old material can free a name for the second product.
+    state.write((2, 90, 0), b, false).unwrap();
+    let before = (state.edits[&lo].block, state.edits[&hi].block, state.edits[&lo].rev, state.edits[&hi].rev);
+    {
+        let mut cells = ServerCells { state: &mut state, generator: chartless() };
+        assert!(!cells.set_pair(lo, a, na, hi, b, nb));
+    }
+    assert_eq!((state.edits[&lo].block, state.edits[&hi].block, state.edits[&lo].rev, state.edits[&hi].rev), before);
+    assert_eq!(state.spec_pool.cells(nb), 0);
+    // Remove B's extra holder. Replacing the last B now admits NB at the exact limit.
+    let extra = state.edits.remove(&(2, 90, 0)).unwrap();
+    state.spec_pool.release(extra.block);
+    {
+        let mut cells = ServerCells { state: &mut state, generator: chartless() };
+        assert!(cells.set_pair(lo, a, na, hi, b, nb));
+    }
+    assert_eq!((state.edits[&lo].block, state.edits[&hi].block), (na, nb));
+    assert_eq!(state.registry.amount(a) + state.registry.amount(b), state.registry.amount(na) + state.registry.amount(nb));
+    assert_eq!(state.spec_pool.len(), MAX_SPEC_POOL);
+}
+
+#[test]
 fn a_tool_use_from_an_unready_player_is_not_evaluated() {
     let (out, rx) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
     let mut players = HashMap::new();
@@ -13,7 +83,7 @@ fn a_tool_use_from_an_unready_player_is_not_evaluated() {
     let shared = Arc::new(Mutex::new(test_state(players)));
     let (_, tool) = place_pair(&shared, (8, 20, 8));
     let count = shared.lock_recover().registry.block_count();
-    on_tool_use(&shared, &test_generator(), 1, 7, 8, 20, 8, 1, &Arc::from(tool.as_str()));
+    on_tool_use(&shared, None, &test_generator(), 1, 7, 8, 20, 8, 1, &Arc::from(tool.as_str()));
     assert_eq!(shared.lock_recover().registry.block_count(), count, "nothing interned");
     assert!(rx.try_recv().is_err());
 }
@@ -22,7 +92,7 @@ fn a_tool_use_from_an_unready_player_is_not_evaluated() {
 fn a_tool_use_runs_one_operation_of_the_law_on_the_server() {
     let (shared, [rx, peer_rx]) = lobby([(1, DVec3::new(8.5, 20.0, 8.5)), (2, DVec3::new(9.5, 20.0, 8.5))]);
     let (_, tool) = place_pair(&shared, (8, 20, 8));
-    on_tool_use(&shared, &test_generator(), 1, 7, 8, 20, 8, 1, &Arc::from(tool.as_str()));
+    on_tool_use(&shared, None, &test_generator(), 1, 7, 8, 20, 8, 1, &Arc::from(tool.as_str()));
     let replies = drain(&rx);
     let [ServerMessage::ToolResult { req: 7, reacted: true, rev: 2, cell_spec, tool_spec }] = replies.as_slice() else {
         panic!("expected one ToolResult, got {replies:?}");
@@ -40,9 +110,9 @@ fn a_tool_use_runs_one_operation_of_the_law_on_the_server() {
         "peers see the cell change"
     );
     // A stale revision, a void tool and a tool out of reach are refused with `reacted: false`.
-    on_tool_use(&shared, &test_generator(), 1, 8, 8, 20, 8, 1, &Arc::from(tool.as_str()));
-    on_tool_use(&shared, &test_generator(), 1, 9, 8, 20, 8, 2, &Arc::from("air"));
-    on_tool_use(&shared, &test_generator(), 1, 10, 80, 20, 8, 0, &Arc::from(tool.as_str()));
+    on_tool_use(&shared, None, &test_generator(), 1, 8, 8, 20, 8, 1, &Arc::from(tool.as_str()));
+    on_tool_use(&shared, None, &test_generator(), 1, 9, 8, 20, 8, 2, &Arc::from("air"));
+    on_tool_use(&shared, None, &test_generator(), 1, 10, 80, 20, 8, 0, &Arc::from(tool.as_str()));
     let refused = drain(&rx);
     assert_eq!(refused.len(), 3);
     assert!(refused.iter().all(|m| matches!(m, ServerMessage::ToolResult { reacted: false, .. })));
@@ -538,7 +608,7 @@ fn cells_name_their_block_after_edits_tool_uses_and_reactions() {
     on_edit(&shared, None, &ctx.generator, 1, 2, 9, 20, 8, 0, &rock_spec());
     on_edit(&shared, None, &ctx.generator, 1, 3, 10, 20, 8, 0, "air");
     place_pair(&shared, (7, 20, 8));
-    on_tool_use(&shared, &ctx.generator, 1, 4, 7, 20, 8, 1, &Arc::from(tool.as_str()));
+    on_tool_use(&shared, None, &ctx.generator, 1, 4, 7, 20, 8, 1, &Arc::from(tool.as_str()));
     for _ in 0..40 {
         run_reactions(&shared, &ctx);
     }
@@ -571,11 +641,11 @@ fn a_refused_tool_use_reads_the_generator_only_outside_the_lock() {
     watched.reads.store(0, Ordering::Relaxed);
 
     // A stale revision, then a use over the tool budget, on the edited cell.
-    on_tool_use(&shared, &generator, 1, 2, 8, 21, 8, 0, &tool);
+    on_tool_use(&shared, None, &generator, 1, 2, 8, 21, 8, 0, &tool);
     refuse_tool(shared.lock_recover(), &shared, &generator, 1, 3, (8, 21, 8), &tool);
     assert_eq!(watched.reads.load(Ordering::Relaxed), 0, "an edited cell is answered from the ledger");
     // The same on generated cells nobody has read yet.
-    on_tool_use(&shared, &generator, 1, 4, 8, 19, 8, 5, &tool);
+    on_tool_use(&shared, None, &generator, 1, 4, 8, 19, 8, 5, &tool);
     refuse_tool(shared.lock_recover(), &shared, &generator, 1, 5, (9, 19, 8), &tool);
     assert_eq!(watched.reads.load(Ordering::Relaxed), 2, "each generated cell is read once");
     assert_eq!(watched.locked.load(Ordering::Relaxed), 0, "never under the state lock");

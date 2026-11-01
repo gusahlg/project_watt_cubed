@@ -62,6 +62,7 @@ pub(super) fn save_world(state: &Mutex<State>, ctx: &Ctx, gate: &Mutex<()>) {
             day: state.day_now(ctx.day_secs),
             edits,
             pending,
+            simulation: state.reactions.state_records(),
         }
     };
     if let Err(e) = store.write(&snap) {

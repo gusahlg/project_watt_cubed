@@ -361,6 +361,18 @@ impl Connection {
         Self::begin_connect(host, port, name, password, mods).wait()
     }
 
+    /// Connect with an explicitly selected compiled simulation model.
+    pub fn connect_with_model(
+        host: &str,
+        port: u16,
+        name: &str,
+        password: &str,
+        mods: &[(String, String)],
+        model: Option<crate::sim::model::ModelSpec>,
+    ) -> Result<Self, ConnectError> {
+        Self::begin_connect_with_model(host, port, name, password, mods, model).wait()
+    }
+
     /// DNS, the QUIC handshake, and `Welcome`, on a worker thread.
     /// [`PendingConnect::poll`] is the render thread's view of it.
     pub fn begin_connect(
@@ -369,6 +381,19 @@ impl Connection {
         name: &str,
         password: &str,
         mods: &[(String, String)],
+    ) -> PendingConnect {
+        Self::begin_connect_with_model(host, port, name, password, mods, crate::net::default_reaction_model())
+    }
+
+    /// The explicit model identity is compared before admission. Clients receive committed cells;
+    /// experimental per-position fields remain on the authority until a field snapshot API exists.
+    pub fn begin_connect_with_model(
+        host: &str,
+        port: u16,
+        name: &str,
+        password: &str,
+        mods: &[(String, String)],
+        model: Option<crate::sim::model::ModelSpec>,
     ) -> PendingConnect {
         let flag = Arc::new(AtomicBool::new(false));
         let notify = Arc::new(tokio::sync::Notify::new());
@@ -381,7 +406,7 @@ impl Connection {
         let notify_worker = Arc::clone(&notify);
         thread::spawn(move || {
             let stop = Stop { flag: flag_worker, notify: notify_worker };
-            let result = connect_cancellable(&host, port, &name, &password, &mods, &stop);
+            let result = connect_cancellable(&host, port, &name, &password, &mods, model, &stop);
             let _ = tx.send(result);
         });
         PendingConnect { done, flag, notify }
@@ -468,6 +493,7 @@ fn connect_cancellable(
     name: &str,
     password: &str,
     mods: &[(String, String)],
+    model: Option<crate::sim::model::ModelSpec>,
     stop: &Stop,
 ) -> Result<Connection, ConnectError> {
     stop.check()?;
@@ -490,7 +516,7 @@ fn connect_cancellable(
     let mut last = ConnectError::plain("could not connect");
     for addr in addrs {
         stop.check()?;
-        match connect_one(&rt, addr, name, password, mods, stop) {
+        match connect_one(&rt, addr, name, password, mods, model, stop) {
             Ok(conn) => return Ok(conn),
             Err(e) if e.message == "cancelled" => return Err(e),
             Err(e) => last = e,
@@ -505,6 +531,7 @@ fn connect_one(
     name: &str,
     password: &str,
     mods: &[(String, String)],
+    model: Option<crate::sim::model::ModelSpec>,
     stop: &Stop,
 ) -> Result<Connection, ConnectError> {
     let (offers, dropped) = protocol::hello_offers(mods);
@@ -534,13 +561,14 @@ fn connect_one(
         conn.open_bi().await.map_err(|e| ConnectError::plain(format!("stream: {e}")))
     })?;
 
-    let id = crate::net::content_id(&crate::block::BlockRegistry::with_builtins());
+    let id = crate::net::content_id_with_model(&crate::block::BlockRegistry::with_builtins(), model);
     let hello = ClientMessage::Hello {
         protocol: PROTOCOL_VERSION,
         worldgen: id.worldgen,
         gravity: id.gravity,
         law: id.law,
         palette: id.palette,
+        simulation: id.simulation,
         name: name.into(),
         password: password.into(),
         mods,

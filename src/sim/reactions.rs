@@ -1,27 +1,10 @@
-//! The reaction scheduler: a deterministic queue of active face contacts, worked through a few
-//! hundred per simulation turn, one law operation per contact per turn.
-//!
-//! Reactions start only when contact or material state changes — a block is placed, removed, moved,
-//! or its configuration changes (a tool, a machine, another reaction). The affected voxel's six
-//! face-sharing contacts are queued, empty neighbours included (a mixture that wants to come apart
-//! can shed into empty space); for a move both the old and the new location are. Diagonals never
-//! interact. When a contact's turn comes, selective transfer v1 runs ONE operation on it
-//! ([`BlockRegistry::react`]); if both configurations changed, every contact of both cells is queued
-//! for the NEXT turn (the cascade advances one hop per turn, visibly, instead of completing at once).
-//! A contact that produces no change goes dormant: it leaves the queue until something wakes it.
-//!
-//! Chunk loading, generation, meshing and rendering never queue anything. The queue order —
-//! `(arrival turn, contact)` with contacts ordered by their lower cell and axis — and the per-turn
-//! quota are part of the world's dynamics: every peer runs [`Budget::DEFAULT`]. A no-op attempt costs
-//! quota like any other. In multiplayer the server owns the scheduler and broadcasts every committed
-//! mutation; a client never evaluates reactions.
-
-use std::collections::{BTreeSet, HashSet};
-
+//! Optional authoritative simulation host. Queueing and interaction laws live in native mods;
+//! core keeps the cell adapter, identity, lifecycle, persistence and common budget vocabulary.
+use super::Tick;
+use super::model::{Model, ModelSpec, Sample, Stats};
 use crate::block::{BlockId, BlockRegistry};
 use crate::world::World;
-
-use super::Tick;
+use std::collections::BTreeMap;
 
 /// A world position of one voxel.
 pub type Pos = (i32, i32, i32);
@@ -52,9 +35,18 @@ impl Contact {
     pub fn around(p: Pos) -> [Contact; 6] {
         let (x, y, z) = p;
         [
-            Contact { lo: (x - 1, y, z), axis: 0 },
-            Contact { lo: (x, y - 1, z), axis: 1 },
-            Contact { lo: (x, y, z - 1), axis: 2 },
+            Contact {
+                lo: (x - 1, y, z),
+                axis: 0,
+            },
+            Contact {
+                lo: (x, y - 1, z),
+                axis: 1,
+            },
+            Contact {
+                lo: (x, y, z - 1),
+                axis: 2,
+            },
             Contact { lo: p, axis: 0 },
             Contact { lo: p, axis: 1 },
             Contact { lo: p, axis: 2 },
@@ -62,13 +54,34 @@ impl Contact {
     }
 }
 
-/// What the scheduler needs from the world: read/write cells and the material table. A trait so the
-/// queue semantics are testable on a plain map.
+/// A simulation model's access to cells and the material table, also usable by a headless map.
 pub trait CellStore {
     /// The material at a position. `None` for space that cannot react (never generated).
     fn block_at(&self, pos: Pos) -> Option<BlockId>;
     /// Overwrite a cell; returns the previous id, or `None` when the store refused the write.
     fn set_block(&mut self, pos: Pos, id: BlockId) -> Option<BlockId>;
+    /// Resolve a virtual seam cell to its real storage identity.
+    fn resolve(&self, pos: Pos) -> Pos {
+        pos
+    }
+    /// Atomically replace two cells after checking both inputs; `false` changes neither. The
+    /// default writes through [`set_block`](Self::set_block) and puts `lo` back when the store
+    /// refuses `hi`. Stores that can refuse a write after accepting one (a bounded spec pool)
+    /// admit both products up front instead.
+    fn set_pair(&mut self, lo: Pos, a: BlockId, na: BlockId, hi: Pos, b: BlockId, nb: BlockId) -> bool {
+        if lo == hi || self.block_at(lo) != Some(a) || self.block_at(hi) != Some(b) {
+            return false;
+        }
+        if self.set_block(lo, na).is_none() {
+            return false;
+        }
+        if self.set_block(hi, nb).is_none() {
+            let undone = self.set_block(lo, a);
+            debug_assert!(undone.is_some(), "a store takes back the material it just held");
+            return false;
+        }
+        true
+    }
     /// The material table.
     fn registry(&self) -> &BlockRegistry;
     /// The material table, for interning results.
@@ -86,152 +99,351 @@ pub struct Mutation {
     pub to: BlockId,
 }
 
-/// Work quota per simulation turn. Part of the simulation configuration, not a render setting.
+/// Work quota per simulation turn. Models document their unit and bounded cost; whole-phase
+/// field models may count sites, while selective transfer counts contact attempts.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Budget {
-    /// Contact attempts per turn (no-op attempts count).
+    /// Historical field name: work units per turn (no-op contact attempts count).
     pub contacts_per_turn: usize,
 }
 
 impl Budget {
-    /// Every peer's quota: 384 attempts per turn at 20 turns per second.
-    pub const DEFAULT: Budget = Budget { contacts_per_turn: 384 };
+    /// Default authority quota: 384 work units per turn at 20 turns per second.
+    pub const DEFAULT: Budget = Budget {
+        contacts_per_turn: 384,
+    };
 }
 
-/// Distinct active contacts the scheduler holds before it refuses more (a memory guard; refusals are
-/// counted in the `dropped` gauge and never happen in ordinary play).
+/// The extracted legacy mod's default active-contact guard. Refusals increment `dropped`;
+/// other models choose and document their own state bounds.
 pub const DEFAULT_CAPACITY: usize = 1 << 16;
 
-/// The scheduler state: active contacts in processing order, and counters.
+/// The longest simulation record value a save holds: the save's cap on one mod-state value.
+const MAX_RECORD: usize = crate::save::format::MAX_MOD_STATE as usize;
+
+#[derive(Clone)]
+struct Saved {
+    version: u32,
+    payload: String,
+}
+
+/// The selected native model, plus frozen state retained for models switched off or absent.
+/// Historical counters remain public for the existing inspection/benchmark API.
 pub struct ReactionScheduler {
-    queue: BTreeSet<(u64, Contact)>,
-    active: HashSet<Contact>,
-    capacity: usize,
-    /// Turns run so far.
+    model: Option<Box<dyn Model>>,
+    spec: Option<ModelSpec>,
+    saved: BTreeMap<String, Saved>,
+    saved_selection: Option<(String, u32)>,
+    legacy: Vec<(u32, Contact)>,
     pub turns: u64,
-    /// Law operations committed so far.
     pub operations: u64,
-    /// Contacts refused because the queue was full.
     pub dropped: u64,
 }
 
 impl Default for ReactionScheduler {
     fn default() -> Self {
-        Self::with_capacity(DEFAULT_CAPACITY)
+        Self::new()
     }
 }
 
 impl ReactionScheduler {
-    /// An empty scheduler.
+    /// Production vanilla is inert. Core tests use the actual extracted legacy implementation
+    /// through a test-only fixture; explicit no-model tests use `disabled`.
     pub fn new() -> Self {
-        Self::default()
+        #[allow(unused_mut)]
+        let mut host = Self::disabled();
+        #[cfg(test)]
+        host.configure(super::model::test_default())
+            .expect("legacy test model");
+        host
     }
-
-    /// An empty scheduler holding at most `capacity` active contacts.
+    pub fn disabled() -> Self {
+        Self {
+            model: None,
+            spec: None,
+            saved: BTreeMap::new(),
+            saved_selection: None,
+            legacy: Vec::new(),
+            turns: 0,
+            operations: 0,
+            dropped: 0,
+        }
+    }
+    /// Kept for existing scheduler fixtures. Real models declare their own bounded queues.
     pub fn with_capacity(capacity: usize) -> Self {
-        Self { queue: BTreeSet::new(), active: HashSet::new(), capacity, turns: 0, operations: 0, dropped: 0 }
-    }
-
-    fn enqueue(&mut self, arrival: u64, c: Contact) {
-        if self.active.contains(&c) {
-            return;
+        #[allow(unused_mut)]
+        let mut host = Self::disabled();
+        #[cfg(test)]
+        {
+            host.spec = super::model::test_default();
+            host.model = Some(super::model::test_with_capacity(capacity));
         }
-        if self.active.len() >= self.capacity {
-            self.dropped += 1;
-            return;
-        }
-        self.active.insert(c);
-        self.queue.insert((arrival, c));
+        #[cfg(not(test))]
+        let _ = capacity;
+        host
     }
-
-    /// Something changed at `p` (placed, removed, configuration changed): wake its six contacts.
-    pub fn wake_cell(&mut self, p: Pos) {
-        for c in Contact::around(p) {
-            self.enqueue(self.turns, c);
-        }
+    pub fn is_enabled(&self) -> bool {
+        self.model.is_some()
     }
-
-    /// A block moved from `from` to `to`: both locations' contacts.
+    pub fn model_id(&self) -> Option<&str> {
+        self.spec.map(|s| s.id)
+    }
+    /// The running model, `None` while paused or frozen.
+    pub fn spec(&self) -> Option<ModelSpec> {
+        self.spec
+    }
+    pub fn selected_record(&self) -> Option<(&str, u32)> {
+        self.saved_selection
+            .as_ref()
+            .map(|(id, version)| (id.as_str(), *version))
+    }
+    fn sync_stats(&mut self) {
+        let s = self.model.as_ref().map_or(Stats::default(), |m| m.stats());
+        self.turns = s.turns;
+        self.operations = s.operations;
+        self.dropped = s.dropped;
+    }
+    pub fn stats(&self) -> Stats {
+        self.model.as_ref().map_or(Stats::default(), |m| m.stats())
+    }
+    pub fn pending(&self) -> usize {
+        self.stats().pending
+    }
+    pub fn sample(&self, pos: Pos) -> Sample {
+        self.model
+            .as_ref()
+            .map_or(Sample::default(), |m| m.sample(pos))
+    }
+    /// Switch/pause implementations without discarding another model's state. Version mismatch
+    /// is an error, never a reinterpretation. Model factories must match their descriptor id.
+    pub fn configure(&mut self, spec: Option<ModelSpec>) -> Result<(), String> {
+        if let (Some((id, version)), Some(next)) = (&self.saved_selection, spec)
+            && id == next.id
+            && *version != next.version
+        {
+            return Err(format!(
+                "simulation {id} selection is v{version}, model is v{}",
+                next.version
+            ));
+        }
+        if self.spec.map(|s| (s.id, s.version)) == spec.map(|s| (s.id, s.version)) {
+            return Ok(());
+        }
+        let next = if let Some(s) = spec {
+            let mut next = (s.create)();
+            if next.id() != s.id {
+                return Err("simulation factory returned a different model id".into());
+            }
+            if let Some(saved) = self.saved.get(s.id) {
+                if saved.version != s.version {
+                    return Err(format!(
+                        "simulation {} state is v{}, model is v{}",
+                        s.id, saved.version, s.version
+                    ));
+                }
+                next.load(&saved.payload)?;
+            }
+            if s.id == super::model::LEGACY_ID && !self.legacy.is_empty() {
+                next.restore_legacy(&self.legacy)?;
+            }
+            Some(next)
+        } else {
+            None
+        };
+        if let (Some(old), Some(s)) = (&self.model, self.spec) {
+            self.saved.insert(
+                s.id.into(),
+                Saved {
+                    version: s.version,
+                    payload: old.save(),
+                },
+            );
+        }
+        self.model = next;
+        self.spec = spec;
+        self.saved_selection = spec.map(|s| (s.id.to_string(), s.version));
+        if spec.is_some_and(|s| s.id == super::model::LEGACY_ID) {
+            self.legacy.clear();
+        }
+        self.sync_stats();
+        Ok(())
+    }
+    pub fn wake_cell(&mut self, pos: Pos) {
+        if let Some(m) = &mut self.model {
+            m.wake_cell(pos);
+        }
+        self.sync_stats();
+    }
     pub fn wake_move(&mut self, from: Pos, to: Pos) {
         self.wake_cell(from);
         self.wake_cell(to);
     }
-
-    /// Active contacts waiting for a turn.
-    pub fn pending(&self) -> usize {
-        self.queue.len()
+    pub fn perturb(&mut self, pos: Pos, amount: i64) {
+        if let Some(m) = &mut self.model {
+            m.perturb(pos, amount);
+        }
+        self.sync_stats();
     }
-
-    /// The active contacts in processing order, each with its age in turns (how long it has been
-    /// waiting): the pending work a save carries. Order and ages restore exactly.
+    pub fn tool(
+        &mut self,
+        registry: &mut BlockRegistry,
+        cell: BlockId,
+        tool: BlockId,
+    ) -> Option<(BlockId, BlockId)> {
+        self.model.as_mut()?.tool(registry, cell, tool)
+    }
+    pub fn tick<S: CellStore>(&mut self, store: &mut S, budget: Budget) -> Vec<Mutation> {
+        let mut out = Vec::new();
+        self.tick_into(store, budget, &mut out);
+        out
+    }
+    pub fn tick_into<S: CellStore>(
+        &mut self,
+        store: &mut S,
+        budget: Budget,
+        out: &mut Vec<Mutation>,
+    ) {
+        if let Some(m) = &mut self.model {
+            m.tick(store, budget, out);
+        }
+        self.sync_stats();
+    }
     pub fn snapshot(&self) -> Vec<(u32, Contact)> {
-        self.queue.iter().map(|&(t, c)| (self.turns.saturating_sub(t).min(u32::MAX as u64) as u32, c)).collect()
-    }
-
-    /// Restore saved pending work with its order, without inventing events.
-    pub fn restore(&mut self, contacts: &[(u32, Contact)]) {
-        let oldest = contacts.iter().map(|&(age, _)| age as u64).max().unwrap_or(0);
-        self.turns = self.turns.max(oldest);
-        for &(age, c) in contacts {
-            self.enqueue(self.turns - age as u64, c);
+        if self.spec.is_some_and(|s| s.id == super::model::LEGACY_ID) {
+            self.model
+                .as_ref()
+                .map_or_else(|| self.legacy.clone(), |m| m.legacy_snapshot())
+        } else {
+            self.legacy.clone()
         }
     }
-
-    /// Run one turn: attempt up to `budget.contacts_per_turn` contacts that arrived before this turn,
-    /// oldest first. A changed contact commits both cells and queues every contact of both cells for
-    /// the next turn; an unchanged one goes dormant. Returns the commits in order.
-    pub fn tick<S: CellStore>(&mut self, store: &mut S, budget: Budget) -> Vec<Mutation> {
-        let mut committed = Vec::new();
-        self.tick_into(store, budget, &mut committed);
-        committed
-    }
-
-    /// [`tick`](Self::tick), appending the commits to `committed`, so a caller that ticks
-    /// every frame reuses one buffer.
-    pub fn tick_into<S: CellStore>(&mut self, store: &mut S, budget: Budget, committed: &mut Vec<Mutation>) {
-        let this_turn = self.turns;
-        let next = this_turn + 1;
-        for _ in 0..budget.contacts_per_turn {
-            let Some(&(arrival, c)) = self.queue.first() else { break };
-            if arrival > this_turn {
-                break;
+    pub fn restore(&mut self, contacts: &[(u32, Contact)]) {
+        if self.spec.is_some_and(|s| s.id == super::model::LEGACY_ID) {
+            if let Some(m) = &mut self.model
+                && let Err(e) = m.restore_legacy(contacts)
+            {
+                eprintln!("could not restore legacy contacts: {e}");
             }
-            self.queue.pop_first();
-            self.active.remove(&c);
-            let (lo, hi) = (c.lo, c.hi());
-            let (Some(a), Some(b)) = (store.block_at(lo), store.block_at(hi)) else { continue };
-            if a == b {
-                // Identical configurations (and two voids) have no candidate: dormant.
+        } else {
+            self.legacy = contacts.to_vec();
+        }
+        self.sync_stats();
+    }
+    /// Reserved records travel in the existing save's opaque mod-state section.
+    /// Each payload is copied once, in id order, with the live model's state in place of its
+    /// frozen copy. A record over the save's mod-state cap is left out with a notice, so one
+    /// oversized model never fails the whole save.
+    pub fn state_records(&self) -> Vec<(String, String)> {
+        // An unavailable provider is frozen, not an intentional conversion to an off-world.
+        let mut out = vec![(
+            "@simulation.selected".into(),
+            self.saved_selection
+                .as_ref()
+                .map_or_else(|| "off".into(), |(id, version)| format!("{id}@{version}")),
+        )];
+        let live = match (&self.model, self.spec) {
+            (Some(m), Some(s)) => Some((s.id, s.version, m.save())),
+            _ => None,
+        };
+        let mut push = |id: &str, version: u32, payload: &str| {
+            let head = format!("v{version};");
+            if head.len() + payload.len() > MAX_RECORD {
+                eprintln!(
+                    "simulation {id} state is {} bytes, over the save limit: it is not saved",
+                    payload.len()
+                );
+                return;
+            }
+            let mut value = String::with_capacity(head.len() + payload.len());
+            value.push_str(&head);
+            value.push_str(payload);
+            out.push((format!("@simulation.state.{id}"), value));
+        };
+        let mut unwritten = live.as_ref();
+        for (id, s) in &self.saved {
+            if let Some(&(live_id, version, ref payload)) = unwritten
+                && live_id < id.as_str()
+            {
+                push(live_id, version, payload);
+                unwritten = None;
+            }
+            if live.as_ref().is_some_and(|l| l.0 == id) {
                 continue;
             }
-            let Some((_, na, nb)) = store.registry_mut().react(a, b) else { continue };
-            // Commit both cells as one change; a refused write commits nothing more.
-            let Some(prev_a) = store.set_block(lo, na) else { continue };
-            debug_assert_eq!(prev_a, a);
-            committed.push(Mutation { pos: lo, from: a, to: na });
-            if let Some(prev_b) = store.set_block(hi, nb) {
-                debug_assert_eq!(prev_b, b);
-                committed.push(Mutation { pos: hi, from: b, to: nb });
-            }
-            self.operations += 1;
-            for p in [lo, hi] {
-                for w in Contact::around(p) {
-                    self.enqueue(next, w);
+            push(id, s.version, &s.payload);
+        }
+        if let Some(&(live_id, version, ref payload)) = unwritten {
+            push(live_id, version, payload);
+        }
+        out
+    }
+    pub fn load_records(&mut self, records: &[(String, String)]) -> Result<(), String> {
+        let mut saved = BTreeMap::new();
+        let mut selection = None;
+        let mut selected_seen = false;
+        for (key, value) in records {
+            if key == "@simulation.selected" {
+                if selected_seen {
+                    return Err("duplicate simulation selection".into());
+                }
+                selected_seen = true;
+                selection = if value == "off" {
+                    None
+                } else {
+                    let (id, version) = value
+                        .rsplit_once('@')
+                        .ok_or("invalid simulation selection")?;
+                    if id.is_empty() {
+                        return Err("empty simulation id".into());
+                    }
+                    Some((
+                        id.into(),
+                        version.parse().map_err(|_| "invalid simulation version")?,
+                    ))
+                };
+            } else if let Some(id) = key.strip_prefix("@simulation.state.") {
+                if id.is_empty() {
+                    return Err("empty simulation state id".into());
+                }
+                let (version, payload) = value
+                    .strip_prefix('v')
+                    .and_then(|v| v.split_once(';'))
+                    .ok_or("invalid simulation state")?;
+                if value.len() > MAX_RECORD {
+                    return Err("simulation state exceeds save limit".into());
+                }
+                if saved
+                    .insert(
+                        id.into(),
+                        Saved {
+                            version: version
+                                .parse()
+                                .map_err(|_| "invalid simulation state version")?,
+                            payload: payload.into(),
+                        },
+                    )
+                    .is_some()
+                {
+                    return Err("duplicate simulation state".into());
                 }
             }
         }
-        self.turns = next;
+        self.saved = saved;
+        self.saved_selection = selection;
+        // Force a later configure to hydrate from the records, even in a legacy test fixture.
+        self.model = None;
+        self.spec = None;
+        self.sync_stats();
+        Ok(())
     }
 }
 
-/// Sim system `Tick("reactions")`: one budgeted scheduler turn at the 20 Hz sim tick.
+/// Generic fixed-tick adapter; the selected mod supplies all simulation work.
 pub struct Reactions;
-
 impl Tick for Reactions {
     fn name(&self) -> &'static str {
         "reactions"
     }
-
     fn tick(&mut self, world: &mut World, _dt: f32) {
         let _ = world.tick_reactions();
     }
@@ -243,8 +455,18 @@ impl Tick for Reactions {
 pub(crate) fn destructive_pair(reg: &mut BlockRegistry) -> (BlockId, BlockId) {
     use material::{Configuration, Element};
     let cfg = |e: [[u8; 4]; 4]| Configuration::new(e.map(Element::new).to_vec()).unwrap();
-    let a = cfg([[73, 145, 162, 161], [71, 77, 157, 208], [34, 125, 217, 144], [8, 85, 210, 206]]);
-    let e = cfg([[83, 135, 211, 195], [51, 125, 144, 147], [11, 72, 167, 145], [25, 80, 211, 204]]);
+    let a = cfg([
+        [73, 145, 162, 161],
+        [71, 77, 157, 208],
+        [34, 125, 217, 144],
+        [8, 85, 210, 206],
+    ]);
+    let e = cfg([
+        [83, 135, 211, 195],
+        [51, 125, 144, 147],
+        [11, 72, 167, 145],
+        [25, 80, 211, 204],
+    ]);
     (reg.intern(&a).unwrap(), reg.intern(&e).unwrap())
 }
 
@@ -254,6 +476,50 @@ mod tests {
     use crate::block::AIR;
     use material::{Configuration, Element};
     use std::collections::HashMap;
+
+    #[test]
+    fn no_model_has_no_implicit_contact_or_tool_law() {
+        let mut host = ReactionScheduler::disabled();
+        host.wake_cell((0, 0, 0));
+        assert_eq!(host.pending(), 0);
+        let mut reg = BlockRegistry::with_builtins();
+        let (a, e) = destructive_pair(&mut reg);
+        assert_eq!(host.tool(&mut reg, a, e), None);
+        assert_eq!(host.model_id(), None);
+    }
+
+    #[test]
+    fn switching_off_preserves_the_real_mod_state_for_later() {
+        let mut host = ReactionScheduler::disabled();
+        host.configure(crate::sim::model::test_default()).unwrap();
+        host.wake_cell((2, 3, 4));
+        let before = host.snapshot();
+        host.configure(None).unwrap();
+        let records = host.state_records();
+        assert_eq!(host.pending(), 0);
+        let mut loaded = ReactionScheduler::disabled();
+        loaded.load_records(&records).unwrap();
+        loaded.configure(crate::sim::model::test_default()).unwrap();
+        assert_eq!(loaded.snapshot(), before);
+    }
+
+    #[test]
+    fn unavailable_model_selection_survives_and_invalid_records_are_transactional() {
+        let mut host = ReactionScheduler::disabled();
+        host.configure(crate::sim::model::test_default()).unwrap();
+        host.wake_cell((2, 3, 4));
+        let records = host.state_records();
+        let before = host.snapshot();
+        assert!(
+            host.load_records(&[("@simulation.selected".into(), "bad".into())])
+                .is_err()
+        );
+        assert_eq!(host.snapshot(), before);
+        let mut missing = ReactionScheduler::disabled();
+        missing.load_records(&records).unwrap();
+        missing.configure(None).unwrap();
+        assert_eq!(missing.state_records(), records);
+    }
 
     struct Map {
         cells: HashMap<Pos, BlockId>,
@@ -276,7 +542,10 @@ mod tests {
     }
 
     fn map() -> Map {
-        Map { cells: HashMap::new(), reg: BlockRegistry::with_builtins() }
+        Map {
+            cells: HashMap::new(),
+            reg: BlockRegistry::with_builtins(),
+        }
     }
 
     fn run_to_rest(m: &mut Map, s: &mut ReactionScheduler) -> Vec<Mutation> {
@@ -300,7 +569,11 @@ mod tests {
         m.set_block((1, 0, 0), e);
         s.wake_cell((1, 0, 0));
         let first = s.tick(&mut m, Budget::DEFAULT);
-        assert_eq!(first.len(), 2, "one transfer per contact per turn: both cells change once");
+        assert_eq!(
+            first.len(),
+            2,
+            "one transfer per contact per turn: both cells change once"
+        );
         assert_eq!(m.reg.configuration(m.cells[&(0, 0, 0)]).len(), 3);
         assert_eq!(m.reg.configuration(m.cells[&(1, 0, 0)]).len(), 5);
         run_to_rest(&mut m, &mut s);
@@ -311,7 +584,10 @@ mod tests {
     #[test]
     fn contacts_without_change_go_dormant_and_identical_neighbours_never_react() {
         let mut m = map();
-        let rock = m.reg.intern(&Configuration::single(Element::new([120, 130, 140, 150]))).unwrap();
+        let rock = m
+            .reg
+            .intern(&Configuration::single(Element::new([120, 130, 140, 150])))
+            .unwrap();
         for x in 0..4 {
             m.set_block((x, 0, 0), rock);
         }
@@ -333,7 +609,16 @@ mod tests {
         let mut sorted = order.clone();
         sorted.sort();
         assert_eq!(order, sorted);
-        assert_eq!(order[0], (0, Contact { lo: (4, 5, 5), axis: 0 }));
+        assert_eq!(
+            order[0],
+            (
+                0,
+                Contact {
+                    lo: (4, 5, 5),
+                    axis: 0
+                }
+            )
+        );
     }
 
     #[test]
@@ -341,14 +626,20 @@ mod tests {
         let mut m = map();
         let mixed = m
             .reg
-            .intern(&Configuration::new(vec![Element::new([0; 4]), Element::new([128; 4])]).unwrap())
+            .intern(
+                &Configuration::new(vec![Element::new([0; 4]), Element::new([128; 4])]).unwrap(),
+            )
             .unwrap();
         m.set_block((0, 0, 0), mixed);
         let mut s = ReactionScheduler::new();
         s.wake_cell((0, 0, 0));
         run_to_rest(&mut m, &mut s);
         let occupied: Vec<_> = m.cells.iter().filter(|(_, id)| **id != AIR).collect();
-        assert_eq!(occupied.len(), 2, "the two repelling elements ended in two cells: {occupied:?}");
+        assert_eq!(
+            occupied.len(),
+            2,
+            "the two repelling elements ended in two cells: {occupied:?}"
+        );
     }
 
     #[test]
@@ -368,7 +659,9 @@ mod tests {
             sf.wake_cell((x, 0, 0));
             ss.wake_cell((x, 0, 0));
         }
-        let small = Budget { contacts_per_turn: 7 };
+        let small = Budget {
+            contacts_per_turn: 7,
+        };
         let mut turns = 0;
         while ss.pending() > 0 {
             let _ = ss.tick(&mut slow, small);
@@ -412,7 +705,11 @@ mod tests {
         }
         let muts = run_to_rest(&mut m, &mut s);
         assert!(!muts.is_empty());
-        let after: usize = m.cells.values().map(|&id| m.reg.configuration(id).len()).sum();
+        let after: usize = m
+            .cells
+            .values()
+            .map(|&id| m.reg.configuration(id).len())
+            .sum();
         assert_eq!(after, total);
     }
 

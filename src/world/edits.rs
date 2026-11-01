@@ -338,10 +338,13 @@ impl World {
         if !self.reactions_authority {
             return Vec::new();
         }
-        let mut sched = std::mem::take(&mut self.reactions);
-        let out = sched.tick(self, reactions::Budget::DEFAULT);
+        let mut sched = std::mem::replace(&mut self.reactions, ReactionScheduler::disabled());
+        let before = sched.stats();
+        let tick = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sched.tick(self, reactions::Budget::DEFAULT)));
+        let after = sched.stats();
+        if (before.pending != 0 || after.pending != 0) && before != after { self.simulation_generation += 1; }
         self.reactions = sched;
-        out
+        tick.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
     }
 
     /// Resume saved reaction work (`(age, contact)` in processing order). Authority only.
@@ -355,7 +358,7 @@ impl World {
     pub fn set_reactions_authority(&mut self, yes: bool) {
         self.reactions_authority = yes;
         if !yes {
-            self.reactions = ReactionScheduler::new();
+            self.reactions = ReactionScheduler::disabled();
         }
     }
 
@@ -363,9 +366,54 @@ impl World {
     pub fn reactions(&self) -> &ReactionScheduler {
         &self.reactions
     }
+
+    /// Install/pause a compiled simulation while retaining other models' sparse saved state.
+    pub fn configure_simulation(&mut self, spec: Option<crate::sim::model::ModelSpec>) -> Result<(), String> {
+        if !self.reactions_authority { return Ok(()); }
+        let before = self.reactions.model_id().map(str::to_string);
+        self.reactions.configure(spec)?;
+        if before.as_deref() != self.reactions.model_id() { self.simulation_generation += 1; }
+        Ok(())
+    }
+
+    pub fn simulation_model_id(&self) -> Option<&str> { self.reactions.model_id() }
+    pub fn simulation_stats(&self) -> crate::sim::model::Stats { self.reactions.stats() }
+    pub fn simulation_sample(&self, pos: Pos) -> crate::sim::model::Sample { self.reactions.sample(pos) }
+
+    /// Resolve an experimental physical input into the voxel address space under it.
+    pub fn simulation_cell(&self, point: voxel_engine::DVec3) -> Pos {
+        let p = self.chart_local(point).map_or(point, |local| local.storage);
+        self.glued((crate::math::block_coord(p.x), crate::math::block_coord(p.y), crate::math::block_coord(p.z)))
+    }
+
+    /// Explicit local lab input; network clients cannot create authority-side field impulses.
+    pub fn perturb_simulation(&mut self, pos: Pos, amount: i64) {
+        if self.reactions_authority { self.reactions.perturb(pos, amount); self.simulation_generation += 1; }
+    }
+
+    pub fn simulation_state_records(&self) -> Vec<(String, String)> { self.reactions.state_records() }
+    pub fn load_simulation_records(&mut self, records: &[(String, String)]) -> Result<(), String> { self.reactions.load_records(records) }
+
+    /// Tools use exactly the selected mod's law; no provider means no hidden old-law operation.
+    pub fn react_tool(&mut self, cell: BlockId, tool: BlockId) -> Option<(BlockId, BlockId)> {
+        if !self.reactions_authority { return None; }
+        self.reactions.tool(&mut self.registry, cell, tool)
+    }
 }
 
 impl CellStore for World {
+    fn resolve(&self, pos: Pos) -> Pos { self.glued(pos) }
+
+    fn set_pair(&mut self, lo: Pos, a: BlockId, na: BlockId, hi: Pos, b: BlockId, nb: BlockId) -> bool {
+        if lo == hi || CellStore::block_at(self, lo) != Some(a) || CellStore::block_at(self, hi) != Some(b) {
+            return false;
+        }
+        if usize::from(na.0) >= self.registry.block_count() || usize::from(nb.0) >= self.registry.block_count() { return false; }
+        // World writes cannot refuse valid intern ids. Admission occurs before either side effect.
+        CellStore::set_block(self, lo, na);
+        CellStore::set_block(self, hi, nb);
+        true
+    }
     /// Loaded chunk, else the edit overlay, else the generator: the infinite world is defined
     /// without loading, so a cascade reads the same cells whatever the streaming state (the server's
     /// store does the same).

@@ -194,7 +194,9 @@ pub(super) fn refuse_tool<'a>(
         None => Arc::clone(state.registry.spec_ref(server_block(&state, generator, at))),
     };
     let msg = ServerMessage::ToolResult { req, reacted: false, rev: state.rev(at), cell_spec, tool_spec: Arc::clone(tool) };
-    let _ = h.out.try_send(msg.frame());
+    if h.out.try_send(msg.frame()).is_err() {
+        kick_slow(&state, &[id]);
+    }
 }
 
 /// A player uses a held configuration as a tool on a cell. Gates: ready, reach, the tool spec
@@ -206,6 +208,7 @@ pub(super) fn refuse_tool<'a>(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn on_tool_use(
     shared: &Arc<Mutex<State>>,
+    hooks: Option<&Mutex<hooks::Table>>,
     generator: &crate::world::terrain::Generator,
     id: u32,
     req: u32,
@@ -221,6 +224,9 @@ pub(super) fn on_tool_use(
     if !h.ready {
         return;
     }
+    if !state.reactions.is_enabled() {
+        return refuse_tool(state, shared, generator, id, req, at, tool_spec);
+    }
     let current = state.rev(at);
     if tool_spec.len() > MAX_SPEC || h.pose.pos.distance(cell_centre(generator, at)) > EDIT_REACH || expect != current {
         return refuse_tool(state, shared, generator, id, req, at, tool_spec);
@@ -235,9 +241,24 @@ pub(super) fn on_tool_use(
     if tool == AIR || cell == AIR || state.registry.block_count() + 2 > CLIENT_INTERN_LIMIT {
         return refuse_tool(state, shared, generator, id, req, at, tool_spec);
     }
-    let Some((_, new_cell, new_tool)) = state.registry.react(cell, tool) else {
+    let state_ref = &mut *state;
+    let Some((new_cell, new_tool)) = state_ref.reactions.tool(&mut state_ref.registry, cell, tool) else {
         return refuse_tool(state, shared, generator, id, req, at, tool_spec);
     };
+    if let Some(hooks) = hooks {
+        let Some(h) = state.players.get(&id) else { return };
+        let intent = EditIntent {
+            player: id, name: Arc::clone(&h.name), x, y, z,
+            spec: Arc::clone(state.registry.spec_ref(new_cell)), expect,
+        };
+        drop(state);
+        let verdict = hooks.lock_recover().validate_edit(&intent);
+        state = shared.lock_recover();
+        if !state.players.contains_key(&id) { return; }
+        if matches!(verdict, Verdict::Deny { .. }) || state.rev(at) != expect {
+            return refuse_tool(state, shared, generator, id, req, at, tool_spec);
+        }
+    }
     let Some((rev, spec)) = state.write(at, new_cell, false) else {
         return refuse_tool(state, shared, generator, id, req, at, tool_spec);
     };
@@ -245,7 +266,9 @@ pub(super) fn on_tool_use(
     let tool_out = Arc::clone(state.registry.spec_ref(new_tool));
     if let Some(h) = state.players.get(&id) {
         let msg = ServerMessage::ToolResult { req, reacted: true, rev, cell_spec: Arc::clone(&spec), tool_spec: tool_out };
-        let _ = h.out.try_send(msg.frame());
+        if h.out.try_send(msg.frame()).is_err() {
+            kick_slow(&state, &[id]);
+        }
     }
     let wake = broadcast(&mut state, &ServerMessage::Edit { x, y, z, rev, spec }, |pid, _| pid != id);
     drop(state);

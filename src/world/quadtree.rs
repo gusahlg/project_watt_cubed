@@ -1,8 +1,8 @@
 //! Quadtree selection and the far field's drawn cut.
 //!
-//! [`whole_cut`] draws every tile whole: a desired tile once it is Ready, until then the Ready
-//! finer tiles under it (a merge waits for its parent) or a Ready ancestor (a split waits for all
-//! four children). No tile is drawn in part and no two drawn tiles overlap.
+//! [`whole_cut`] draws every tile whole: a desired tile once it is Ready, until then its nearest
+//! Ready ancestor (a split waits for all four children) or, with none, the Ready finer tiles under
+//! it. No tile is drawn in part and no two drawn tiles overlap.
 
 use crate::ident::Detail;
 
@@ -48,12 +48,13 @@ pub(in crate::world) fn stand_in_nodes(ready: impl IntoIterator<Item = SectionPo
 }
 
 /// The tiles to draw for the cut `desired` (the leaves of complete splits, coarsest at `max_detail`)
-/// given which tiles are Ready. A desired tile draws once it is Ready. Until every desired tile
-/// under a node is, the node's nearest Ready ancestor draws whole in their place: a split waits
-/// for all four children, and with ancestors resident a merge is at once. Only where no ancestor is
-/// Ready do the Ready finer tiles under an unready desired tile draw it. Every tile is drawn whole
-/// and no two overlap; a square nothing Ready covers stays empty. Sorted by
-/// `(body, face, detail, x, z)`.
+/// given which tiles are Ready. A desired tile draws once it is Ready. Until then its nearest Ready
+/// ancestor draws whole in place of that ancestor's square: a split waits for all four children,
+/// and with ancestors resident a merge is at once. The stand-in is the nearest one, never a coarser
+/// ancestor: a tile still being built while the eye moves must not pop a root over the whole view.
+/// Only where no ancestor is Ready do the Ready finer tiles under an unready desired tile draw it.
+/// Every tile is drawn whole and no two overlap; a square nothing Ready covers stays empty. Sorted
+/// by `(body, face, detail, x, z)`.
 pub(in crate::world) fn whole_cut(desired: &[SectionPos], max_detail: Detail, ready: &impl Fn(SectionPos) -> bool, stand_ins: &FastSet<SectionPos>) -> Vec<SectionPos> {
     let leaves: FastSet<SectionPos> = desired.iter().copied().collect();
     let mut inner: FastSet<SectionPos> = FastSet::default();
@@ -83,7 +84,9 @@ pub(in crate::world) fn whole_cut(desired: &[SectionPos], max_detail: Detail, re
     out
 }
 
-/// [`whole_cut`]'s walk: which nodes are complete (every desired tile under them Ready), memoised.
+/// [`whole_cut`]'s walk: which nodes of the cut can be drawn whole by Ready tiles at or under them,
+/// memoised. Finer stand-ins under an unready desired tile do not count: a Ready ancestor wins over
+/// them.
 struct Cut<'a, F: Fn(SectionPos) -> bool> {
     leaves: &'a FastSet<SectionPos>,
     inner: &'a FastSet<SectionPos>,
@@ -93,19 +96,25 @@ struct Cut<'a, F: Fn(SectionPos) -> bool> {
 }
 
 impl<F: Fn(SectionPos) -> bool> Cut<'_, F> {
-    fn complete(&mut self, s: SectionPos) -> bool {
+    /// Whether `s`'s square can be drawn whole by `s` or the tiles under it: a desired tile once it
+    /// is Ready, a node of the cut once all four of its children can be or it is Ready.
+    fn drawable(&mut self, s: SectionPos) -> bool {
         if let Some(&c) = self.done.get(&s) {
             return c;
         }
         let c = if self.leaves.contains(&s) {
             (self.ready)(s)
         } else if self.inner.contains(&s) {
-            Quadrant::ALL.into_iter().all(|q| self.complete(s.child(q)))
+            self.children_drawable(s) || (self.ready)(s)
         } else {
             true
         };
         self.done.insert(s, c);
         c
+    }
+
+    fn children_drawable(&mut self, s: SectionPos) -> bool {
+        Quadrant::ALL.into_iter().all(|q| self.drawable(s.child(q)))
     }
 
     fn draw(&mut self, s: SectionPos, out: &mut Vec<SectionPos>) {
@@ -120,7 +129,9 @@ impl<F: Fn(SectionPos) -> bool> Cut<'_, F> {
         if !self.inner.contains(&s) {
             return;
         }
-        if !self.complete(s) && (self.ready)(s) {
+        // A Ready node draws itself only for a child that cannot draw its own square: it is the
+        // nearest Ready ancestor of the tile still missing there.
+        if !self.children_drawable(s) && (self.ready)(s) {
             out.push(s);
             return;
         }
@@ -182,8 +193,8 @@ mod tests {
 
     /// Over random cuts and random Ready sets: no two drawn tiles overlap; every drawn tile is a
     /// desired tile, a Ready ancestor of one drawn whole, or (only where no ancestor is Ready) a
-    /// Ready finer tile; a desired tile with every desired tile of its parent Ready draws itself;
-    /// and with every desired tile Ready the drawn tiles are exactly the cut.
+    /// Ready finer tile; an ancestor draws only for an unready desired tile no nearer Ready
+    /// ancestor could draw; and with every desired tile Ready the drawn tiles are exactly the cut.
     #[test]
     fn whole_cut_never_overlaps_and_draws_the_target_or_an_ancestor() {
         let mut state = 0x5EED_0F_C0DE_u64;
@@ -207,6 +218,12 @@ mod tests {
                 let ancestor = cut.iter().any(|&c| c != a && contains(a, c));
                 let finer = cut.iter().any(|&c| c != a && contains(c, a));
                 assert!(target || ancestor || finer, "round {round}: {a:?} is not of the cut");
+                if ancestor && !target {
+                    let needed = cut.iter().any(|&l| {
+                        l != a && contains(a, l) && !ready.contains(&l) && std::iter::successors(Some(l.parent()), |p| Some(p.parent())).take_while(|&p| p != a).all(|p| !ready.contains(&p))
+                    });
+                    assert!(needed, "round {round}: {a:?} drawn though a nearer Ready tile could draw every square under it");
+                }
                 if finer {
                     let c = *cut.iter().find(|&&c| contains(c, a)).expect("its desired tile");
                     let mut p = c;
@@ -237,5 +254,28 @@ mod tests {
         ready.insert(kids[3]);
         assert_eq!(whole_cut(&kids, Detail(5), &|p| ready.contains(&p), &below(&ready)).len(), 4);
         assert_eq!(whole_cut(&[parent], Detail(5), &|p| ready.contains(&p), &below(&ready)), vec![parent], "a merge draws the parent at once");
+    }
+
+    /// With every ancestor of the cut resident (as streaming keeps them), one tile still being
+    /// built is drawn by its parent alone: the root over it and every other tile draw as before.
+    #[test]
+    fn a_missing_tile_is_stood_in_for_by_its_parent_not_the_root() {
+        let root = SectionPos { detail: Detail(6), body: 0, face: Face::PosY, x: 3, z: -2 };
+        // The cut of an eye at the root's corner: each level splits its first quadrant.
+        let (mut cut, mut ancestors, mut s) = (Vec::new(), Vec::new(), root);
+        while s.detail.0 > 2 {
+            ancestors.push(s);
+            let kids = Quadrant::ALL.map(|q| s.child(q));
+            cut.extend_from_slice(&kids[1..]);
+            s = kids[0];
+        }
+        cut.push(s);
+        let missing = cut[cut.len() - 2];
+        let ready: FastSet<SectionPos> = cut.iter().chain(&ancestors).copied().filter(|&p| p != missing).collect();
+        let drawn = whole_cut(&cut, Detail(6), &|p| ready.contains(&p), &stand_in_nodes(ready.iter().copied()));
+        let parent = missing.parent();
+        let mut want: Vec<SectionPos> = cut.iter().copied().filter(|&c| c.parent() != parent).chain([parent]).collect();
+        want.sort_unstable_by_key(|s| (s.body, s.face as u8, s.detail, s.x, s.z));
+        assert_eq!(drawn, want);
     }
 }

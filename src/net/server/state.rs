@@ -159,6 +159,8 @@ impl SpecPool {
 }
 
 pub(super) struct State {
+    /// Simulation adjacency is reused across contact reads, independent of rendering residence.
+    pub(super) reaction_seams: std::sync::OnceLock<Seams>,
     /// Keyed by cells clients choose, so it keeps SipHash.
     pub(super) edits: HashMap<(i32, i32, i32), Cell>,
     pub(super) spec_pool: SpecPool,
@@ -206,6 +208,7 @@ impl State {
     /// An empty world on `registry`, with no players and the clock at `day`.
     pub(super) fn new(registry: BlockRegistry, day: f32, max_speed: f64) -> Self {
         Self {
+            reaction_seams: std::sync::OnceLock::new(),
             edits: HashMap::new(),
             spec_pool: SpecPool::default(),
             registry,
@@ -391,6 +394,57 @@ impl TerrainCache {
 }
 
 impl CellStore for ServerCells<'_> {
+    fn resolve(&self, pos: Pos) -> Pos {
+        let seams = self.state.reaction_seams.get_or_init(|| Seams::new(self.generator.atlases().to_vec()));
+        seams.glue_cell(BlockCoord::new(pos.0, pos.1, pos.2))
+            .map_or(pos, |cell| (cell.x, cell.y, cell.z))
+    }
+
+    /// Admit both products against the final spec-pool occupancy before changing either cell.
+    fn set_pair(&mut self, lo: Pos, a: BlockId, na: BlockId, hi: Pos, b: BlockId, nb: BlockId) -> bool {
+        if lo == hi || server_block(self.state, self.generator, lo) != a || server_block(self.state, self.generator, hi) != b {
+            return false;
+        }
+        let changes = [(lo, a, na), (hi, b, nb)];
+        let mut deltas = [(AIR, 0i32); 4];
+        let mut count = 0;
+        for (at, from, to) in changes {
+            if from == to { continue; }
+            let old = self.state.edits.get(&at).map(|cell| cell.block);
+            for (id, delta) in old.into_iter().map(|id| (id, -1)).chain(std::iter::once((to, 1))) {
+                let index = (0..count).find(|&i| deltas[i].0 == id).unwrap_or_else(|| {
+                    let index = count;
+                    count += 1;
+                    deltas[index].0 = id;
+                    index
+                });
+                deltas[index].1 += delta;
+            }
+        }
+        let mut named = self.state.spec_pool.named as i64;
+        for &(id, delta) in &deltas[..count] {
+            let before = self.state.spec_pool.cells.get(usize::from(id.0)).copied().unwrap_or(0) as i64;
+            let after = before + i64::from(delta);
+            if after < 0 { return false; }
+            named += i64::from(after > 0) - i64::from(before > 0);
+        }
+        if named > MAX_SPEC_POOL as i64 { return false; }
+        for (at, from, to) in changes {
+            if from != to && let Some(old) = self.state.edits.get(&at) {
+                self.state.spec_pool.release(old.block);
+            }
+        }
+        for (at, from, to) in changes {
+            if from == to { continue; }
+            let admitted = self.state.spec_pool.take(to);
+            debug_assert!(admitted, "pair preflight admitted both products");
+            let spec = Arc::clone(self.state.registry.spec_ref(to));
+            let rev = self.state.rev(at).saturating_add(1);
+            self.state.edits.insert(at, Cell { block: to, spec, rev, natural: false });
+        }
+        true
+    }
+
     fn block_at(&self, pos: Pos) -> Option<BlockId> {
         Some(server_block(self.state, self.generator, pos))
     }

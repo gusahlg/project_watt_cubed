@@ -112,6 +112,11 @@ impl World {
         self.edit_generation
     }
 
+    /// Incremented when blocks are edited or simulation state changes: what a save holds.
+    pub fn save_generation(&self) -> u64 {
+        self.edit_generation.wrapping_add(self.simulation_generation)
+    }
+
     /// The block palette, for resolving ids to names, properties, and the hot
     /// solidity/colour arrays.
     pub fn registry(&self) -> &BlockRegistry {

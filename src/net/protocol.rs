@@ -1038,6 +1038,7 @@ messages! {
             gravity: u64,
             law: u64,
             palette: u64,
+            simulation: u64,
             name: Arc<str>,
             password: Arc<str>,
             mods: Vec<ModOffer>,
@@ -1250,6 +1251,7 @@ mod tests {
                 gravity: 0xDEAD_BEEF_1234_5678,
                 law: 0x1111,
                 palette: 0x2222,
+                simulation: 0,
                 name: "player".into(),
                 password: "hunter2".into(),
                 mods: vec![ModOffer { id: "pwc.hotbar".into(), version: "0.1.0".into() }],
@@ -2047,6 +2049,7 @@ mod tests {
             gravity: 0,
             law: 0,
             palette: 0,
+            simulation: 0,
             name: cap_name.clone(),
             password: "".into(),
             mods: vec![],
@@ -2060,6 +2063,7 @@ mod tests {
             gravity: 0,
             law: 0,
             palette: 0,
+            simulation: 0,
             name: over,
             password: "p".repeat(super::super::MAX_NAME + 1).into(),
             mods: vec![],
@@ -2140,6 +2144,7 @@ mod tests {
             gravity: 0,
             law: 0,
             palette: 0,
+            simulation: 0,
             name: "ada".into(),
             password: "".into(),
             mods,
@@ -2164,7 +2169,7 @@ mod golden {
     const POSES: &str = "050000000000407f4000000000008034c00000000080842e41030007055f14300aa0018000c0feac0238c585e3c20108208000490038fffb00b500140064f0a20423be280000000011800000000000000100";
     const SNAPSHOT: &str = "020203006169720c00633a30313238353038636130042080011f01000200000301a1897a8901a0d0acf30effffffff0f00a2897a8c019fd0acf30e0201";
     /// FNV-64 over every encoding in the round-trip cases, client then server.
-    const DIGEST: u64 = 0x4935_facd_0ee5_2bd8;
+    const DIGEST: u64 = 0x9c27_b235_0147_4258;
 
     fn golden_move() -> ClientMessage {
         ClientMessage::Move { pose: Pose {

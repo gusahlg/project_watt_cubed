@@ -1,7 +1,7 @@
 # Protocol version history
 
-Moved verbatim from `src/net/mod.rs` (`PROTOCOL_VERSION`). Client and server
-must match exactly, checked at join.
+History of `src/net/mod.rs`'s `PROTOCOL_VERSION`. Client and server must match
+exactly, checked at join. The current version is 18.
 
 v2: positions are 3x f64 on the wire (far-coordinate correctness).
 v4: worldgen v2 — chunk materials are a pure function of (seed, worldgen),
@@ -64,3 +64,11 @@ sides a pose at once. `Snapshot` cells carry a palette of the specs the frame
 names, then per cell LEB128 zigzag coordinate deltas, the revision, and the
 palette index; the join overlay is sorted chunk by chunk. Mixed v16/v17 peers
 must not join.
+v18: `Hello`'s content parts add a u64 simulation fingerprint, derived from
+the selected native `ModelSpec` id and version. Zero means no simulation
+provider. Worldgen, gravity, catalog law and palette checks remain separate.
+Only the server runs the model, so the fingerprint never refuses a join: a
+client's provider, or none, joins any server. Mixed v17/v18 peers must not join. This identifies the selected law but does
+not replicate experimental per-cell fields or local laboratory input. The
+separate save format remains v10: model selection and versioned payloads use
+reserved records in the existing opaque mod-state section.

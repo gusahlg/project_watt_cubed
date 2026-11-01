@@ -17,6 +17,35 @@
 //! requires a major version bump. The [`prelude`] covers what most mods need; the module
 //! re-exports give access to the game's subsystems a mod may read or drive.
 //!
+//! # 3.3.0
+//!
+//! Additive on 3.2 (`^3.0` still matches):
+//! - [`headless::HeadlessClient`] is one player on a server with the game's world mirror and
+//!   physics and none of the window. [`HeadlessClient::connect`](headless::HeadlessClient::connect)
+//!   blocks until a frame can run; [`step`](headless::HeadlessClient::step) polls, moves, acts
+//!   and sends. The caller names the held material for a place or a tool use. `target` and `ray`
+//!   use the game's raycast; `cell_center` embeds a round world's storage cell in world space.
+//! - [`ModRegistrar::cli`] registers a command-line entry point ([`Cli`], [`CliContext`]).
+//!   `help` and `--commands` list the registered commands. Any other first argument starts the game.
+//!
+//! # 3.2.0
+//!
+//! Additive native simulation providers on 3.1 (`^3.0` still matches):
+//! - [`Mod::reaction_model`] offers `sim::model::ModelSpec { id, version, create }`.
+//!   The first active provider wins; no provider means no automatic or held-material reactions.
+//! - `sim::model::Model: Send` owns wakeups, budgeted stepping, optional tool interactions,
+//!   counters, samples, and saved dynamical state. `sim::reactions::CellStore` provides the
+//!   world adapter and atomic pair admission. The common material catalog remains in core.
+//! - `World::configure_simulation`, `simulation_model_id`, `simulation_stats`,
+//!   `simulation_sample`, `simulation_cell`, and `perturb_simulation` support selection and
+//!   laboratory inspection/input. Switching or disabling a model preserves its saved payload.
+//! - The original selective-transfer queue/tool law is the separate `pwc.physics-selective`
+//!   package. Experimental wave, packet, reservoir and rotor packages are independent providers.
+//! - Protocol 18 adds the selected model id/version fingerprint (informational: only the
+//!   server runs the model, so it never refuses a join); server configuration accepts an
+//!   explicit factory. Save v10 uses reserved opaque records without a binary format bump.
+//!   Experimental per-cell fields and local perturbations are not replicated to clients yet.
+//!
 //! # 3.1.0
 //!
 //! The emergent cosmos (worldgen 11): every seed grows its own bodies. Additions only.
@@ -136,15 +165,15 @@
 //! There is no controls screen. [`Action::label`] is what a future one will show; rebinding is
 //! left for later.
 //!
-//! **Rules of the game** (see the package manager's POLICY.md): matter is not a mod — blocks are
-//! configurations of elements under one law; names and looks are presentation and never feed
-//! back into the law, world generation, saves or the network; anything that affects the world is
-//! deterministic; in multiplayer the server is the authority; hooks run at frame/event
-//! granularity, never per voxel.
+//! **Rules of the game** (see the package manager's POLICY.md): blocks are canonical element
+//! configurations, with no named special cases. Optional native models supply universal laws;
+//! names and looks never feed back into world state. World-affecting code is deterministic and
+//! the multiplayer server is authoritative. Frame/event hooks remain cheap; budgeted model ticks
+//! handle local simulation work and document its cost.
 
 pub use project_watt_cubed::modding::{
-    Action, ActionSet, BuildInfo, GameBuild, Mod, ModContext, ModDescriptor, ModRegistrar, PackageInfo, PackageKind,
-    ToolUse, VisualMask,
+    Action, ActionSet, BuildInfo, Cli, CliContext, GameBuild, Mod, ModContext, ModDescriptor, ModRegistrar,
+    PackageInfo, PackageKind, ToolUse, VisualMask,
 };
 
 pub mod testing;
@@ -206,8 +235,8 @@ pub mod audio {
 
 /// The game's subsystems, as far as mods may use them.
 pub use project_watt_cubed::{
-    block, derived, engine, gravity, input, inventory, material, math, net, player, render_config, screen, session,
-    settings, sim, sky, ui, world,
+    block, derived, engine, gravity, headless, input, inventory, material, math, net, player, render_config, screen,
+    session, settings, sim, sky, ui, world,
 };
 
 /// The mod API version this crate provides (`pwc-api` requirements are checked against it).

@@ -9,6 +9,8 @@
 #[cfg(test)]
 mod alloc_count;
 #[cfg(test)]
+extern crate self as pwc_mod_api;
+#[cfg(test)]
 #[global_allocator]
 static ALLOC: alloc_count::Counting = alloc_count::Counting;
 pub mod app;
@@ -23,6 +25,7 @@ pub mod gravity;
 pub(crate) mod frame_snapshot;
 pub(crate) mod game;
 pub mod harness;
+pub mod headless;
 pub(crate) mod hash;
 #[cfg(feature = "dev-tools")]
 pub use hash::splitmix_next;
@@ -38,6 +41,7 @@ pub mod modding;
 pub mod net;
 pub mod paths;
 pub mod player;
+pub(crate) mod play;
 pub(crate) mod presence;
 pub mod render_config;
 pub(crate) mod save;
@@ -59,6 +63,10 @@ pub use material;
 /// Run the game with the mod packages of `build` (`GameBuild::vanilla()` for the bare game).
 /// Returns when the window closes.
 pub fn run(build: modding::GameBuild) {
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(code) = modding::dispatch(&build, &args) {
+        std::process::exit(code);
+    }
     // The material palette is searched once per process (~0.5 s). Start it now, off the main thread,
     // so the first world finds it ready instead of stalling its first frame.
     let _ = std::thread::Builder::new()

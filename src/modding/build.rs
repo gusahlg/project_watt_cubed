@@ -244,6 +244,12 @@ impl<'a> ModRegistrar<'a> {
         self.mods.add_entry_from(Some(self.package.id), entry);
     }
 
+    /// Register a command-line entry point. The first registration of a name wins. `help` and
+    /// `--commands` stay reserved and list every registered command.
+    pub fn cli(&mut self, cli: super::cli::Cli) {
+        self.mods.add_cli(cli);
+    }
+
     /// Share a value with the packages registered after this one (handles are usually `Rc`s).
     /// A second value of the same type replaces the first.
     pub fn provide<T: Any>(&mut self, value: T) {

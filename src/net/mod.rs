@@ -160,7 +160,7 @@ pub(crate) mod quic {
 
 /// Wire revision. Client and server must match exactly at join. Bump on any
 /// incompatible frame change; history is `documentation/notes/protocol-history.md`.
-pub(crate) const PROTOCOL_VERSION: u32 = 17;
+pub(crate) const PROTOCOL_VERSION: u32 = 18;
 
 pub const DEFAULT_PORT: u16 = 5555;
 
@@ -189,6 +189,26 @@ pub(crate) struct ContentId {
     pub gravity: u64,
     pub law: u64,
     pub palette: u64,
+    /// Selected compiled simulation and version; zero means no simulation.
+    pub simulation: u64,
+}
+
+pub(crate) fn simulation_fingerprint(model: Option<crate::sim::model::ModelSpec>) -> u64 {
+    model.map_or(0, |model| model.fingerprint())
+}
+
+pub(crate) fn default_reaction_model() -> Option<crate::sim::model::ModelSpec> {
+    #[cfg(test)]
+    { crate::sim::model::test_default() }
+    #[cfg(not(test))]
+    { None }
+}
+
+pub(crate) fn content_id_with_model(
+    registry: &crate::block::BlockRegistry,
+    model: Option<crate::sim::model::ModelSpec>,
+) -> ContentId {
+    ContentId { simulation: simulation_fingerprint(model), ..content_id(registry) }
 }
 
 /// Code and content identity of `registry`. Interning a block does not change it: the
@@ -207,6 +227,7 @@ pub(crate) fn content_id(registry: &crate::block::BlockRegistry) -> ContentId {
         gravity: gravity.finish(),
         law: registry.law().fingerprint(),
         palette: palette.finish(),
+        simulation: 0,
     }
 }
 
@@ -232,8 +253,12 @@ pub(crate) fn world_fingerprint(
 
 /// `None` when `client` may share a world with `server`. Otherwise a reason that names the
 /// first part that differs and contains `content`, so a refusal says what diverged.
+///
+/// The simulation identity never refuses a join: only the server runs the model and a client
+/// receives committed cells, so a client's provider (or none) works on any server. The field
+/// stays on the wire for when per-cell fields replicate.
 pub(crate) fn content_mismatch(server: ContentId, client: ContentId) -> Option<String> {
-    if server == client {
+    if (ContentId { simulation: 0, ..server }) == (ContentId { simulation: 0, ..client }) {
         return None;
     }
     let detail = if server.worldgen != client.worldgen {
@@ -303,7 +328,7 @@ mod fingerprint_tests {
         let id = content_id(&crate::block::BlockRegistry::with_builtins());
         assert_eq!(
             id,
-            ContentId { worldgen: 11, gravity: 0xbda9_b2eb_c25d_c4d0, law: 0x04ce_0caa_d622_c6eb, palette: 0x95c9_349d_7e12_74b8 }
+            ContentId { worldgen: 11, gravity: 0xbda9_b2eb_c25d_c4d0, law: 0x04ce_0caa_d622_c6eb, palette: 0x95c9_349d_7e12_74b8, simulation: 0 }
         );
     }
 }

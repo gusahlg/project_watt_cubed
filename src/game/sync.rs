@@ -1,35 +1,89 @@
 //! Multiplayer sync and world edits: the server's events, the player's breaks, placements and
 //! tool uses, and the optimistic-edit bookkeeping that rolls a refused edit back.
-use std::time::Instant;
-
-use voxel_engine::DVec3;
-
 use super::{Game, Signal};
 use crate::audio::GameEvent;
 use crate::block::{AIR, BlockId};
+use crate::camera::GameCamera;
 use crate::interact;
-use crate::math::{Aabb, Bounded};
 use crate::modding::{Channel, Message, Mods, Notice, NoticeLevel, ToolUse};
 use crate::net::client::Incoming;
-use crate::presence::{Stance, WireAction};
-use crate::save;
+use crate::play::{self, Cue, Host};
+use crate::presence::{Animator, Stance, WireAction};
+use crate::sky::Sky;
 use crate::world::World;
 
-/// One optimistic edit awaiting the server's verdict: everything needed to
-/// undo it if the verdict is a rejection.
-pub(super) struct PendingEdit {
-    cell: (i32, i32, i32),
-    /// What the cell held before the optimistic apply.
-    prev: BlockId,
-    kind: PendingKind,
+pub(super) use crate::play::PendingEdit;
+#[cfg(test)]
+pub(super) use crate::play::PendingKind;
+
+/// The game's half of a shared play cue: the same sounds, mod calls and snap load as before.
+struct GameHost<'a> {
+    mods: &'a mut Mods,
+    events: &'a mut Vec<GameEvent>,
+    camera: &'a mut GameCamera,
+    anim: &'a mut Animator,
+    sky: &'a mut Sky,
+    force_stream: &'a mut bool,
 }
 
-/// The economy side of a pending edit — what to give back on rejection.
-enum PendingKind {
-    /// Breaking yielded this configuration; a rejection revokes it only if it fit (`gained`).
-    Break { id: BlockId, gained: bool },
-    /// Placing spent one crafted block of this id; a rejection refunds it.
-    Place(BlockId),
+impl Host for GameHost<'_> {
+    fn cue(&mut self, world: &World, cue: Cue) {
+        match cue {
+            Cue::RemoteEdit { at, id, prev, .. } => {
+                self.events.push(if id == AIR {
+                    GameEvent::BlockBroken { at, block: prev, local: false }
+                } else {
+                    GameEvent::BlockPlaced { at, block: id, local: false }
+                });
+            }
+            Cue::LocalBreak { at, block, .. } => {
+                self.events.push(GameEvent::Swing { at });
+                self.events.push(GameEvent::BlockBroken { at, block, local: true });
+            }
+            Cue::LocalPlace { at, block, .. } => {
+                self.events.push(GameEvent::Swing { at });
+                self.events.push(GameEvent::BlockPlaced { at, block, local: true });
+            }
+            Cue::SwingAt { at } => self.events.push(GameEvent::Swing { at }),
+            Cue::PeerSwing { at, peer } => self.events.push(GameEvent::PeerSwing { at, peer }),
+            Cue::ToolReacted { at, block } => self.events.push(GameEvent::ToolReacted { at, block }),
+            Cue::BreakNoted { id, overflow } => self.mods.on_block_break(id, world, overflow),
+            Cue::BreakRejected { id } => self.mods.on_break_rejected(id),
+            Cue::PlaceRejected { id } => self.mods.on_place_rejected(id, world),
+            Cue::ToolNoReaction => self.mods.on_tool_used(ToolUse::NoReaction),
+            Cue::ToolChanged { tool, new_tool } => self.mods.on_tool_changed(tool, new_tool),
+            Cue::ToolUsed(outcome) => self.mods.on_tool_used(outcome),
+            Cue::Chat { from, channel, text } => {
+                self.mods.on_message(&Message::Chat {
+                    from: from.as_ref(),
+                    channel: Channel::from_wire(channel),
+                    text: text.as_ref(),
+                });
+            }
+            Cue::Joined { name } => {
+                self.mods.on_message(&Message::Joined { name: name.as_ref() });
+            }
+            Cue::Left { name } => {
+                self.mods.on_message(&Message::Left { name: name.as_ref() });
+            }
+            Cue::Time { day, day_secs } => {
+                self.sky.clock.set_day(day as f64);
+                self.sky.day_length = crate::sky::DayLength::clamped(day_secs as f64);
+            }
+            Cue::Interrupted => {
+                let text = crate::net::client::INTERRUPTED.to_string();
+                post(self.mods, Notice { level: NoticeLevel::Warning, text });
+            }
+            Cue::Trauma(amount) => self.camera.fx.add_trauma(amount),
+            Cue::AnimSwing => self.anim.on_action(WireAction::Swing),
+            Cue::Snapped { .. } => *self.force_stream = true,
+            Cue::Mutation { .. } | Cue::Confirmed { .. } | Cue::Rejected { .. } | Cue::ToolDone { .. } => {}
+        }
+    }
+
+    fn prepare(&mut self, world: &mut World, pos: voxel_engine::DVec3) {
+        world.prepare_around(pos);
+    }
 }
 
 impl Game {
@@ -100,112 +154,23 @@ impl Game {
         mods: &mut Mods,
         events: &mut Vec<GameEvent>,
     ) -> Option<String> {
-        let mut disconnected = None;
-        let mut ledger = crate::world::Ledger::default();
-        for event in incoming {
-            // Every other event lands after the snapshot cells before it.
-            if !matches!(event, Incoming::Mutation { .. }) {
-                self.world.install(&mut ledger);
-            }
-            match event {
-                Incoming::Edit { x, y, z, spec } => {
-                    // Resolve the portable spec against our own palette, then
-                    // apply. The connection already dropped stale revisions,
-                    // and our own edits come back as acks, not broadcasts.
-                    // A remote break names the block that WAS there (its sound
-                    // class), not a generic default.
-                    let id = save::parse_block(self.world.registry_mut(), &spec);
-                    self.write_cell((x, y, z), id, |at, prev| {
-                        events.push(if id == AIR {
-                            GameEvent::BlockBroken { at, block: prev, local: false }
-                        } else {
-                            GameEvent::BlockPlaced { at, block: id, local: false }
-                        });
-                    });
-                }
-                Incoming::Mutation { x, y, z, spec } => {
-                    // Snapshot content: queued for the bulk install, silently. A client is never
-                    // the reaction authority, so there is nothing to note; a cascade of a
-                    // thousand cells must not play a thousand block cues.
-                    let id = save::parse_block(self.world.registry_mut(), &spec);
-                    ledger.push((x, y, z), id);
-                }
-                Incoming::EditAccepted { req } => {
-                    // Prediction confirmed: the optimistic apply IS the truth.
-                    self.pending_edits.remove(&req);
-                }
-                Incoming::EditRejected { req, restore } => {
-                    if let Some(pending) = self.pending_edits.remove(&req) {
-                        self.rollback(pending, restore, mods);
-                    }
-                }
-                Incoming::Position { pos, frame, up } => {
-                    // Authoritative snap-back (refused teleport or implausible
-                    // move): request the collision slab and freeze until it
-                    // lands, exactly like a local teleport. The server's
-                    // MOVE_WINDOW_CAP_SECS envelope tolerates a brief pause.
-                    self.world.prepare_around(pos);
-                    self.player.position = pos;
-                    self.player.orientation.frame = frame;
-                    self.player.up_axis = up;
-                    self.player.cancel_fall();
-                    self.force_stream = true;
-                }
-                // Chat and the roster are messages for the mods: the core shows none of them.
-                Incoming::Chat {
-                    from_name,
-                    channel,
-                    text,
-                } => {
-                    mods.on_message(&Message::Chat { from: &from_name, channel: Channel::from_wire(channel), text: &text });
-                }
-                Incoming::Joined { name } => {
-                    mods.on_message(&Message::Joined { name: &name });
-                }
-                Incoming::Left { name } => {
-                    mods.on_message(&Message::Left { name: &name });
-                }
-                Incoming::Time { day, day_secs } => {
-                    // The server owns the shared clock: phase AND cycle length.
-                    self.sky.clock.set_day(day as f64);
-                    self.sky.day_length = crate::sky::DayLength::clamped(day_secs as f64);
-                }
-                Incoming::Disconnected { reason } => disconnected = Some(reason),
-                Incoming::Interrupted => {
-                    let text = crate::net::client::INTERRUPTED.to_string();
-                    post(mods, Notice { level: NoticeLevel::Warning, text });
-                }
-                Incoming::ToolResult { req, reacted, cell, cell_spec, tool_spec } => {
-                    let Some(tool) = self.pending_tools.remove(&req) else { continue };
-                    if !reacted {
-                        mods.on_tool_used(ToolUse::NoReaction);
-                        continue;
-                    }
-                    let new_cell = save::parse_block(self.world.registry_mut(), &cell_spec);
-                    let new_tool = save::parse_block(self.world.registry_mut(), &tool_spec);
-                    let target = self.write_cell(cell, new_cell, |at, block| {
-                        events.push(GameEvent::ToolReacted { at, block });
-                    });
-                    self.finish_tool_change(tool, new_tool, target, new_cell, mods);
-                }
-                Incoming::PeerSwing { id } => {
-                    // The swing edge → a whoosh at the peer's current position. The
-                    // local animator update already happened in `Connection::apply`.
-                    if let Some(peer) = self
-                        .net
-                        .as_ref()
-                        .and_then(|net| net.peer(id))
-                    {
-                        events.push(GameEvent::PeerSwing {
-                            at: peer.sample(Instant::now()).pos.0,
-                            peer: id,
-                        });
-                    }
-                }
-            }
-        }
-        self.world.install(&mut ledger);
-        disconnected
+        let mut host = GameHost {
+            mods,
+            events,
+            camera: &mut self.camera,
+            anim: &mut self.local_anim,
+            sky: &mut self.sky,
+            force_stream: &mut self.force_stream,
+        };
+        play::apply_incoming(
+            &mut self.world,
+            &mut self.player,
+            &mut self.pending_edits,
+            &mut self.pending_tools,
+            self.net.as_ref(),
+            incoming,
+            &mut host,
+        )
     }
 
     /// Left click: with a tool, a reaction between the tool and the targeted block; with
@@ -221,121 +186,62 @@ impl Game {
         }
     }
 
-    /// Use the held configuration `tool` on the block at `cell`: ONE operation of the law between
-    /// the block (A, the world cell) and the tool (B). Elements move between them; the block may
-    /// empty (the tool has absorbed it) and the tool may grow, shrink or change entirely. The
-    /// changed cell wakes its contacts, so a disturbed block can start a cascade. On a server the
-    /// law is the server's to run: the request goes out and [`Incoming::ToolResult`] applies it.
+    /// Use the held configuration `tool` on the block at `cell`. On a server the law runs there.
     fn use_tool(&mut self, tool: BlockId, cell: (i32, i32, i32), mods: &mut Mods, events: &mut Vec<GameEvent>) {
-        let (x, y, z) = cell;
-        let target = self.world.block_at(x, y, z);
-        self.local_anim.on_action(WireAction::Swing);
-        let at = sound_at(&self.world, x, y, z);
-        events.push(GameEvent::Swing { at });
-        if let Some(net) = &mut self.net {
-            let spec = save::block_spec(self.world.registry(), tool);
-            if let Some(req) = net.send_tool_use(x, y, z, spec.into()) {
-                self.pending_tools.insert(req, tool);
-            }
-            net.send_swing();
-            return;
-        }
-        match self.world.registry_mut().react(target, tool) {
-            Some((_, new_cell, new_tool)) => {
-                self.write_cell(cell, new_cell, |at, block| events.push(GameEvent::ToolReacted { at, block }));
-                self.finish_tool_change(tool, new_tool, target, new_cell, mods);
-                self.camera.fx.add_trauma(0.08);
-            }
-            None => mods.on_tool_used(ToolUse::NoReaction),
-        }
-    }
-
-    /// One unit of `tool` became `new_tool` (the cell went `target` → `new_cell`): update the
-    /// inventory and tell the mods.
-    fn finish_tool_change(&mut self, tool: BlockId, new_tool: BlockId, target: BlockId, new_cell: BlockId, mods: &mut Mods) {
-        if self.player.inventory.consume(tool, 1) && new_tool != AIR {
-            self.player.inventory.add(new_tool, 1);
-        }
-        mods.on_tool_changed(tool, new_tool);
-        let reg = self.world.registry();
-        let before = reg.configuration(tool).len();
-        let after = reg.configuration(new_tool).len();
-        let outcome = if new_cell == AIR {
-            ToolUse::CellDissolved { cell: target }
-        } else if new_tool == AIR {
-            ToolUse::ToolDissolved { cell: target }
-        } else if after > before {
-            ToolUse::Drew { cell: target }
-        } else if after < before {
-            ToolUse::Gave { cell: target }
-        } else {
-            ToolUse::Exchanged { cell: target }
+        let mut host = GameHost {
+            mods,
+            events,
+            camera: &mut self.camera,
+            anim: &mut self.local_anim,
+            sky: &mut self.sky,
+            force_stream: &mut self.force_stream,
         };
-        mods.on_tool_used(outcome);
+        play::use_tool(
+            &mut self.world,
+            &mut self.player,
+            &mut self.pending_tools,
+            self.net.as_mut(),
+            tool,
+            cell,
+            &mut host,
+        );
     }
 
     /// No tool: break the block at `cell` into the inventory.
     fn break_block(&mut self, cell: (i32, i32, i32), mods: &mut Mods, events: &mut Vec<GameEvent>) {
-        let id = self.write_cell(cell, AIR, |at, block| {
-            events.push(GameEvent::Swing { at });
-            events.push(GameEvent::BlockBroken { at, block, local: true });
-        });
-        let gained = self.player.inventory.add(id, 1);
-        mods.on_block_break(id, &self.world, !gained);
-        self.camera.fx.add_trauma(0.15);
-        self.local_anim.on_action(WireAction::Swing);
-        self.predict(PendingEdit { cell, prev: id, kind: PendingKind::Break { id, gained } }, mods);
-    }
-
-    /// Write `id` into `cell`, wake its contacts, and report the write: `report` gets where the
-    /// cell sounds and what it held, which is also returned.
-    fn write_cell(&mut self, (x, y, z): (i32, i32, i32), id: BlockId, report: impl FnOnce(DVec3, BlockId)) -> BlockId {
-        let prev = self.world.block_at(x, y, z);
-        self.world.set_block(x, y, z, id);
-        self.world.note_cell_changed(x, y, z);
-        report(sound_at(&self.world, x, y, z), prev);
-        prev
-    }
-
-    /// Tell the server about a local edit (it validates and relays to everyone else). The local
-    /// apply is a PREDICTION for responsiveness: the verdict rolls it back, cell and economy
-    /// both, if we lose the race for the cell. An edit that cannot be sent rolls back at once.
-    fn predict(&mut self, edit: PendingEdit, mods: &mut Mods) {
-        let Some(net) = &mut self.net else { return };
-        let spec: std::sync::Arc<str> = match edit.kind {
-            PendingKind::Break { .. } => "air".into(),
-            PendingKind::Place(id) => save::block_spec(self.world.registry(), id).into(),
+        let mut host = GameHost {
+            mods,
+            events,
+            camera: &mut self.camera,
+            anim: &mut self.local_anim,
+            sky: &mut self.sky,
+            force_stream: &mut self.force_stream,
         };
-        let (x, y, z) = edit.cell;
-        match net.send_edit(x, y, z, spec) {
-            Some(req) => {
-                self.pending_edits.insert(req, edit);
-                net.send_swing();
-            }
-            None => self.rollback(edit, true, mods),
-        }
+        play::commit_break(
+            &mut self.world,
+            &mut self.player,
+            &mut self.pending_edits,
+            self.net.as_mut(),
+            cell,
+            &mut host,
+        );
     }
 
     /// Undo a refused or unsent edit: give the cell back when `restore` (nothing newer landed on
-    /// it), revoke loot only if it fit, and refund a spent block.
+    /// it), revoke loot only if it fit, and refund a spent block. The live path rolls back inside
+    /// [`crate::play`]; tests call this wrapper.
+    #[cfg(test)]
     fn rollback(&mut self, edit: PendingEdit, restore: bool, mods: &mut Mods) {
-        if restore {
-            let (x, y, z) = edit.cell;
-            self.world.set_block(x, y, z, edit.prev);
-            self.world.note_cell_changed(x, y, z);
-        }
-        match edit.kind {
-            PendingKind::Break { id, gained } => {
-                if gained {
-                    self.player.inventory.revoke(id, 1);
-                }
-                mods.on_break_rejected(id);
-            }
-            PendingKind::Place(id) => {
-                self.player.inventory.add(id, 1);
-                mods.on_place_rejected(id, &self.world);
-            }
-        }
+        let mut events = Vec::new();
+        let mut host = GameHost {
+            mods,
+            events: &mut events,
+            camera: &mut self.camera,
+            anim: &mut self.local_anim,
+            sky: &mut self.sky,
+            force_stream: &mut self.force_stream,
+        };
+        play::rollback(&mut self.world, &mut self.player, edit, restore, &mut host);
     }
 
     /// Apply the block placements mods queued this tick, draining the buffer in
@@ -351,46 +257,39 @@ impl Game {
         events: &mut Vec<GameEvent>,
         mods: &mut Mods,
     ) {
+        let mut host = GameHost {
+            mods,
+            events,
+            camera: &mut self.camera,
+            anim: &mut self.local_anim,
+            sky: &mut self.sky,
+            force_stream: &mut self.force_stream,
+        };
         for (x, y, z, id) in placements.drain(..) {
-            // Overlap check in f64: at far coordinates an f32 cell centre
-            // would land whole blocks away from the real cell.
-            let cell = Aabb::new(
-                DVec3::new(x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5),
-                DVec3::splat(0.5),
-            );
             // Lands only in empty space clear of the player; a refused placement gives the
             // spent unit back.
-            if self.world.is_solid(x, y, z) || cell.intersects(&self.player.aabb()) {
+            if play::blocks_placement(&self.world, &self.player, (x, y, z)) {
                 self.player.inventory.add(id, 1);
                 continue;
             }
-            let prev = self.write_cell((x, y, z), id, |at, _| {
-                events.push(GameEvent::Swing { at });
-                events.push(GameEvent::BlockPlaced { at, block: id, local: true });
-            });
-            self.local_anim.on_action(WireAction::Swing);
-            // The server gets the same portable spec form saves use.
-            self.predict(PendingEdit { cell: (x, y, z), prev, kind: PendingKind::Place(id) }, mods);
+            play::commit_place(
+                &mut self.world,
+                &mut self.player,
+                &mut self.pending_edits,
+                self.net.as_mut(),
+                (x, y, z),
+                id,
+                &mut host,
+            );
         }
     }
 }
 
-/// The world-space centre of a voxel cell (occurrence position).
 /// Hand a session notice to the mods now; with no mod showing it, stderr.
 fn post(mods: &mut Mods, notice: Notice) {
     if !mods.on_message(&Message::Notice(&notice)) {
         eprintln!("{}", notice.text);
     }
-}
-
-fn cell_center(x: i32, y: i32, z: i32) -> DVec3 {
-    DVec3::new(x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5)
-}
-
-/// Where a sound at cell `(x, y, z)` plays: the cell's physical centre. A round world's storage cell
-/// (x past a billion) sits where its chart embeds it, next to the listener.
-fn sound_at(world: &World, x: i32, y: i32, z: i32) -> DVec3 {
-    crate::space::atlas::embed_cell(world.atlases(), (x, y, z)).unwrap_or_else(|| cell_center(x, y, z))
 }
 
 #[cfg(test)]

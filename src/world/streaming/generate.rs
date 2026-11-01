@@ -500,6 +500,48 @@ impl World {
         self.spawn_slab = (!self.slab_loaded(slab)).then_some(slab);
     }
 
+    /// Synchronously generate the collision slab around `center`, then drop chunk data whose
+    /// box sits farther than `radius` from it. A non-finite or negative radius only loads.
+    /// The windowed stream still unloads through [`unload_far`](Self::unload_far); this is the
+    /// engine-free path a headless world uses as the player walks.
+    pub fn keep_around(&mut self, center: DVec3, radius: f64) {
+        self.ensure_around(center);
+        if !radius.is_finite() || radius < 0.0 {
+            return;
+        }
+        // Chunk boxes live in storage. On a flat world that is the eye; on a chart it is
+        // `stream_eye`, the same point `ensure_around` just filled.
+        let center = self.stream_eye(center);
+        let mut far = Vec::new();
+        for &coord in self.chunks.keys() {
+            if chunk_gap(coord, center) > radius {
+                far.push(coord);
+            }
+        }
+        if far.is_empty() {
+            return;
+        }
+        self.occlusion_topo_dirty.raise(true);
+        for &coord in &far {
+            if let Some((state, cage)) = self.forget_chunk(coord) {
+                debug_assert!(cage.is_none(), "keep_around drops chunk data; this world has a GPU cage");
+                drop((state, cage));
+            }
+        }
+        // Twin of the light-queue retain in `unload_far_with`: a settled grid must not land on
+        // a chunk this call just dropped.
+        if !self.light_apply_queue.is_empty() {
+            let inflight = &mut self.light_inflight;
+            self.light_apply_queue.retain(|(c, _)| {
+                let gone = far.contains(c);
+                if gone {
+                    inflight.remove(c);
+                }
+                !gone
+            });
+        }
+    }
+
     /// Synchronously generate the collision slab. Headless callers (tests,
     /// anything that queries voxels before a stream pass).
     pub fn ensure_around(&mut self, pos: DVec3) {
@@ -802,6 +844,17 @@ impl World {
     }
 }
 
+/// Euclidean gap from `center` to the chunk's AABB. Zero when the point is inside the box.
+fn chunk_gap(coord: Coord, center: DVec3) -> f64 {
+    let s = CHUNK_SIZE as f64;
+    let (min_x, min_y, min_z) = (coord.x as f64 * s, coord.y as f64 * s, coord.z as f64 * s);
+    let (max_x, max_y, max_z) = (min_x + s, min_y + s, min_z + s);
+    let dx = (min_x - center.x).max(center.x - max_x).max(0.0);
+    let dy = (min_y - center.y).max(center.y - max_y).max(0.0);
+    let dz = (min_z - center.z).max(center.z - max_z).max(0.0);
+    (dx * dx + dy * dy + dz * dz).sqrt()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -896,5 +949,23 @@ mod tests {
             true,
         );
         assert_eq!(runs, vec![GenRun::Open { coord }]);
+    }
+
+    /// A walk drops the slab left behind instead of keeping every chunk ever visited.
+    #[test]
+    fn keep_around_drops_chunks_left_behind() {
+        let mut world = World::with_kind_cfg(
+            1,
+            crate::render_config::RenderConfig::default(),
+            crate::world::generation::WorldgenKind::Flat,
+            crate::world::terrain::TerrainCfg::default(),
+            false,
+        );
+        world.keep_around(DVec3::ZERO, 96.0);
+        let near = world.stream_gauges().chunks;
+        assert!(near > 0, "the slab loaded");
+        world.keep_around(DVec3::new(500.0, 0.0, 0.0), 96.0);
+        let moved = world.stream_gauges().chunks;
+        assert!(moved < near * 2, "kept {moved} chunks after the move, had {near} at the origin");
     }
 }

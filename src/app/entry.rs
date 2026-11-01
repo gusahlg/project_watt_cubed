@@ -48,7 +48,7 @@ pub(super) struct Recipe {
 
 impl Recipe {
     fn world(self) -> World {
-        World::with_kind_cfg(self.seed, self.render, self.kind, self.cfg, false)
+        World::mirror(self.seed, self.render, self.kind, self.cfg)
     }
 }
 

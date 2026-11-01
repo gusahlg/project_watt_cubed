@@ -50,6 +50,8 @@ pub(crate) struct Loaded {
     pub edits: Vec<(i32, i32, i32, String)>,
     /// Contacts the file still had waiting. Restored into the scheduler before the first tick.
     pub pending: Vec<PendingContact>,
+    /// Reserved model selection and opaque model state from the save document.
+    pub simulation: Vec<(String, String)>,
     pub store: Option<Store>,
 }
 
@@ -73,7 +75,7 @@ pub(crate) struct LoadError {
 }
 
 impl LoadError {
-    fn new(path: &Path, reason: impl Into<String>) -> Self {
+    pub(crate) fn new(path: &Path, reason: impl Into<String>) -> Self {
         Self { path: path.to_path_buf(), reason: reason.into() }
     }
 
@@ -101,6 +103,7 @@ pub(crate) struct Snapshot {
     pub edits: Vec<(i32, i32, i32, Arc<str>)>,
     /// Active reaction contacts, in processing order.
     pub pending: Vec<PendingContact>,
+    pub simulation: Vec<(String, String)>,
 }
 
 /// Operators and mod policy that live beside a world file.
@@ -147,6 +150,7 @@ pub(crate) fn fresh(flags: &Flags) -> Loaded {
         day: DEFAULT_DAY,
         edits: Vec::new(),
         pending: Vec::new(),
+        simulation: Vec::new(),
         store: None,
     }
 }
@@ -248,6 +252,12 @@ fn open(path: &Path, mut doc: SaveDoc, flags: &Flags, rotate: bool) -> Result<Lo
     let spec_table = std::mem::take(&mut doc.specs);
     let stored = std::mem::take(&mut doc.edits);
     let pending = std::mem::take(&mut doc.pending);
+    let mut simulation: Vec<_> = doc.mods.iter().filter(|(name, _)| name.starts_with("@simulation.")).cloned().collect();
+    // Actual pre-extraction saves used selective transfer even after their contacts settled.
+    // Fresh worlds bypass this migration through `fresh`.
+    if !simulation.iter().any(|(name, _)| name == "@simulation.selected") {
+        simulation.push(("@simulation.selected".into(), format!("{}@1", crate::sim::model::LEGACY_ID)));
+    }
     let mut edits = Vec::with_capacity(stored.len());
     for edit in stored {
         let Some(spec) = spec_table.get(usize::from(edit.spec)) else { continue };
@@ -260,6 +270,7 @@ fn open(path: &Path, mut doc: SaveDoc, flags: &Flags, rotate: bool) -> Result<Lo
         day,
         edits,
         pending,
+        simulation,
         store: Some(Store {
             path: path.to_path_buf(),
             doc: Mutex::new(doc),
@@ -345,7 +356,8 @@ fn encode_snapshot(
     doc.specs = table.specs;
     doc.edits = records;
     doc.pending = snap.pending.clone();
-    doc.mods.retain(|(name, _)| name != CLOCK_MOD);
+    doc.mods.retain(|(name, _)| name != CLOCK_MOD && !name.starts_with("@simulation."));
+    doc.mods.extend(snap.simulation.iter().cloned());
     let day = if snap.day.is_finite() { snap.day.rem_euclid(1.0) } else { DEFAULT_DAY };
     doc.mods.push((CLOCK_MOD.to_string(), format!("{:08x}", day.to_bits())));
     format::encode(doc)
@@ -507,7 +519,7 @@ mod tests {
         let pending = loaded.pending.clone();
         assert_eq!(pending, vec![PendingContact { x: 1, y: 2, z: 3, axis: 0, age: 4 }]);
         store
-            .write(&Snapshot {
+            .write(&Snapshot { simulation: Vec::new(),
                 seed: 42,
                 worldgen: WorldgenKind::Flat,
                 terrain: TerrainCfg::default(),
@@ -596,7 +608,7 @@ mod tests {
         let store = loaded.store.unwrap();
         let pending = vec![PendingContact { x: 4, y: 5, z: 6, axis: 1, age: 2 }];
         store
-            .write(&Snapshot {
+            .write(&Snapshot { simulation: Vec::new(),
                 seed: 1,
                 worldgen: WorldgenKind::Flat,
                 terrain: TerrainCfg::default(),
@@ -606,7 +618,7 @@ mod tests {
             })
             .unwrap();
         store
-            .write(&Snapshot {
+            .write(&Snapshot { simulation: Vec::new(),
                 seed: 2,
                 worldgen: WorldgenKind::Flat,
                 terrain: TerrainCfg::default(),
@@ -653,7 +665,7 @@ mod tests {
         let store = loaded.store.unwrap();
         store.set_kept(kept);
         store
-            .write(&Snapshot {
+            .write(&Snapshot { simulation: Vec::new(),
                 seed: 3,
                 worldgen: WorldgenKind::Flat,
                 terrain: TerrainCfg::default(),
@@ -668,7 +680,7 @@ mod tests {
         let store = again.store.unwrap();
         store.set_kept(vec![(1, 2, 3, "natural:Stone".into())]);
         store
-            .write(&Snapshot {
+            .write(&Snapshot { simulation: Vec::new(),
                 seed: 3,
                 worldgen: WorldgenKind::Flat,
                 terrain: TerrainCfg::default(),
@@ -684,7 +696,7 @@ mod tests {
     }
 
     fn snapshot(seed: i64, edits: Vec<(i32, i32, i32, Arc<str>)>) -> Snapshot {
-        Snapshot { seed, worldgen: WorldgenKind::Flat, terrain: TerrainCfg::default(), day: 0.3, edits, pending: Vec::new() }
+        Snapshot { simulation: Vec::new(), seed, worldgen: WorldgenKind::Flat, terrain: TerrainCfg::default(), day: 0.3, edits, pending: Vec::new() }
     }
 
     fn intact(path: &Path) -> SaveDoc {

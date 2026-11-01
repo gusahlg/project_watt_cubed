@@ -84,6 +84,13 @@ impl MoveInput {
         }
     }
 
+    /// Walking intent from plain axes. `right` is strafe and `forward` is ahead, each clamped
+    /// to `-1..=1`. A non-finite axis is zero.
+    pub(crate) fn walk(forward: f32, right: f32, jump: bool, sprint: bool, sneak: bool) -> Self {
+        let axis = |v: f32| if v.is_finite() { v.clamp(-1.0, 1.0) } else { 0.0 };
+        Self { move_x: axis(right), move_y: 0.0, move_z: axis(forward), jump, sprint, sneak }
+    }
+
     /// Held jump state, exposed so a fixed physics clock can also retain a
     /// short press that begins and ends between two physics ticks.
     pub(crate) fn jump(&self) -> bool {

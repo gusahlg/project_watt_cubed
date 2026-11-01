@@ -3,6 +3,7 @@
 //! real active-cell model and observable behaviour.
 
 pub mod reactions;
+pub mod model;
 
 use crate::sched::{Ctx, Run};
 use crate::world::World;

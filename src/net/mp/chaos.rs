@@ -1579,7 +1579,7 @@ fn a_long_join_overlay_is_not_a_quiet_link() {
     let store = persist::load(&path, &flags).expect("a fresh world").store.expect("a world file");
     let plank = Ground::new(1).blocks[3].clone();
     let edits = (0..CELLS).map(|i| (i % 300, OWN_Y, i / 300, plank.clone())).collect();
-    let world = persist::Snapshot {
+    let world = persist::Snapshot { simulation: Vec::new(),
         seed: 1,
         worldgen: WorldgenKind::Flat,
         terrain: TerrainCfg::default(),

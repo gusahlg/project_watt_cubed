@@ -3,6 +3,24 @@ use super::super::*;
 use super::support::*;
 use crate::net::client::Incoming;
 
+/// Only the server runs the simulation, so a client's provider never decides a join: a client
+/// with a model joins a server without one, and the other way round.
+#[test]
+fn a_clients_simulation_provider_never_blocks_a_join() {
+    let vanilla = flat(Config { reaction_model: None, ..Config::default() });
+    let with_model = Connection::connect_with_model(
+        "127.0.0.1", vanilla.addr().port(), "modded", "", &[], crate::sim::model::test_default(),
+    );
+    assert!(with_model.is_ok(), "a client's provider joins a vanilla server");
+    drop(with_model);
+    vanilla.stop();
+    let simulated = flat(Config::default());
+    let without = Connection::connect_with_model("127.0.0.1", simulated.addr().port(), "vanilla", "", &[], None);
+    assert!(without.is_ok(), "a vanilla client joins a server running a model");
+    drop(without);
+    simulated.stop();
+}
+
 #[test]
 fn names_are_capped_and_sanitised() {
     assert_eq!(&*clean_name("  guahlg\n "), "guahlg");

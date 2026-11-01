@@ -177,6 +177,8 @@ impl PendingModInput {
 
 /// The live world the player is in.
 pub struct Game {
+    /// Last requested native model; factory selection is a transition, never a per-voxel hook.
+    simulation_choice: Option<Option<(&'static str, u32)>>,
     world: World,
     player: Player,
     /// First/third person and freecam modes, plus shake effects.
@@ -363,6 +365,7 @@ impl Game {
             sched.register_interval(MinimapConfig::DEFAULT.refresh_every.as_secs_f32());
         Self {
             world,
+            simulation_choice: None,
             player,
             camera: GameCamera::new(),
             notices: Notices::default(),
@@ -489,7 +492,7 @@ impl Game {
 
         // The sim lane stays registered on the scheduler; the gate merely
         // stops it being ticked (no hidden periodic work while disabled).
-        self.sched.set_enabled(self.sim_source, crate::settings::simulation_enabled());
+        self.sched.set_enabled(self.sim_source, crate::settings::simulation_enabled() && self.net.is_none() && self.world.simulation_model_id().is_some());
         if settings.minimap {
             if self.minimap.is_none() {
                 self.minimap = Some(Minimap::new(MinimapConfig::DEFAULT));
@@ -571,6 +574,7 @@ impl Game {
     pub fn with_net(mut self, net: Connection) -> Self {
         self.net = Some(net);
         self.world.set_reactions_authority(false);
+        self.sched.set_enabled(self.sim_source, false);
         self
     }
 
@@ -675,6 +679,18 @@ impl Game {
         audio: &mut AudioService,
         cues: &CueSymbols,
     ) -> Signal {
+        if self.net.is_none() {
+            let selected = mods.reaction_model();
+            let key = selected.map(|s| (s.id, s.version));
+            if self.simulation_choice != Some(key) {
+                self.simulation_choice = Some(key);
+                if let Err(error) = self.world.configure_simulation(selected) {
+                    let _ = self.world.configure_simulation(None);
+                    self.notify(format!("simulation paused: {error}"));
+                }
+                self.sched.set_enabled(self.sim_source, crate::settings::simulation_enabled() && self.world.simulation_model_id().is_some());
+            }
+        }
         // Clamp dt so a stall (window minimized, world load hitch) becomes one
         // slightly-long step instead of a single giant physics step that would
         // tunnel the player through terrain.
@@ -1082,7 +1098,7 @@ impl Game {
             look::apply(&mut self.player, input.look_delta);
             // The body frame follows the local up at render rate, from the gravity the last
             // physics step applied; it holds in weak gravity (zero-g keeps its orientation).
-            align_body(&mut self.player, dt);
+            crate::play::align_body(&mut self.player, dt);
 
             if let Some(mi) = &input.move_input {
                 self.pending_jump |= mi.jump();
@@ -1096,25 +1112,13 @@ impl Game {
                         // A cruise feels no gravity and moves physically (its steps outrun any patch).
                         let cruising = self.player.cruising();
                         let gravity = if cruising { DVec3::ZERO } else { self.gravity_at(self.player.position) };
-                        // On a round world the step runs in the storage frame of the patch underfoot.
-                        let patch = if cruising { None } else { self.world.atlas_at(self.player.position) };
-                        let trauma = match patch {
-                            Some(atlas) => movement::update_player_in(
-                                &mut self.player,
-                                &self.world,
-                                atlas,
-                                &tick_input,
-                                step_dt,
-                                gravity,
-                            ),
-                            None => movement::update_player(
-                                &mut self.player,
-                                &self.world,
-                                &tick_input,
-                                step_dt,
-                                gravity,
-                            ),
-                        };
+                        let trauma = crate::play::integrate(
+                            &mut self.player,
+                            &self.world,
+                            &tick_input,
+                            step_dt,
+                            gravity,
+                        );
                         if trauma > 0.0 {
                             self.camera.fx.add_trauma(trauma);
                         }
@@ -1141,7 +1145,6 @@ impl Game {
     /// World edits: block breaking, then cadence-controlled mod hooks and
     /// queued placements. Edge-bearing render frames are replayed in order at
     /// the next permitted mod tick; hooks never run inside the voxel loop.
-
     fn interact_phase(
         &mut self,
         input: &FrameInput,
@@ -1429,18 +1432,6 @@ fn toggle_mouse(eng: &mut Engine, router: &mut Router) {
     }
 }
 
-
-/// Turn the body frame toward −gravity, weighted so weak gravity barely turns it and near-zero
-/// gravity leaves it alone (never normalising a vanishing vector).
-fn align_body(player: &mut Player, dt: f32) {
-    let g0 = crate::player::STANDARD_GRAVITY;
-    let g = player.gravity.length();
-    let weight = crate::math::smooth_between(0.02 * g0 as f32, 0.10 * g0 as f32, g as f32) as f64;
-    if weight > 0.0 {
-        let amount = 1.0 - (-crate::camera::ALIGN_RATE * weight * dt as f64).exp();
-        player.orientation.align(-player.gravity / g, amount);
-    }
-}
 
 #[cfg(test)]
 mod tests {

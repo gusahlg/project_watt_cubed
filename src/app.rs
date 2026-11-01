@@ -1093,11 +1093,11 @@ impl App {
         }
         // The interval gate is cleared on the attempt, not on success, so a
         // failing write doesn't retry every frame.
-        if autosaver.wants_write(game.world().edit_generation()) && game.autosave_due() {
+        if autosaver.wants_write(game.world().save_generation()) && game.autosave_due() {
             game.mark_autosave();
             let started = autosaver.start(
                 id,
-                game.world().edit_generation(),
+                game.world().save_generation(),
                 save::snapshot(game.world(), game.player(), &self.mods, meta.clone()),
             );
             if let Tick::Finished(Err(e)) = started {
@@ -1125,7 +1125,7 @@ impl App {
             autosaver,
             ..
         } = active;
-        if let Err(e) = autosaver.flush_now(id, game.world().edit_generation(), || {
+        if let Err(e) = autosaver.flush_now(id, game.world().save_generation(), || {
             save::encode_current(game.world(), game.player(), &self.mods, meta.clone())
         }) {
             eprintln!("could not save {id}: {e}");

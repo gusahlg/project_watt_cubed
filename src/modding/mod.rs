@@ -18,6 +18,7 @@
 //! suspended mods are skipped entirely. A mod therefore costs nothing where it would
 //! matter and only what it draws where it wouldn't.
 mod build;
+mod cli;
 mod frame;
 mod hud;
 mod message;
@@ -25,6 +26,8 @@ mod message;
 pub(crate) mod testing;
 
 pub use build::{BuildInfo, GameBuild, ModDescriptor, ModRegistrar, PackageInfo, PackageKind};
+pub use cli::{Cli, CliContext};
+pub(crate) use cli::dispatch;
 pub use frame::{Channel, FrameContext, GameContext, TextFrame};
 pub use hud::HudFacts;
 pub use message::{Message, Notice, NoticeLevel, Notices};
@@ -296,6 +299,11 @@ impl<'a> ModContext<'a> {
 /// parses it. What a package is called and what it does are its `mod.toml` (see
 /// [`ModRegistrar::package`]); a mod has no display text of its own.
 pub trait Mod {
+    /// Optional authoritative simulation. The first active provider wins; no provider means no
+    /// reactions. A native factory is copied into world/server construction, never the UI mod.
+    fn reaction_model(&self) -> Option<crate::sim::model::ModelSpec> {
+        None
+    }
     /// Name for logs, and the key old saves used before mods had ids. Defaults to
     /// [`id`](Self::id).
     fn name(&self) -> &str {
@@ -514,6 +522,8 @@ pub struct Mods {
     registered_screens: Vec<(Option<&'static str>, ScreenEntry)>,
     /// The screen entries of active packages, by order (ties in registration order).
     screens: Vec<ScreenEntry>,
+    /// Command-line entry points. The first registration of a name wins.
+    clis: Vec<cli::Cli>,
 }
 
 impl Mods {
@@ -546,7 +556,20 @@ impl Mods {
             capture: None,
             registered_screens: Vec::new(),
             screens: Vec::new(),
+            clis: Vec::new(),
         }
+    }
+
+    /// Register a command. A second command with the same name is ignored.
+    pub(crate) fn add_cli(&mut self, cli: cli::Cli) {
+        if self.clis.iter().any(|have| have.name == cli.name) {
+            return;
+        }
+        self.clis.push(cli);
+    }
+
+    pub(crate) fn clis(&self) -> &[cli::Cli] {
+        &self.clis
     }
 
     /// Offer a screen entry (see [`ModRegistrar::screen_entry`]).
@@ -755,6 +778,11 @@ impl Mods {
     /// The configuration a primary action applies: the first active mod that answers.
     pub fn tool(&self, player: &Player) -> Option<BlockId> {
         self.entries.iter().filter(|e| e.active).find_map(|e| e.module.tool(player))
+    }
+
+    /// Selected native simulation factory, independent of frame-rate/UI hooks.
+    pub fn reaction_model(&self) -> Option<crate::sim::model::ModelSpec> {
+        self.entries.iter().filter(|e| e.active).find_map(|e| e.module.reaction_model())
     }
 
     /// The first active namer, if any.

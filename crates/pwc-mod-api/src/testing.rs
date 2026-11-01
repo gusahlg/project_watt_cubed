@@ -46,6 +46,10 @@ pub struct Harness {
 }
 
 impl Harness {
+    /// Native authoritative law chosen by this build's currently active providers.
+    pub fn reaction_model(&self) -> Option<project_watt_cubed::sim::model::ModelSpec> {
+        self.mods.reaction_model()
+    }
     /// Register every package of `build` in order, as the game does; every mod hears the default
     /// options.
     pub fn new(build: GameBuild) -> Self {
