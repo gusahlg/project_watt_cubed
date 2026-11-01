@@ -217,13 +217,14 @@ impl ReactionScheduler {
     /// Switch/pause implementations without discarding another model's state. Version mismatch
     /// is an error, never a reinterpretation. Model factories must match their descriptor id.
     pub fn configure(&mut self, spec: Option<ModelSpec>) -> Result<(), String> {
-        if let (Some((id, version)), Some(next)) = (&self.saved_selection, spec) {
-            if id == next.id && *version != next.version {
-                return Err(format!(
-                    "simulation {id} selection is v{version}, model is v{}",
-                    next.version
-                ));
-            }
+        if let (Some((id, version)), Some(next)) = (&self.saved_selection, spec)
+            && id == next.id
+            && *version != next.version
+        {
+            return Err(format!(
+                "simulation {id} selection is v{version}, model is v{}",
+                next.version
+            ));
         }
         if self.spec.map(|s| (s.id, s.version)) == spec.map(|s| (s.id, s.version)) {
             return Ok(());
@@ -318,10 +319,10 @@ impl ReactionScheduler {
     }
     pub fn restore(&mut self, contacts: &[(u32, Contact)]) {
         if self.spec.is_some_and(|s| s.id == super::model::LEGACY_ID) {
-            if let Some(m) = &mut self.model {
-                if let Err(e) = m.restore_legacy(contacts) {
-                    eprintln!("could not restore legacy contacts: {e}");
-                }
+            if let Some(m) = &mut self.model
+                && let Err(e) = m.restore_legacy(contacts)
+            {
+                eprintln!("could not restore legacy contacts: {e}");
             }
         } else {
             self.legacy = contacts.to_vec();

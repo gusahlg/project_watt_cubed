@@ -23,3 +23,14 @@ the rest of it described code that no longer exists; it remains in git history.
 ## Performance (LOD, after 0.5.0)
 - Flying very fast costs about 0.1 ms more main-thread time per frame than 0.4.0. Ideas: align the near field's and
   the streaming centre's triggers, make the cut incremental, run the samplers on the worker pool.
+- **The LOD cut can outgrow the section floor (audit B16).** `desired_sections_with` debug-asserts that a cut fits
+  `SECTION_SLOT_FLOOR`; face-twin, cube-edge and altitude selections reach 1025–1810 tiles, so twelve `world` lib
+  tests panic in debug builds (they did in 0.6.1 too). Release builds skip the assertion. The fix is a derived bound
+  for multi-face cuts, enforced in selection and admission, not a bigger constant
+  ([audit note](notes/2026-10-12-audit/bugs.md#b16--ordinary-lod-selections-exceed-the-asserted-section-capacity-contract)).
+
+## Simulation models (0.7.0)
+- **The server steps the selected model every tick, even when nothing is in contact.** An idle-skip needs each model
+  to say when it is quiescent.
+- **A tool use consults the model before the edit policy.** A stateful model keeps whatever it changed when the
+  policy then denies the edit; the policy should decide first.

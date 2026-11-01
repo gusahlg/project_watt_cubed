@@ -23,18 +23,14 @@ pub struct CliContext {
 /// `Some(code)` when the first argument is a registered command, `help`, or `--commands`.
 /// `None` starts the game. No arguments does not register mods.
 pub(crate) fn dispatch(build: &GameBuild, args: &[String]) -> Option<i32> {
-    let Some(name) = args.get(1).map(String::as_str) else {
-        return None;
-    };
+    let name = args.get(1).map(String::as_str)?;
     let mods = load(build);
     if name == "help" || name == "--commands" {
         print!("{}", command_text(&mods));
         let _ = std::io::Write::flush(&mut std::io::stdout());
         return Some(0);
     }
-    let Some(cli) = mods.clis().iter().find(|cli| cli.name == name) else {
-        return None;
-    };
+    let cli = mods.clis().iter().find(|cli| cli.name == name)?;
     let ctx = CliContext {
         args: args[2..].to_vec(),
         data_dir: crate::paths::Paths::get().data.clone(),

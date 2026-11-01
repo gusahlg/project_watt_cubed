@@ -187,6 +187,6 @@ The controls and option labels above come from the canonical
 [Game UI](https://github.com/gusahlg/pwc-package-manager/blob/main/mods/game-ui/README.md) and
 [Mod menu](https://github.com/gusahlg/pwc-package-manager/blob/main/mods/mod-menu/README.md).
 The visual lab behavior comes from the instance's
-[Law Lab README](../../../.wt/physics/pwc-package-manager/mods/law-lab/README.md)
+[Law Lab README](https://github.com/gusahlg/pwc-package-manager/blob/physics-candidates/mods/law-lab/README.md)
 and its six candidate package READMEs. These source-tree links describe the two existing lab
 systems; the built instance should be checked in its Mods menu after installation/rebuild.

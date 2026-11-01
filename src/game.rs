@@ -1145,7 +1145,6 @@ impl Game {
     /// World edits: block breaking, then cadence-controlled mod hooks and
     /// queued placements. Edge-bearing render frames are replayed in order at
     /// the next permitted mod tick; hooks never run inside the voxel loop.
-
     fn interact_phase(
         &mut self,
         input: &FrameInput,

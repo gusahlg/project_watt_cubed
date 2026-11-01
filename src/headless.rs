@@ -238,7 +238,7 @@ impl HeadlessClient {
     /// move. `dt` is clamped to 0.1 s like the game. Returns what happened this frame.
     pub fn step(&mut self, input: &Input, dt: f32) -> Step {
         let dt = if dt.is_finite() {
-            dt.min(0.1).max(0.0)
+            dt.clamp(0.0, 0.1)
         } else {
             0.0
         };
