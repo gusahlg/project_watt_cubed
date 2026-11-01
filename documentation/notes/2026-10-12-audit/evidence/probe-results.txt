@@ -1,0 +1,25 @@
+SPDX-FileCopyrightText: 2026 Project Watt Cubed contributors
+SPDX-License-Identifier: CC-BY-SA-4.0
+
+Observed-behavior tests; passing means the existing defect was reproduced.
+
+running 17 tests
+test block::registry::audit_probes::audit_lower_descriptor_cap_does_not_reassign_existing_layers ... 
+BUG: pre-existing layer 5 survives cap 2; debug panics, release aliases to last layer
+test block::registry::audit_probes::audit_provider_switch_with_equal_revision_keeps_old_names ... BUG: switching naming providers with revision 0 leaves first provider's name
+test game::sync::audit_probes::audit_two_tool_commits_spend_one_held_unit ... BUG: two tool commits transform two cells, but only one tool product survives
+test modding::audit_probes::audit_duplicate_mod_ids_share_a_persistence_key ... BUG: two different packages' mod ids collide and first state is overwritten
+test modding::audit_probes::audit_missing_mod_state_is_not_retained ... BUG: absent package state disappears from the next snapshot
+test net::client::audit_probes::audit_duplicate_pose_collapses_interpolation ... BUG: a duplicate target pose turns the interpolated midpoint 0.5 into a snap at 1.0
+test net::client::audit_probes::audit_late_tool_result_is_discarded_after_timeout ... BUG: a late committed tool result updates neither the cell nor the held tool
+test net::client::audit_probes::audit_stale_tool_result_is_emitted_after_newer_snapshot ... RISK: stale tool content is emitted while known revision stays 3 (wire reordering not demonstrated)
+test net::server::audit_probes::audit_full_outbox_loses_tool_commit_without_kicking_sender ... BUG: the cell committed, but its sender receives no ToolResult or kick
+test net::server::audit_probes::audit_physical_collision_misses_chart_ground ... BUG: the same embedded body is blocked in storage, clear in physical coordinates
+test net::server::audit_probes::audit_reaction_second_write_refusal_loses_matter ... BUG: partial reaction changed contact amount from 8 to 7
+test net::server::audit_probes::audit_refused_tool_still_queries_arbitrary_terrain ... BUG: 100 over-budget refusals still generated 100 arbitrary cells
+test net::server::audit_probes::audit_tool_bypasses_edit_policy ... BUG: a denied edit became an accepted tool mutation
+test save::bridge::audit_probes::audit_mod_extended_inventory_capacity_does_not_survive_save ... BUG: capacity 250 with 200 units restores as capacity 100 with 100 units
+test save::store::audit_probes::audit_failed_write_after_backup_recovery_loses_both_old_copies ... BUG: failed save after backup recovery leaves only the corrupt live bytes
+test world::audit_probes::audit_reaction_store_does_not_glue_chart_neighbours ... BUG: reaction neighbour BlockCoord { x: 1148234496, y: 15508833, z: 120586368 } reads a different cell from its glued neighbour BlockCoord { x: 1100000000, y: 15508833, z: 24117248 }
+test world::audit_probes::audit_restored_natural_edits_leave_column_indexes_behind ... BUG: zero remaining edits retain 100 column entries in each index
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 1302 filtered out; finished in 4.89s

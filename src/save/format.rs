@@ -107,7 +107,7 @@ const EDIT_BYTES: usize = 14;
 /// The spec-table count is a u16, so the table can hold every `u16` index.
 const MAX_SPECS: usize = 65_535;
 pub(crate) const MAX_EDITS: u32 = 50_000_000;
-const MAX_MOD_STATE: u32 = 16 * 1024 * 1024;
+pub(crate) const MAX_MOD_STATE: u32 = 16 * 1024 * 1024;
 /// Bytes of one pending reaction contact.
 const CONTACT_BYTES: usize = 4 * 3 + 1 + 4;
 const MAX_PENDING: u32 = 1 << 20;

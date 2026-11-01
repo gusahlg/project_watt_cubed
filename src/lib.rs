@@ -9,6 +9,8 @@
 #[cfg(test)]
 mod alloc_count;
 #[cfg(test)]
+extern crate self as pwc_mod_api;
+#[cfg(test)]
 #[global_allocator]
 static ALLOC: alloc_count::Counting = alloc_count::Counting;
 pub mod app;

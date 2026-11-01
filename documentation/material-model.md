@@ -1,13 +1,16 @@
 # Matter
 
 A voxel holds a **configuration**: a multiset of **elements** (points of a 4-D periodic resource
-lattice, identity = coordinates). There are no block types. Grass, rock, a mine lamp, a pickaxe and
-a planet's core are all just configurations; one integer **law** — *selective transfer v1* — decides
-what happens when two of them touch. Nothing in the simulation has a name. All decisions are integer
-arithmetic over a committed table, so every peer computes the same bytes.
+lattice, identity = coordinates). Grass, rock, a lamp, a tool and a planet's core are all
+configurations, with no named block types. The common material catalog, compatibility kernel,
+observations and presentation remain in `crates/material` and `src/block/registry.rs`.
 
-Code: `crates/material` (the pure law). Game intern table: `src/block/registry.rs`. Scheduler:
-`src/sim/reactions.rs`. Specification: `guides/reaction-guide/selective-transfer-v1.md`.
+Material interaction models are optional native mods. The extracted
+[Selective Transfer Physics](https://github.com/gusahlg/pwc-package-manager/blob/main/mods/physics-selective/README.md) supplies the original integer
+contact law and queue. `src/sim/model.rs` defines its interface; `src/sim/reactions.rs` hosts the
+selected model, authority and saved state. Production vanilla has no reaction provider and
+performs no automatic reactions or held-material reaction. The original law's specification
+is [selective transfer v1](../guides/reaction-guide/selective-transfer-v1.md).
 
 ## Lattice and configurations
 
@@ -20,7 +23,7 @@ Code: `crates/material` (the pure law). Game intern table: `src/block/registry.r
 
 `BlockId(u16)` is the intern index in one world's table (id 0 = air).
 
-## The law: selective transfer v1
+## Common compatibility kernel and selective transfer v1
 
 `fit_raw(a, b)` reads the committed 256-entry `FIT` table once per axis (byte difference) and sums:
 positive favours grouping, negative favours separation, identical elements fit 0.
@@ -37,12 +40,14 @@ Elements are conserved: matter is regrouped, never minted or destroyed. A contac
 rest. Air is the empty configuration, so a mixture whose occurrences fit badly can shed into empty
 space; a cohesive material never does.
 
-The law is a value (`Law`): version (2 = selective transfer v1), the observation probes and the
-presentation seed. Its stamp folds a digest of the fit table, so a world never silently mixes laws.
+The catalog law is a value (`Law`): version (2 = selective transfer v1), observation probes and
+presentation seed. Its stamp folds the fit table's digest. This common catalog identity is
+separate from the selected simulation model's id and version; changing a simulation provider
+does not replace the element encoding or intern table.
 
 ## Observations
 
-Properties are readings of the law, never authored stats (`observe(law, block)`):
+Properties are readings of the common catalog law, never authored stats (`observe(law, block)`):
 
 | Reading | Source |
 |---|---|
@@ -61,12 +66,34 @@ configuration in the registry hot tables (mesher, light, physics, audio read tho
 configuration's **centroid** on the torus (so a block that gains or loses constituents visibly
 drifts toward them), the accent is the least-held occurrence's colour mixed into a darker base,
 plus pattern frequency, roughness, alpha and glow. An appearance mod turns that (and the
-configuration itself) into the texture layer — see `documentation/mods.md`.
+configuration itself) into the texture layer — see [mods](mods.md).
 
-## Reactions in the world
+## Optional simulation in the world
 
-`src/sim/reactions.rs`. Reactions start **only** when contact or material state changes: a block is
-placed, removed or moved, or its configuration changes (a tool use, a machine, another reaction).
+`Mod::reaction_model()` returns a `ModelSpec { id, version, create }`. The first active mod
+returning a provider wins. Its `Model: Send` instance owns its queue or per-cell fields,
+budgeted `tick`, optional `tool`, wakeups, counters, and `save`/`load` payload. Core supplies
+the `CellStore` adapter and mutation bookkeeping; pair writes require atomic admission.
+Dynamic fields belong to voxel instances, not shared material IDs.
+
+A provider can declare an enabled option and return `None` when off. Switching or disabling
+it freezes its payload in the host; restoring the same id and version resumes that state.
+Only one model runs at once. Alternative bounded laboratories are
+[waves](https://github.com/gusahlg/pwc-package-manager/blob/main/mods/physics-wave/README.md), [packets](https://github.com/gusahlg/pwc-package-manager/blob/main/mods/physics-packets/README.md),
+[reservoir chemistry](https://github.com/gusahlg/pwc-package-manager/blob/main/mods/physics-reservoir/README.md), and
+[memory matter](https://github.com/gusahlg/pwc-package-manager/blob/main/mods/physics-rotor/README.md); see the
+[research notes](notes/2026-10-13-simulation/research.md) for their limitations.
+
+Eight more separately packaged laws explore fuel fronts, excitation/recovery, loop currents,
+spin order, nonlinear modular maps, plastic bonds, cooperative chemistry and matter permutations.
+The [continued investigation](notes/2026-10-13-simulation/continuation.md) links their canonical
+package-manager sources and records the small demonstrations. None is a selected final model.
+
+### Extracted selective-transfer scheduler
+
+`../pwc-package-manager/mods/physics-selective/src/model.rs`. Reactions start **only** when contact or material state
+changes: a block is placed, removed or moved, or its configuration changes (a tool use, a
+machine, another reaction).
 The affected voxel's six face contacts are queued — empty neighbours included; for a move both the
 old and the new location are. Diagonals never interact.
 
@@ -77,40 +104,55 @@ old and the new location are. Diagonals never interact.
 - A contact that produces no change goes **dormant**: it leaves the queue until something wakes it.
 - Chunk loading, generation, meshing and rendering never queue anything. Cells are read through the
   edit overlay and the generator, so results never depend on streaming.
-- Multiplayer: the server owns the scheduler and broadcasts committed cells
-  (`ServerMessage::Snapshot` / `Edit`); clients never evaluate reactions.
+- Multiplayer: the server owns the selected model and broadcasts committed cells
+  (`ServerMessage::Snapshot` / `Edit`); clients never evaluate reactions. Experimental per-cell
+  fields and laboratory perturbations are not replicated yet.
 - The pending queue (with arrival ages) is saved with the world and restored on load.
 
-Console: `/reactions` (`active`, `turns`, `operations`).
+The host exposes model counters and samples through `World::simulation_stats` and
+`World::simulation_sample`; command and HUD mods can present them.
 
 ### Tools
 
-A tool is a block in hand. Left-click with a held material runs the law between the held unit and
-the targeted cell (`BlockRegistry::react`, stepped to rest): occurrences move between them, the cell
-and the held unit both change configuration, and the cell's contacts wake. A held counter-material
-can empty a resistant block one constituent at a time. On a server the client sends
+A tool is a block in hand. Left-click with a held material asks the selected model's `tool`
+operation. Selective Transfer Physics runs **one** `BlockRegistry::react` operation between
+the targeted cell and held unit: occurrences move, both configurations change, and the
+cell's contacts wake. Repeated uses can empty a resistant block one constituent at a time.
+No provider means no held-material reaction; another provider chooses its own tool behavior.
+On a server the client sends
 `ClientMessage::ToolUse` and the server answers `ServerMessage::ToolResult`. With no tool, a
 primary action breaks the block; breaking yields that configuration into the inventory.
 
 ## Worldgen materials
 
-The generator (`src/world/terrain`) never names an element. `terrain::palette` *searches the law* for
-a configuration per role (grass, banded rock strata, timber, mine lamp, a planet's glowing core, …):
+The generator (`src/world/terrain`) never names an element. `terrain::palette` *searches the
+catalog law* for a configuration per role (grass, rock strata, timber, lamp, glowing core, …):
 nearest colour to the role's target, the needed glow or clarity, **cohesive** (every internal pair
 fits non-negatively, so no occurrence wants to leave for empty space) and **mutually dormant** with
 every other common material in both orientations, so the generated world is at rest until a player
 disturbs it. **Reagents** break that rule on purpose: counter-materials that empty one specific
 rock while staying dormant against the rest — the natural tools found as veins in the mines.
+These dormancy guarantees refer to selective transfer; another simulation model can evolve
+the same generated configurations differently.
 
 ## Saves and protocol
 
-Save **v9** (`src/save/format.rs`): spec table of encodings, the law stamp, the edit overlay, the
-reaction queue. Protocol **v11** (`PROTOCOL_VERSION`): `Welcome` carries the law stamp; the content
-fingerprint folds `WORLDGEN_VERSION`, the law fingerprint and the generator's palette. Mixed laws do
-not join.
+Save **v10** (`src/save/format.rs`) retains the catalog stamp, canonical specs, edits and legacy
+pending-contact field. Model state uses the existing opaque mod-state section:
+`@simulation.selected` records `id@version` or `off`, and `@simulation.state.<id>` records a
+versioned payload. Paused providers' payloads remain present. This extraction does not bump
+the binary save format; the selective provider can also import legacy pending contacts.
+
+Protocol **v18** adds a simulation fingerprint to `Hello`'s content identity alongside
+worldgen, gravity, catalog law and palette. It hashes the selected model id and version;
+zero means no model. Mismatches refuse a join. A server restoring a world requires the saved
+selection to match its configured compiled provider. Field-state replication is separate
+future work; matching model identity does not make the experimental laboratory HUD networked.
 
 ## Changing the law
 
-Build a new `Law` (or a new fit table), bump `Law::version`, re-run the palette search and the
-material tests (`cargo test -p material`, `terrain::palette`), bump save/protocol as needed. Game
-systems read observations and visuals only — they must not grow named special cases.
+To change the common catalog `Law` or fit table, bump `Law::version`, re-run palette search
+and material checks, and update save/protocol compatibility as needed. To change a simulation,
+implement a native `Model` in its own mod and bump `ModelSpec::version` when its law or saved
+state interpretation changes. Game systems consume observations and visuals without adding
+named-material special cases.

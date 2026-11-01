@@ -244,3 +244,65 @@ fn a_no_op_edit_stays_out_of_the_world_file() {
     assert_eq!(again.edits, vec![(1, ground - 1, 0, "air".to_string())]);
     let _ = std::fs::remove_file(&path);
 }
+
+/// Writes a flat world file whose simulation records are `simulation` (empty: a world saved
+/// before simulation providers existed), with one pending contact.
+fn world_with_simulation(path: &std::path::Path, simulation: Vec<(String, String)>) -> persist::Flags {
+    let _ = std::fs::remove_file(path);
+    let flags = persist::Flags { seed: 1, worldgen: WorldgenKind::Flat, terrain: TerrainCfg::default(), warn: false };
+    let store = persist::load(path, &flags).unwrap().store.expect("a new file has a store");
+    let pending = vec![crate::save::format::PendingContact { x: 4, y: 5, z: 6, axis: 1, age: 2 }];
+    store
+        .write(&persist::Snapshot { seed: 1, worldgen: WorldgenKind::Flat, terrain: TerrainCfg::default(), day: 0.3, edits: Vec::new(), pending, simulation })
+        .unwrap();
+    flags
+}
+
+fn selected(loaded: &persist::Loaded) -> Option<&str> {
+    loaded.simulation.iter().find(|(key, _)| key == "@simulation.selected").map(|(_, value)| value.as_str())
+}
+
+/// A world saved before simulation providers existed selects the legacy model. A server
+/// without that model still starts, runs no simulation, and saves the selection and the
+/// queue back unchanged, as single-player does.
+#[test]
+fn a_server_without_the_saved_model_starts_with_it_frozen() {
+    let path = crate::save::store::test_temp_path("frozen-simulation");
+    let flags = world_with_simulation(&path, Vec::new());
+    let handle = flat(Config { reaction_model: None, world: Some(path.clone()), ..Config::default() });
+    let joined = Connection::connect_with_model("127.0.0.1", handle.addr().port(), "ada", "", &[], None);
+    assert!(joined.is_ok(), "a frozen world serves clients without a model");
+    drop(joined);
+    handle.stop();
+    let again = persist::load(&path, &flags).unwrap();
+    let legacy = format!("{}@1", crate::sim::model::LEGACY_ID);
+    assert_eq!(selected(&again), Some(legacy.as_str()), "the selection is kept, not turned off");
+    assert_eq!(again.pending.len(), 1, "the frozen queue is kept");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A world saved with no simulation adopts the model a server runs, like single-player.
+#[test]
+fn a_server_with_a_model_adopts_an_off_world() {
+    let path = crate::save::store::test_temp_path("adopt-simulation");
+    let flags = world_with_simulation(&path, vec![("@simulation.selected".into(), "off".into())]);
+    let handle = flat(Config { world: Some(path.clone()), ..Config::default() });
+    handle.stop();
+    let again = persist::load(&path, &flags).unwrap();
+    let legacy = format!("{}@1", crate::sim::model::LEGACY_ID);
+    assert_eq!(selected(&again), Some(legacy.as_str()));
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Unreadable simulation records are a damaged file: a load error the host skips past.
+#[test]
+fn malformed_simulation_records_are_a_load_error() {
+    let path = crate::save::store::test_temp_path("bad-simulation");
+    let twice = vec![("@simulation.selected".into(), "off".into()), ("@simulation.selected".into(), "off".into())];
+    world_with_simulation(&path, twice);
+    let Err(error) = spawn(0, Config { seed: 1, worldgen: WorldgenKind::Flat, world: Some(path.clone()), ..Config::default() }) else {
+        panic!("duplicate selections must not load");
+    };
+    assert!(error.get_ref().and_then(|inner| inner.downcast_ref::<persist::LoadError>()).is_some(), "{error}");
+    let _ = std::fs::remove_file(&path);
+}

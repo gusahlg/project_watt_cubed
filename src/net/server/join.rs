@@ -224,8 +224,8 @@ pub(super) fn hello_name(frame: &[u8], ctx: &Ctx) -> Result<Arc<str>, HelloFail>
         )));
     }
     match ClientMessage::decode(frame) {
-        Some(ClientMessage::Hello { worldgen, gravity, law, palette, name, password, mods, .. }) => {
-            let client = crate::net::ContentId { worldgen, gravity, law, palette };
+        Some(ClientMessage::Hello { worldgen, gravity, law, palette, simulation, name, password, mods, .. }) => {
+            let client = crate::net::ContentId { worldgen, gravity, law, palette, simulation };
             if let Some(why) = crate::net::content_mismatch(ctx.content, client) {
                 return Err(HelloFail::Reject(why));
             }

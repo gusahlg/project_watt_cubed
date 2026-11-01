@@ -110,6 +110,7 @@ pub(super) fn hello(name: &str, password: &str, protocol: u32, content: crate::n
         gravity: content.gravity,
         law: content.law,
         palette: content.palette,
+        simulation: content.simulation,
         name: name.into(),
         password: password.into(),
         mods: vec![],
@@ -118,7 +119,7 @@ pub(super) fn hello(name: &str, password: &str, protocol: u32, content: crate::n
 }
 
 pub(super) fn server_content() -> crate::net::ContentId {
-    crate::net::content_id(&BlockRegistry::with_builtins())
+    crate::net::content_id_with_model(&BlockRegistry::with_builtins(), crate::net::default_reaction_model())
 }
 
 pub(super) fn rock_spec() -> String {

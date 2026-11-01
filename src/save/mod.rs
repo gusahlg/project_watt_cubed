@@ -632,7 +632,7 @@ mod tests {
             },
             specs,
             edits,
-            mods: mods.save_states(world),
+            mods: mods.save_states(world).into_iter().chain(world.simulation_state_records()).collect(),
             pending: Vec::new(),
         }
     }

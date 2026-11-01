@@ -441,7 +441,7 @@ fn write_world(path: &Path, cells: &[(Cell, String)]) {
     let flags = persist::Flags { seed: 1, worldgen: WorldgenKind::Flat, terrain: Default::default(), warn: false };
     let store = persist::load(path, &flags).expect("a fresh world").store.expect("a file to write");
     let edits = cells.iter().map(|((x, y, z), s)| (*x, *y, *z, Arc::from(s.as_str()))).collect();
-    let snap = persist::Snapshot { seed: 1, worldgen: WorldgenKind::Flat, terrain: Default::default(), day: 0.3, edits, pending: Vec::new() };
+    let snap = persist::Snapshot { simulation: Vec::new(), seed: 1, worldgen: WorldgenKind::Flat, terrain: Default::default(), day: 0.3, edits, pending: Vec::new() };
     store.write(&snap).expect("world written");
 }
 

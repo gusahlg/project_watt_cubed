@@ -77,7 +77,11 @@ impl SaveSnapshot {
                 noclip,
                 inventory: Some(player.inventory.to_portable(|id| world.registry().spec(id))),
             },
-            mods: mods.save_states(world),
+            mods: {
+                let mut states = mods.save_states(world);
+                states.extend(world.simulation_state_records());
+                states
+            },
             meta,
             worldgen_version: crate::world::terrain::WORLDGEN_VERSION,
             worldgen: stamp_from_world(world),
@@ -280,6 +284,9 @@ impl Restored {
             self.unknown.legacy_holdings += mods.load_state(name, data, &mut self.world);
         }
         self.world.restore_reactions(&self.pending);
+        if let Err(error) = self.world.configure_simulation(mods.reaction_model()) {
+            eprintln!("simulation paused: {error}");
+        }
         if let Some(msg) = unknown_material_notice(self.unknown) {
             eprintln!("{msg}");
         }
@@ -291,7 +298,7 @@ impl Restored {
 /// Unknown specs degrade to air. A law stamp that does not match this game's law is a
 /// different universe and is refused, never a panic.
 fn rebuild(
-    doc: SaveDoc,
+    mut doc: SaveDoc,
     make_world: impl FnOnce(i64, WorldgenKind, TerrainCfg) -> World,
 ) -> Result<Restored, SaveError> {
     if doc.law_stamp != material::Law::current().stamp() {
@@ -308,6 +315,12 @@ fn rebuild(
     }
     let (kind, cfg) = kind_cfg_from_stamp(doc.worldgen);
     let mut world = make_world(doc.meta.seed, kind, cfg);
+    // Match the dedicated loader: all actual pre-extraction saves used selective transfer,
+    // including settled worlds with no pending contacts. Fresh worlds do not use this path.
+    if !doc.mods.iter().any(|(key, _)| key == "@simulation.selected") {
+        doc.mods.push(("@simulation.selected".into(), format!("{}@1", crate::sim::model::LEGACY_ID)));
+    }
+    world.load_simulation_records(&doc.mods).map_err(|_| SaveError::Corrupt("invalid simulation records"))?;
 
     // A saved position outside the world (a corrupt or runaway save) restarts at the spawn rather than
     // streaming around nonsense.

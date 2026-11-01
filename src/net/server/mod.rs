@@ -253,6 +253,8 @@ pub type NoclipPolicy = Policy;
 /// Matches the client's [`World`](crate::world::World::new) so server spawn
 /// heights land on real ground.
 pub struct Config {
+    /// Compiled authoritative model; vanilla runs no reaction or field dynamics.
+    pub reaction_model: Option<crate::sim::model::ModelSpec>,
     /// Empty means no password is required.
     pub password: String,
     pub seed: i64,
@@ -291,6 +293,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            reaction_model: crate::net::default_reaction_model(),
             password: String::new(),
             seed: 0,
             day_secs: 600.0, // matches the client's default DayLength
@@ -508,9 +511,21 @@ pub(crate) fn spawn(port: u16, config: Config) -> io::Result<ServerHandle> {
         }
     };
     let mut state = State::new(registry, loaded.day, finite_speed(config.max_speed));
+    // Unreadable records are a damaged file: the host skips it like any other load failure.
+    state.reactions.load_records(&loaded.simulation).map_err(|reason| match &config.world {
+        Some(path) => io::Error::other(persist::LoadError::new(path, reason)),
+        None => io::Error::other(reason),
+    })?;
+    // The single-player rule, never a refusal to start: with no model configured a saved
+    // selection stays frozen in the records; a configured model is adopted over `off` or another
+    // model, whose state the records keep; a different version of the saved model, or state it
+    // cannot load, pauses the simulation with the records kept.
+    if let Err(error) = state.reactions.configure(config.reaction_model) {
+        eprintln!("simulation paused: {error}");
+    }
     let kept = install_edits(&mut state, &loaded.edits);
     state.reactions.restore(&contacts_of(&loaded.pending));
-    let content = crate::net::content_id(&state.registry);
+    let content = crate::net::content_id_with_model(&state.registry, state.reactions.spec());
     let shared = Arc::new(Mutex::new(state));
     debug_assert_ne!(WORLD_PLAYER, 1, "player ids start at 1; 0 is the world");
 

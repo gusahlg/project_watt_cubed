@@ -49,7 +49,7 @@ impl ConnectJob {
         notice: Option<String>,
     ) -> Self {
         let (host, port, name, password) = target;
-        let pending = Connection::begin_connect(host, port, name, password, &mods.active_package_reports(packages));
+        let pending = Connection::begin_connect_with_model(host, port, name, password, &mods.active_package_reports(packages), mods.reaction_model());
         Self {
             pending,
             hosted,
@@ -72,7 +72,7 @@ impl ConnectJob {
                 self.notice = Some(mod_hold_notice(packages, &err.mods_denied));
                 mods.suspend_packages(&err.mods_denied);
                 let reports = mods.active_package_reports(packages);
-                self.pending = Connection::begin_connect(&self.host, self.port, &self.name, &self.password, &reports);
+                self.pending = Connection::begin_connect_with_model(&self.host, self.port, &self.name, &self.password, &reports, mods.reaction_model());
                 self.retried = true;
                 None
             }
@@ -122,11 +122,13 @@ impl App {
         debug_assert!(self.active.is_none(), "hosting starts from the menu, never over an open world");
         let worldgen = self.mods.worldgen_kind();
         let terrain = terrain_cfg_from_mods(&self.mods);
+        let reaction_model = self.mods.reaction_model();
         let started = self.host.start(&self.saves, info.port, |world| Config {
             password: info.password.clone(),
             seed: fresh_seed(),
             worldgen,
             terrain,
+            reaction_model,
             teleport: TeleportPolicy::All,
             noclip: NoclipPolicy::All,
             world: Some(world),

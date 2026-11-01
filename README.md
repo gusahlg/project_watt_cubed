@@ -1,8 +1,12 @@
 A super awesome game, trust.
 
-A voxel is a **configuration** of points on a 4-D resource lattice; one integer
-**law** decides how neighbouring matter changes. Names are presentation only —
+A voxel is a **configuration** of points on a 4-D resource lattice. Optional native
+physics mods decide how neighbouring matter and dynamic fields change. Names are presentation only —
 see [documentation/material-model.md](documentation/material-model.md).
+
+The original reaction law is now [a separate mod](https://github.com/gusahlg/pwc-package-manager/blob/main/mods/physics-selective). Four independent
+experiments and a selectable native launcher are documented in the
+[fundamental simulation investigation](documentation/notes/2026-10-13-simulation/README.md).
 
 ## Mods: vanilla and modded builds
 

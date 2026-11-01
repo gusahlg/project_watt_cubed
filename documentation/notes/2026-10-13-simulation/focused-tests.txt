@@ -1,0 +1,38 @@
+   Compiling pwc_physics_frames v0.1.0 (/tmp/pwc-physics-focused/cache/builds/e38777c3acbba450a0d3023441c1a382/mods/pwc_physics_frames)
+   Compiling pwc_physics_dipole v0.1.0 (/tmp/pwc-physics-focused/cache/builds/e38777c3acbba450a0d3023441c1a382/mods/pwc_physics_dipole)
+   Compiling pwc_physics_lab v0.2.0 (/tmp/pwc-physics-focused/cache/builds/e38777c3acbba450a0d3023441c1a382/mods/pwc_physics_lab)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.66s
+     Running unittests /tmp/pwc-physics-focused/data/store/87a6e153ddd217d295ea28bf14cca29d13a03ede778ba8d4cec9945245f9cd98/src/lib.rs (/home/gusahlg/repos/project_watt_cubed/target/debug/deps/pwc_physics_dipole-289866f6fa1e4659)
+
+running 1 test
+single charge frozen for36phases; neutral pair moved longitudinally and transversely, conserved (Q,D,norm)=(0, [-1, 0, 0], 2), then reversed
+test model::tests::one_charge_is_frozen_but_neutral_pairs_translate_with_all_invariants ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests /tmp/pwc-physics-focused/data/store/5dfd8ef52e4985296775f170234e9d78f67ffa7a61564feb13e2392a413c2fd0/src/lib.rs (/home/gusahlg/repos/project_watt_cubed/target/debug/deps/pwc_physics_frames-a4cbcff63aa66729)
+
+running 1 test
+36 inverse/product/class cases; 48/216 Yang-Baxter failures; three-encounter recurrence; disturbance changed 28 sites and six phases reversed exactly
+test tests::quiet_backgrounds_history_and_propagation_follow_the_same_small_rule ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests /tmp/pwc-physics-focused/data/store/ea0bbff393420e5e7034aed75980b0c84aaabdaa52a74051ceacf14397e15644/src/lib.rs (/home/gusahlg/repos/project_watt_cubed/target/debug/deps/pwc_physics_lab-dc783847dc017530)
+
+running 2 tests
+test tests::managed_registration_selects_exactly_the_requested_factory_and_pauses ... ok
+{"model":"pwc.physics-dipole","tick":0,"turns":0,"operations":0,"pending":343,"dropped":0,"matter":0,"sample":[1, 0, 2, -1],"state_bytes":3279}
+{"model":"pwc.physics-dipole","tick":8,"turns":8,"operations":4,"pending":343,"dropped":0,"matter":0,"sample":[0, 0, 2, -1],"state_bytes":3279}
+{"model":"pwc.physics-dipole","tick":16,"turns":16,"operations":6,"pending":343,"dropped":0,"matter":0,"sample":[0, 0, 2, -1],"state_bytes":3280}
+{"model":"pwc.physics-dipole","tick":24,"turns":24,"operations":8,"pending":343,"dropped":0,"matter":0,"sample":[0, 0, 2, -1],"state_bytes":3280}
+{"model":"pwc.physics-dipole","tick":32,"turns":32,"operations":11,"pending":343,"dropped":0,"matter":0,"sample":[0, 0, 2, -1],"state_bytes":3281}
+{"model":"pwc.physics-frames","tick":0,"turns":0,"operations":0,"pending":6,"dropped":0,"matter":0,"sample":[5, 6, 0, 0],"state_bytes":4656}
+{"model":"pwc.physics-frames","tick":8,"turns":8,"operations":93,"pending":174,"dropped":0,"matter":0,"sample":[2, 174, 93, 8],"state_bytes":4657}
+{"model":"pwc.physics-frames","tick":16,"turns":16,"operations":421,"pending":192,"dropped":0,"matter":0,"sample":[2, 192, 421, 16],"state_bytes":4659}
+{"model":"pwc.physics-frames","tick":24,"turns":24,"operations":575,"pending":81,"dropped":0,"matter":0,"sample":[5, 81, 575, 24],"state_bytes":4659}
+{"model":"pwc.physics-frames","tick":32,"turns":32,"operations":856,"pending":320,"dropped":0,"matter":0,"sample":[5, 320, 856, 32],"state_bytes":4659}
+test tests::short_all_model_demonstrations_and_full_state_round_trips ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+

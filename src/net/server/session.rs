@@ -83,7 +83,7 @@ pub(super) fn client_loop(
             ClientMessage::Hello { .. } => {} // Already authenticated; ignore repeats.
             ClientMessage::Cruise { speed } => on_cruise(shared, id, speed),
             ClientMessage::ToolUse { req, x, y, z, expect, tool_spec } => {
-                on_tool_use(shared, &ctx.generator, id, req, x, y, z, expect, &tool_spec)
+                on_tool_use(shared, ctx.hooks.as_ref(), &ctx.generator, id, req, x, y, z, expect, &tool_spec)
             }
         }
     }

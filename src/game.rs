@@ -177,6 +177,8 @@ impl PendingModInput {
 
 /// The live world the player is in.
 pub struct Game {
+    /// Last requested native model; factory selection is a transition, never a per-voxel hook.
+    simulation_choice: Option<Option<(&'static str, u32)>>,
     world: World,
     player: Player,
     /// First/third person and freecam modes, plus shake effects.
@@ -363,6 +365,7 @@ impl Game {
             sched.register_interval(MinimapConfig::DEFAULT.refresh_every.as_secs_f32());
         Self {
             world,
+            simulation_choice: None,
             player,
             camera: GameCamera::new(),
             notices: Notices::default(),
@@ -489,7 +492,7 @@ impl Game {
 
         // The sim lane stays registered on the scheduler; the gate merely
         // stops it being ticked (no hidden periodic work while disabled).
-        self.sched.set_enabled(self.sim_source, crate::settings::simulation_enabled());
+        self.sched.set_enabled(self.sim_source, crate::settings::simulation_enabled() && self.net.is_none() && self.world.simulation_model_id().is_some());
         if settings.minimap {
             if self.minimap.is_none() {
                 self.minimap = Some(Minimap::new(MinimapConfig::DEFAULT));
@@ -571,6 +574,7 @@ impl Game {
     pub fn with_net(mut self, net: Connection) -> Self {
         self.net = Some(net);
         self.world.set_reactions_authority(false);
+        self.sched.set_enabled(self.sim_source, false);
         self
     }
 
@@ -675,6 +679,18 @@ impl Game {
         audio: &mut AudioService,
         cues: &CueSymbols,
     ) -> Signal {
+        if self.net.is_none() {
+            let selected = mods.reaction_model();
+            let key = selected.map(|s| (s.id, s.version));
+            if self.simulation_choice != Some(key) {
+                self.simulation_choice = Some(key);
+                if let Err(error) = self.world.configure_simulation(selected) {
+                    let _ = self.world.configure_simulation(None);
+                    self.notify(format!("simulation paused: {error}"));
+                }
+                self.sched.set_enabled(self.sim_source, crate::settings::simulation_enabled() && self.world.simulation_model_id().is_some());
+            }
+        }
         // Clamp dt so a stall (window minimized, world load hitch) becomes one
         // slightly-long step instead of a single giant physics step that would
         // tunnel the player through terrain.

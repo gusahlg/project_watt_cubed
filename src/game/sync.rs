@@ -240,8 +240,8 @@ impl Game {
             net.send_swing();
             return;
         }
-        match self.world.registry_mut().react(target, tool) {
-            Some((_, new_cell, new_tool)) => {
+        match self.world.react_tool(target, tool) {
+            Some((new_cell, new_tool)) => {
                 self.write_cell(cell, new_cell, |at, block| events.push(GameEvent::ToolReacted { at, block }));
                 self.finish_tool_change(tool, new_tool, target, new_cell, mods);
                 self.camera.fx.add_trauma(0.08);

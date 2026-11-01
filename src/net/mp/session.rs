@@ -217,7 +217,7 @@ impl Room {
 }
 
 fn ours() -> ContentId {
-    crate::net::content_id(&crate::block::BlockRegistry::with_builtins())
+    crate::net::content_id_with_model(&crate::block::BlockRegistry::with_builtins(), crate::net::default_reaction_model())
 }
 
 fn hello(name: &str, password: &str, protocol: u32, content: ContentId, mods: &[&str]) -> ClientMessage {
@@ -227,6 +227,7 @@ fn hello(name: &str, password: &str, protocol: u32, content: ContentId, mods: &[
         gravity: content.gravity,
         law: content.law,
         palette: content.palette,
+        simulation: content.simulation,
         name: name.into(),
         password: password.into(),
         mods: mods.iter().map(|id| ModOffer { id: (*id).into(), version: "1.0.0".into() }).collect(),

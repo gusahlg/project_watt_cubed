@@ -263,13 +263,14 @@ struct Session {
 }
 
 fn hello(name: &str) -> Vec<u8> {
-    let content = crate::net::content_id(&crate::block::BlockRegistry::with_builtins());
+    let content = crate::net::content_id_with_model(&crate::block::BlockRegistry::with_builtins(), crate::net::default_reaction_model());
     ClientMessage::Hello {
         protocol: PROTOCOL_VERSION,
         worldgen: content.worldgen,
         gravity: content.gravity,
         law: content.law,
         palette: content.palette,
+        simulation: content.simulation,
         name: name.into(),
         password: "".into(),
         mods: vec![],

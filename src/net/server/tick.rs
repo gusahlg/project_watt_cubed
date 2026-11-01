@@ -43,11 +43,11 @@ pub(super) fn panic_text(payload: &Box<dyn std::any::Any + Send>) -> String {
 pub(super) fn run_reactions(shared: &Arc<Mutex<State>>, ctx: &Ctx) {
     let mut state = shared.lock_recover();
     let force = take_panic_tick(&mut state);
-    if state.reactions.pending() == 0 && !force {
+    if !state.reactions.is_enabled() && !force {
         return;
     }
     let budget = reactions::Budget::DEFAULT;
-    let mut sched = std::mem::take(&mut state.reactions);
+    let mut sched = std::mem::replace(&mut state.reactions, ReactionScheduler::disabled());
     let mut mutations = std::mem::take(&mut state.mutations);
     mutations.clear();
     let tick = catch_unwind(AssertUnwindSafe(|| {

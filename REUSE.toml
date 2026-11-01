@@ -35,6 +35,7 @@ path = [
   "documentation/**",
   "guides/*.md",
   "guides/reaction-guide/*.md",
+  "notes/**",
 ]
 precedence = "aggregate"
 SPDX-FileCopyrightText = "2026 Project Watt Cubed contributors <https://github.com/gusahlg/project_watt_cubed/blob/main/CONTRIBUTORS.md>"

@@ -384,6 +384,9 @@ pub struct World {
     /// Monotone counter bumped on every recorded edit; the autosaver compares
     /// it against the last written generation to know the world is dirty.
     pub(crate) edit_generation: u64,
+    /// Bumped when only simulation state changed (its queue or fields, or the selected model):
+    /// dirty for the autosaver, never for surface or acoustic caches.
+    pub(crate) simulation_generation: u64,
     /// Last chunk centre; `None` forces a full stream pass. Streams only react to boundary crosses.
     center: Option<Coord>,
     /// The near field around [`center`](Self::center): the chunk columns whose ground is within
@@ -801,6 +804,7 @@ impl World {
             ceilings: FastMap::default(),
             edits: FastMap::default(),
             edit_generation: 0,
+            simulation_generation: 0,
             center: None,
             near: streaming::NearField::default(),
             eye_at: None,

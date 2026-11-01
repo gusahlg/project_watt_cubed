@@ -80,13 +80,14 @@ impl Raw {
             Endpoint::client(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))).expect("endpoint")
         };
         endpoint.set_default_client_config(quic::client_config());
-        let content = crate::net::content_id(&BlockRegistry::with_builtins());
+        let content = crate::net::content_id_with_model(&BlockRegistry::with_builtins(), crate::net::default_reaction_model());
         let hello = ClientMessage::Hello {
             protocol: PROTOCOL_VERSION,
             worldgen: content.worldgen,
             gravity: content.gravity,
             law: content.law,
             palette: content.palette,
+            simulation: content.simulation,
             name: name.into(),
             password: "".into(),
             mods: Vec::new(),
