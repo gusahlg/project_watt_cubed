@@ -18,15 +18,15 @@
 //! by [`protocol`]; every client is rate-limited; every edit is bounds- and
 //! reach-validated against the sender's own reported position.
 //!
-//! The mod list on `Hello` is what an honest client reports. A modified client
-//! can lie about it. What stops mod tools is enforced here: teleport permission,
+//! The module list on `Hello` is what an honest client reports. A modified client
+//! can lie about it. What stops module tools is enforced here: teleport permission,
 //! the speed cap (flight, and cruise when the cap is below the game maximum),
 //! operator-only time, edit reach, and the movement envelope. A reported move whose
 //! body overlaps solid ground is snapped back unless [`NoclipPolicy`] allows it.
 //! Gravity is not simulated; the envelope's gravity bound is only a limit on how
 //! fast a reported velocity may grow.
 //!
-//! **Server mods.** [`Config::hooks`] is a [`ServerMod`] table (plain-data
+//! **Server modules.** [`Config::hooks`] is a [`ServerModule`] table (plain-data
 //! arguments, no protocol change). Calls run outside the [`State`] lock.
 //!
 //! **Layout.** `state` holds what the lock guards (roster, ledger, interest grid,
@@ -65,9 +65,9 @@ use crate::player::{self, standing_pose};
 use crate::block::registry::{BlockId, BlockRegistry, AIR};
 use crate::net::hooks;
 use crate::sim::reactions::{self, CellStore, Contact, Mutation, Pos, ReactionScheduler};
-pub(crate) use crate::net::hooks::{ChatFacts, EditIntent, JoinFacts, ServerMod, Verdict};
+pub(crate) use crate::net::hooks::{ChatFacts, EditIntent, JoinFacts, ServerModule, Verdict};
 use crate::net::persist::{self, Store};
-use crate::net::protocol::{self, ClientMessage, ModId, ModOffer, Pose, PoseBody, PosesWriter, ServerMessage, SnapshotWriter};
+use crate::net::protocol::{self, ClientMessage, ModuleId, ModuleOffer, Pose, PoseBody, PosesWriter, ServerMessage, SnapshotWriter};
 use crate::net::{MAX_CHAT, MAX_FRAME, MAX_NAME, MAX_SPEC, PROTOCOL_VERSION, chat, quic};
 use crate::presence::Stance;
 use crate::world::seam::Seams;
@@ -153,9 +153,9 @@ const TELEPORT_RATE: u32 = 4;
 /// A 20 ms capture cadence is ~50 frames/s sustained; 100 leaves headroom for
 /// bursts. Excess frames are dropped silently — channel traffic is loss-tolerant.
 const CHANNEL_RATE_LIMIT: u32 = 100;
-/// Mod frames one connection may send per second over all its channels, charged before
+/// Module frames one connection may send per second over all its channels, charged before
 /// the channel's own window, so switching names buys no extra rate.
-const MOD_DATA_RATE: u32 = 2 * CHANNEL_RATE_LIMIT;
+const MODULE_DATA_RATE: u32 = 2 * CHANNEL_RATE_LIMIT;
 /// Distinct channel names one connection may use. A new name past this is dropped.
 const MAX_CHANNELS: usize = 32;
 /// Tool uses one connection may send per second: each one evaluates the law and may intern two
@@ -264,10 +264,10 @@ pub struct Config {
     pub noclip: NoclipPolicy,
     pub worldgen: WorldgenKind,
     pub terrain: TerrainCfg,
-    /// Server-side mods (`validate_edit`, join/leave, `on_chat`). Empty by
+    /// Server-side modules (`validate_edit`, join/leave, `on_chat`). Empty by
     /// default — this crate ships no implementations. Hook bodies run outside
     /// the roster lock.
-    pub hooks: Vec<Box<dyn ServerMod>>,
+    pub hooks: Vec<Box<dyn ServerModule>>,
     /// Save file. `None` is an unsaved world (tests). A missing file is created
     /// from the flags; an existing file's seed and generator replace them.
     pub world: Option<PathBuf>,
@@ -280,10 +280,10 @@ pub struct Config {
     /// [`crate::player::MAX_SPEED`], which leaves cruise at its own ceiling.
     /// A lower cap also bounds cruise.
     pub max_speed: f64,
-    /// When non-empty, an enabled mod must be in this list.
-    pub mods_allow: Vec<String>,
-    /// Enabled mods in this list are refused.
-    pub mods_deny: Vec<String>,
+    /// When non-empty, an enabled module must be in this list.
+    pub modules_allow: Vec<String>,
+    /// Enabled modules in this list are refused.
+    pub modules_deny: Vec<String>,
     /// Log when a stored seed or generator differs from the flags.
     pub warn_world_overrides: bool,
     /// How often a world file is written. Also written on shutdown.
@@ -306,8 +306,8 @@ impl Default for Config {
             ops: Vec::new(),
             op_secrets: Vec::new(),
             max_speed: crate::player::MAX_SPEED,
-            mods_allow: Vec::new(),
-            mods_deny: Vec::new(),
+            modules_allow: Vec::new(),
+            modules_deny: Vec::new(),
             warn_world_overrides: false,
             autosave_every: Duration::from_secs(180),
         }
@@ -340,8 +340,8 @@ struct Ctx {
     ops: Vec<String>,
     /// Lowercased names and their `/op` secrets.
     op_secrets: Vec<(String, String)>,
-    mods_allow: Vec<String>,
-    mods_deny: Vec<String>,
+    modules_allow: Vec<String>,
+    modules_deny: Vec<String>,
     store: Option<Arc<Store>>,
 }
 
@@ -365,8 +365,8 @@ impl Ctx {
             hooks,
             ops: canonical_ops(&config.ops, &op_secrets),
             op_secrets,
-            mods_allow: config.mods_allow,
-            mods_deny: config.mods_deny,
+            modules_allow: config.modules_allow,
+            modules_deny: config.modules_deny,
             store,
         }
     }

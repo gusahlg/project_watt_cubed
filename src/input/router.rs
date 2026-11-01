@@ -12,11 +12,11 @@ use crate::input::intent::{
     Repeat,
 };
 use crate::input::intent::Source;
-use crate::modding::ActionSet;
+use crate::modules::ActionSet;
 use voxel_engine::Key;
 
-/// Same autofire as breaking and placing, for a mod action that asks to repeat.
-const MOD_REPEAT: Repeat = Repeat::new(0.25, 0.20);
+/// Same autofire as breaking and placing, for a module action that asks to repeat.
+const MODULE_REPEAT: Repeat = Repeat::new(0.25, 0.20);
 
 /// The single exclusive interaction context for a frame. Exactly one is active;
 /// the global set is always available alongside it.
@@ -47,12 +47,12 @@ impl Timers {
     }
 }
 
-/// One mod action's chords after core bindings have taken any clash.
-struct ModBinding {
+/// One module action's chords after core bindings have taken any clash.
+struct ModuleBinding {
     chords: Vec<Chord>,
     repeat: bool,
     held: bool,
-    /// Sampled with the mod-logic lane off too, and reported apart (see `Action::immediate`).
+    /// Sampled with the module-logic lane off too, and reported apart (see `Action::immediate`).
     immediate: bool,
 }
 
@@ -168,7 +168,7 @@ fn eval_event(chords: &[Chord], repeat: Option<Repeat>, timer: &mut f32, probe: 
 }
 
 /// True when a core gameplay or global binding already owns `chord`. Menu chords
-/// are not claims: the wheel scrolls menus and may also be a mod action in play.
+/// are not claims: the wheel scrolls menus and may also be a module action in play.
 fn core_claims(bindings: &Bindings, chord: Chord) -> bool {
     let claimed = bindings
         .gameplay_event
@@ -186,7 +186,7 @@ pub(crate) struct Sample {
     pub gameplay: [bool; GameplayEvent::COUNT],
     pub menu: [bool; MenuEvent::COUNT],
     pub actions: ActionSet,
-    /// Immediate actions that fired: sampled whatever the mod-logic lane says.
+    /// Immediate actions that fired: sampled whatever the module-logic lane says.
     pub immediate: ActionSet,
     pub wheel: i8,
 }
@@ -198,14 +198,14 @@ pub struct Router {
     context: Context,
     captured: bool,
     timers: Timers,
-    /// Mod actions, rebuilt when mods are enabled or disabled. Empty chords were
+    /// Module actions, rebuilt when modules are enabled or disabled. Empty chords were
     /// dropped because a core binding owns them.
-    mod_bindings: Vec<ModBinding>,
-    mod_ids: Vec<&'static str>,
-    mod_timers: Vec<f32>,
+    module_bindings: Vec<ModuleBinding>,
+    module_ids: Vec<&'static str>,
+    module_timers: Vec<f32>,
     /// `u64::MAX` until the first sync, so the table is built once and a quiet
     /// frame does not allocate.
-    mod_gen: u64,
+    module_gen: u64,
 }
 
 impl Router {
@@ -215,10 +215,10 @@ impl Router {
             context: Context::Gameplay,
             captured: true,
             timers: Timers::new(),
-            mod_bindings: Vec::new(),
-            mod_ids: Vec::new(),
-            mod_timers: Vec::new(),
-            mod_gen: u64::MAX,
+            module_bindings: Vec::new(),
+            module_ids: Vec::new(),
+            module_timers: Vec::new(),
+            module_gen: u64::MAX,
         }
     }
 
@@ -228,12 +228,12 @@ impl Router {
         if self.context != c {
             self.context = c;
             self.timers.reset();
-            self.reset_mod_timers();
+            self.reset_module_timers();
         }
     }
 
-    fn reset_mod_timers(&mut self) {
-        for t in &mut self.mod_timers {
+    fn reset_module_timers(&mut self) {
+        for t in &mut self.module_timers {
             *t = -1.0;
         }
     }
@@ -248,37 +248,37 @@ impl Router {
         self.captured = captured;
     }
 
-    /// Rebuild the mod-action table when the enabled set changed. A matching
+    /// Rebuild the module-action table when the enabled set changed. A matching
     /// generation returns without allocating.
-    pub fn sync_actions(&mut self, host: &crate::modding::Mods) {
+    pub fn sync_actions(&mut self, host: &crate::modules::Modules) {
         let generation = host.action_generation();
-        if self.mod_gen == generation {
+        if self.module_gen == generation {
             return;
         }
-        self.mod_gen = generation;
-        self.mod_ids.clear();
-        self.mod_bindings.clear();
-        self.mod_timers.clear();
+        self.module_gen = generation;
+        self.module_ids.clear();
+        self.module_bindings.clear();
+        self.module_timers.clear();
         for action in host.enabled_actions() {
-            if self.mod_ids.len() >= ActionSet::CAP {
-                debug_assert!(false, "more than {} mod actions", ActionSet::CAP);
+            if self.module_ids.len() >= ActionSet::CAP {
+                debug_assert!(false, "more than {} module actions", ActionSet::CAP);
                 break;
             }
             let chords = action.default.iter().copied().filter(|c| !core_claims(&self.bindings, *c)).collect();
-            self.mod_ids.push(action.id);
-            self.mod_bindings.push(ModBinding {
+            self.module_ids.push(action.id);
+            self.module_bindings.push(ModuleBinding {
                 chords,
                 repeat: action.repeat,
                 held: action.held,
                 immediate: action.immediate,
             });
-            self.mod_timers.push(-1.0);
+            self.module_timers.push(-1.0);
         }
     }
 
     /// Ids of the actions in [`Self::sync_actions`], in bit order.
     pub fn action_ids(&self) -> &[&'static str] {
-        &self.mod_ids
+        &self.module_ids
     }
 
     /// Per-frame input observation: advances repeat timers and returns an
@@ -292,10 +292,10 @@ impl Router {
     /// frame, so they cannot replay when input unlocks.
     pub fn drain_frame(&mut self) {
         self.timers.reset();
-        self.reset_mod_timers();
+        self.reset_module_timers();
     }
 
-    /// Gameplay variant that can structurally skip mod logic and the minimap
+    /// Gameplay variant that can structurally skip module logic and the minimap
     /// key. A disabled lane's chords are never evaluated and its repeat timer
     /// is unprimed, so a held key cannot autofire the instant the lane
     /// re-enables. Menus use [`frame`](Self::frame).
@@ -303,13 +303,13 @@ impl Router {
         &'e mut self,
         engine: &'e Engine,
         dt: f32,
-        mod_logic: bool,
+        module_logic: bool,
         minimap: bool,
     ) -> FrameInput<'e> {
         let mods = Mods::current(engine);
         let sample = {
             let probe = EngineProbe { eng: engine, mods };
-            self.sample(&probe, dt, mod_logic, minimap)
+            self.sample(&probe, dt, module_logic, minimap)
         };
         FrameInput {
             eng: engine,
@@ -326,10 +326,10 @@ impl Router {
         }
     }
 
-    /// Evaluate the active context. `mod_logic` false unprimes the timers of the
+    /// Evaluate the active context. `module_logic` false unprimes the timers of the
     /// cadence actions and reports none of them and no wheel; immediate actions
     /// are sampled either way.
-    pub(crate) fn sample(&mut self, probe: &impl Probe, dt: f32, mod_logic: bool, minimap: bool) -> Sample {
+    pub(crate) fn sample(&mut self, probe: &impl Probe, dt: f32, module_logic: bool, minimap: bool) -> Sample {
         let mut global_fired = [false; GlobalEvent::COUNT];
         for e in GlobalEvent::ALL {
             if !minimap && e == GlobalEvent::MinimapMode {
@@ -347,7 +347,7 @@ impl Router {
         match self.context {
             Context::Gameplay => {
                 for e in GameplayEvent::ALL {
-                    if e == GameplayEvent::Place && !mod_logic {
+                    if e == GameplayEvent::Place && !module_logic {
                         self.timers.gameplay[e as usize] = -1.0;
                         continue;
                     }
@@ -359,20 +359,20 @@ impl Router {
                         dt,
                     );
                 }
-                if mod_logic {
+                if module_logic {
                     wheel = scroll_steps(probe.wheel());
                 }
-                for i in 0..self.mod_bindings.len() {
-                    let binding = &self.mod_bindings[i];
-                    if !binding.immediate && !mod_logic {
-                        self.mod_timers[i] = -1.0;
+                for i in 0..self.module_bindings.len() {
+                    let binding = &self.module_bindings[i];
+                    if !binding.immediate && !module_logic {
+                        self.module_timers[i] = -1.0;
                         continue;
                     }
                     let hit = if binding.held {
                         binding.chords.iter().any(|chord| probe.held(*chord))
                     } else {
-                        let repeat = binding.repeat.then_some(MOD_REPEAT);
-                        eval_event(&binding.chords, repeat, &mut self.mod_timers[i], probe, dt)
+                        let repeat = binding.repeat.then_some(MODULE_REPEAT);
+                        eval_event(&binding.chords, repeat, &mut self.module_timers[i], probe, dt)
                     };
                     match (hit, binding.immediate) {
                         (true, true) => immediate.insert(i),
@@ -464,17 +464,17 @@ impl Gameplay<'_> {
         }
     }
 
-    /// Mod actions that fired this frame. Empty when mod logic is off.
+    /// Module actions that fired this frame. Empty when module logic is off.
     pub fn actions(&self) -> ActionSet {
         self.fi.actions
     }
 
-    /// Immediate mod actions that fired this frame, mod logic on or off.
+    /// Immediate module actions that fired this frame, module logic on or off.
     pub fn immediate_actions(&self) -> ActionSet {
         self.fi.immediate
     }
 
-    /// Signed scroll steps this frame. Zero when mod logic is off.
+    /// Signed scroll steps this frame. Zero when module logic is off.
     pub fn wheel(&self) -> i8 {
         self.fi.wheel
     }
@@ -593,8 +593,8 @@ impl Global<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::modding::testing::{action, Stub};
-    use crate::modding::{Action, Mods as Host};
+    use crate::modules::testing::{action, Stub};
+    use crate::modules::{Action, Modules as Host};
 
     const SLOT3: &[Action] = &[action("bar.slot3", &[Chord::key(Key::Num3)])];
     /// Tab is the core capture key.
@@ -604,11 +604,11 @@ mod tests {
     const WHEEL: &[Action] = &[action("wheel.down", &[Chord::bare(Source::WheelDown)])];
     const HOLD: &[Action] = &[Action { held: true, ..action("voice.talk", &[Chord::key(Key::V)]) }];
 
-    /// One enabled mod declaring `actions`.
+    /// One enabled module declaring `actions`.
     fn host(actions: &'static [Action]) -> Host {
-        let mut mods = Host::empty();
-        mods.install(Box::new(Stub::new("stub").actions(actions)));
-        mods
+        let mut modules = Host::empty();
+        modules.install(Box::new(Stub::new("stub").actions(actions)));
+        modules
     }
 
     fn fired(router: &Router, id: &str, actions: ActionSet) -> bool {
@@ -620,37 +620,37 @@ mod tests {
         let mut router = Router::new();
         router.timers.gameplay[0] = 0.12;
         router.timers.menu[0] = 0.08;
-        router.mod_timers.push(0.4);
+        router.module_timers.push(0.4);
         router.drain_frame();
         assert!(router.timers.gameplay.iter().all(|&t| t < 0.0));
         assert!(router.timers.menu.iter().all(|&t| t < 0.0));
-        assert!(router.mod_timers.iter().all(|&t| t < 0.0));
+        assert!(router.module_timers.iter().all(|&t| t < 0.0));
     }
 
     #[test]
-    fn a_mod_action_fires_on_its_default_chord() {
+    fn a_module_action_fires_on_its_default_chord() {
         let mut router = Router::new();
-        let mods = host(SLOT3);
-        router.sync_actions(&mods);
+        let modules = host(SLOT3);
+        router.sync_actions(&modules);
         let sample = router.sample(&Press::key(Key::Num3), 1.0 / 60.0, true, true);
         assert!(fired(&router, "bar.slot3", sample.actions));
         assert!(sample.immediate.is_empty());
         assert!(!sample.gameplay[GameplayEvent::ToggleCapture as usize]);
     }
 
-    /// An immediate action fires with the mod-logic lane off, on its own set, and not while
+    /// An immediate action fires with the module-logic lane off, on its own set, and not while
     /// text is captured; a cadence action does not fire with the lane off.
     #[test]
-    fn an_immediate_action_fires_with_mod_logic_off() {
+    fn an_immediate_action_fires_with_module_logic_off() {
         let mut router = Router::new();
-        let mut mods = host(CHAT);
-        mods.install(Box::new(Stub::new("bar").actions(SLOT3)));
-        router.sync_actions(&mods);
+        let mut modules = host(CHAT);
+        modules.install(Box::new(Stub::new("bar").actions(SLOT3)));
+        router.sync_actions(&modules);
         let chat = router.sample(&Press::key(Key::Backquote), 1.0 / 60.0, false, true);
         assert!(fired(&router, "chat.open", chat.immediate), "the chat key works under the Minimum preset");
         assert!(chat.actions.is_empty(), "an immediate action is not a cadence action");
         let slot = router.sample(&Press::key(Key::Num3), 1.0 / 60.0, false, true);
-        assert!(slot.actions.is_empty() && slot.immediate.is_empty(), "mod logic off silences cadence actions");
+        assert!(slot.actions.is_empty() && slot.immediate.is_empty(), "module logic off silences cadence actions");
         let on = router.sample(&Press::key(Key::Backquote), 1.0 / 60.0, true, true);
         assert!(fired(&router, "chat.open", on.immediate));
         router.set_context(Context::Text);
@@ -661,21 +661,21 @@ mod tests {
     #[test]
     fn a_core_binding_wins_a_clash() {
         let mut router = Router::new();
-        let mods = host(CLASH);
-        router.sync_actions(&mods);
+        let modules = host(CLASH);
+        router.sync_actions(&modules);
         let tab = router.sample(&Press::key(Key::Tab), 1.0 / 60.0, true, true);
         assert!(tab.gameplay[GameplayEvent::ToggleCapture as usize], "Tab stays the capture key");
-        assert!(!fired(&router, "clash.fire", tab.actions), "the core chord is not also a mod action");
+        assert!(!fired(&router, "clash.fire", tab.actions), "the core chord is not also a module action");
         let slot = router.sample(&Press::key(Key::Num3), 1.0 / 60.0, true, true);
         assert!(fired(&router, "clash.fire", slot.actions), "the other default chord still fires");
         assert!(!slot.gameplay[GameplayEvent::ToggleCapture as usize]);
     }
 
     #[test]
-    fn a_menu_wheel_chord_does_not_block_a_mod_action() {
+    fn a_menu_wheel_chord_does_not_block_a_module_action() {
         let mut router = Router::new();
-        let mods = host(WHEEL);
-        router.sync_actions(&mods);
+        let modules = host(WHEEL);
+        router.sync_actions(&modules);
         let sample = router.sample(&Press::wheel(-1.0), 1.0 / 60.0, true, true);
         assert!(fired(&router, "wheel.down", sample.actions));
         assert_eq!(sample.wheel, -1);
@@ -685,8 +685,8 @@ mod tests {
     #[test]
     fn a_held_action_stays_on_while_the_chord_is_down() {
         let mut router = Router::new();
-        let mods = host(HOLD);
-        router.sync_actions(&mods);
+        let modules = host(HOLD);
+        router.sync_actions(&modules);
         let down = Press {
             pressed_keys: 0,
             down_keys: 1u128 << Key::V as u32,

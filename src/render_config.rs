@@ -81,7 +81,7 @@ pub fn vrs_effective(choice: VrsChoice, render_w: u32, render_h: u32, min_pixels
 /// [`RenderConfig::strip_group`] cannot disagree.
 macro_rules! visual_groups {
     ($($group:ident: $($lane:ident)+;)+) => {
-        /// Fancy presentation groups owned by default-enabled visual mods.
+        /// Fancy presentation groups owned by default-enabled visual modules.
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
         pub enum VisualGroup {
             $($group,)+
@@ -90,15 +90,15 @@ macro_rules! visual_groups {
         impl VisualGroup {
             pub const ALL: [VisualGroup; [$(VisualGroup::$group),+].len()] = [$(VisualGroup::$group),+];
 
-            /// The visual mod that owns the group (the name the forced-off marker shows).
-            pub fn mod_name(self) -> &'static str {
+            /// The visual module that owns the group (the name the forced-off marker shows).
+            pub fn module_name(self) -> &'static str {
                 match self {
                     $(Self::$group => stringify!($group),)+
                 }
             }
         }
 
-        /// Which visual-mod group owns a settings/`/gfx` lane key, if any.
+        /// Which visual-module group owns a settings/`/gfx` lane key, if any.
         pub fn lane_group(key: &str) -> Option<VisualGroup> {
             match key {
                 $($(stringify!($lane))|+ => Some(VisualGroup::$group),)+
@@ -107,7 +107,7 @@ macro_rules! visual_groups {
         }
 
         impl RenderConfig {
-            /// Drop one visual group; used when that group's mod is disabled.
+            /// Drop one visual group; used when that group's module is disabled.
             pub fn strip_group(&mut self, group: VisualGroup) {
                 match group {
                     $(VisualGroup::$group => {

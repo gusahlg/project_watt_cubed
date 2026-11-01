@@ -56,7 +56,7 @@ const MAX_FIXED_ACCUM: f32 = 0.25;
 /// A bounded fixed-rate clock: banks frame time (capped at
 /// [`MAX_FIXED_ACCUM`]) and converts it into whole due steps. THE one
 /// accumulator implementation — the scheduler's `Cadence::Hz` lanes and the
-/// game's throttled clocks (physics/stream/sky/mod rates) all run on it, so
+/// game's throttled clocks (physics/stream/sky/module rates) all run on it, so
 /// the catch-up bound and the zero-rate convention cannot drift apart.
 ///
 /// Rate zero is the explicit every-frame mode: always one step due, nothing

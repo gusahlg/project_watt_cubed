@@ -113,7 +113,7 @@ pub(super) fn hello(name: &str, password: &str, protocol: u32, content: crate::n
         simulation: content.simulation,
         name: name.into(),
         password: password.into(),
-        mods: vec![],
+        modules: vec![],
     }
     .encode()
 }

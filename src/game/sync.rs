@@ -5,7 +5,7 @@ use crate::audio::GameEvent;
 use crate::block::{AIR, BlockId};
 use crate::camera::GameCamera;
 use crate::interact;
-use crate::modding::{Channel, Message, Mods, Notice, NoticeLevel, ToolUse};
+use crate::modules::{Channel, Message, Modules, Notice, NoticeLevel, ToolUse};
 use crate::net::client::Incoming;
 use crate::play::{self, Cue, Host};
 use crate::presence::{Animator, Stance, WireAction};
@@ -16,9 +16,9 @@ pub(super) use crate::play::PendingEdit;
 #[cfg(test)]
 pub(super) use crate::play::PendingKind;
 
-/// The game's half of a shared play cue: the same sounds, mod calls and snap load as before.
+/// The game's half of a shared play cue: the same sounds, module calls and snap load as before.
 struct GameHost<'a> {
-    mods: &'a mut Mods,
+    modules: &'a mut Modules,
     events: &'a mut Vec<GameEvent>,
     camera: &'a mut GameCamera,
     anim: &'a mut Animator,
@@ -47,24 +47,24 @@ impl Host for GameHost<'_> {
             Cue::SwingAt { at } => self.events.push(GameEvent::Swing { at }),
             Cue::PeerSwing { at, peer } => self.events.push(GameEvent::PeerSwing { at, peer }),
             Cue::ToolReacted { at, block } => self.events.push(GameEvent::ToolReacted { at, block }),
-            Cue::BreakNoted { id, overflow } => self.mods.on_block_break(id, world, overflow),
-            Cue::BreakRejected { id } => self.mods.on_break_rejected(id),
-            Cue::PlaceRejected { id } => self.mods.on_place_rejected(id, world),
-            Cue::ToolNoReaction => self.mods.on_tool_used(ToolUse::NoReaction),
-            Cue::ToolChanged { tool, new_tool } => self.mods.on_tool_changed(tool, new_tool),
-            Cue::ToolUsed(outcome) => self.mods.on_tool_used(outcome),
+            Cue::BreakNoted { id, overflow } => self.modules.on_block_break(id, world, overflow),
+            Cue::BreakRejected { id } => self.modules.on_break_rejected(id),
+            Cue::PlaceRejected { id } => self.modules.on_place_rejected(id, world),
+            Cue::ToolNoReaction => self.modules.on_tool_used(ToolUse::NoReaction),
+            Cue::ToolChanged { tool, new_tool } => self.modules.on_tool_changed(tool, new_tool),
+            Cue::ToolUsed(outcome) => self.modules.on_tool_used(outcome),
             Cue::Chat { from, channel, text } => {
-                self.mods.on_message(&Message::Chat {
+                self.modules.on_message(&Message::Chat {
                     from: from.as_ref(),
                     channel: Channel::from_wire(channel),
                     text: text.as_ref(),
                 });
             }
             Cue::Joined { name } => {
-                self.mods.on_message(&Message::Joined { name: name.as_ref() });
+                self.modules.on_message(&Message::Joined { name: name.as_ref() });
             }
             Cue::Left { name } => {
-                self.mods.on_message(&Message::Left { name: name.as_ref() });
+                self.modules.on_message(&Message::Left { name: name.as_ref() });
             }
             Cue::Time { day, day_secs } => {
                 self.sky.clock.set_day(day as f64);
@@ -72,7 +72,7 @@ impl Host for GameHost<'_> {
             }
             Cue::Interrupted => {
                 let text = crate::net::client::INTERRUPTED.to_string();
-                post(self.mods, Notice { level: NoticeLevel::Warning, text });
+                post(self.modules, Notice { level: NoticeLevel::Warning, text });
             }
             Cue::Trauma(amount) => self.camera.fx.add_trauma(amount),
             Cue::AnimSwing => self.anim.on_action(WireAction::Swing),
@@ -89,15 +89,15 @@ impl Host for GameHost<'_> {
 impl Game {
     /// Drain server events and send our heartbeat. `Some(ExitToMenu)` when the
     /// server dropped us. Runs before input so edits and chat keep flowing even
-    /// while a mod is typing or the player stands still — and the move
+    /// while a module is typing or the player stands still — and the move
     /// report doubles as the keepalive, so it too runs unconditionally.
-    pub(super) fn net_phase(&mut self, mods: &mut Mods, events: &mut Vec<GameEvent>) -> Option<Signal> {
+    pub(super) fn net_phase(&mut self, modules: &mut Modules, events: &mut Vec<GameEvent>) -> Option<Signal> {
         // The overwhelmingly common singleplayer path should not even enter a
         // profiling scope or call through the event-poll seam.
         self.net.as_ref()?;
         let net_disconnected = {
             let _p = voxel_engine::profile::scope(voxel_engine::profile::Meter::NetEvents);
-            self.apply_net_events(mods, events)
+            self.apply_net_events(modules, events)
         };
         if let Some(reason) = net_disconnected {
             let interrupted = reason == crate::net::client::INTERRUPTED;
@@ -110,7 +110,7 @@ impl Game {
             } else {
                 format!("* disconnected: {reason}")
             };
-            post(mods, Notice { level: NoticeLevel::Warning, text: line.clone() });
+            post(modules, Notice { level: NoticeLevel::Warning, text: line.clone() });
             self.leave_notice = Some(line);
             return Some(Signal::ExitToMenu);
         }
@@ -130,20 +130,20 @@ impl Game {
     }
 
     /// Drain queued server messages: apply world edits, resolve our own edit
-    /// verdicts (rolling back rejected predictions), hand chat to the mods, and report
+    /// verdicts (rolling back rejected predictions), hand chat to the modules, and report
     /// a lost connection. `Some(reason)` if the server dropped us.
-    fn apply_net_events(&mut self, mods: &mut Mods, events: &mut Vec<GameEvent>) -> Option<String> {
+    fn apply_net_events(&mut self, modules: &mut Modules, events: &mut Vec<GameEvent>) -> Option<String> {
         let incoming = match &mut self.net {
             Some(net) => net.poll(),
             None => return None,
         };
-        self.apply_incoming(incoming, mods, events)
+        self.apply_incoming(incoming, modules, events)
     }
 
     /// The network phase alone, for probes. True once the join overlay is in.
     #[cfg(test)]
-    pub(crate) fn pump_net(&mut self, mods: &mut Mods) -> bool {
-        self.apply_net_events(mods, &mut Vec::new());
+    pub(crate) fn pump_net(&mut self, modules: &mut Modules) -> bool {
+        self.apply_net_events(modules, &mut Vec::new());
         self.net.as_ref().is_some_and(|net| net.snapshot_ready())
     }
 
@@ -151,11 +151,11 @@ impl Game {
     pub(super) fn apply_incoming(
         &mut self,
         incoming: Vec<Incoming>,
-        mods: &mut Mods,
+        modules: &mut Modules,
         events: &mut Vec<GameEvent>,
     ) -> Option<String> {
         let mut host = GameHost {
-            mods,
+            modules,
             events,
             camera: &mut self.camera,
             anim: &mut self.local_anim,
@@ -175,21 +175,21 @@ impl Game {
 
     /// Left click: with a tool, a reaction between the tool and the targeted block; with
     /// no tool, breaking the block into the inventory.
-    pub(super) fn primary_action(&mut self, mods: &mut Mods, events: &mut Vec<GameEvent>) {
+    pub(super) fn primary_action(&mut self, modules: &mut Modules, events: &mut Vec<GameEvent>) {
         let Some(hit) = interact::raycast(&self.world, self.player.position, self.player.forward(), interact::REACH)
         else {
             return;
         };
-        match mods.tool(&self.player) {
-            Some(tool) => self.use_tool(tool, hit.block, mods, events),
-            None => self.break_block(hit.block, mods, events),
+        match modules.tool(&self.player) {
+            Some(tool) => self.use_tool(tool, hit.block, modules, events),
+            None => self.break_block(hit.block, modules, events),
         }
     }
 
     /// Use the held configuration `tool` on the block at `cell`. On a server the law runs there.
-    fn use_tool(&mut self, tool: BlockId, cell: (i32, i32, i32), mods: &mut Mods, events: &mut Vec<GameEvent>) {
+    fn use_tool(&mut self, tool: BlockId, cell: (i32, i32, i32), modules: &mut Modules, events: &mut Vec<GameEvent>) {
         let mut host = GameHost {
-            mods,
+            modules,
             events,
             camera: &mut self.camera,
             anim: &mut self.local_anim,
@@ -208,9 +208,9 @@ impl Game {
     }
 
     /// No tool: break the block at `cell` into the inventory.
-    fn break_block(&mut self, cell: (i32, i32, i32), mods: &mut Mods, events: &mut Vec<GameEvent>) {
+    fn break_block(&mut self, cell: (i32, i32, i32), modules: &mut Modules, events: &mut Vec<GameEvent>) {
         let mut host = GameHost {
-            mods,
+            modules,
             events,
             camera: &mut self.camera,
             anim: &mut self.local_anim,
@@ -231,10 +231,10 @@ impl Game {
     /// it), revoke loot only if it fit, and refund a spent block. The live path rolls back inside
     /// [`crate::play`]; tests call this wrapper.
     #[cfg(test)]
-    fn rollback(&mut self, edit: PendingEdit, restore: bool, mods: &mut Mods) {
+    fn rollback(&mut self, edit: PendingEdit, restore: bool, modules: &mut Modules) {
         let mut events = Vec::new();
         let mut host = GameHost {
-            mods,
+            modules,
             events: &mut events,
             camera: &mut self.camera,
             anim: &mut self.local_anim,
@@ -244,21 +244,21 @@ impl Game {
         play::rollback(&mut self.world, &mut self.player, edit, restore, &mut host);
     }
 
-    /// Apply the block placements mods queued this tick, draining the buffer in
+    /// Apply the block placements modules queued this tick, draining the buffer in
     /// place so its capacity is retained. A placement lands only in a
     /// non-obstacle cell (air, or a liquid it replaces) that doesn't overlap
-    /// the player. Well-behaved mods (the crafting mod) ran an equivalent check
+    /// the player. Well-behaved modules (the crafting module) ran an equivalent check
     /// before queueing — and before spending a block on it — so within one tick
-    /// the two always agree; re-checking here is a cheap guard against a mod that
+    /// the two always agree; re-checking here is a cheap guard against a module that
     /// queues without validating.
     pub(super) fn apply_placements(
         &mut self,
         placements: &mut Vec<(i32, i32, i32, crate::block::BlockId)>,
         events: &mut Vec<GameEvent>,
-        mods: &mut Mods,
+        modules: &mut Modules,
     ) {
         let mut host = GameHost {
-            mods,
+            modules,
             events,
             camera: &mut self.camera,
             anim: &mut self.local_anim,
@@ -285,9 +285,9 @@ impl Game {
     }
 }
 
-/// Hand a session notice to the mods now; with no mod showing it, stderr.
-fn post(mods: &mut Mods, notice: Notice) {
-    if !mods.on_message(&Message::Notice(&notice)) {
+/// Hand a session notice to the modules now; with no module showing it, stderr.
+fn post(modules: &mut Modules, notice: Notice) {
+    if !modules.on_message(&Message::Notice(&notice)) {
         eprintln!("{}", notice.text);
     }
 }
@@ -297,7 +297,7 @@ mod tests {
     use super::{Game, PendingEdit, PendingKind};
     use crate::block::{AIR, BlockId};
     use crate::game::tests::game;
-    use crate::modding::Mods;
+    use crate::modules::Modules;
 
     /// A break whose loot did not fit (full inventory) and that the server refuses gives the cell
     /// back and takes no unit the player already held.
@@ -340,15 +340,15 @@ mod tests {
             cell(&mut incoming, &mut reference, c, rock);
         }
 
-        game.apply_incoming(incoming, &mut crate::modding::testing::standard(), &mut Vec::new());
+        game.apply_incoming(incoming, &mut crate::modules::testing::standard(), &mut Vec::new());
         game.world.assert_same_edits(&reference);
     }
 
-    /// A chat line a mod queues goes to the server, which relays it back as a message for the
-    /// mods; the core shows nothing itself.
+    /// A chat line a module queues goes to the server, which relays it back as a message for the
+    /// modules; the core shows nothing itself.
     #[test]
     fn queued_chat_goes_to_the_server_and_returns_as_a_message() {
-        use crate::game::tests::{probe_mods, type_word};
+        use crate::game::tests::{probe_modules, type_word};
         use crate::net::client::Connection;
         use crate::net::server::{self, Config};
         use std::time::{Duration, Instant};
@@ -356,15 +356,15 @@ mod tests {
         let server = server::spawn(0, Config { seed: 1, ..Config::default() }).expect("loopback server");
         let conn = Connection::connect("127.0.0.1", server.addr().port(), "ada", "").expect("connect");
         let mut game = game().with_net(conn);
-        let (mut mods, log) = probe_mods();
+        let (mut modules, log) = probe_modules();
         let mut settings = crate::settings::Settings::default();
-        type_word(&mut game, &mut mods, &mut settings, "chat");
+        type_word(&mut game, &mut modules, &mut settings, "chat");
         assert!(game.chat_out.is_empty(), "sent, not kept");
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut events = Vec::new();
         while !log.borrow().iter().any(|l| l.starts_with("chat")) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
-            assert!(game.apply_net_events(&mut mods, &mut events).is_none(), "still connected");
+            assert!(game.apply_net_events(&mut modules, &mut events).is_none(), "still connected");
         }
         let chats: Vec<String> = log.borrow().iter().filter(|l| l.starts_with("chat")).cloned().collect();
         assert_eq!(chats, ["chat ada Local hello"]);
@@ -389,14 +389,14 @@ mod tests {
         let held = game.player.inventory.capacity() as u32;
         assert!(game.player.inventory.add(rock, held));
 
-        let (mut mods, mut events) = (Mods::empty(), Vec::new());
-        game.break_block((x, y, z), &mut mods, &mut events);
+        let (mut modules, mut events) = (Modules::empty(), Vec::new());
+        game.break_block((x, y, z), &mut modules, &mut events);
         assert_eq!(game.world.block_at(x, y, z), AIR, "the break is predicted");
         assert_eq!(game.player.inventory.count(rock), held, "the loot did not fit");
         let deadline = Instant::now() + Duration::from_secs(5);
         while !game.pending_edits.is_empty() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
-            assert!(game.apply_net_events(&mut mods, &mut events).is_none(), "still connected");
+            assert!(game.apply_net_events(&mut modules, &mut events).is_none(), "still connected");
         }
         assert!(game.pending_edits.is_empty(), "the server answered");
         assert_eq!(game.world.block_at(x, y, z), rock, "the refused break gives the cell back");
@@ -419,7 +419,7 @@ mod tests {
         game.world.set_block(x, y, z, rock);
         let woken = game.world.reactions().pending();
         let edit = PendingEdit { cell: (x, y, z), prev: AIR, kind: PendingKind::Place(rock) };
-        game.rollback(edit, true, &mut Mods::empty());
+        game.rollback(edit, true, &mut Modules::empty());
         assert_eq!(game.world.block_at(x, y, z), AIR, "the cell is given back");
         assert_eq!(game.player.inventory.count(rock), 1, "the spent block is refunded");
         assert!(game.world.reactions().pending() > woken, "the restored cell wakes its contacts");
@@ -430,7 +430,7 @@ mod tests {
         let (mut game, rock, (x, y, z)) = edit_game();
         assert!(game.player.inventory.add(rock, 1));
         let edit = PendingEdit { cell: (x, y, z), prev: rock, kind: PendingKind::Break { id: rock, gained: true } };
-        game.rollback(edit, false, &mut Mods::empty());
+        game.rollback(edit, false, &mut Modules::empty());
         assert_eq!(game.world.block_at(x, y, z), AIR, "a newer edit owns the cell");
         assert_eq!(game.player.inventory.count(rock), 0, "loot that fit is revoked");
         assert_eq!(game.world.reactions().pending(), 0, "an untouched cell wakes nothing");

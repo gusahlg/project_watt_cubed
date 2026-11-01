@@ -1,9 +1,9 @@
-//! Hello HUD: the smallest useful PWC mod. One HUD line, one counter, one event hook.
+//! Hello HUD: the smallest useful PWC module. One HUD line, one counter, one event hook.
 
-use pwc_mod_api::prelude::*;
+use pwc_module_api::prelude::*;
 
 /// The package entry point: the PWC builder calls it once at startup.
-pub fn register(registrar: &mut ModRegistrar) {
+pub fn register(registrar: &mut ModuleRegistrar) {
     registrar.add(HelloHud::default());
 }
 
@@ -13,7 +13,7 @@ pub struct HelloHud {
     broken: u64,
 }
 
-impl Mod for HelloHud {
+impl Module for HelloHud {
     fn name(&self) -> &str {
         "Hello HUD"
     }
@@ -32,7 +32,7 @@ impl Mod for HelloHud {
 
     fn hud(&self, facts: &HudFacts, _world: &World, _player: &Player, out: &mut Vec<HudElement>) {
         // The core asks in every HUD mode; this line shows in Full and Minimal.
-        if !facts.hud_mode.shows_mod_hud() {
+        if !facts.hud_mode.shows_module_hud() {
             return;
         }
         out.push(HudElement::Label {
@@ -40,7 +40,7 @@ impl Mod for HelloHud {
             off: (-12, 96),
             base_fs: 18,
             role: Role::Muted,
-            text: format!("Hello from a mod - {} blocks broken", self.broken).into(),
+            text: format!("Hello from a module - {} blocks broken", self.broken).into(),
         });
     }
 }
@@ -48,15 +48,15 @@ impl Mod for HelloHud {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pwc_mod_api::testing::Harness;
-    use pwc_mod_api::{GameBuild, ModDescriptor};
+    use pwc_module_api::testing::Harness;
+    use pwc_module_api::{GameBuild, ModuleDescriptor};
 
     #[test]
-    fn registers_one_mod() {
-        let harness = Harness::new(GameBuild::new().with_mod(ModDescriptor {
+    fn registers_one_module() {
+        let harness = Harness::new(GameBuild::new().with_module(ModuleDescriptor {
             id: "example.hello-hud",
             name: "Hello HUD",
-            version: "1.1.0",
+            version: "1.1.1",
             register,
         }));
         assert_eq!(harness.len(), 1);

@@ -10,7 +10,7 @@ use voxel_engine::DVec3;
 use crate::block::{AIR, BlockId};
 use crate::input::movement::{self, MoveInput};
 use crate::math::{Aabb, Bounded};
-use crate::modding::ToolUse;
+use crate::modules::ToolUse;
 use crate::net::client::{Connection, Incoming};
 use crate::player::Player;
 use crate::save;
@@ -32,7 +32,7 @@ pub(crate) enum PendingKind {
     Place(BlockId),
 }
 
-/// A fact the host turns into a sound, a mod call, or a headless event.
+/// A fact the host turns into a sound, a module call, or a headless event.
 pub(crate) enum Cue {
     RemoteEdit {
         cell: (i32, i32, i32),

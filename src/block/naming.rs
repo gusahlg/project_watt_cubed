@@ -1,9 +1,9 @@
 //! Material naming seam: a configuration becomes words a person can hold on to.
 //!
-//! The simulation has no names. A naming mod ([`MaterialNamer`]) maps each interned configuration to a
+//! The simulation has no names. A naming module ([`MaterialNamer`]) maps each interned configuration to a
 //! block name and a tool name once, when the configuration first appears; the registry keeps them
 //! beside the visuals as presentation. Names never flow back into the law, worldgen, saves or the
-//! wire. With no naming mod enabled the core falls back to [`describe`]: words read off the
+//! wire. With no naming module enabled the core falls back to [`describe`]: words read off the
 //! observation ("glowing clear hard solid").
 
 use material::{Configuration, Law, Observation};

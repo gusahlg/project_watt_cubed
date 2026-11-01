@@ -1,17 +1,17 @@
 //! Joining a server off the render thread: one attempt behind the connecting screen, and the
-//! single retry a mod refusal earns. The mod list a client reports is what an honest client
+//! single retry a module refusal earns. The module list a client reports is what an honest client
 //! says; a modified client can lie. One refusal suspends those packages for this session and
 //! tries again; a second failure resumes them. Suspension is never saved.
 use voxel_engine::Engine;
 
-use super::{App, Screen, fresh_seed, terrain_cfg_from_mods};
+use super::{App, Screen, fresh_seed, terrain_cfg_from_modules};
 use super::entry::Loading;
 use crate::screen::{HostInfo, JoinInfo};
-use crate::modding::{Mods, PackageInfo};
+use crate::modules::{Modules, PackageInfo};
 use crate::net::client::{Connection, PendingConnect};
 use crate::net::server::{Config, NoclipPolicy, TeleportPolicy};
 
-/// One join attempt and where it goes. A mod refusal restarts it once, with `retried` set.
+/// One join attempt and where it goes. A module refusal restarts it once, with `retried` set.
 pub(super) struct ConnectJob {
     pending: PendingConnect,
     /// The server is the integrated one this app started.
@@ -21,7 +21,7 @@ pub(super) struct ConnectJob {
     port: u16,
     name: String,
     password: String,
-    /// Shown once the attempt joins: a skipped save, or mods held for the session.
+    /// Shown once the attempt joins: a skipped save, or modules held for the session.
     notice: Option<String>,
 }
 
@@ -33,23 +33,23 @@ pub(super) enum Landed {
     Failed(String),
 }
 
-/// The retry decision: a refusal that names mods earns exactly one more attempt, with those
-/// mods held off. Any other failure, or a second refusal, ends the join.
-pub(super) fn retry_after(mods_denied: &[String], retried: bool) -> bool {
-    !mods_denied.is_empty() && !retried
+/// The retry decision: a refusal that names modules earns exactly one more attempt, with those
+/// modules held off. Any other failure, or a second refusal, ends the join.
+pub(super) fn retry_after(modules_denied: &[String], retried: bool) -> bool {
+    !modules_denied.is_empty() && !retried
 }
 
 impl ConnectJob {
-    /// Start joining `host:port`, reporting the packages `mods` runs.
+    /// Start joining `host:port`, reporting the packages `modules` runs.
     pub(super) fn begin(
         target: (&str, u16, &str, &str),
-        mods: &Mods,
+        modules: &Modules,
         packages: &[PackageInfo],
         hosted: bool,
         notice: Option<String>,
     ) -> Self {
         let (host, port, name, password) = target;
-        let pending = Connection::begin_connect_with_model(host, port, name, password, &mods.active_package_reports(packages), mods.reaction_model());
+        let pending = Connection::begin_connect_with_model(host, port, name, password, &modules.active_package_reports(packages), modules.reaction_model());
         Self {
             pending,
             hosted,
@@ -62,23 +62,23 @@ impl ConnectJob {
         }
     }
 
-    /// `None` while the attempt runs, and after a mod refusal has started the retry: the denied
-    /// packages are suspended in `mods` and the notice replaces any earlier one. A failure after
+    /// `None` while the attempt runs, and after a module refusal has started the retry: the denied
+    /// packages are suspended in `modules` and the notice replaces any earlier one. A failure after
     /// the retry resumes them.
-    pub(super) fn poll(&mut self, mods: &mut Mods, packages: &[PackageInfo]) -> Option<Landed> {
+    pub(super) fn poll(&mut self, modules: &mut Modules, packages: &[PackageInfo]) -> Option<Landed> {
         match self.pending.poll()? {
             Ok(conn) => Some(Landed::Joined { conn, notice: self.notice.take(), hosted: self.hosted }),
-            Err(err) if retry_after(&err.mods_denied, self.retried) => {
-                self.notice = Some(mod_hold_notice(packages, &err.mods_denied));
-                mods.suspend_packages(&err.mods_denied);
-                let reports = mods.active_package_reports(packages);
-                self.pending = Connection::begin_connect_with_model(&self.host, self.port, &self.name, &self.password, &reports, mods.reaction_model());
+            Err(err) if retry_after(&err.modules_denied, self.retried) => {
+                self.notice = Some(module_hold_notice(packages, &err.modules_denied));
+                modules.suspend_packages(&err.modules_denied);
+                let reports = modules.active_package_reports(packages);
+                self.pending = Connection::begin_connect_with_model(&self.host, self.port, &self.name, &self.password, &reports, modules.reaction_model());
                 self.retried = true;
                 None
             }
             Err(err) => {
                 if self.retried {
-                    mods.resume_packages();
+                    modules.resume_packages();
                 }
                 Some(Landed::Failed(if self.hosted {
                     format!("hosted, but could not connect: {err}")
@@ -101,7 +101,7 @@ impl ConnectJob {
 /// "This server does not allow: Developer Toolkit; it is off while you are connected".
 /// Several names use "they are". Display names come from the build; an unknown
 /// id is shown as itself.
-fn mod_hold_notice(packages: &[PackageInfo], ids: &[String]) -> String {
+fn module_hold_notice(packages: &[PackageInfo], ids: &[String]) -> String {
     let names: Vec<&str> = ids
         .iter()
         .map(|id| packages.iter().find(|pkg| pkg.id == id).map(|pkg| pkg.name).unwrap_or(id.as_str()))
@@ -120,9 +120,9 @@ impl App {
     /// an operator and teleport stays open. A stored seed and generator win.
     pub(super) fn start_host(&mut self, info: HostInfo) {
         debug_assert!(self.active.is_none(), "hosting starts from the menu, never over an open world");
-        let worldgen = self.mods.worldgen_kind();
-        let terrain = terrain_cfg_from_mods(&self.mods);
-        let reaction_model = self.mods.reaction_model();
+        let worldgen = self.modules.worldgen_kind();
+        let terrain = terrain_cfg_from_modules(&self.modules);
+        let reaction_model = self.modules.reaction_model();
         let started = self.host.start(&self.saves, info.port, |world| Config {
             password: info.password.clone(),
             seed: fresh_seed(),
@@ -138,7 +138,7 @@ impl App {
         });
         match started {
             Ok((port, skipped)) => {
-                let job = ConnectJob::begin(("127.0.0.1", port, &info.name, &info.password), &self.mods, self.build.packages(), true, skipped);
+                let job = ConnectJob::begin(("127.0.0.1", port, &info.name, &info.password), &self.modules, self.build.packages(), true, skipped);
                 self.screen = Screen::Connecting(job);
             }
             Err(e) => self.fail_to_menu(format!("could not host on port {}: {e}", info.port)),
@@ -147,25 +147,25 @@ impl App {
 
     /// Connect to a remote server. The attempt runs behind the connecting screen.
     pub(super) fn start_join(&mut self, info: JoinInfo) {
-        let job = ConnectJob::begin((&info.host, info.port, &info.name, &info.password), &self.mods, self.build.packages(), false, None);
+        let job = ConnectJob::begin((&info.host, info.port, &info.name, &info.password), &self.modules, self.build.packages(), false, None);
         self.screen = Screen::Connecting(job);
     }
 
     /// Poll the attempt. Cancel returns to the menu and stops a host we started.
-    /// A mod refusal retries once; any other failure leaves a spawned host running.
+    /// A module refusal retries once; any other failure leaves a spawned host running.
     pub(super) fn update_connecting(&mut self, eng: &mut Engine) {
         if self.cancel_pressed(eng) {
             self.cancel_connect();
             return;
         }
         let Screen::Connecting(job) = &mut self.screen else { return };
-        let Some(landed) = job.poll(&mut self.mods, self.build.packages()) else { return };
+        let Some(landed) = job.poll(&mut self.modules, self.build.packages()) else { return };
         // A fresh root screen stands by under the world being built.
         self.screen = Screen::Menus;
         self.menus = self.root_stack(None);
         match landed {
             Landed::Joined { conn, notice, hosted } => {
-                let render = self.mods.effective_render(&self.settings);
+                let render = self.modules.effective_render(&self.settings);
                 self.begin_loading(eng, Loading::join(conn, render, notice, hosted));
             }
             Landed::Failed(text) => self.fail_to_menu(text),
@@ -192,26 +192,26 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
-    use crate::modding::testing::Stub;
-    use crate::modding::{GameBuild, PackageKind};
+    use crate::modules::testing::Stub;
+    use crate::modules::{GameBuild, PackageKind};
     use crate::net::server;
     use crate::world::generation::WorldgenKind;
 
-    fn register_toolkit(reg: &mut crate::modding::ModRegistrar) {
+    fn register_toolkit(reg: &mut crate::modules::ModuleRegistrar) {
         reg.add(Stub::new("dev-toolkit"));
     }
 
-    fn register_hotbar(reg: &mut crate::modding::ModRegistrar) {
+    fn register_hotbar(reg: &mut crate::modules::ModuleRegistrar) {
         reg.add(Stub::new("hotbar"));
     }
 
     fn sample_packages() -> [PackageInfo; 2] {
-        let package = |id, name, version, register: fn(&mut crate::modding::ModRegistrar)| PackageInfo {
+        let package = |id, name, version, register: fn(&mut crate::modules::ModuleRegistrar)| PackageInfo {
             id,
             name,
             version,
             description: "",
-            kind: PackageKind::Mod,
+            kind: PackageKind::Module,
             dependencies: &[],
             register: Some(register),
         };
@@ -223,18 +223,18 @@ mod tests {
 
     const TOOLKIT_HELD: &str = "This server does not allow: Developer Toolkit; it is off while you are connected";
 
-    /// The mods of a client built with both sample packages, and the toolkit's index.
-    fn sample_mods(packages: &[PackageInfo; 2]) -> (Mods, usize) {
-        let mods = GameBuild::new().with_package(packages[0]).with_package(packages[1]).mods();
-        let toolkit = (0..mods.len()).find(|&i| mods.id(i) == "dev-toolkit").expect("toolkit");
-        (mods, toolkit)
+    /// The modules of a client built with both sample packages, and the toolkit's index.
+    fn sample_modules(packages: &[PackageInfo; 2]) -> (Modules, usize) {
+        let modules = GameBuild::new().with_package(packages[0]).with_package(packages[1]).modules();
+        let toolkit = (0..modules.len()).find(|&i| modules.id(i) == "dev-toolkit").expect("toolkit");
+        (modules, toolkit)
     }
 
     /// Poll `job` as the connecting screen does, every frame, until it lands.
-    fn land(job: &mut ConnectJob, mods: &mut Mods, packages: &[PackageInfo]) -> Landed {
+    fn land(job: &mut ConnectJob, modules: &mut Modules, packages: &[PackageInfo]) -> Landed {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
-            if let Some(landed) = job.poll(mods, packages) {
+            if let Some(landed) = job.poll(modules, packages) {
                 return landed;
             }
             assert!(Instant::now() < deadline, "the join never landed");
@@ -243,23 +243,23 @@ mod tests {
     }
 
     #[test]
-    fn mod_hold_notice_names_one_and_several() {
+    fn module_hold_notice_names_one_and_several() {
         let packages = sample_packages();
-        assert_eq!(mod_hold_notice(&packages, &["pwc.dev-toolkit".into()]), TOOLKIT_HELD);
+        assert_eq!(module_hold_notice(&packages, &["pwc.dev-toolkit".into()]), TOOLKIT_HELD);
         assert_eq!(
-            mod_hold_notice(&packages, &["pwc.dev-toolkit".into(), "pwc.hotbar".into()]),
+            module_hold_notice(&packages, &["pwc.dev-toolkit".into(), "pwc.hotbar".into()]),
             "This server does not allow: Developer Toolkit; Hotbar; they are off while you are connected"
         );
         assert_eq!(
-            mod_hold_notice(&packages, &["pwc.unknown".into()]),
+            module_hold_notice(&packages, &["pwc.unknown".into()]),
             "This server does not allow: pwc.unknown; it is off while you are connected"
         );
     }
 
     /// The whole decision table the connecting screen runs: only a first refusal that names
-    /// mods earns a retry.
+    /// modules earns a retry.
     #[test]
-    fn only_a_first_mod_refusal_earns_a_retry() {
+    fn only_a_first_module_refusal_earns_a_retry() {
         let refused = ["pwc.dev-toolkit".to_string()];
         let table: [(&[String], bool, bool); 4] = [(&refused, false, true), (&refused, true, false), (&[], false, false), (&[], true, false)];
         for (denied, retried, retry) in table {
@@ -270,26 +270,26 @@ mod tests {
     /// The server refuses the toolkit, the job suspends it and joins once, screens see it
     /// suspended, and leaving resumes it.
     #[test]
-    fn a_denied_mod_is_suspended_for_the_session_and_shown_as_such() {
+    fn a_denied_module_is_suspended_for_the_session_and_shown_as_such() {
         let packages = sample_packages();
-        let (mut mods, index) = sample_mods(&packages);
-        let config = Config { seed: 1, worldgen: WorldgenKind::Flat, mods_deny: vec!["pwc.dev-toolkit".into()], ..Config::default() };
+        let (mut modules, index) = sample_modules(&packages);
+        let config = Config { seed: 1, worldgen: WorldgenKind::Flat, modules_deny: vec!["pwc.dev-toolkit".into()], ..Config::default() };
         let handle = server::spawn(0, config).unwrap();
-        let mut job = ConnectJob::begin(("127.0.0.1", handle.addr().port(), "ada", ""), &mods, &packages, false, None);
-        let Landed::Joined { conn, notice, hosted } = land(&mut job, &mut mods, &packages) else { panic!("the retry joins") };
+        let mut job = ConnectJob::begin(("127.0.0.1", handle.addr().port(), "ada", ""), &modules, &packages, false, None);
+        let Landed::Joined { conn, notice, hosted } = land(&mut job, &mut modules, &packages) else { panic!("the retry joins") };
         assert!(conn.is_alive() && !hosted);
         assert_eq!(notice.as_deref(), Some(TOOLKIT_HELD));
-        assert!(!mods.is_active(index));
-        assert_eq!(mods.suspended(), ["pwc.dev-toolkit"]);
-        assert_eq!(mods.active_package_reports(&packages), [("pwc.hotbar".to_string(), "0.1.0".to_string())]);
-        let hotbar = (0..mods.len()).find(|&i| mods.id(i) == "hotbar").expect("hotbar");
-        assert!(mods.is_active(hotbar));
-        let (suspended, _, _) = mods.screen_view();
-        assert_eq!(suspended, ["pwc.dev-toolkit"], "what a mods screen reads as off on this server");
+        assert!(!modules.is_active(index));
+        assert_eq!(modules.suspended(), ["pwc.dev-toolkit"]);
+        assert_eq!(modules.active_package_reports(&packages), [("pwc.hotbar".to_string(), "0.1.0".to_string())]);
+        let hotbar = (0..modules.len()).find(|&i| modules.id(i) == "hotbar").expect("hotbar");
+        assert!(modules.is_active(hotbar));
+        let (suspended, _, _) = modules.screen_view();
+        assert_eq!(suspended, ["pwc.dev-toolkit"], "what a modules screen reads as off on this server");
         drop(conn);
-        mods.resume_packages();
-        assert!(mods.is_active(index));
-        assert!(mods.suspended().is_empty());
+        modules.resume_packages();
+        assert!(modules.is_active(index));
+        assert!(modules.suspended().is_empty());
         handle.stop();
     }
 
@@ -301,7 +301,7 @@ mod tests {
         /// root in `data`.
         fn start(bin: &std::path::Path, port: u16, data: &std::path::Path) -> Self {
             let child = std::process::Command::new(bin)
-                .args(["--port", &port.to_string(), "--seed", "5", "--worldgen", "flat", "--mods-deny", "pwc.dev-toolkit"])
+                .args(["--port", &port.to_string(), "--seed", "5", "--worldgen", "flat", "--modules-deny", "pwc.dev-toolkit"])
                 .arg("--data-dir")
                 .arg(data)
                 .stdout(std::process::Stdio::null())
@@ -327,11 +327,11 @@ mod tests {
     }
 
     /// Join as the connecting screen does until the server answers (it may still be starting).
-    fn join_when_up(port: u16, name: &str, mods: &mut Mods, packages: &[PackageInfo]) -> (Connection, Option<String>) {
+    fn join_when_up(port: u16, name: &str, modules: &mut Modules, packages: &[PackageInfo]) -> (Connection, Option<String>) {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
-            let mut job = ConnectJob::begin(("127.0.0.1", port, name, ""), mods, packages, false, None);
-            match land(&mut job, mods, packages) {
+            let mut job = ConnectJob::begin(("127.0.0.1", port, name, ""), modules, packages, false, None);
+            match land(&mut job, modules, packages) {
                 Landed::Joined { conn, notice, .. } => return (conn, notice),
                 Landed::Failed(why) => assert!(Instant::now() < deadline, "the server never answered: {why}"),
             }
@@ -357,7 +357,7 @@ mod tests {
     /// `WATT_SERVER_BIN`.
     #[test]
     #[ignore]
-    fn the_release_server_process_takes_a_mods_retry_a_rejoin_and_a_reconnect() {
+    fn the_release_server_process_takes_a_modules_retry_a_rejoin_and_a_reconnect() {
         let bin = std::env::var_os("WATT_SERVER_BIN").map(std::path::PathBuf::from).unwrap_or_else(|| {
             let exe = std::env::current_exe().expect("test binary path");
             exe.parent().and_then(|deps| deps.parent()).expect("target profile dir").join("watt_server")
@@ -367,12 +367,12 @@ mod tests {
         let data = std::env::temp_dir().join(format!("pwc-connect-process-{}", std::process::id()));
         let mut server = ServerProcess::start(&bin, port, &data);
         let packages = sample_packages();
-        let (mut mods, toolkit) = sample_mods(&packages);
+        let (mut modules, toolkit) = sample_modules(&packages);
 
         // A refusal, then the retry with the toolkit held.
-        let (mut conn, notice) = join_when_up(port, "ada", &mut mods, &packages);
+        let (mut conn, notice) = join_when_up(port, "ada", &mut modules, &packages);
         assert_eq!(notice.as_deref(), Some(TOOLKIT_HELD));
-        assert!(!mods.is_active(toolkit));
+        assert!(!modules.is_active(toolkit));
         until_ready(&mut conn);
         let s = conn.spawn();
         let cell = (crate::math::block_coord(s.x), crate::math::block_coord(s.y) - 3, crate::math::block_coord(s.z));
@@ -394,9 +394,9 @@ mod tests {
 
         // Leave, and the name is free again for the same player.
         drop(conn);
-        mods.resume_packages();
-        assert!(mods.is_active(toolkit));
-        let (mut conn, notice) = join_when_up(port, "ada", &mut mods, &packages);
+        modules.resume_packages();
+        assert!(modules.is_active(toolkit));
+        let (mut conn, notice) = join_when_up(port, "ada", &mut modules, &packages);
         assert_eq!(notice.as_deref(), Some(TOOLKIT_HELD));
         until_ready(&mut conn);
 
@@ -416,11 +416,11 @@ mod tests {
         assert_eq!(reason, "server shutting down");
         assert!(!conn.is_alive());
         drop(conn);
-        mods.resume_packages();
+        modules.resume_packages();
 
         // A new server process on the same port takes the reconnect.
         let _server = ServerProcess::start(&bin, port, &data);
-        let (mut conn, notice) = join_when_up(port, "ada", &mut mods, &packages);
+        let (mut conn, notice) = join_when_up(port, "ada", &mut modules, &packages);
         assert_eq!(notice.as_deref(), Some(TOOLKIT_HELD));
         until_ready(&mut conn);
         assert!(conn.is_alive());
@@ -429,19 +429,19 @@ mod tests {
     }
 
     /// A refusal, then a retry that fails for another reason (the name is taken): the join
-    /// ends with that reason and the suspended mods run again.
+    /// ends with that reason and the suspended modules run again.
     #[test]
-    fn a_failed_retry_releases_the_held_mods() {
+    fn a_failed_retry_releases_the_held_modules() {
         let packages = sample_packages();
-        let (mut mods, index) = sample_mods(&packages);
-        let config = Config { seed: 1, worldgen: WorldgenKind::Flat, mods_deny: vec!["pwc.dev-toolkit".into()], ..Config::default() };
+        let (mut modules, index) = sample_modules(&packages);
+        let config = Config { seed: 1, worldgen: WorldgenKind::Flat, modules_deny: vec!["pwc.dev-toolkit".into()], ..Config::default() };
         let handle = server::spawn(0, config).unwrap();
         let port = handle.addr().port();
         let _ada = Connection::connect("127.0.0.1", port, "ada", "").expect("the first ada joins");
-        let mut job = ConnectJob::begin(("127.0.0.1", port, "ada", ""), &mods, &packages, true, None);
-        let Landed::Failed(text) = land(&mut job, &mut mods, &packages) else { panic!("the name is taken") };
+        let mut job = ConnectJob::begin(("127.0.0.1", port, "ada", ""), &modules, &packages, true, None);
+        let Landed::Failed(text) = land(&mut job, &mut modules, &packages) else { panic!("the name is taken") };
         assert_eq!(text, "hosted, but could not connect: that name is already in use");
-        assert!(mods.is_active(index) && mods.suspended().is_empty(), "the suspension is lifted");
+        assert!(modules.is_active(index) && modules.suspended().is_empty(), "the suspension is lifted");
         handle.stop();
     }
 }

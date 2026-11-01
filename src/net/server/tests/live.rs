@@ -12,7 +12,7 @@ fn cell_under(pos: DVec3) -> Pos {
     (block_coord(pos.x), FLAT_HEIGHT - 1, block_coord(pos.z))
 }
 
-/// Break, place, a rejected edit, a refused and an allowed teleport, chat and mod data, as two
+/// Break, place, a rejected edit, a refused and an allowed teleport, chat and module data, as two
 /// players see them.
 #[test]
 #[ignore = "needs a watt_server process: see the module docs"]
@@ -105,7 +105,7 @@ fn external_server_session() {
     assert_eq!(line.as_deref(), Some("ada"));
     println!("chat: ok");
 
-    // Mod data, once both stand in each other's interest set again.
+    // Module data, once both stand in each other's interest set again.
     assert!(eventually(ANSWER, || {
         stand(&mut ada);
         bob.poll();
@@ -119,5 +119,5 @@ fn external_server_session() {
         !got.is_empty()
     });
     assert_eq!(got, vec![(ada_id, 7, vec![1, 2, 3, 4])], "bob hears ada's channel, stamped with her id");
-    println!("mod data: ok");
+    println!("module data: ok");
 }

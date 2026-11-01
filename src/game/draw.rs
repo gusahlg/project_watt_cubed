@@ -7,7 +7,7 @@ use crate::camera::ViewPose;
 use crate::derived::Memo;
 use super::{DebugView, SKY_KEY, TERRAIN_KEY};
 use crate::interact;
-use crate::modding::{HudFacts, Mods};
+use crate::modules::{HudFacts, Modules};
 use crate::presence::{self, Eye, Feet, Gait, RenderPose, Stance, TagVisibility};
 use crate::sched::RateGate;
 use crate::sky::SkyFrame;
@@ -98,7 +98,7 @@ impl Game {
     /// 3D draws are camera-relative. Differences are computed at f64 precision
     /// before narrowing to f32 for the GPU, keeping far terrain stable.
     /// `overlay` is a screen over the world (the pause screen), drawn last; `&[]` for none.
-    pub fn draw(&mut self, eng: &mut Engine, mods: &mut Mods, fov: f32, shake: f32, overlay: &[crate::screen::UiElement]) {
+    pub fn draw(&mut self, eng: &mut Engine, modules: &mut Modules, fov: f32, shake: f32, overlay: &[crate::screen::UiElement]) {
         // The home map is installed on the engine, so it has to land before the frame opens.
         if matches!(self.debug_view, DebugView::Normal) {
             // Benchmarks and the scripted harness stay on the sphere unless a bench opts in.
@@ -115,7 +115,7 @@ impl Game {
         let mut scene = self.compose_phase(eng, fov, shake);
         let mut f = eng.begin_frame(scene.lighting.clear);
         self.scene_phase(&mut f, &scene);
-        self.hud_phase(&mut f, mods, &scene);
+        self.hud_phase(&mut f, modules, &scene);
         crate::screen::render(&mut f, overlay);
         // Reclaim peer capacity after both consumers finish with the immutable
         // scene. Stable multiplayer frames allocate no new draw-record vector.
@@ -287,7 +287,7 @@ impl Game {
         }
     }
 
-    /// Sample the frame rate the HUD shows at human display cadence (4 Hz), so a HUD mod
+    /// Sample the frame rate the HUD shows at human display cadence (4 Hz), so a HUD module
     /// re-formats only when the shown number changes. Scripted (harness) frames pin it: a live
     /// FPS number is the one nondeterministic pixel region in an otherwise reproducible shot.
     fn sample_fps(&mut self, fps: i32, dt: f32) {
@@ -298,7 +298,7 @@ impl Game {
         }
     }
 
-    /// This frame's facts for the HUD mods: the frame rate, the link, loading, the HUD mode and
+    /// This frame's facts for the HUD modules: the frame rate, the link, loading, the HUD mode and
     /// scale, and the corner the minimap takes.
     pub(super) fn hud_facts(&self, screen: (i32, i32)) -> HudFacts {
         let net = self.net.as_ref();
@@ -388,11 +388,11 @@ impl Game {
         }
     }
 
-    /// Everything over the world: the minimap and name tags, then the mods' HUD data on top
-    /// (rendered by the core — mods never touch the frame). The core draws no HUD text of its
+    /// Everything over the world: the minimap and name tags, then the modules' HUD data on top
+    /// (rendered by the core — modules never touch the frame). The core draws no HUD text of its
     /// own: the reticle, coordinates, frame rate, player count, loading and link notices are a
-    /// mod's, from [`HudFacts`].
-    fn hud_phase(&mut self, f: &mut voxel_engine::Frame, mods: &mut Mods, scene: &Scene) {
+    /// module's, from [`HudFacts`].
+    fn hud_phase(&mut self, f: &mut voxel_engine::Frame, modules: &mut Modules, scene: &Scene) {
         let map_sample = self.map_sample.take();
         let screen = scene.screen;
         let _hud = voxel_engine::profile::scope(voxel_engine::profile::Meter::ListHud);
@@ -426,24 +426,24 @@ impl Game {
             }
         }
 
-        // The mods' HUD, in every mode: each mod reads `hud_mode` and decides (an open chat
+        // The modules' HUD, in every mode: each module reads `hud_mode` and decides (an open chat
         // stays reachable with the HUD off). An empty contribution records nothing.
         self.hud_scratch.clear();
         let facts = self.hud_facts(screen);
-        mods.hud(&facts, &self.world, &self.player, &mut self.hud_scratch);
+        modules.hud(&facts, &self.world, &self.player, &mut self.hud_scratch);
         ui::render_hud(f, &self.theme, screen, &self.hud_scratch);
     }
 
-    /// Lighting + the mods' HUD data for a headless quiet frame (no Engine).
+    /// Lighting + the modules' HUD data for a headless quiet frame (no Engine).
     #[cfg(test)]
-    pub(super) fn compose_quiet(&mut self, mods: &mut Mods) {
+    pub(super) fn compose_quiet(&mut self, modules: &mut Modules) {
         const DT: f32 = 1.0 / 60.0;
         self.sample_fps(0, DT);
         let pose = self.camera.pose(&self.player, &self.world, 90.0, 0.0);
         self.compose_lighting(&pose, voxel_engine::skeleton::Exposure::DEFAULT);
         self.hud_scratch.clear();
         let facts = self.hud_facts((1280, 720));
-        mods.hud(&facts, &self.world, &self.player, &mut self.hud_scratch);
+        modules.hud(&facts, &self.world, &self.player, &mut self.hud_scratch);
     }
 
     /// Build the per-frame draw data for other players. `&mut self` because
@@ -597,10 +597,10 @@ fn tag_visibility(
 mod tests {
     use super::*;
 
-    /// A HUD mod that shows which HUD mode it was told, in every mode.
+    /// A HUD module that shows which HUD mode it was told, in every mode.
     struct ModeLabel;
 
-    impl crate::modding::Mod for ModeLabel {
+    impl crate::modules::Module for ModeLabel {
         fn name(&self) -> &str {
             "mode"
         }
@@ -618,16 +618,16 @@ mod tests {
         }
     }
 
-    /// The core draws no HUD text: the mods get the facts in every HUD mode, Off included, and
+    /// The core draws no HUD text: the modules get the facts in every HUD mode, Off included, and
     /// decide what to show.
     #[test]
-    fn the_mods_hud_runs_in_every_mode_with_the_facts() {
+    fn the_modules_hud_runs_in_every_mode_with_the_facts() {
         let mut game = crate::game::tests::game();
-        let mut mods = Mods::empty();
-        mods.install(Box::new(ModeLabel));
+        let mut modules = Modules::empty();
+        modules.install(Box::new(ModeLabel));
         for mode in [ui::HudMode::Full, ui::HudMode::Minimal, ui::HudMode::Off] {
             game.theme.hud = mode;
-            game.compose_quiet(&mut mods);
+            game.compose_quiet(&mut modules);
             assert_eq!(ui::hud_text(&game.hud_scratch), format!("{}\n", mode.label()));
         }
     }
@@ -687,11 +687,11 @@ mod tests {
         let (mut sound, symbols) = SoundSystem::mute();
         let mut audio = AudioService::new();
         let mut router = Router::new();
-        let mut mods = crate::modding::testing::standard();
+        let mut modules = crate::modules::testing::standard();
         const DT: f32 = 1.0 / 60.0;
         for i in 0..10 {
             alloc_count::reset();
-            game.tick_quiet(DT, &mut router, &mut sound, &mut audio, &symbols, &mut settings, &mut mods);
+            game.tick_quiet(DT, &mut router, &mut sound, &mut audio, &symbols, &mut settings, &mut modules);
             let pose = game.camera.pose(&game.player, &game.world, 90.0, 0.0);
             let draws = game.peer_draws((1280, 720), &pose.camera3d(), &pose, DT, true, true);
             assert_eq!(draws.len(), 1, "the visible peer is drawn");

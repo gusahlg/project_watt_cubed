@@ -1,8 +1,8 @@
-//! Command-line entry points a mod registers. [`dispatch`] runs before a window or an audio
+//! Command-line entry points a module registers. [`dispatch`] runs before a window or an audio
 //! device opens.
 use std::path::PathBuf;
 
-use super::Mods;
+use super::Modules;
 use super::build::{BuildInfo, GameBuild};
 use crate::settings::{Options, Settings};
 
@@ -21,16 +21,16 @@ pub struct CliContext {
 }
 
 /// `Some(code)` when the first argument is a registered command, `help`, or `--commands`.
-/// `None` starts the game. No arguments does not register mods.
+/// `None` starts the game. No arguments does not register modules.
 pub(crate) fn dispatch(build: &GameBuild, args: &[String]) -> Option<i32> {
     let name = args.get(1).map(String::as_str)?;
-    let mods = load(build);
+    let modules = load(build);
     if name == "help" || name == "--commands" {
-        print!("{}", command_text(&mods));
+        print!("{}", command_text(&modules));
         let _ = std::io::Write::flush(&mut std::io::stdout());
         return Some(0);
     }
-    let cli = mods.clis().iter().find(|cli| cli.name == name)?;
+    let cli = modules.clis().iter().find(|cli| cli.name == name)?;
     let ctx = CliContext {
         args: args[2..].to_vec(),
         data_dir: crate::paths::Paths::get().data.clone(),
@@ -39,18 +39,18 @@ pub(crate) fn dispatch(build: &GameBuild, args: &[String]) -> Option<i32> {
     Some((cli.run)(&ctx))
 }
 
-fn load(build: &GameBuild) -> Mods {
+fn load(build: &GameBuild) -> Modules {
     crate::paths::Paths::init(None);
     let mut options = Options::new();
-    let mut mods = Mods::from_build(build, &mut options);
+    let mut modules = Modules::from_build(build, &mut options);
     let _settings = Settings::load(&mut options);
-    mods.options_changed(&options);
-    mods
+    modules.options_changed(&options);
+    modules
 }
 
-fn command_text(mods: &Mods) -> String {
+fn command_text(modules: &Modules) -> String {
     let mut out = String::from("commands:\n");
-    for cli in mods.clis() {
+    for cli in modules.clis() {
         out.push_str("  ");
         out.push_str(cli.name);
         out.push_str("  ");
@@ -65,7 +65,7 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
-    use crate::modding::{GameBuild, Mod, ModDescriptor, ModRegistrar};
+    use crate::modules::{GameBuild, Module, ModuleDescriptor, ModuleRegistrar};
 
     thread_local! {
         static OPTIONS_HITS: Cell<u32> = const { Cell::new(0) };
@@ -74,7 +74,7 @@ mod tests {
 
     struct Probe;
 
-    impl Mod for Probe {
+    impl Module for Probe {
         fn id(&self) -> &'static str {
             "cli.probe"
         }
@@ -84,7 +84,7 @@ mod tests {
         }
     }
 
-    fn register(registrar: &mut ModRegistrar) {
+    fn register(registrar: &mut ModuleRegistrar) {
         registrar.add(Probe);
         registrar.cli(Cli {
             name: "probe",
@@ -112,7 +112,7 @@ mod tests {
     }
 
     fn build() -> GameBuild {
-        GameBuild::new().with_mod(ModDescriptor {
+        GameBuild::new().with_module(ModuleDescriptor {
             id: "cli.probe",
             name: "Probe",
             version: "1.0.0",

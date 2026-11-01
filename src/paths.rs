@@ -1,6 +1,6 @@
 //! Application data and config directories, resolved once at startup.
 //!
-//! Worlds live under [`Paths::data`]; settings, session, and mod choices under
+//! Worlds live under [`Paths::data`]; settings, session, and module choices under
 //! [`Paths::config`]. Override with `WATT_DATA_DIR` (or `watt_server --data-dir`),
 //! else a launch-directory `saves/` folder is kept as-is, else XDG.
 //! `WATT_CHECKOUT_DIR` (`play.sh`) is the source checkout, kept only when it
@@ -72,9 +72,11 @@ impl Paths {
         self.config.join("session.cfg")
     }
 
-    /// The mod choices file older games wrote. Read once for knob values, never written.
-    pub(crate) fn legacy_mods_file(&self) -> PathBuf {
-        self.config.join("mods.cfg")
+    /// The module choices file older games wrote. Read once for knob values, never written.
+    /// Games before 0.8 called it `mods.cfg`: that name is read when `modules.cfg` is absent.
+    pub(crate) fn legacy_modules_file(&self) -> PathBuf {
+        let current = self.config.join("modules.cfg");
+        if current.exists() { current } else { self.config.join("mods.cfg") }
     }
 
     pub(crate) fn checkout_dir(&self) -> Option<&Path> {
@@ -82,8 +84,8 @@ impl Paths {
     }
 
     #[cfg(test)]
-    pub(crate) fn mods_selection_file(&self) -> Option<PathBuf> {
-        Some(self.checkout_dir()?.join("mods.toml"))
+    pub(crate) fn modules_selection_file(&self) -> Option<PathBuf> {
+        Some(self.checkout_dir()?.join("modules.toml"))
     }
 }
 
@@ -285,7 +287,21 @@ mod tests {
         };
         assert_eq!(p.settings_file(), PathBuf::from("/config/settings.cfg"));
         assert_eq!(p.session_file(), PathBuf::from("/config/session.cfg"));
-        assert_eq!(p.mods_selection_file(), None);
+        assert_eq!(p.modules_selection_file(), None);
+    }
+
+    #[test]
+    fn the_old_mods_cfg_is_read_only_when_modules_cfg_is_absent() {
+        let dir = std::env::temp_dir().join(format!("pwc-paths-modules-cfg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = Paths { data: dir.clone(), config: dir.clone(), checkout: None };
+        assert_eq!(p.legacy_modules_file(), dir.join("mods.cfg"), "nothing written yet: the old name");
+        std::fs::write(dir.join("mods.cfg"), "version=2\n").unwrap();
+        assert_eq!(p.legacy_modules_file(), dir.join("mods.cfg"));
+        std::fs::write(dir.join("modules.cfg"), "version=2\n").unwrap();
+        assert_eq!(p.legacy_modules_file(), dir.join("modules.cfg"), "the new name wins");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -293,7 +309,7 @@ mod tests {
         let checkout = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let p = Paths::resolve(Some(Path::new("/tmp/watt-data-dir-test")), Some(&checkout));
         assert_eq!(p.checkout_dir(), Some(checkout.as_path()));
-        assert_eq!(p.mods_selection_file(), Some(checkout.join("mods.toml")));
+        assert_eq!(p.modules_selection_file(), Some(checkout.join("modules.toml")));
     }
 
     #[test]
@@ -306,7 +322,7 @@ mod tests {
         );
         let p = Paths::resolve(Some(Path::new("/tmp/watt-data-dir-test")), Some(&checkout));
         assert_eq!(p.checkout_dir(), None);
-        assert_eq!(p.mods_selection_file(), None);
+        assert_eq!(p.modules_selection_file(), None);
     }
 
     #[test]
@@ -316,6 +332,6 @@ mod tests {
             Some(Path::new("")),
         );
         assert_eq!(p.checkout_dir(), None);
-        assert_eq!(p.mods_selection_file(), None);
+        assert_eq!(p.modules_selection_file(), None);
     }
 }

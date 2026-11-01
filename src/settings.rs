@@ -198,8 +198,8 @@ settings_fields! {
     stream_hz: u32 = 0,
     physics_hz: u32 = 0,
     sky_hz: u32 = 0,
-    mod_hz: u32 = 0,
-    mod_logic: bool = true,
+    module_hz: u32 = 0,
+    module_logic: bool = true,
     autosave: bool = true,
     hud_mode: HudMode = HudMode::Full,
     minimap: bool = true,
@@ -692,13 +692,13 @@ pub const SETTINGS: [Setting; 46] = [
         &["skyrate"]
     ),
     rate_setting!(
-        mod_hz,
-        "mod_hz",
-        "Mod Update Rate",
-        "mod updates",
+        module_hz,
+        "module_hz",
+        "Module Update Rate",
+        "module updates",
         UPDATE_RATES,
-        "mod_hz every|15|30|60|120|240",
-        &["modrate"]
+        "module_hz every|15|30|60|120|240",
+        &["modulerate", "modrate", "mod_hz"]
     ),
     enum_setting!(
         assign, Profile::Owned, Category::Performance, hud_mode, HudMode, "HUD Mode",
@@ -708,10 +708,10 @@ pub const SETTINGS: [Setting; 46] = [
     toggle_setting!(
         Profile::Owned,
         Category::Performance,
-        mod_logic,
-        "mod_logic",
-        "Mod Updates",
-        &["mods"]
+        module_logic,
+        "module_logic",
+        "Module Updates",
+        &["modules", "mods", "mod_logic"]
     ),
     toggle_setting!(Profile::Owned, Category::Performance, autosave, "autosave", "Autosave", &[]),
     toggle_setting!(
@@ -972,7 +972,7 @@ impl Settings {
         // Each profile is a diffable override literal over `stripped()` (the
         // default with the costly lanes off); only the perf/gameplay fields and
         // `lod2` differ, so a glance shows exactly what a profile changes. Fast
-        // omits `mod_logic`, keeping the default (mods stay live).
+        // omits `module_logic`, keeping the default (modules stay live).
         let profile = match preset {
             Preset::Minimum => Settings {
                 vsync: false,
@@ -984,8 +984,8 @@ impl Settings {
                 stream_hz: 15,
                 physics_hz: 30,
                 sky_hz: 15,
-                mod_hz: 15,
-                mod_logic: false,
+                module_hz: 15,
+                module_logic: false,
                 autosave: false,
                 hud_mode: HudMode::Off,
                 minimap: false,
@@ -1004,7 +1004,7 @@ impl Settings {
                 stream_hz: 60,
                 physics_hz: 60,
                 sky_hz: 60,
-                mod_hz: 60,
+                module_hz: 60,
                 autosave: true,
                 hud_mode: HudMode::Minimal,
                 minimap: false,
@@ -1034,12 +1034,12 @@ impl Settings {
 
     /// Load from disk, falling back to defaults for missing/invalid entries. The packages'
     /// option lines in the same file go to `options` (declare the options first). Until
-    /// `settings.cfg` records the options format, an old `mods.cfg` is read once for the knob
+    /// `settings.cfg` records the options format, an old `modules.cfg` is read once for the knob
     /// values packages name as legacy keys; the file itself is left alone.
     pub fn load(options: &mut Options) -> Self {
         let text = fs::read_to_string(settings_path()).ok();
-        let legacy_mods_cfg = || fs::read_to_string(crate::paths::Paths::get().legacy_mods_file()).ok();
-        let mut settings = Self::from_text(text.as_deref(), legacy_mods_cfg, options);
+        let legacy_modules_cfg = || fs::read_to_string(crate::paths::Paths::get().legacy_modules_file()).ok();
+        let mut settings = Self::from_text(text.as_deref(), legacy_modules_cfg, options);
         // The engine picks the six-way cull itself; `WATT_CULL=0|1` forces it (env-only, not in the
         // persisted table). Read after the file parse so it can't be overwritten.
         settings.cull_faces = match std::env::var("WATT_CULL").as_deref() {
@@ -1051,15 +1051,15 @@ impl Settings {
         settings
     }
 
-    /// The settings and options in a `settings.cfg` text (`None`: no file). `mods_cfg` is asked
-    /// for an old `mods.cfg` only when the text does not record the options format yet.
-    fn from_text(text: Option<&str>, mods_cfg: impl FnOnce() -> Option<String>, options: &mut Options) -> Self {
+    /// The settings and options in a `settings.cfg` text (`None`: no file). `modules_cfg` is asked
+    /// for an old `modules.cfg` only when the text does not record the options format yet.
+    fn from_text(text: Option<&str>, modules_cfg: impl FnOnce() -> Option<String>, options: &mut Options) -> Self {
         let mut settings = Self::default();
         let text = text.unwrap_or("");
         settings.parse_from(text);
         let mut migrated = false;
         each_kv_line(text, |key, _| migrated |= key == options::FORMAT_KEY);
-        let legacy = if migrated { String::new() } else { mods_cfg().map(|t| options::flatten_mods_cfg(&t)).unwrap_or_default() };
+        let legacy = if migrated { String::new() } else { modules_cfg().map(|t| options::flatten_modules_cfg(&t)).unwrap_or_default() };
         options.read_text(text, &legacy, |key| SETTINGS.iter().any(|f| f.matches(key)));
         settings
     }
@@ -1294,7 +1294,7 @@ impl Settings {
     /// change. Hardware MSAA support is already snapped in [`Self::clamp`]; VRAM-budget
     /// MSAA/scale cuts are applied here without writing them back (they are this session
     /// only). Render-lane flags are not pushed here: `App::push_gfx` writes them once, after
-    /// visual mods have masked them, so a stripped lane never flickers on.
+    /// visual modules have masked them, so a stripped lane never flickers on.
     pub fn apply(&mut self, eng: &mut impl GfxEngine) {
         eng.set_fullscreen(self.fullscreen);
         // Vsync and the fps cap are not pushed here: `App::frame` is the
@@ -1349,9 +1349,9 @@ impl Settings {
         }
     }
 
-    /// The render lanes this settings state names, before visual-mod masking.
+    /// The render lanes this settings state names, before visual-module masking.
     /// World construction, `/gfx` apply, and engine flags go through
-    /// [`Mods::effective_render`](crate::modding::Mods::effective_render). (The
+    /// [`Modules::effective_render`](crate::modules::Modules::effective_render). (The
     /// golden harness keeps its own pinned
     /// [`RenderConfig::golden`](crate::render_config::RenderConfig::golden).)
     pub fn render_config(&self) -> RenderConfig {
@@ -1652,10 +1652,10 @@ mod tests {
         assert_eq!(loaded, s);
     }
 
-    /// The knob values an old game kept in `mods.cfg` reach the package options that name them,
-    /// once: a `settings.cfg` written since records the format, and `mods.cfg` is not read again.
+    /// The knob values an old game kept in `modules.cfg` reach the package options that name them,
+    /// once: a `settings.cfg` written since records the format, and `modules.cfg` is not read again.
     #[test]
-    fn old_knob_values_migrate_from_mods_cfg_once() {
+    fn old_knob_values_migrate_from_modules_cfg_once() {
         fn options() -> (Options, [OptionId; 3]) {
             let mut o = Options::new();
             let relief = o.declare(
@@ -1672,9 +1672,9 @@ mod tests {
             );
             (o, [relief, detail, style])
         }
-        let mods_cfg = "version=2\ndiffusion=on\ndiffusion.state=relief=150,caves=75\nneural_textures.state=detail=1.3,contrast=0.5\nmaterial_names.state=style=arcane\n";
+        let modules_cfg = "version=2\ndiffusion=on\ndiffusion.state=relief=150,caves=75\nneural_textures.state=detail=1.3,contrast=0.5\nmaterial_names.state=style=arcane\n";
         let (mut o, [relief, detail, style]) = options();
-        let settings = Settings::from_text(Some("fov=100\n"), || Some(mods_cfg.to_string()), &mut o);
+        let settings = Settings::from_text(Some("fov=100\n"), || Some(modules_cfg.to_string()), &mut o);
         assert_eq!(settings.fov, 100.0);
         assert_eq!((o.int(relief), o.float(detail), o.choice(style)), (150, 1.3, 1), "the old knobs carry over");
         let written = settings.to_text(&o);
@@ -1684,17 +1684,17 @@ mod tests {
         let (mut again, [relief, ..]) = options();
         let asked = std::cell::Cell::new(false);
         Settings::from_text(Some(&written), || { asked.set(true); Some("diffusion.state=relief=25\n".to_string()) }, &mut again);
-        assert!(!asked.get(), "mods.cfg is not read once settings.cfg records the format");
+        assert!(!asked.get(), "modules.cfg is not read once settings.cfg records the format");
         assert_eq!(again.int(relief), 150);
 
         // An option's own line wins over the old file, and no files mean defaults.
         let (mut own, [relief, ..]) = options();
-        Settings::from_text(Some("pwc.infinite-diffusion.relief=50\n"), || Some(mods_cfg.to_string()), &mut own);
+        Settings::from_text(Some("pwc.infinite-diffusion.relief=50\n"), || Some(modules_cfg.to_string()), &mut own);
         assert_eq!(own.int(relief), 50);
         let (mut none, [relief, detail, style]) = options();
         Settings::from_text(None, || None, &mut none);
         assert_eq!((none.int(relief), none.float(detail), none.choice(style)), (100, 1.0, 0));
-        assert_eq!(options::flatten_mods_cfg("a.state=x=1, y = 2\nb=on\njunk\n"), "a.state.x=1\na.state.y=2\n");
+        assert_eq!(options::flatten_modules_cfg("a.state=x=1, y = 2\nb=on\njunk\n"), "a.state.x=1\na.state.y=2\n");
     }
 
     #[test]
@@ -1962,11 +1962,11 @@ mod tests {
             "render distance 0 selects 3 levels at detail 4"
         );
         assert_eq!(
-            (s.stream_hz, s.physics_hz, s.sky_hz, s.mod_hz),
+            (s.stream_hz, s.physics_hz, s.sky_hz, s.module_hz),
             (15, 30, 15, 15)
         );
         assert_eq!(s.hud_mode, HudMode::Off);
-        assert!(!s.mod_logic && !s.autosave);
+        assert!(!s.module_logic && !s.autosave);
         assert!(!s.minimap && !s.player_models && !s.name_tags);
         assert!(!s.lighting && !s.occlusion && !s.ao);
         assert_eq!(s.vrs, VrsChoice::Off);
@@ -1985,11 +1985,11 @@ mod tests {
             "render distance 3 keeps the previous Fast ladder"
         );
         assert_eq!(
-            (s.stream_hz, s.physics_hz, s.sky_hz, s.mod_hz),
+            (s.stream_hz, s.physics_hz, s.sky_hz, s.module_hz),
             (60, 60, 60, 60)
         );
         assert_eq!(s.hud_mode, HudMode::Minimal);
-        assert!(s.mod_logic && s.autosave && s.player_models);
+        assert!(s.module_logic && s.autosave && s.player_models);
         assert!(!s.minimap && !s.name_tags);
         assert_eq!(s.vrs, VrsChoice::Off);
 
@@ -2054,6 +2054,17 @@ mod tests {
                 && !field.matches("lod_levels")
                 && !field.matches("lod_detail")
         }));
+    }
+
+    #[test]
+    fn the_old_mod_keys_still_load_and_the_module_keys_are_written() {
+        let mut loaded = Settings::default();
+        loaded.parse_from("mod_hz=30\nmod_logic=off\n");
+        assert_eq!(loaded.module_hz, 30, "mod_hz is module_hz");
+        assert!(!loaded.module_logic, "mod_logic is module_logic");
+        let text = loaded.to_text(&Options::new());
+        assert!(text.contains("module_hz=") && text.contains("module_logic="));
+        assert!(!text.contains("mod_hz") && !text.contains("mod_logic"));
     }
 
     #[test]

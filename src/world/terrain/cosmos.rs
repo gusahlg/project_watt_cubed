@@ -107,7 +107,7 @@ pub enum Form {
 }
 
 /// What a body is, derived from its matter and its place (design v5 §3.4). Painters, the sky and
-/// mods read these; physics reads only the shape and density.
+/// modules read these; physics reads only the shape and density.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Traits {
     pub rank: Rank,
@@ -185,7 +185,7 @@ impl Traits {
         }
     }
 
-    /// Today's kind of a body with these traits, kept one release for mods and tests: id 0 is
+    /// Today's kind of a body with these traits, kept one release for modules and tests: id 0 is
     /// home, a free core the Ember, a satellite a moon, a cube partner a twin, a shell the Hollow,
     /// anything else Verdant.
     pub fn legacy_kind(&self, id: u16) -> Kind {
@@ -204,7 +204,7 @@ impl Traits {
         }
     }
 
-    /// A label of what the body is, for the UI, mods and tests: "start world", "binary cube",
+    /// A label of what the body is, for the UI, modules and tests: "start world", "binary cube",
     /// "cube moon", "glowing world", "living moon", "airless world", ...
     pub fn class(&self) -> &'static str {
         let moon = self.rank == Rank::Satellite;
@@ -234,7 +234,7 @@ impl Traits {
 pub struct Body {
     /// Stable index into the catalog: `bodies()[id]`.
     pub id: u16,
-    /// Today's kind, derived from `traits` ([`Traits::legacy_kind`]); kept one release for mods.
+    /// Today's kind, derived from `traits` ([`Traits::legacy_kind`]); kept one release for modules.
     pub kind: Kind,
     pub centre: [i64; 3],
     pub shape: Shape,

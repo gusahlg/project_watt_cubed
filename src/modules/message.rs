@@ -1,13 +1,13 @@
 //! What the game tells the player: network chat, joins and leaves, and the core's notices, as
-//! events for [`Mod::on_message`](super::Mod::on_message). The core shows none of it itself; a
-//! mod (the chat) prints what it wants, and a notice no mod showed goes to stderr.
+//! events for [`Module::on_message`](super::Module::on_message). The core shows none of it itself; a
+//! module (the chat) prints what it wants, and a notice no module showed goes to stderr.
 
 use super::frame::Channel;
 
 /// How serious a notice is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum NoticeLevel {
-    /// Status: a save restored, a server's mod list.
+    /// Status: a save restored, a server's module list.
     Info,
     /// Something degraded but the game goes on: an interrupted link, a refused change.
     Warning,
@@ -36,7 +36,7 @@ pub enum Message<'a> {
 }
 
 /// The core's notice sink: the save code, the audio service and the session write here, and the
-/// game hands each notice to the mods once per frame. Empty between frames, so a quiet frame
+/// game hands each notice to the modules once per frame. Empty between frames, so a quiet frame
 /// does no work.
 #[derive(Debug, Default)]
 pub struct Notices {

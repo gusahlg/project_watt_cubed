@@ -20,7 +20,7 @@ use glam::DQuat;
 use voxel_engine::{Color, DVec3, Vec3};
 
 use crate::coord::Face;
-use crate::net::protocol::{self, ClientMessage, ModBytes, ServerMessage};
+use crate::net::protocol::{self, ClientMessage, ModuleBytes, ServerMessage};
 use crate::net::{MAX_CHAT, MAX_SPEC, PROTOCOL_VERSION, quic};
 use crate::presence::{self, Eye, Stance, WireAction};
 use crate::sched::RateGate;
@@ -39,17 +39,17 @@ const MOVE_INTERVAL: Duration = Duration::from_millis(33);
 /// So the server's idle timeout never reaps an active-but-idle player.
 const HEARTBEAT: Duration = Duration::from_secs(1);
 const PING_INTERVAL: Duration = Duration::from_secs(2);
-/// Mod-channel traffic is loss-tolerant, so an overrun drops the OLDEST frame
+/// Module-channel traffic is loss-tolerant, so an overrun drops the OLDEST frame
 /// on that channel rather than blocking or growing.
-const MOD_RING_CAP: usize = 64;
+const MODULE_RING_CAP: usize = 64;
 /// Snapshot cells one [`Connection::poll`] hands the game, so a big join overlay
 /// is applied over several frames instead of in one long one.
 pub(crate) const APPLY_BUDGET: usize = 2048;
 
-struct InboundMod {
+struct InboundModule {
     sender: u32,
     seq: u32,
-    bytes: ModBytes,
+    bytes: ModuleBytes,
 }
 
 /// Snapshotted so we can interpolate between two.
@@ -221,18 +221,18 @@ pub enum Incoming {
     Interrupted,
 }
 
-/// Why [`Connection::connect`] failed. `mods_denied` is empty unless the server
-/// answered [`ServerMessage::ModsDenied`](crate::net::protocol::ServerMessage::ModsDenied).
+/// Why [`Connection::connect`] failed. `modules_denied` is empty unless the server
+/// answered [`ServerMessage::ModulesDenied`](crate::net::protocol::ServerMessage::ModulesDenied).
 #[derive(Debug)]
 pub struct ConnectError {
     message: String,
     /// Package ids the server refuses. The caller disables these and may retry once.
-    pub mods_denied: Vec<String>,
+    pub modules_denied: Vec<String>,
 }
 
 impl ConnectError {
     fn plain(message: impl Into<String>) -> Self {
-        Self { message: message.into(), mods_denied: Vec::new() }
+        Self { message: message.into(), modules_denied: Vec::new() }
     }
 
     pub fn message(&self) -> &str {
@@ -320,7 +320,7 @@ pub struct Connection {
     /// Kept OUT of `inbox`. Each channel has its own drop-oldest ring, so one
     /// channel cannot flush another. `HashMap::new` allocates nothing until the
     /// first frame of a channel arrives.
-    mod_in: Arc<Mutex<HashMap<Arc<str>, VecDeque<InboundMod>>>>,
+    module_in: Arc<Mutex<HashMap<Arc<str>, VecDeque<InboundModule>>>>,
     player_id: u32,
     seed: i64,
     worldgen: crate::world::generation::WorldgenKind,
@@ -342,12 +342,12 @@ pub struct Connection {
 
 impl Connection {
     /// `Err` carries a human-readable reason (bad address, refused, wrong
-    /// password, version mismatch). No mods are reported.
+    /// password, version mismatch). No modules are reported.
     pub fn connect(host: &str, port: u16, name: &str, password: &str) -> Result<Self, ConnectError> {
         Self::connect_with(host, port, name, password, &[])
     }
 
-    /// As [`connect`](Self::connect), reporting `mods` as the enabled packages.
+    /// As [`connect`](Self::connect), reporting `modules` as the enabled packages.
     /// That list is the client's own word; the server does not trust it for
     /// anything except the whitelist. Blocks until the attempt finishes;
     /// [`begin_connect`](Self::begin_connect) is the same work off this thread.
@@ -356,9 +356,9 @@ impl Connection {
         port: u16,
         name: &str,
         password: &str,
-        mods: &[(String, String)],
+        modules: &[(String, String)],
     ) -> Result<Self, ConnectError> {
-        Self::begin_connect(host, port, name, password, mods).wait()
+        Self::begin_connect(host, port, name, password, modules).wait()
     }
 
     /// Connect with an explicitly selected compiled simulation model.
@@ -367,10 +367,10 @@ impl Connection {
         port: u16,
         name: &str,
         password: &str,
-        mods: &[(String, String)],
+        modules: &[(String, String)],
         model: Option<crate::sim::model::ModelSpec>,
     ) -> Result<Self, ConnectError> {
-        Self::begin_connect_with_model(host, port, name, password, mods, model).wait()
+        Self::begin_connect_with_model(host, port, name, password, modules, model).wait()
     }
 
     /// DNS, the QUIC handshake, and `Welcome`, on a worker thread.
@@ -380,9 +380,9 @@ impl Connection {
         port: u16,
         name: &str,
         password: &str,
-        mods: &[(String, String)],
+        modules: &[(String, String)],
     ) -> PendingConnect {
-        Self::begin_connect_with_model(host, port, name, password, mods, crate::net::default_reaction_model())
+        Self::begin_connect_with_model(host, port, name, password, modules, crate::net::default_reaction_model())
     }
 
     /// The explicit model identity is compared before admission. Clients receive committed cells;
@@ -392,7 +392,7 @@ impl Connection {
         port: u16,
         name: &str,
         password: &str,
-        mods: &[(String, String)],
+        modules: &[(String, String)],
         model: Option<crate::sim::model::ModelSpec>,
     ) -> PendingConnect {
         let flag = Arc::new(AtomicBool::new(false));
@@ -401,12 +401,12 @@ impl Connection {
         let host = host.to_string();
         let name = name.to_string();
         let password = password.to_string();
-        let mods = mods.to_vec();
+        let modules = modules.to_vec();
         let flag_worker = Arc::clone(&flag);
         let notify_worker = Arc::clone(&notify);
         thread::spawn(move || {
             let stop = Stop { flag: flag_worker, notify: notify_worker };
-            let result = connect_cancellable(&host, port, &name, &password, &mods, model, &stop);
+            let result = connect_cancellable(&host, port, &name, &password, &modules, model, &stop);
             let _ = tx.send(result);
         });
         PendingConnect { done, flag, notify }
@@ -492,7 +492,7 @@ fn connect_cancellable(
     port: u16,
     name: &str,
     password: &str,
-    mods: &[(String, String)],
+    modules: &[(String, String)],
     model: Option<crate::sim::model::ModelSpec>,
     stop: &Stop,
 ) -> Result<Connection, ConnectError> {
@@ -516,7 +516,7 @@ fn connect_cancellable(
     let mut last = ConnectError::plain("could not connect");
     for addr in addrs {
         stop.check()?;
-        match connect_one(&rt, addr, name, password, mods, model, stop) {
+        match connect_one(&rt, addr, name, password, modules, model, stop) {
             Ok(conn) => return Ok(conn),
             Err(e) if e.message == "cancelled" => return Err(e),
             Err(e) => last = e,
@@ -530,17 +530,17 @@ fn connect_one(
     addr: SocketAddr,
     name: &str,
     password: &str,
-    mods: &[(String, String)],
+    modules: &[(String, String)],
     model: Option<crate::sim::model::ModelSpec>,
     stop: &Stop,
 ) -> Result<Connection, ConnectError> {
-    let (offers, dropped) = protocol::hello_offers(mods);
+    let (offers, dropped) = protocol::hello_offers(modules);
     if dropped > 0 {
-        let omitted = mods.iter().filter(|(id, version)| !offers.iter().any(|o| o.id.as_ref() == id && o.version.as_ref() == version))
+        let omitted = modules.iter().filter(|(id, version)| !offers.iter().any(|o| o.id.as_ref() == id && o.version.as_ref() == version))
             .map(|(id, _)| id.as_str()).collect::<Vec<_>>().join(", ");
-        return Err(ConnectError::plain(format!("enabled mods cannot fit the join request: {omitted}")));
+        return Err(ConnectError::plain(format!("enabled modules cannot fit the join request: {omitted}")));
     }
-    let mods = offers;
+    let modules = offers;
     let bind = if addr.is_ipv4() {
         SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
     } else {
@@ -571,7 +571,7 @@ fn connect_one(
         simulation: id.simulation,
         name: name.into(),
         password: password.into(),
-        mods,
+        modules,
     };
     let hello_bytes = hello.encode();
     with_stop(rt, stop, "connect timed out", async {
@@ -588,21 +588,21 @@ fn connect_one(
             .map_err(|e| ConnectError::plain(format!("no reply: {e}")))
     })?;
         let decoded = ServerMessage::decode(&frame);
-        if let Some(ServerMessage::ModsDenied { ids }) = &decoded {
+        if let Some(ServerMessage::ModulesDenied { ids }) = &decoded {
             return Err(ConnectError {
                 message: format!(
-                    "server refused mods: {}",
+                    "server refused modules: {}",
                     ids.iter().map(|id| id.as_ref()).collect::<Vec<_>>().join(", ")
                 ),
-                mods_denied: ids.iter().map(|id| id.to_string()).collect(),
+                modules_denied: ids.iter().map(|id| id.to_string()).collect(),
             });
         }
         let (player_id, seed, spawn, worldgen, terrain) = welcome_from(decoded)?;
 
         let (tx, inbox) = mpsc::channel();
-        let mod_in: Arc<Mutex<HashMap<Arc<str>, VecDeque<InboundMod>>>> =
+        let module_in: Arc<Mutex<HashMap<Arc<str>, VecDeque<InboundModule>>>> =
             Arc::new(Mutex::new(HashMap::new()));
-        let mod_reader = mod_in.clone();
+        let module_reader = module_in.clone();
         let reader_rt = rt.clone();
         let close_reason = Arc::new(Mutex::new(String::new()));
         let reason_slot = close_reason.clone();
@@ -612,13 +612,13 @@ fn connect_one(
                 match ServerMessage::decode(&frame) {
                     // A hung-up game side stops draining but channel frames just
                     // roll over; the connection close ends the loop.
-                    Some(ServerMessage::PeerModData { channel, sender, seq, bytes }) => {
-                        let mut map = mod_reader.lock().unwrap_or_else(PoisonError::into_inner);
+                    Some(ServerMessage::PeerModuleData { channel, sender, seq, bytes }) => {
+                        let mut map = module_reader.lock().unwrap_or_else(PoisonError::into_inner);
                         let ring = map.entry(channel.share()).or_default();
-                        if ring.len() >= MOD_RING_CAP {
+                        if ring.len() >= MODULE_RING_CAP {
                             ring.pop_front();
                         }
-                        ring.push_back(InboundMod { sender, seq, bytes });
+                        ring.push_back(InboundModule { sender, seq, bytes });
                     }
                     Some(msg) => {
                         if tx.send(msg).is_err() {
@@ -656,7 +656,7 @@ fn connect_one(
             writer_tx: Some(writer_tx),
             writer: Some(writer),
             inbox,
-            mod_in,
+            module_in,
             player_id,
             seed,
             worldgen,
@@ -1013,16 +1013,16 @@ impl Session {
                 self.alive = false;
                 self.emit_disconnect(&reason, out);
             }
-            ServerMessage::ModsDenied { ids } => {
+            ServerMessage::ModulesDenied { ids } => {
                 self.alive = false;
                 let list = ids.iter().map(|id| id.as_ref()).collect::<Vec<_>>().join(", ");
-                self.emit_disconnect(&format!("mods denied: {list}"), out);
+                self.emit_disconnect(&format!("modules denied: {list}"), out);
             }
             // A second Welcome is meaningless mid-session.
             ServerMessage::Welcome { .. } => {}
-            // Channel frames never reach here: the reader thread routes PeerModData
+            // Channel frames never reach here: the reader thread routes PeerModuleData
             // into the per-channel rings, not the inbox this drains.
-            ServerMessage::PeerModData { .. } => {}
+            ServerMessage::PeerModuleData { .. } => {}
             ServerMessage::ToolResult { req, reacted, rev, cell_spec, tool_spec } => {
                 let Some(at) = self.pending_edits.iter().position(|p| p.req == req) else {
                     return;
@@ -1230,21 +1230,21 @@ impl Connection {
             return false;
         }
         let Some(channel) = protocol::Channel::parse(channel) else { return false };
-        let Ok(bytes) = ModBytes::try_from(bytes.to_vec()) else { return false };
-        self.dispatch(&ClientMessage::ModData { channel, seq, bytes });
+        let Ok(bytes) = ModuleBytes::try_from(bytes.to_vec()) else { return false };
+        self.dispatch(&ClientMessage::ModuleData { channel, seq, bytes });
         true
     }
 
     /// True when `channel` has a frame waiting. A miss does not allocate.
     pub fn channel_pending(&self, channel: &str) -> bool {
-        let map = self.mod_in.lock().unwrap_or_else(PoisonError::into_inner);
+        let map = self.module_in.lock().unwrap_or_else(PoisonError::into_inner);
         map.get(channel).is_some_and(|ring| !ring.is_empty())
     }
 
     /// Take every waiting frame on `channel`. An empty or unknown channel returns
     /// an empty vec and allocates nothing.
     pub fn drain_channel(&mut self, channel: &str) -> Vec<(u32, u32, Vec<u8>)> {
-        let mut map = self.mod_in.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut map = self.module_in.lock().unwrap_or_else(PoisonError::into_inner);
         let Some(ring) = map.get_mut(channel) else { return Vec::new() };
         let mut out = Vec::with_capacity(ring.len());
         while let Some(frame) = ring.pop_front() {

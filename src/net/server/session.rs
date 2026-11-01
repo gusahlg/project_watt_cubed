@@ -11,7 +11,7 @@ pub(super) fn client_loop(
     id: u32,
 ) {
     // Each kind has its own budget, so a swing flood cannot starve edits.
-    // Mod channels keep a total window and one per channel name.
+    // Module channels keep a total window and one per channel name.
     let mut budgets = KindBudget::new();
     let mut channels = ChannelBudget::new();
     // Frames a handler queues for after its lock hold, reused from message to message.
@@ -64,11 +64,11 @@ pub(super) fn client_loop(
                 None => on_chat(shared, ctx.hooks.as_ref(), id, channel, &text),
             },
             ClientMessage::SetTime { day } => on_set_time(shared, ctx, id, day, &mut sends),
-            ClientMessage::ModData { channel, seq, bytes } => {
+            ClientMessage::ModuleData { channel, seq, bytes } => {
                 if !channels.allow(&channel, now) {
                     continue; // Over this channel's budget this second — drop silently.
                 }
-                on_mod_data(shared, id, channel, seq, bytes);
+                on_module_data(shared, id, channel, seq, bytes);
             }
             // Only players who can see the swinger, the same audience as voice.
             ClientMessage::Swing => relay_swing(shared, id),

@@ -213,7 +213,7 @@ fn fall_flight_and_cruise_follow_the_reported_speed() {
 
 /// `/tp` and `/time` are operator-only under [`TeleportPolicy::Ops`]. The
 /// reason is a private chat from "server". The speed cap is the same
-/// whether or not the client claimed a mod.
+/// whether or not the client claimed a module.
 #[test]
 fn non_operator_time_and_teleport_are_refused_with_a_reason() {
     let start = DVec3::new(8.5, 20.0, 8.5);

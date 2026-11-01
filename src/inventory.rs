@@ -1,11 +1,11 @@
-//! The configurations a player carries. Owned by the core; mods only present and spend it.
+//! The configurations a player carries. Owned by the core; modules only present and spend it.
 use crate::block::registry::BlockId;
 
 /// Starting capacity, in units. Counts of one configuration add together.
 pub const START_CAPACITY: usize = 100;
 
 /// The block counts the player is carrying — the single source of truth.
-/// Mods read, spend, and display it; they do not own it.
+/// Modules read, spend, and display it; they do not own it.
 pub struct Inventory {
     /// Per-block counts in first-seen order, so display rows are stable as
     /// counts change.

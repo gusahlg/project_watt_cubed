@@ -86,7 +86,7 @@ mod tests {
     use super::*;
     use crate::block::AIR;
     use crate::math::block_coord;
-    use crate::modding::Mods;
+    use crate::modules::Modules;
     use crate::net::client::{Connection, Incoming};
     use crate::player::Player;
     use crate::render_config::RenderConfig;
@@ -116,7 +116,7 @@ mod tests {
         remove(&id);
         let meta = SaveMeta { name: name.into(), seed: 5, created: 1, last_played, playtime_secs: 0, edit_count: 0 };
         let player = Player::new(DVec3::new(0.5, 40.0, 0.5));
-        save::save(&id, &world(5, WorldgenKind::Flat, TerrainCfg::default()), &player, &Mods::empty(), meta.clone()).unwrap();
+        save::save(&id, &world(5, WorldgenKind::Flat, TerrainCfg::default()), &player, &Modules::empty(), meta.clone()).unwrap();
         Slot { id, meta: Ok(meta) }
     }
 
@@ -162,17 +162,17 @@ mod tests {
 
         assert_eq!(host.stop(), Some(STOPPED));
         assert!(!host.running() && !host.serves(&id));
-        let mut mods = Mods::empty();
-        let (mut sp, player, meta, _) = save::load(&id, &mut mods, world).unwrap();
+        let mut modules = Modules::empty();
+        let (mut sp, player, meta, _) = save::load(&id, &mut modules, world).unwrap();
         assert!(meta.edit_count >= 1, "the stop saved the friend's edit before singleplayer read the slot");
         let (x, z) = (8, 8);
         let y = sp.surface_y(x, z) - 1;
         assert_ne!(sp.block_at(x, y, z), AIR);
         sp.set_block(x, y, z, AIR);
-        save::save(&id, &sp, &player, &mods, meta).unwrap();
+        save::save(&id, &sp, &player, &modules, meta).unwrap();
 
         drop(host);
-        let (again, _, _, _) = save::load(&id, &mut Mods::empty(), world).unwrap();
+        let (again, _, _, _) = save::load(&id, &mut Modules::empty(), world).unwrap();
         assert_eq!(again.block_at(x, y, z), AIR, "the singleplayer edit survives the app's exit");
         remove(&id);
     }

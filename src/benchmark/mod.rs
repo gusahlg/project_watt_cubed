@@ -72,8 +72,8 @@ enum Phase {
 
 /// Pins parsed from `WATT_BENCH_WORLDGEN` / `WATT_BENCH_VISUALS` / `WATT_BENCH_SUSPEND`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct BenchModPins {
-    /// The generator new worlds use, whatever the installed mods say.
+pub struct BenchModulePins {
+    /// The generator new worlds use, whatever the installed modules say.
     pub worldgen: Option<WorldgenKind>,
     /// `Some(true)` suspends every package that provides a visual group (core look);
     /// `Some(false)` leaves them on.
@@ -237,7 +237,7 @@ impl Benchmark {
     /// The only parser for `WATT_BENCH_WORLDGEN` / `WATT_BENCH_VISUALS` / `WATT_BENCH_SUSPEND`.
     /// Applied even when `WATT_BENCH` itself is unset so a pin-and-play run
     /// uses the same accepted values as a timed harness run.
-    pub fn mod_pins_from_env() -> BenchModPins {
+    pub fn module_pins_from_env() -> BenchModulePins {
         let worldgen = match std::env::var("WATT_BENCH_WORLDGEN") {
             Ok(value) => match parse_bench_worldgen(&value) {
                 Some(parsed) => Some(parsed),
@@ -263,7 +263,7 @@ impl Benchmark {
             Err(_) => None,
         };
         let suspend = std::env::var("WATT_BENCH_SUSPEND").map(|v| parse_bench_suspend(&v)).unwrap_or_default();
-        BenchModPins {
+        BenchModulePins {
             worldgen,
             visuals_core,
             suspend,
@@ -999,7 +999,7 @@ fn parse_bench_suspend(value: &str) -> Vec<String> {
     ids
 }
 
-/// `Some(true)` strips the visual mods (core look); `Some(false)` leaves them on.
+/// `Some(true)` strips the visual modules (core look); `Some(false)` leaves them on.
 fn parse_bench_visuals(value: &str) -> Option<bool> {
     match value {
         "off" | "core" => Some(true),

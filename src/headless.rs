@@ -29,8 +29,8 @@ const CHAT_PER_SEC: usize = 5;
 #[derive(Debug)]
 pub struct ConnectError {
     message: String,
-    /// Package ids the server refuses. Empty unless it denied the mod list.
-    pub mods_denied: Vec<String>,
+    /// Package ids the server refuses. Empty unless it denied the module list.
+    pub modules_denied: Vec<String>,
 }
 
 impl ConnectError {
@@ -41,7 +41,7 @@ impl ConnectError {
     pub(crate) fn plain(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
-            mods_denied: Vec::new(),
+            modules_denied: Vec::new(),
         }
     }
 }
@@ -50,7 +50,7 @@ impl From<crate::net::client::ConnectError> for ConnectError {
     fn from(err: crate::net::client::ConnectError) -> Self {
         Self {
             message: err.message().to_string(),
-            mods_denied: err.mods_denied,
+            modules_denied: err.modules_denied,
         }
     }
 }
@@ -63,14 +63,14 @@ impl std::fmt::Display for ConnectError {
 
 impl std::error::Error for ConnectError {}
 
-/// What [`HeadlessClient::connect`] needs. `mods` is the enabled package list the server may refuse.
+/// What [`HeadlessClient::connect`] needs. `modules` is the enabled package list the server may refuse.
 #[derive(Clone, Debug)]
 pub struct JoinOptions {
     pub host: String,
     pub port: u16,
     pub name: String,
     pub password: String,
-    pub mods: Vec<(String, String)>,
+    pub modules: Vec<(String, String)>,
     pub timeout: Duration,
 }
 
@@ -203,7 +203,7 @@ impl HeadlessClient {
             opts.port,
             &opts.name,
             &opts.password,
-            &opts.mods,
+            &opts.modules,
             deadline,
         )?;
         let world = World::mirror(
@@ -646,10 +646,10 @@ fn connect_within(
     port: u16,
     name: &str,
     password: &str,
-    mods: &[(String, String)],
+    modules: &[(String, String)],
     deadline: Instant,
 ) -> Result<Connection, ConnectError> {
-    let mut pending = Connection::begin_connect(host, port, name, password, mods);
+    let mut pending = Connection::begin_connect(host, port, name, password, modules);
     loop {
         if let Some(result) = pending.poll() {
             return result.map_err(ConnectError::from);
@@ -673,14 +673,14 @@ mod tests {
     use super::*;
     use crate::block::AIR;
     use crate::math::PER_METER;
-    use crate::net::server::{self, Config, EditIntent, ServerMod, Verdict};
+    use crate::net::server::{self, Config, EditIntent, ServerModule, Verdict};
     use crate::world::generation::WorldgenKind;
 
     const DT: f32 = 1.0 / 60.0;
 
     struct Deny;
 
-    impl ServerMod for Deny {
+    impl ServerModule for Deny {
         fn id(&self) -> &'static str {
             "deny-edits"
         }
@@ -697,13 +697,13 @@ mod tests {
             port,
             name: name.into(),
             password: String::new(),
-            mods: Vec::new(),
+            modules: Vec::new(),
             timeout: Duration::from_secs(15),
         })
         .unwrap_or_else(|e| panic!("join {name}: {e}"))
     }
 
-    fn flat(hooks: Vec<Box<dyn ServerMod>>) -> server::ServerHandle {
+    fn flat(hooks: Vec<Box<dyn ServerModule>>) -> server::ServerHandle {
         server::spawn(
             0,
             Config {

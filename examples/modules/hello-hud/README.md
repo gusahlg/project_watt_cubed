@@ -1,19 +1,19 @@
 # Hello HUD
 
-The smallest useful PWC mod, kept in the game repository as a living example of the mod API
-(`crates/pwc-mod-api`). It adds one HUD line in the top-right corner that counts the blocks you
+The smallest useful PWC module, kept in the game repository as a living example of the module API
+(`crates/pwc-module-api`). It adds one HUD line in the top-right corner that counts the blocks you
 broke this session.
 
-- **Controls:** none. It is in a build when the instance has it (`pwc mod add`), and runs there.
+- **Controls:** none. It is in a build when the instance has it (`pwc module add`), and runs there.
 - **Persisted state:** none.
-- **Dependencies:** none besides the mod API (`pwc-api ^3.0`). Its test uses
-  `pwc_mod_api::testing::Harness`.
+- **Dependencies:** none besides the module API (`pwc-api ^3.4`). Its test uses
+  `pwc_module_api::testing::Harness`.
 
 Try it with the PWC package manager:
 
 ```bash
 pwc instance create hello --use
-pwc mod add /path/to/project_watt_cubed/examples/mods/hello-hud
+pwc module add /path/to/project_watt_cubed/examples/modules/hello-hud
 pwc run
 ```
 
@@ -26,9 +26,9 @@ Licensed under either of
 
 at your option.
 
-Copy it to start your own mod. `Apache-2.0 OR MIT` is the recommended licence for new mods; any
-other free licence accepted by `MOD_POLICY.md` and the package manager's `POLICY.md` (for example
-`MPL-2.0` or `AGPL-3.0-or-later`) works too. Proprietary mods are not accepted.
+Copy it to start your own module. `Apache-2.0 OR MIT` is the recommended licence for new modules; any
+other free licence accepted by `MODULE_POLICY.md` and the package manager's `POLICY.md` (for example
+`MPL-2.0` or `AGPL-3.0-or-later`) works too. Proprietary modules are not accepted.
 
 ### Contribution
 

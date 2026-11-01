@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: 2026 Project Watt Cubed contributors
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Test-only legacy fixture so core tests remain independent of the package-manager checkout.
-//! Production law and package integration tests live in pwc-package-manager/mods/physics-selective.
-use pwc_mod_api::block::{BlockId, BlockRegistry};
-use pwc_mod_api::sim::{
+//! Production law and package integration tests live in pwc-package-manager/modules/physics-selective.
+use pwc_module_api::block::{BlockId, BlockRegistry};
+use pwc_module_api::sim::{
     model::{Model, Sample, Stats},
     reactions::{Budget, CellStore, Contact, DEFAULT_CAPACITY, Mutation, Pos},
 };

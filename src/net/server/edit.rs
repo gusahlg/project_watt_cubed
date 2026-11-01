@@ -43,7 +43,7 @@ enum Wanted {
 
 /// Gates, in order: reach (against the sender's last ACCEPTED position, per
 /// [`on_move`]'s envelope), a canonical spec (no intern), the expected cell
-/// revision, installed [`ServerMod::validate_edit`] hooks, the revision again,
+/// revision, installed [`ServerModule::validate_edit`] hooks, the revision again,
 /// then — only if it is still the winner — interning a novel spec under the
 /// per-client quota and the world's reserve. A stale novel spec never enters
 /// the registry. When two players race one cell, the loser rolls back. An edit that

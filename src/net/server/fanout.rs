@@ -213,14 +213,14 @@ pub(super) fn queue(state: &State, sends: &mut Vec<PendingSend>) -> Wake {
 /// never counted toward the slow-client kick ([`kick_slow`]/[`OUT_CAPACITY`]).
 /// Relayed only to the sender's visible interest set. The sender id is stamped
 /// here; the client's own message does not carry it. Size is capped by the codec.
-pub(super) fn on_mod_data(
+pub(super) fn on_module_data(
     shared: &Arc<Mutex<State>>,
     id: u32,
     channel: protocol::Channel,
     seq: u32,
-    bytes: protocol::ModBytes,
+    bytes: protocol::ModuleBytes,
 ) {
-    relay(shared, id, ServerMessage::PeerModData { channel, sender: id, seq, bytes }.frame());
+    relay(shared, id, ServerMessage::PeerModuleData { channel, sender: id, seq, bytes }.frame());
 }
 
 /// Loss-tolerant: `frame` reaches `from`'s visible, ready peers, and a full queue drops

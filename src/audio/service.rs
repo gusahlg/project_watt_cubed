@@ -1,8 +1,8 @@
 //! The audio service: gait, the acoustic window, capture and the voice sessions.
-//! Mods decide which cue plays and who is heard; this only carries out those decisions.
+//! Modules decide which cue plays and who is heard; this only carries out those decisions.
 //!
 //! Footsteps stay here. A step is a π crossing of the same stride phase the wire already
-//! carries, so the core emits [`GameEvent::Footstep`] and a mod only picks the cue.
+//! carries, so the core emits [`GameEvent::Footstep`] and a module only picks the cue.
 
 use std::sync::Arc;
 
@@ -10,9 +10,9 @@ use glam::DQuat;
 use voxel_engine::{DVec3, IVec3};
 
 use crate::block::registry::{BlockId, SoundClass};
-use crate::modding::{NoticeLevel, Notices};
+use crate::modules::{NoticeLevel, Notices};
 use crate::coord::Face;
-use crate::modding::ActionSet;
+use crate::modules::ActionSet;
 use crate::net::client::Connection;
 use crate::presence::STRIDE_FREQ;
 use crate::world::World;
@@ -89,14 +89,14 @@ impl AudioView<'_> {
     }
 }
 
-/// One captured opus frame. The bytes are opaque; the mod does not decode them.
+/// One captured opus frame. The bytes are opaque; the module does not decode them.
 pub struct CapturedFrame {
     pub seq: u32,
     pub bytes: Vec<u8>,
 }
 
-/// One frame a mod channel delivered. `sender` is the server-stamped player id.
-pub struct ModFrame {
+/// One frame a module channel delivered. `sender` is the server-stamped player id.
+pub struct ModuleFrame {
     pub sender: u32,
     pub seq: u32,
     pub bytes: Vec<u8>,
@@ -110,17 +110,17 @@ pub struct Play {
     pub gain: f32,
 }
 
-/// The link a mod uses to send and receive on a named channel. Idle when there is no server.
-pub struct ModLink<'a> {
+/// The link a module uses to send and receive on a named channel. Idle when there is no server.
+pub struct ModuleLink<'a> {
     net: Option<&'a mut Connection>,
 }
 
-impl<'a> ModLink<'a> {
+impl<'a> ModuleLink<'a> {
     pub(crate) fn new(net: Option<&'a mut Connection>) -> Self {
         Self { net }
     }
 
-    /// No connection. A menu frame and a disabled voice mod both look like this.
+    /// No connection. A menu frame and a disabled voice module both look like this.
     pub fn idle() -> Self {
         Self { net: None }
     }
@@ -145,15 +145,15 @@ impl<'a> ModLink<'a> {
 
     /// Append waiting frames. A channel with nothing queued leaves `out` untouched
     /// and allocates nothing.
-    pub fn drain(&mut self, channel: &str, out: &mut Vec<ModFrame>) {
+    pub fn drain(&mut self, channel: &str, out: &mut Vec<ModuleFrame>) {
         let Some(net) = self.net.as_deref_mut() else { return };
         for (sender, seq, bytes) in net.drain_channel(channel) {
-            out.push(ModFrame { sender, seq, bytes });
+            out.push(ModuleFrame { sender, seq, bytes });
         }
     }
 }
 
-/// The local pose the gait integrator reads. Not part of the mod surface.
+/// The local pose the gait integrator reads. Not part of the module surface.
 pub(crate) struct StepPose {
     pub feet: DVec3,
     pub velocity: DVec3,
@@ -361,7 +361,7 @@ impl AudioService {
         AudioApi { sound, symbols, service: self, world, notices, log: None }
     }
 
-    /// Submit the journal the mods just filled, then surface faults. An empty idle
+    /// Submit the journal the modules just filled, then surface faults. An empty idle
     /// journal does not sample the acoustic window.
     pub(crate) fn finish(
         &mut self,
@@ -411,7 +411,7 @@ impl Default for AudioService {
     }
 }
 
-/// What a mod may ask the audio service to do. It does not expose the device, the codecs,
+/// What a module may ask the audio service to do. It does not expose the device, the codecs,
 /// or the mixer internals.
 pub struct AudioApi<'a> {
     sound: &'a mut SoundSystem,
@@ -604,7 +604,7 @@ fn finite_gain(gain: f32) -> Option<f32> {
     gain.is_finite().then_some(gain.clamp(0.0, 4.0))
 }
 
-/// Headless driver for mod tests: a recording backend plus the cue log.
+/// Headless driver for module tests: a recording backend plus the cue log.
 pub struct AudioBench {
     sound: SoundSystem,
     symbols: CueSymbols,
@@ -670,7 +670,7 @@ mode = "one_shot"
 "#;
 
 impl AudioBench {
-    /// A system whose catalog has the six cues the sounds mod plays, and whose backend
+    /// A system whose catalog has the six cues the sounds module plays, and whose backend
     /// records every clip and stream.
     pub fn recording() -> Self {
         let (mut backend, recorder) = RecordingBackend::new();

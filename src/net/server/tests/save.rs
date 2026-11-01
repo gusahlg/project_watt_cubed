@@ -140,25 +140,25 @@ fn world_policy_unions_flags_with_side_files() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("ops.txt"), "cara\n").unwrap();
     std::fs::write(
-        dir.join("mods.toml"),
+        dir.join("modules.toml"),
         "allow = [\"pwc.hotbar\"]\ndeny = [\"pwc.dev-toolkit\"]\n",
     ).unwrap();
     let mut config = Config {
         world: Some(dir.join("world.save")),
         ops: vec!["Ada".into()],
-        mods_deny: vec!["pwc.other".into()],
+        modules_deny: vec!["pwc.other".into()],
         ..Config::default()
     };
     load_world_policy(&mut config).unwrap();
     assert!(config.ops.iter().any(|n| n.eq_ignore_ascii_case("ada")));
     assert!(config.ops.iter().any(|n| n.eq_ignore_ascii_case("cara")));
-    assert_eq!(config.mods_allow, vec!["pwc.hotbar".to_string()]);
-    assert!(config.mods_deny.iter().any(|id| id == "pwc.dev-toolkit"));
-    assert!(config.mods_deny.iter().any(|id| id == "pwc.other"));
+    assert_eq!(config.modules_allow, vec!["pwc.hotbar".to_string()]);
+    assert!(config.modules_deny.iter().any(|id| id == "pwc.dev-toolkit"));
+    assert!(config.modules_deny.iter().any(|id| id == "pwc.other"));
 
     let bad = crate::save::store::test_temp_path("policy-bad");
     std::fs::create_dir_all(&bad).unwrap();
-    std::fs::write(bad.join("mods.toml"), "allow = 1\n").unwrap();
+    std::fs::write(bad.join("modules.toml"), "allow = 1\n").unwrap();
     let mut broken = Config { world: Some(bad.join("world.save")), ..Config::default() };
     assert!(load_world_policy(&mut broken).is_err());
     let _ = std::fs::remove_dir_all(&dir);

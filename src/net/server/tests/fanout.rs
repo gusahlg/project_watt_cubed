@@ -5,7 +5,7 @@ use super::support::*;
 /// A channel relays to the sender's interest set and nobody else, and the
 /// server stamps the sender. A full queue simply drops the frame.
 #[test]
-fn mod_data_relays_only_to_the_visible_set() {
+fn module_data_relays_only_to_the_visible_set() {
     let (out1, _rx1) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
     let (out2, rx2) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
     let (out3, rx3) = sync_channel::<Arc<[u8]>>(OUT_CAPACITY);
@@ -19,14 +19,14 @@ fn mod_data_relays_only_to_the_visible_set() {
     let shared = Arc::new(Mutex::new(test_state(players)));
 
     let channel = protocol::Channel::parse("voice").unwrap();
-    on_mod_data(&shared, 1, channel, 42, vec![1, 2, 3].try_into().unwrap());
+    on_module_data(&shared, 1, channel, 42, vec![1, 2, 3].try_into().unwrap());
 
     match ServerMessage::decode(&rx2.try_recv().expect("the visible peer hears it")) {
-        Some(ServerMessage::PeerModData { channel, sender, seq, bytes }) => {
+        Some(ServerMessage::PeerModuleData { channel, sender, seq, bytes }) => {
             assert_eq!(channel.as_str(), "voice");
             assert_eq!((sender, seq, bytes.as_slice()), (1, 42, &[1, 2, 3][..]));
         }
-        other => panic!("expected PeerModData, got {other:?}"),
+        other => panic!("expected PeerModuleData, got {other:?}"),
     }
     assert!(rx3.try_recv().is_err(), "a peer outside interest hears nothing");
 }

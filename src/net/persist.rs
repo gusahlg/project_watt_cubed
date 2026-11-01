@@ -1,7 +1,7 @@
 //! The dedicated server's world file: seed, generator, edit ledger, and clock.
 //!
 //! The bytes are a [`save::format`](crate::save::format) document. Edits use the
-//! spec palette. The clock is the mod record `pwc.clock` (eight hex digits of
+//! spec palette. The clock is the module record `pwc.clock` (eight hex digits of
 //! `f32::to_bits`); singleplayer ignores that name. Pending reactions are the live
 //! scheduler's contacts, so a reload continues work in progress. A spec this build
 //! cannot parse stays in the file until a later edit replaces that cell.
@@ -27,8 +27,8 @@ use crate::save;
 use crate::world::generation::WorldgenKind;
 use crate::world::terrain::{TerrainCfg, WORLDGEN_VERSION};
 
-/// Mod record that holds the day fraction. Not a gameplay mod.
-const CLOCK_MOD: &str = "pwc.clock";
+/// Module record that holds the day fraction. Not a gameplay module.
+const CLOCK_MODULE: &str = "pwc.clock";
 /// Day fraction when a world has no clock record.
 const DEFAULT_DAY: f32 = 0.3;
 
@@ -55,7 +55,7 @@ pub(crate) struct Loaded {
     pub store: Option<Store>,
 }
 
-/// One world file and the player/mod skeleton kept across saves.
+/// One world file and the player/module skeleton kept across saves.
 pub(crate) struct Store {
     path: PathBuf,
     doc: Mutex<SaveDoc>,
@@ -106,7 +106,7 @@ pub(crate) struct Snapshot {
     pub simulation: Vec<(String, String)>,
 }
 
-/// Operators and mod policy that live beside a world file.
+/// Operators and module policy that live beside a world file.
 pub(crate) struct SideFiles {
     /// Lowercased operator names with no secret.
     pub ops: Vec<String>,
@@ -128,7 +128,7 @@ impl Store {
     }
 
     /// Replace the ledger, clock, generator stamp, and pending reactions.
-    /// Player, other mod records, name, created time, and playtime stay.
+    /// Player, other module records, name, created time, and playtime stay.
     /// The previous file is rotated to `.bak` the way a singleplayer slot is,
     /// unless the backup was loaded in its place.
     pub fn write(&self, snap: &Snapshot) -> io::Result<()> {
@@ -248,11 +248,11 @@ fn open(path: &Path, mut doc: SaveDoc, flags: &Flags, rotate: bool) -> Result<Lo
             flags.worldgen.id()
         );
     }
-    let day = clock_of(&doc.mods);
+    let day = clock_of(&doc.modules);
     let spec_table = std::mem::take(&mut doc.specs);
     let stored = std::mem::take(&mut doc.edits);
     let pending = std::mem::take(&mut doc.pending);
-    let mut simulation: Vec<_> = doc.mods.iter().filter(|(name, _)| name.starts_with("@simulation.")).cloned().collect();
+    let mut simulation: Vec<_> = doc.modules.iter().filter(|(name, _)| name.starts_with("@simulation.")).cloned().collect();
     // Actual pre-extraction saves used selective transfer even after their contacts settled.
     // Fresh worlds bypass this migration through `fresh`.
     if !simulation.iter().any(|(name, _)| name == "@simulation.selected") {
@@ -315,7 +315,7 @@ fn blank_doc(flags: &Flags) -> SaveDoc {
         },
         specs: Vec::new(),
         edits: Vec::new(),
-        mods: Vec::new(),
+        modules: Vec::new(),
         pending: Vec::new(),
     }
 }
@@ -356,15 +356,15 @@ fn encode_snapshot(
     doc.specs = table.specs;
     doc.edits = records;
     doc.pending = snap.pending.clone();
-    doc.mods.retain(|(name, _)| name != CLOCK_MOD && !name.starts_with("@simulation."));
-    doc.mods.extend(snap.simulation.iter().cloned());
+    doc.modules.retain(|(name, _)| name != CLOCK_MODULE && !name.starts_with("@simulation."));
+    doc.modules.extend(snap.simulation.iter().cloned());
     let day = if snap.day.is_finite() { snap.day.rem_euclid(1.0) } else { DEFAULT_DAY };
-    doc.mods.push((CLOCK_MOD.to_string(), format!("{:08x}", day.to_bits())));
+    doc.modules.push((CLOCK_MODULE.to_string(), format!("{:08x}", day.to_bits())));
     format::encode(doc)
 }
 
-fn clock_of(mods: &[(String, String)]) -> f32 {
-    let Some((_, text)) = mods.iter().find(|(name, _)| name == CLOCK_MOD) else {
+fn clock_of(modules: &[(String, String)]) -> f32 {
+    let Some((_, text)) = modules.iter().find(|(name, _)| name == CLOCK_MODULE) else {
         return DEFAULT_DAY;
     };
     let Ok(bits) = u32::from_str_radix(text, 16) else { return DEFAULT_DAY };
@@ -372,15 +372,18 @@ fn clock_of(mods: &[(String, String)]) -> f32 {
     if day.is_finite() { day.rem_euclid(1.0) } else { DEFAULT_DAY }
 }
 
-/// `ops.txt` (one name a line, `#` comments) and `mods.toml` (`allow` / `deny`
+/// `ops.txt` (one name a line, `#` comments) and `modules.toml` (`allow` / `deny`
 /// string arrays) in the world's directory. A missing file is empty. A
-/// `mods.toml` that is not that shape is an error.
+/// `modules.toml` that is not that shape is an error.
 pub(crate) fn read_side_files(world: &Path) -> Result<SideFiles, String> {
     let Some(dir) = world.parent() else {
         return Ok(SideFiles { ops: Vec::new(), op_secrets: Vec::new(), allow: Vec::new(), deny: Vec::new() });
     };
     let (ops, op_secrets) = read_ops(&dir.join("ops.txt"))?;
-    let (allow, deny) = read_mods_toml(&dir.join("mods.toml"))?;
+    // Servers before 0.8 called the file `mods.toml`: it is read when `modules.toml` is absent.
+    let list = dir.join("modules.toml");
+    let list = if list.exists() { list } else { dir.join("mods.toml") };
+    let (allow, deny) = read_modules_toml(&list)?;
     Ok(SideFiles { ops, op_secrets, allow, deny })
 }
 
@@ -433,32 +436,32 @@ pub(crate) fn parse_ops(text: &str) -> Ops {
     (ops, secrets)
 }
 
-fn read_mods_toml(path: &Path) -> Result<(Vec<String>, Vec<String>), String> {
+fn read_modules_toml(path: &Path) -> Result<(Vec<String>, Vec<String>), String> {
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok((Vec::new(), Vec::new())),
         Err(e) => return Err(format!("could not read {}: {e}", path.display())),
     };
-    parse_mods_toml(&text).map_err(|e| format!("{}: {e}", path.display()))
+    parse_modules_toml(&text).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-pub(crate) fn parse_mods_toml(text: &str) -> Result<(Vec<String>, Vec<String>), String> {
+pub(crate) fn parse_modules_toml(text: &str) -> Result<(Vec<String>, Vec<String>), String> {
     let value: toml::Value = toml::from_str(text).map_err(|e| e.to_string())?;
     let Some(table) = value.as_table() else {
-        return Err("mods.toml must be a table".into());
+        return Err("modules.toml must be a table".into());
     };
-    Ok((mod_ids(table, "allow")?, mod_ids(table, "deny")?))
+    Ok((module_ids(table, "allow")?, module_ids(table, "deny")?))
 }
 
-fn mod_ids(table: &toml::map::Map<String, toml::Value>, key: &str) -> Result<Vec<String>, String> {
+fn module_ids(table: &toml::map::Map<String, toml::Value>, key: &str) -> Result<Vec<String>, String> {
     let Some(value) = table.get(key) else { return Ok(Vec::new()) };
     let Some(items) = value.as_array() else {
-        return Err(format!("{key} must be an array of mod ids"));
+        return Err(format!("{key} must be an array of module ids"));
     };
     let mut ids = Vec::with_capacity(items.len());
     for item in items {
         let Some(id) = item.as_str() else {
-            return Err(format!("{key} must be an array of mod ids"));
+            return Err(format!("{key} must be an array of module ids"));
         };
         let id = id.trim();
         if !id.is_empty() && !ids.iter().any(|have: &String| have == id) {
@@ -488,9 +491,9 @@ mod tests {
         doc.meta.edit_count = edits.len() as u32;
         doc.specs = specs;
         doc.edits = edits;
-        doc.mods = vec![
+        doc.modules = vec![
             ("inventory".into(), "Stone".into()),
-            (CLOCK_MOD.into(), format!("{day_bits:08x}")),
+            (CLOCK_MODULE.into(), format!("{day_bits:08x}")),
         ];
         doc.pending = vec![PendingContact { x: 1, y: 2, z: 3, axis: 0, age: 4 }];
         doc
@@ -538,7 +541,7 @@ mod tests {
             Decoded::Salvaged { .. } => panic!("resave must be intact"),
         };
         assert_eq!(saved.pending, pending);
-        assert!(saved.mods.iter().any(|(n, d)| n == "inventory" && d == "Stone"));
+        assert!(saved.modules.iter().any(|(n, d)| n == "inventory" && d == "Stone"));
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(sibling(&path, ".bak"));
     }
@@ -581,12 +584,12 @@ mod tests {
     }
 
     #[test]
-    fn side_files_union_ops_and_mod_lists() {
+    fn side_files_union_ops_and_module_lists() {
         let dir = crate::save::store::test_temp_path("side");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("ops.txt"), "# staff\nAda\n\n bob \nAda\ncara  s3cret \nCara other\n").unwrap();
         fs::write(
-            dir.join("mods.toml"),
+            dir.join("modules.toml"),
             "allow = [\"pwc.hotbar\", \"pwc.hotbar\"]\ndeny = [\"pwc.dev-toolkit\"]\n",
         )
         .unwrap();
@@ -595,6 +598,19 @@ mod tests {
         assert_eq!(side.op_secrets, vec![("cara".to_string(), "s3cret".to_string())], "the first line for a name wins");
         assert_eq!(side.allow, vec!["pwc.hotbar".to_string()]);
         assert_eq!(side.deny, vec!["pwc.dev-toolkit".to_string()]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_old_mods_toml_is_read_only_when_modules_toml_is_absent() {
+        let dir = crate::save::store::test_temp_path("side-old-name");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("mods.toml"), "deny = [\"old.one\"]\n").unwrap();
+        let old = read_side_files(&dir.join("world.save")).unwrap();
+        assert_eq!(old.deny, vec!["old.one".to_string()], "the old name is read");
+        fs::write(dir.join("modules.toml"), "deny = [\"new.one\"]\n").unwrap();
+        let new = read_side_files(&dir.join("world.save")).unwrap();
+        assert_eq!(new.deny, vec!["new.one".to_string()], "the new name wins");
         let _ = fs::remove_dir_all(&dir);
     }
 

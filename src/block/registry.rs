@@ -3,7 +3,7 @@
 //! internal supports, so a reaction never rebuilds them), to the hot per-voxel readings the meshers,
 //! light, physics and audio consume (SoA, observed once per distinct configuration), to its own
 //! texture-array layer (every configuration has a unique look while the device has layers), to the
-//! names a naming mod gave it, and to its spec text (`air` or `c:<hex>`), spelled once at intern. A
+//! names a naming module gave it, and to its spec text (`air` or `c:<hex>`), spelled once at intern. A
 //! lookup writes its key on the stack, so a hit never allocates.
 
 use std::collections::HashMap;
@@ -541,7 +541,7 @@ impl BlockRegistry {
         self.named_upto = self.configs.len();
     }
 
-    /// What a player calls the block: the naming mod's name, else words read off the observation.
+    /// What a player calls the block: the naming module's name, else words read off the observation.
     pub fn display_name(&self, id: BlockId) -> String {
         match &self.names[id.0 as usize] {
             Some(n) if id != AIR => n.block.clone(),

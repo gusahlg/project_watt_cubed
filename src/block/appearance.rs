@@ -1,10 +1,10 @@
 //! Block appearance seam: a configuration becomes one texture-array layer.
 //!
 //! Every configuration owns a layer while the device has layers (see
-//! [`BlockRegistry::render_layer`]), so an appearance mod paints a texture *per configuration* from
+//! [`BlockRegistry::render_layer`]), so an appearance module paints a texture *per configuration* from
 //! the configuration itself — its elements, readings and presentation colours. The core fallback is
 //! [`FlatAppearance`] (flat base colour + alpha). The world's texture cache asks
-//! [`Mods::appearance`](crate::modding::Mods::appearance) — the first enabled appearance mod, else this
+//! [`Modules::appearance`](crate::modules::Modules::appearance) — the first enabled appearance module, else this
 //! fallback. A `revision` change rebuilds every layer; otherwise the cache is append-only.
 
 use material::{Block, Law, Observation, Visual};
@@ -29,8 +29,8 @@ pub struct AppearanceSource<'a> {
     pub obs: &'a Observation,
 }
 
-/// Turns a configuration into pixels. Implementors live in mods; core only ships
-/// [`FlatAppearance`]. `layer` must be a pure function of the source (and the mod's own knobs).
+/// Turns a configuration into pixels. Implementors live in modules; core only ships
+/// [`FlatAppearance`]. `layer` must be a pure function of the source (and the module's own knobs).
 pub trait BlockAppearance {
     fn layer(&self, src: &AppearanceSource, out: &mut [u8; LAYER_BYTES]);
     fn revision(&self) -> u32;
@@ -39,7 +39,7 @@ pub trait BlockAppearance {
 /// Core fallback: every texel is the base colour with the visual's alpha.
 pub struct FlatAppearance;
 
-/// Process-lifetime fallback when no appearance mod is enabled.
+/// Process-lifetime fallback when no appearance module is enabled.
 pub static FLAT: FlatAppearance = FlatAppearance;
 
 impl BlockAppearance for FlatAppearance {
@@ -76,7 +76,7 @@ pub fn fill_layer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::modding::Mods;
+    use crate::modules::Modules;
     use material::{Configuration, Element};
 
     #[test]
@@ -91,12 +91,12 @@ mod tests {
     }
 
     #[test]
-    fn empty_mods_use_flat_appearance_and_layer_zero_is_white() {
-        let mods = Mods::empty();
-        assert_eq!(mods.appearance().revision(), 0);
+    fn empty_modules_use_flat_appearance_and_layer_zero_is_white() {
+        let modules = Modules::empty();
+        assert_eq!(modules.appearance().revision(), 0);
         let reg = BlockRegistry::with_builtins();
         let mut out = [0u8; LAYER_BYTES];
-        fill_layer(mods.appearance(), &reg, 0, &mut out);
+        fill_layer(modules.appearance(), &reg, 0, &mut out);
         assert!(out.iter().all(|&b| b == 255));
     }
 }

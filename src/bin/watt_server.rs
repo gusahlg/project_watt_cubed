@@ -6,7 +6,7 @@
 //! ```text
 //! watt_server [--port <n>] [--password <pw>] [--seed <n>] [--day-secs <n>]
 //!             [--world <path>] [--ops <name,name>] [--teleport off|ops|all]
-//!             [--noclip off|ops|all] [--max-speed <m/s>] [--mods-allow <id,id>] [--mods-deny <id,id>]
+//!             [--noclip off|ops|all] [--max-speed <m/s>] [--modules-allow <id,id>] [--modules-deny <id,id>]
 //!             [--worldgen <flat|diffusion>] [--relief <n>] [--caves <n>] [--mines <n>]
 //!             [--space <n>] [--variety <n>] [--features <n>] [--structures <n>] [--deep <n>]
 //!             [--data-dir <dir>]
@@ -14,13 +14,13 @@
 //! `--world` loads and saves the seed, generator, edit ledger, and clock.
 //! A stored seed and generator win over the flags. The world is written every
 //! few minutes and on shutdown (SIGINT, SIGTERM). Next to that file, `ops.txt`
-//! and `mods.toml` are read and united with the flags. An `ops.txt` line is
+//! and `modules.toml` are read and united with the flags. An `ops.txt` line is
 //! `name secret`: that player becomes an operator by sending the chat line
 //! `/op secret`. Quote names containing spaces, e.g. `"Big Ada" secret` or
 //! `"Big Ada"` for a trusted name with no secret. Unquoted lines keep their meaning.
 //! A line with a name alone, like `--ops`, trusts the name, so
 //! anyone who joins under it is an operator; the server warns about those.
-//! A `mods.toml`:
+//! A `modules.toml`:
 //! ```toml
 //! deny = ["pwc.dev-toolkit"]
 //! # allow = [...] would admit only the listed packages: name every package players need.
@@ -34,8 +34,8 @@
 //! a move whose body overlaps solid ground snaps back unless that player may pass.
 //! `--max-speed` is metres per
 //! second; omitted, it is the game's own cap, which leaves cruise alone.
-//! `--mods-allow` and `--mods-deny` name package ids. With no allow list every
-//! reported mod is admitted. The list is the client's own word.
+//! `--modules-allow` and `--modules-deny` (the older `--mods-allow` and `--mods-deny` still work) name package ids. With no allow list every
+//! reported module is admitted. The list is the client's own word.
 //! `--data-dir` sets the data and config root (same as `WATT_DATA_DIR`).
 use std::path::PathBuf;
 use std::process;
@@ -51,7 +51,7 @@ const USAGE: &str = "\
 usage: watt_server [--port <n>] [--password <pw>] [--seed <n>] [--day-secs <n>] \
 [--world <path>] [--ops <name,name>] [--teleport off|ops|all] [--noclip off|ops|all] \
 [--max-speed <m/s>] \
-[--mods-allow <id,id>] [--mods-deny <id,id>] \
+[--modules-allow <id,id>] [--modules-deny <id,id>] \
 [--worldgen <flat|diffusion>] [--relief <n>] [--caves <n>] [--mines <n>] [--space <n>] \
 [--variety <n>] [--features <n>] [--structures <n>] [--deep <n>] [--data-dir <dir>]";
 
@@ -117,8 +117,12 @@ fn main() {
                 }
                 config.max_speed = mps * PER_METER;
             }
-            "--mods-allow" => config.mods_allow.extend(split_list(&take(&args, &mut i, "--mods-allow"))),
-            "--mods-deny" => config.mods_deny.extend(split_list(&take(&args, &mut i, "--mods-deny"))),
+            "--modules-allow" | "--mods-allow" => {
+                config.modules_allow.extend(split_list(&take(&args, &mut i, "--modules-allow")))
+            }
+            "--modules-deny" | "--mods-deny" => {
+                config.modules_deny.extend(split_list(&take(&args, &mut i, "--modules-deny")))
+            }
             "--data-dir" => {
                 data_dir = Some(PathBuf::from(take(&args, &mut i, "--data-dir")));
             }
@@ -144,14 +148,14 @@ fn main() {
         config.noclip.name(),
         config.max_speed / PER_METER
     );
-    match (config.mods_allow.is_empty(), config.mods_deny.is_empty()) {
-        (true, true) => println!("mods: unrestricted"),
-        (true, false) => println!("mods: deny {}", config.mods_deny.join(",")),
-        (false, true) => println!("mods: allow only {}", config.mods_allow.join(",")),
+    match (config.modules_allow.is_empty(), config.modules_deny.is_empty()) {
+        (true, true) => println!("modules: unrestricted"),
+        (true, false) => println!("modules: deny {}", config.modules_deny.join(",")),
+        (false, true) => println!("modules: allow only {}", config.modules_allow.join(",")),
         (false, false) => println!(
-            "mods: allow only {}; deny {}",
-            config.mods_allow.join(","),
-            config.mods_deny.join(",")
+            "modules: allow only {}; deny {}",
+            config.modules_allow.join(","),
+            config.modules_deny.join(",")
         ),
     }
     if !config.op_secrets.is_empty() {

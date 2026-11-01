@@ -2,7 +2,7 @@
 //!
 //! Development runs normally find `<checkout>/assets`, while an installed Nix
 //! package finds `<prefix>/share/project_watt_cubed/assets` beside its executable.
-//! `WATT_ASSET_DIR` is an explicit override for modding, tests, and deployments
+//! `WATT_ASSET_DIR` is an explicit override for modules, tests, and deployments
 //! with a separate data directory.
 
 use std::path::{Path, PathBuf};

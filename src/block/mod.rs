@@ -1,6 +1,6 @@
 //! The world's material table: voxels store a compact [`BlockId`], the [`registry`] maps it to a
 //! configuration observed under the law. Presentation: a texture layer per configuration painted by
-//! an appearance mod ([`appearance`]) and names given by a naming mod ([`naming`]).
+//! an appearance module ([`appearance`]) and names given by a naming module ([`naming`]).
 pub mod appearance;
 pub mod naming;
 pub mod registry;

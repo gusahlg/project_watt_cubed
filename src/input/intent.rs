@@ -109,7 +109,7 @@ impl fmt::Display for Mods {
     }
 }
 
-/// Modifier-exact chord: fires only on exact mod match, so Ctrl+U ≠ U.
+/// Modifier-exact chord: fires only on exact module match, so Ctrl+U ≠ U.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Chord {
     pub mods: Mods,
@@ -144,7 +144,7 @@ impl Chord {
         self.source.is_pressed(eng) && mods == self.mods
     }
 
-    /// Hold condition for auto-repeat (source down, mod match).
+    /// Hold condition for auto-repeat (source down, module match).
     pub fn held(self, eng: &Engine, mods: Mods) -> bool {
         self.source.is_down(eng) && mods == self.mods
     }
@@ -268,7 +268,7 @@ impl GameplayState {
 }
 
 /// A gameplay edge event (bound to modifier-exact chords). Chat, commands and flight are not
-/// here: the mods that offer them declare their own [`Action`](crate::modding::Action)s.
+/// here: the modules that offer them declare their own [`Action`](crate::modules::Action)s.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum GameplayEvent {
     Break,

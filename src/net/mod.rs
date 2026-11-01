@@ -12,7 +12,7 @@
 //! **Trust:** the server is authoritative and never trusts a client. Frames are
 //! length-capped, joins are password-gated, and every edit and move is validated
 //! and rate-limited server-side ([`server`]). Communities add extra rules through
-//! the [`hooks`] seam (`ServerMod`) without changing the wire.
+//! the [`hooks`] seam (`ServerModule`) without changing the wire.
 pub(crate) mod client;
 pub(crate) mod hooks;
 #[cfg(test)]
@@ -174,11 +174,11 @@ pub(crate) const MAX_CHAT: usize = 256;
 /// (`1 + CAPACITY * D` bytes). A shorter cap rejects blocks the game can place.
 pub(crate) const MAX_SPEC: usize = 2 + 2 * (1 + material::CAPACITY * material::D);
 
-/// Largest accepted mod-channel payload (bytes). One 20 ms opus frame at up to
+/// Largest accepted module-channel payload (bytes). One 20 ms opus frame at up to
 /// ~64 kbps fits, with margin, and the same cap bounds every channel. `net`
 /// owns its own copy rather than depending on `audio`. The codec rejects a
 /// longer frame before the bytes are trusted.
-pub(crate) const MAX_MOD_BYTES: usize = 400;
+pub(crate) const MAX_MODULE_BYTES: usize = 400;
 
 /// What a join must share: generator version, gravity, material law, palette.
 /// Worldgen kind and terrain knobs are not in here — [`Welcome`](protocol::ServerMessage::Welcome)
